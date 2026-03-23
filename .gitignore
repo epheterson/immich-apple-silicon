@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# ML models (large, download at runtime)
+ml/models/
+ml/cache/
+ml/venv/
+ml/.venv/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+*.err
+
+# IDE
+.idea/
+.vscode/

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.immich.ffmpeg-proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/elp/immich-ffmpeg-proxy/server.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/elp/immich-ffmpeg-proxy</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FFMPEG_PROXY_PORT</key>
+        <string>3005</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/immich-ffmpeg-proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/immich-ffmpeg-proxy.err</string>
+</dict>
+</plist>

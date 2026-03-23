@@ -1,0 +1,53 @@
+services:
+  immich-server:
+    container_name: immich_server
+    image: ghcr.io/immich-app/immich-server:release
+    volumes:
+      - /Users/elp/docker/immich/upload:/usr/src/app/upload
+      - /nas/Pictures:/mnt/photos:ro
+      - /Users/elp/docker/immich/ffmpeg-wrapper.sh:/usr/bin/ffmpeg:ro
+      - /Users/elp/docker/immich/ffprobe-wrapper.sh:/usr/bin/ffprobe:ro
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - DB_HOSTNAME=immich_postgres
+      - IMMICH_MACHINE_LEARNING_URL=http://host.internal:3004
+      - DB_USERNAME=postgres
+      - DB_PASSWORD=postgres
+      - DB_DATABASE_NAME=immich
+      - REDIS_HOSTNAME=immich_redis
+    depends_on:
+      - redis
+      - database
+    restart: unless-stopped
+    ports:
+      - "2283:2283"
+
+  # ML: native macOS (GPU/Neural Engine) — /Users/elp/immich-ml-metal/
+  # Video: native macOS (VideoToolbox) — /Users/elp/immich-ffmpeg-proxy/
+
+  redis:
+    container_name: immich_redis
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: redis-cli ping || exit 1
+
+  database:
+    container_name: immich_postgres
+    image: tensorchord/pgvecto-rs:pg14-v0.2.0
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=immich
+      - POSTGRES_INITDB_ARGS=--data-checksums
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: pg_isready --dbname=immich
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
