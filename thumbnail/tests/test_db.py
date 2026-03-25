@@ -1,7 +1,15 @@
-"""Tests for thumbnail.db — ThumbnailDB."""
+"""Tests for thumbnail.db -- ThumbnailDB."""
+
+import os
 
 import pytest
 from thumbnail.db import ThumbnailDB
+
+
+# Use env vars for test configuration; defaults are generic placeholders.
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/tmp/test-upload")
+PHOTOS_DIR = os.environ.get("PHOTOS_DIR", "/tmp/test-photos")
+DB_PASS = os.environ.get("DB_PASS", "testpass")
 
 
 # Shared fixture
@@ -9,20 +17,20 @@ from thumbnail.db import ThumbnailDB
 def db():
     return ThumbnailDB(
         host="localhost", port=5432, dbname="immich",
-        user="postgres", password="postgres",
-        upload_dir="/Users/elp/docker/immich/upload",
-        photos_dir="/nas/Pictures",
+        user="postgres", password=DB_PASS,
+        upload_dir=UPLOAD_DIR,
+        photos_dir=PHOTOS_DIR,
     )
 
 
 # --- Path translation (no DB needed) ---
 
 def test_translate_path_photos(db):
-    assert db.translate_path("/mnt/photos/iCloud/test.jpg") == "/nas/Pictures/iCloud/test.jpg"
+    assert db.translate_path("/mnt/photos/iCloud/test.jpg") == PHOTOS_DIR + "/iCloud/test.jpg"
 
 
 def test_translate_path_upload(db):
-    assert db.translate_path("/usr/src/app/upload/thumbs/abc") == "/Users/elp/docker/immich/upload/thumbs/abc"
+    assert db.translate_path("/usr/src/app/upload/thumbs/abc") == UPLOAD_DIR + "/thumbs/abc"
 
 
 def test_translate_path_passthrough(db):
@@ -30,11 +38,11 @@ def test_translate_path_passthrough(db):
 
 
 def test_container_path_photos(db):
-    assert db.container_path("/nas/Pictures/iCloud/test.jpg") == "/mnt/photos/iCloud/test.jpg"
+    assert db.container_path(PHOTOS_DIR + "/iCloud/test.jpg") == "/mnt/photos/iCloud/test.jpg"
 
 
 def test_container_path_upload(db):
-    assert db.container_path("/Users/elp/docker/immich/upload/thumbs/abc") == "/usr/src/app/upload/thumbs/abc"
+    assert db.container_path(UPLOAD_DIR + "/thumbs/abc") == "/usr/src/app/upload/thumbs/abc"
 
 
 def test_container_path_passthrough(db):

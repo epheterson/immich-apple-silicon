@@ -3,8 +3,10 @@
 Queries the Immich Postgres database to find assets needing thumbnails,
 and writes back preview/thumbnail paths + thumbhash when done.
 """
+from __future__ import annotations
 
 import psycopg2
+import psycopg2.extensions
 import psycopg2.extras
 
 
@@ -24,16 +26,29 @@ class ThumbnailDB:
         self.password = password
         self.upload_dir = upload_dir.rstrip("/") + "/"
         self.photos_dir = photos_dir.rstrip("/") + "/"
+        self._conn = None
 
-    def _connect(self):
-        """Return a new psycopg2 connection."""
-        return psycopg2.connect(
+    def _connect(self) -> psycopg2.extensions.connection:
+        """Return a psycopg2 connection, reusing an existing one if healthy."""
+        if self._conn is not None:
+            try:
+                self._conn.cursor().execute("SELECT 1")
+                return self._conn
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+
+        self._conn = psycopg2.connect(
             host=self.host,
             port=self.port,
             dbname=self.dbname,
             user=self.user,
             password=self.password,
         )
+        return self._conn
 
     def translate_path(self, container_path: str) -> str:
         """Translate a container path to a host path.
@@ -75,10 +90,12 @@ class ThumbnailDB:
                 cur.execute(sql, (asset_type, limit))
                 rows = cur.fetchall()
                 return [dict(r) for r in rows]
-        finally:
-            conn.close()
+        except Exception:
+            # Connection may be broken; reset it
+            self._conn = None
+            raise
 
-    def mark_complete(self, asset_id: str, owner_id: str,
+    def mark_complete(self, asset_id: str,
                       preview_container_path: str, thumb_container_path: str,
                       thumbhash_bytes: bytes) -> None:
         """Mark an asset as having thumbnails generated.
@@ -97,18 +114,17 @@ class ThumbnailDB:
         conn = self._connect()
         try:
             with conn.cursor() as cur:
-                # UPSERT preview
                 cur.execute(upsert_sql, (asset_id, "preview", preview_container_path))
-                # UPSERT thumbnail
                 cur.execute(upsert_sql, (asset_id, "thumbnail", thumb_container_path))
-                # Update thumbhash
                 cur.execute(thumbhash_sql, (psycopg2.Binary(thumbhash_bytes), asset_id))
             conn.commit()
         except Exception:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            self._conn = None
             raise
-        finally:
-            conn.close()
 
     def get_stats(self) -> dict:
         """Return thumbnail generation stats.
@@ -129,5 +145,6 @@ class ThumbnailDB:
                 cur.execute(sql)
                 row = cur.fetchone()
                 return dict(row)
-        finally:
-            conn.close()
+        except Exception:
+            self._conn = None
+            raise

@@ -8,12 +8,13 @@ Configuration via environment variables:
     DB_PORT         Postgres port         (default: 5432)
     DB_NAME         Database name         (default: immich)
     DB_USER         Database user         (default: postgres)
-    DB_PASS         Database password     (default: postgres)
-    UPLOAD_DIR      Immich upload mount   (default: /Users/elp/docker/immich/upload)
-    PHOTOS_DIR      External photos mount (default: /nas/Pictures)
+    DB_PASS         Database password     (REQUIRED)
+    UPLOAD_DIR      Immich upload mount   (REQUIRED)
+    PHOTOS_DIR      External photos mount (REQUIRED)
     BATCH_SIZE      Assets per poll       (default: 20)
     POLL_INTERVAL   Seconds between polls (default: 5)
 """
+from __future__ import annotations
 
 import logging
 import os
@@ -23,20 +24,34 @@ from thumbnail.db import ThumbnailDB
 from thumbnail.worker import ThumbnailWorker
 
 
-def main():
+def main() -> None:
+    """Configure logging, read env vars, and start the thumbnail worker loop."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-5s %(name)s — %(message)s",
         datefmt="%H:%M:%S",
     )
 
+    # Required environment variables
+    db_pass = os.environ.get("DB_PASS")
+    if not db_pass:
+        print("ERROR: DB_PASS environment variable required")
+        sys.exit(1)
+
+    upload_dir = os.environ.get("UPLOAD_DIR")
+    if not upload_dir:
+        print("ERROR: UPLOAD_DIR environment variable required")
+        sys.exit(1)
+
+    photos_dir = os.environ.get("PHOTOS_DIR")
+    if not photos_dir:
+        print("ERROR: PHOTOS_DIR environment variable required")
+        sys.exit(1)
+
     db_host = os.environ.get("DB_HOST", "localhost")
     db_port = int(os.environ.get("DB_PORT", "5432"))
     db_name = os.environ.get("DB_NAME", "immich")
     db_user = os.environ.get("DB_USER", "postgres")
-    db_pass = os.environ.get("DB_PASS", "postgres")
-    upload_dir = os.environ.get("UPLOAD_DIR", "/Users/elp/docker/immich/upload")
-    photos_dir = os.environ.get("PHOTOS_DIR", "/nas/Pictures")
     batch_size = int(os.environ.get("BATCH_SIZE", "20"))
     poll_interval = int(os.environ.get("POLL_INTERVAL", "5"))
 

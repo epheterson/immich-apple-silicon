@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- EDIT PATHS BELOW: replace /path/to with your actual install location.
+     Python must have Pillow installed (for WebP fallback).
+     If using the immich-ml-metal venv, use its python3 path instead of /usr/bin/python3. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -7,14 +10,18 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/elp/immich-ffmpeg-proxy/server.py</string>
+        <string>/path/to/immich-apple-silicon/ffmpeg-proxy/server.py</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/elp/immich-ffmpeg-proxy</string>
+    <string>/path/to/immich-apple-silicon/ffmpeg-proxy</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>FFMPEG_PROXY_PORT</key>
         <string>3005</string>
+        <key>UPLOAD_DIR</key>
+        <string>/path/to/your/immich/upload</string>
+        <key>PHOTOS_DIR</key>
+        <string>/path/to/your/photos</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/bin:/bin</string>
     </dict>

@@ -1,26 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- EDIT PATHS BELOW: replace /path/to with your actual install location -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.immich.thumbnail</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/elp/immich-ml-metal/venv/bin/python3</string>
+        <string>/path/to/immich-apple-silicon/ml/venv/bin/python3</string>
         <string>-m</string>
         <string>thumbnail</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/elp/Repos/immich-apple-silicon</string>
+    <string>/path/to/immich-apple-silicon</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>DB_HOST</key><string>localhost</string>
         <key>DB_PORT</key><string>5432</string>
         <key>DB_NAME</key><string>immich</string>
         <key>DB_USER</key><string>postgres</string>
-        <key>DB_PASS</key><string>postgres</string>
-        <key>UPLOAD_DIR</key><string>/Users/elp/docker/immich/upload</string>
-        <key>PHOTOS_DIR</key><string>/nas/Pictures</string>
+        <key>DB_PASS</key><string>YOUR_DB_PASSWORD</string>
+        <key>UPLOAD_DIR</key><string>/path/to/your/immich/upload</string>
+        <key>PHOTOS_DIR</key><string>/path/to/your/photos</string>
         <key>BATCH_SIZE</key><string>20</string>
         <key>POLL_INTERVAL</key><string>5</string>
     </dict>

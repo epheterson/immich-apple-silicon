@@ -1,8 +1,8 @@
-"""Integration test — process one real asset end-to-end.
+"""Integration test -- process one real asset end-to-end.
 
 Requires:
     - Live Postgres with Immich DB on localhost:5432
-    - NFS mount at /nas/Pictures
+    - External photos mount (PHOTOS_DIR env var)
     - At least one pending IMAGE asset
 """
 
@@ -13,14 +13,20 @@ import pytest
 from thumbnail.db import ThumbnailDB
 from thumbnail.worker import ThumbnailWorker
 
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "")
+PHOTOS_DIR = os.environ.get("PHOTOS_DIR", "")
+DB_PASS = os.environ.get("DB_PASS", "")
+
 
 @pytest.fixture
 def db():
+    if not UPLOAD_DIR or not PHOTOS_DIR or not DB_PASS:
+        pytest.skip("Set UPLOAD_DIR, PHOTOS_DIR, and DB_PASS env vars for integration tests")
     return ThumbnailDB(
         host="localhost", port=5432, dbname="immich",
-        user="postgres", password="postgres",
-        upload_dir="/Users/elp/docker/immich/upload",
-        photos_dir="/nas/Pictures",
+        user="postgres", password=DB_PASS,
+        upload_dir=UPLOAD_DIR,
+        photos_dir=PHOTOS_DIR,
     )
 
 
@@ -29,7 +35,7 @@ def test_full_pipeline_one_asset(db):
     """Pick one pending asset, generate thumbnails, verify everything."""
     # 1. Get a pending asset
     pending = db.get_pending_assets(limit=1, asset_type="IMAGE")
-    assert len(pending) >= 1, "No pending IMAGE assets — nothing to test"
+    assert len(pending) >= 1, "No pending IMAGE assets -- nothing to test"
     asset = pending[0]
     asset_id = asset["id"]
     owner_id = asset["ownerId"]
@@ -44,8 +50,7 @@ def test_full_pipeline_one_asset(db):
     assert os.path.isfile(host_path), f"Source not found: {host_path}"
 
     # 2. Process it
-    upload_dir = "/Users/elp/docker/immich/upload"
-    worker = ThumbnailWorker(db=db, upload_dir=upload_dir)
+    worker = ThumbnailWorker(db=db, upload_dir=UPLOAD_DIR)
 
     worker.process_asset(asset_id, original_path, owner_id)
 
@@ -54,7 +59,7 @@ def test_full_pipeline_one_asset(db):
 
     # 3. Verify output files exist
     stripped = asset_id.replace("-", "")
-    out_dir = os.path.join(upload_dir, "thumbs", owner_id, stripped[0:2], stripped[2:4])
+    out_dir = os.path.join(UPLOAD_DIR, "thumbs", owner_id, stripped[0:2], stripped[2:4])
     preview_path = os.path.join(out_dir, f"{asset_id}_preview.jpeg")
     thumb_path = os.path.join(out_dir, f"{asset_id}_thumbnail.webp")
 
@@ -75,7 +80,7 @@ def test_full_pipeline_one_asset(db):
 
     conn = psycopg2.connect(
         host="localhost", port=5432, dbname="immich",
-        user="postgres", password="postgres",
+        user="postgres", password=DB_PASS,
     )
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -97,8 +102,8 @@ def test_full_pipeline_one_asset(db):
             assert "thumbnail" in types, "No thumbnail row in asset_file"
 
             for f in files:
-                print(f"  asset_file: {f['type']} → {f['path']}")
+                print(f"  asset_file: {f['type']} -> {f['path']}")
     finally:
         conn.close()
 
-    print(f"\n  SUCCESS — asset {asset_id} fully processed")
+    print(f"\n  SUCCESS -- asset {asset_id} fully processed")

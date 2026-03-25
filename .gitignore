@@ -22,3 +22,9 @@ ml/.venv/
 # IDE
 .idea/
 .vscode/
+
+# Test caches
+.pytest_cache/
+
+# Internal planning docs
+docs/plans/

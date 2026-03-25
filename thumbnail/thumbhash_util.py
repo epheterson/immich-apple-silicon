@@ -1,4 +1,5 @@
 """ThumbHash computation for Immich Apple Silicon thumbnail worker."""
+from __future__ import annotations
 
 from pathlib import Path
 

@@ -1,17 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- EDIT PATHS BELOW: replace /path/to with your actual install location -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.immich.ml-metal</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/elp/immich-ml-metal/venv/bin/python3</string>
+        <string>/path/to/immich-apple-silicon/ml/venv/bin/python3</string>
         <string>-m</string>
         <string>src.main</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/elp/immich-ml-metal</string>
+    <string>/path/to/immich-apple-silicon/ml</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>ML_PORT</key>
@@ -19,7 +20,7 @@
         <key>ML_MAX_CONCURRENT_REQUESTS</key>
         <string>16</string>
         <key>PATH</key>
-        <string>/Users/elp/immich-ml-metal/venv/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <string>/path/to/immich-apple-silicon/ml/venv/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
     </dict>
     <key>KeepAlive</key>
     <true/>
