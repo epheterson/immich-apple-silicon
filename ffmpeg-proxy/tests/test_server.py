@@ -4,8 +4,7 @@ Tests the pure logic — path translation, encoder remapping, hwaccel injection,
 WebP detection — without requiring a running server, Docker, or ffmpeg binary.
 
 Run:
-    cd /Users/elp/Repos/immich-apple-silicon/ffmpeg-proxy
-    python -m pytest tests/test_server.py -v
+    python -m pytest ffmpeg-proxy/tests/test_server.py -v
 """
 import os
 import sys

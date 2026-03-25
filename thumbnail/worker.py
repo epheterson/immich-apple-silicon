@@ -159,6 +159,17 @@ class ThumbnailWorker:
         log.info("Worker started (batch=%d, poll=%ds, upload=%s)",
                  self.batch_size, self.poll_interval, self.upload_dir)
 
+        # Prevent macOS Spotlight from indexing generated thumbnails.
+        for subdir in ("thumbs", "encoded-video"):
+            marker = os.path.join(self.upload_dir, subdir, ".metadata_never_index")
+            try:
+                os.makedirs(os.path.dirname(marker), exist_ok=True)
+                if not os.path.exists(marker):
+                    with open(marker, "w"):
+                        pass
+            except OSError:
+                pass
+
         batch_start = time.monotonic()
 
         while self._running:

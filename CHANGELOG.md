@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4 — 2026-03-25
+
+- Auto-suppress Spotlight indexing on generated thumbnail/video directories
+- README: documented all integrated performance mitigations per component
+- Integration test skips gracefully when no pending assets
+- Removed personal path from test docstring
+
 ## 0.1.3 — 2026-03-24
 
 ### Fixed (from code review)

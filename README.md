@@ -1,6 +1,6 @@
 # immich-apple-silicon
 
-[![Version](https://img.shields.io/badge/version-0.1.0-blue)]()
+[![Version](https://img.shields.io/badge/version-0.1.4-blue)]()
 
 GPU-accelerated [Immich](https://immich.app) on Apple Silicon. Offloads CPU-bound Docker processing to native macOS services using Metal GPU, Neural Engine, and VideoToolbox.
 
@@ -37,6 +37,7 @@ Docker (unchanged Immich image)              Native macOS services
 | Expose Postgres port to localhost | `127.0.0.1:5432:5432` in docker-compose | Remove the port line | None |
 | 3 native macOS services via launchd | Standard launchd plists, auto-start on boot | `launchctl bootout` to stop, delete plist to remove | None — all use off-the-shelf tools (Python, ffmpeg, launchd) |
 | **Thumbnail worker writes to Immich's DB** | UPSERTs into `asset_file`, updates `asset.thumbhash` | Stop the service; Immich can regenerate all thumbnails itself | **Medium** — if Immich changes its DB schema, the worker's queries could fail |
+| Spotlight indexing suppressed | Creates `.metadata_never_index` in `thumbs/` and `encoded-video/` | Delete the files | None — prevents macOS from wasting CPU analyzing generated thumbnails |
 
 **To fully revert:** Stop the 3 native services, restore your original docker-compose.yml, re-add the `immich-machine-learning` container, `docker compose up -d`. Immich is back to stock.
 
@@ -218,7 +219,8 @@ HTTP proxy that intercepts ffmpeg calls from the Docker container and runs them 
 - Injects `-hwaccel videotoolbox` for hardware video decoding
 - WebP output fallback via PIL (Homebrew ffmpeg typically lacks libwebp)
 - Falls back to container ffmpeg if proxy is unreachable
-- Stats endpoint: `curl http://localhost:3005/stats`
+- Threaded server: handles parallel transcodes without blocking
+- Stats endpoint with session tracking: `curl http://localhost:3005/stats`
 
 ### Thumbnail Worker (`thumbnail/`)
 
@@ -229,12 +231,21 @@ Generates Immich thumbnails using Core Image on the Metal GPU.
 - Generates preview (1440px JPEG) + thumbnail (250px WebP)
 - Computes thumbhash (perceptual blur placeholder)
 - Persistent DB connection for throughput
+- Memory-aware: pauses when available RAM drops below 500MB
+- `F_NOCACHE` on source reads — prevents macOS buffer cache from filling with one-time image data
+- `gc.collect()` between batches — frees GPU/PIL objects promptly
+- Suppresses Spotlight indexing on output directories automatically
+- Self-healing: exponential backoff on DB errors, auto-recovers after Immich restarts
+- UPSERT-safe: reruns don't create duplicate data
 
 **Integrated from the community:**
 
 ### ML Service (`ml/`) — forked from [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal)
 
 Maintained fork of the immich-ml-metal project, included as a git submodule. Replaces Immich's Docker ML container with native macOS inference using Apple Vision (face detection), MLX (CLIP embeddings), and CoreML (face recognition). Upstream changes are reviewed before merging. 21x faster than Docker ML.
+
+- Fixed face recognition: landmark coordinates correctly mapped through face bounding box ([upstream PR](https://github.com/sebastianfredette/immich-ml-metal/pull/3))
+- Idle model unloading: CLIP and ArcFace models freed after 120s inactive (~700MB recovered)
 
 ## Configuration
 
