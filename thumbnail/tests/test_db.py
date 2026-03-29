@@ -59,6 +59,48 @@ def test_roundtrip_upload(db):
     assert db.container_path(db.translate_path(original)) == original
 
 
+# --- Custom container paths (remote Docker setups) ---
+
+@pytest.fixture
+def custom_db():
+    """DB with non-standard container paths (e.g., Synology NAS running Docker)."""
+    return ThumbnailDB(
+        host="localhost", port=5432, dbname="immich",
+        user="postgres", password=DB_PASS,
+        upload_dir="/Volumes/docker/immich/library",
+        photos_dir="/Volumes/photo",
+        container_upload="/data/upload",
+        container_photos="/mnt/media/Syno",
+    )
+
+
+def test_custom_translate_upload(custom_db):
+    assert custom_db.translate_path("/data/upload/abc/def.JPG") == "/Volumes/docker/immich/library/abc/def.JPG"
+
+
+def test_custom_translate_photos(custom_db):
+    assert custom_db.translate_path("/mnt/media/Syno/2012/DSC_3918.JPG") == "/Volumes/photo/2012/DSC_3918.JPG"
+
+
+def test_custom_container_path_upload(custom_db):
+    assert custom_db.container_path("/Volumes/docker/immich/library/abc/def.JPG") == "/data/upload/abc/def.JPG"
+
+
+def test_custom_container_path_photos(custom_db):
+    assert custom_db.container_path("/Volumes/photo/2012/DSC_3918.JPG") == "/mnt/media/Syno/2012/DSC_3918.JPG"
+
+
+def test_custom_roundtrip(custom_db):
+    original = "/mnt/media/Syno/2024/vacation/IMG_001.heic"
+    assert custom_db.container_path(custom_db.translate_path(original)) == original
+
+
+def test_default_paths_unchanged(db):
+    """Verify defaults still work when custom paths aren't provided."""
+    assert db.container_upload == "/usr/src/app/upload/"
+    assert db.container_photos == "/mnt/photos/"
+
+
 # --- Database tests (need live Postgres) ---
 
 @pytest.mark.db

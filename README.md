@@ -258,6 +258,8 @@ Maintained fork of the immich-ml-metal project, included as a git submodule. Rep
 | `DB_PASS` | *(required)* | Database password |
 | `UPLOAD_DIR` | *(required)* | Host path to Immich upload directory |
 | `PHOTOS_DIR` | *(required)* | Host path to external photo library |
+| `CONTAINER_UPLOAD_PATH` | `/usr/src/app/upload` | Upload path inside the Immich Docker container |
+| `CONTAINER_PHOTOS_PATH` | `/mnt/photos` | Photos path inside the Immich Docker container |
 | `FFMPEG_PROXY_PORT` | `3005` | FFmpeg proxy listen port |
 | `FFMPEG_PROXY_BIND` | `0.0.0.0` | FFmpeg proxy bind address |
 | `BATCH_SIZE` | `20` | Thumbnail worker batch size |

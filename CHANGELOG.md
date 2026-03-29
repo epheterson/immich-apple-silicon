@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.5 — 2026-03-29
+
+- Configurable Docker container paths (`CONTAINER_UPLOAD_PATH`, `CONTAINER_PHOTOS_PATH`) for setups where Immich runs on a separate machine (e.g., Synology NAS) with non-standard volume mounts
+- Supports split deployments: Immich server on NAS, native services on Mac
+
 ## 0.1.4 — 2026-03-25
 
 - Auto-suppress Spotlight indexing on generated thumbnail/video directories

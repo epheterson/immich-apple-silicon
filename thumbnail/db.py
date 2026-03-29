@@ -13,12 +13,13 @@ import psycopg2.extras
 class ThumbnailDB:
     """Talks to the Immich Postgres database for thumbnail work."""
 
-    # Container paths used by Immich inside Docker
-    CONTAINER_UPLOAD = "/usr/src/app/upload/"
-    CONTAINER_PHOTOS = "/mnt/photos/"
+    # Default container paths used by Immich inside Docker
+    DEFAULT_CONTAINER_UPLOAD = "/usr/src/app/upload/"
+    DEFAULT_CONTAINER_PHOTOS = "/mnt/photos/"
 
     def __init__(self, host: str, port: int, dbname: str, user: str, password: str,
-                 upload_dir: str, photos_dir: str):
+                 upload_dir: str, photos_dir: str,
+                 container_upload: str = "", container_photos: str = ""):
         self.host = host
         self.port = port
         self.dbname = dbname
@@ -26,6 +27,8 @@ class ThumbnailDB:
         self.password = password
         self.upload_dir = upload_dir.rstrip("/") + "/"
         self.photos_dir = photos_dir.rstrip("/") + "/"
+        self.container_upload = (container_upload or self.DEFAULT_CONTAINER_UPLOAD).rstrip("/") + "/"
+        self.container_photos = (container_photos or self.DEFAULT_CONTAINER_PHOTOS).rstrip("/") + "/"
         self._conn = None
 
     def _connect(self) -> psycopg2.extensions.connection:
@@ -53,21 +56,21 @@ class ThumbnailDB:
     def translate_path(self, container_path: str) -> str:
         """Translate a container path to a host path.
 
-        /usr/src/app/upload/... → upload_dir/...
-        /mnt/photos/...        → photos_dir/...
+        container_upload/... → upload_dir/...
+        container_photos/... → photos_dir/...
         """
-        if container_path.startswith(self.CONTAINER_UPLOAD):
-            return self.upload_dir + container_path[len(self.CONTAINER_UPLOAD):]
-        if container_path.startswith(self.CONTAINER_PHOTOS):
-            return self.photos_dir + container_path[len(self.CONTAINER_PHOTOS):]
+        if container_path.startswith(self.container_upload):
+            return self.upload_dir + container_path[len(self.container_upload):]
+        if container_path.startswith(self.container_photos):
+            return self.photos_dir + container_path[len(self.container_photos):]
         return container_path
 
     def container_path(self, host_path: str) -> str:
         """Translate a host path back to a container path (reverse of translate_path)."""
         if host_path.startswith(self.upload_dir):
-            return self.CONTAINER_UPLOAD + host_path[len(self.upload_dir):]
+            return self.container_upload + host_path[len(self.upload_dir):]
         if host_path.startswith(self.photos_dir):
-            return self.CONTAINER_PHOTOS + host_path[len(self.photos_dir):]
+            return self.container_photos + host_path[len(self.photos_dir):]
         return host_path
 
     def get_pending_assets(self, limit: int = 20, asset_type: str = "IMAGE") -> list[dict]:

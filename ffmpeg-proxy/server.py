@@ -39,9 +39,14 @@ if not UPLOAD_HOST or not PHOTOS_HOST:
     log.error("UPLOAD_DIR and PHOTOS_DIR environment variables are required")
     sys.exit(1)
 
+# Container-side paths as stored in the Immich database.
+# Override these if your Immich Docker uses non-standard volume mounts.
+CONTAINER_UPLOAD = os.environ.get("CONTAINER_UPLOAD_PATH", "/usr/src/app/upload").rstrip("/") + "/"
+CONTAINER_PHOTOS = os.environ.get("CONTAINER_PHOTOS_PATH", "/mnt/photos").rstrip("/") + "/"
+
 PATH_MAP = [
-    ("/usr/src/app/upload/", UPLOAD_HOST.rstrip("/") + "/"),
-    ("/mnt/photos/", PHOTOS_HOST.rstrip("/") + "/"),
+    (CONTAINER_UPLOAD, UPLOAD_HOST.rstrip("/") + "/"),
+    (CONTAINER_PHOTOS, PHOTOS_HOST.rstrip("/") + "/"),
 ]
 
 # Map software encoders AND codec names to VideoToolbox hardware encoders.
