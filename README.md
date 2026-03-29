@@ -1,6 +1,6 @@
 # immich-apple-silicon
 
-[![Version](https://img.shields.io/badge/version-0.1.4-blue)]()
+[![Version](https://img.shields.io/badge/version-0.1.5-blue)]()
 
 GPU-accelerated [Immich](https://immich.app) on Apple Silicon. Offloads CPU-bound Docker processing to native macOS services using Metal GPU, Neural Engine, and VideoToolbox.
 
@@ -155,6 +155,8 @@ cd .. && UPLOAD_DIR=/path/to/upload PHOTOS_DIR=/path/to/photos python ffmpeg-pro
 # Thumbnail worker (Core Image Metal GPU)
 DB_HOST=localhost DB_PASS=YOUR_DB_PASSWORD UPLOAD_DIR=/path/to/upload PHOTOS_DIR=/path/to/photos python -m thumbnail &
 ```
+
+**Split deployment (Immich on NAS, native services on Mac):** If your Immich Docker uses non-standard volume mounts (e.g., Synology NAS with `/data/upload` instead of `/usr/src/app/upload`), add `CONTAINER_UPLOAD_PATH` and `CONTAINER_PHOTOS_PATH` to match your Docker volume configuration. See the [Configuration](#configuration) table for details.
 
 For persistent services that auto-start on boot:
 

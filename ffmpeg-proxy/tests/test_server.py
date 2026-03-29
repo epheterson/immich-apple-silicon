@@ -403,3 +403,60 @@ class TestEdgeCases:
         result = server.translate_args(args)
         hwaccel_count = sum(1 for a in result if a == "-hwaccel")
         assert hwaccel_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Custom container paths (remote Docker / NAS setups)
+# ---------------------------------------------------------------------------
+class TestCustomContainerPaths:
+    """Verify path translation works with non-standard container mount points.
+
+    Simulates a Synology NAS setup where Immich Docker uses /data/upload/
+    instead of /usr/src/app/upload/ and /mnt/media/Syno/ instead of /mnt/photos/.
+    Patches module-level PATH_MAP since server.py reads env vars at import time.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_path_map(self):
+        """Temporarily replace PATH_MAP with custom container paths."""
+        original_map = server.PATH_MAP
+        original_upload = server.CONTAINER_UPLOAD
+        original_photos = server.CONTAINER_PHOTOS
+        server.CONTAINER_UPLOAD = "/data/upload/"
+        server.CONTAINER_PHOTOS = "/mnt/media/Syno/"
+        server.PATH_MAP = [
+            ("/data/upload/", "/host/upload/"),
+            ("/mnt/media/Syno/", "/host/photos/"),
+        ]
+        yield
+        server.PATH_MAP = original_map
+        server.CONTAINER_UPLOAD = original_upload
+        server.CONTAINER_PHOTOS = original_photos
+
+    def test_custom_upload_path(self):
+        """Custom container upload path translates correctly."""
+        result = server.translate_path("/data/upload/library/thumb.jpg")
+        assert result == "/host/upload/library/thumb.jpg"
+
+    def test_custom_photos_path(self):
+        """Custom container photos path translates correctly."""
+        result = server.translate_path("/mnt/media/Syno/2012/DSC_3918.JPG")
+        assert result == "/host/photos/2012/DSC_3918.JPG"
+
+    def test_default_paths_no_longer_match(self):
+        """Old default paths pass through unchanged when custom paths are set."""
+        result = server.translate_path("/usr/src/app/upload/library/thumb.jpg")
+        assert result == "/usr/src/app/upload/library/thumb.jpg"
+
+    def test_custom_path_in_translate_args(self):
+        """translate_args uses custom PATH_MAP for input paths."""
+        args = ["-i", "/data/upload/lib/video.mp4", "-c:v", "copy", "out.mp4"]
+        result = server.translate_args(args)
+        i_idx = result.index("-i")
+        assert result[i_idx + 1] == "/host/upload/lib/video.mp4"
+
+    def test_custom_output_path_translated(self):
+        """Output path with custom container prefix is translated."""
+        args = ["-i", "in.mp4", "-c:v", "copy", "/mnt/media/Syno/out.mp4"]
+        result = server.translate_args(args)
+        assert result[-1] == "/host/photos/out.mp4"

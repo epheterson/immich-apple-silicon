@@ -22,6 +22,12 @@
         <string>/path/to/your/immich/upload</string>
         <key>PHOTOS_DIR</key>
         <string>/path/to/your/photos</string>
+        <!-- Uncomment if your Immich Docker uses non-standard volume mounts (e.g., Synology NAS):
+        <key>CONTAINER_UPLOAD_PATH</key>
+        <string>/data/upload</string>
+        <key>CONTAINER_PHOTOS_PATH</key>
+        <string>/mnt/media/Syno</string>
+        -->
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/bin:/bin</string>
     </dict>

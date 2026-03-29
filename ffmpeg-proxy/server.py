@@ -8,9 +8,11 @@ decoding, and handles WebP output (since Homebrew ffmpeg typically
 lacks libwebp).
 
 Configuration via environment variables:
-    FFMPEG_PROXY_PORT   Listen port           (default: 3005)
-    UPLOAD_DIR          Immich upload mount    (REQUIRED)
-    PHOTOS_DIR          External photos mount  (REQUIRED)
+    FFMPEG_PROXY_PORT        Listen port                    (default: 3005)
+    UPLOAD_DIR               Immich upload mount on host     (REQUIRED)
+    PHOTOS_DIR               External photos mount on host   (REQUIRED)
+    CONTAINER_UPLOAD_PATH    Upload path inside Docker       (default: /usr/src/app/upload)
+    CONTAINER_PHOTOS_PATH    Photos path inside Docker       (default: /mnt/photos)
 """
 from __future__ import annotations
 
@@ -313,6 +315,8 @@ if __name__ == "__main__":
     log.info(f"  ffmpeg:  {FFMPEG}")
     log.info(f"  upload:  {UPLOAD_HOST}")
     log.info(f"  photos:  {PHOTOS_HOST}")
+    log.info(f"  container upload: {CONTAINER_UPLOAD}")
+    log.info(f"  container photos: {CONTAINER_PHOTOS}")
     log.info(f"  encoder map: {ENCODER_MAP}")
     # Binds to all interfaces by default because Docker containers reach the
     # host via a bridge IP (e.g. host.internal on OrbStack). If the Mac is on
