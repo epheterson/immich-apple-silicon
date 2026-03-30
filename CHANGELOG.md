@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.6 — 2026-03-29
+
+### ML Service (upstream PR [sebastianfredette/immich-ml-metal#4](https://github.com/sebastianfredette/immich-ml-metal/pull/4))
+- Concurrent inference: CLIP (GPU), face detection (ANE), face embedding (CPU/CoreML), OCR (ANE) run simultaneously via `asyncio.gather`
+- Batched face embeddings: single ONNX call for N faces instead of N separate calls
+- In-memory CLIP: eliminated temp file I/O, PIL image passed directly to MLX processor
+- Inference locks narrowed: image decode/preprocessing outside GPU lock
+- Dedicated thread pool, per-task timing logs, busy guards for model unloading
+- **3.2x faster** on group photos (5 faces: 1899ms → 599ms)
+
 ## 0.1.5 — 2026-03-29
 
 - Configurable Docker container paths (`CONTAINER_UPLOAD_PATH`, `CONTAINER_PHOTOS_PATH`) for setups where Immich runs on a separate machine (e.g., Synology NAS) with non-standard volume mounts
