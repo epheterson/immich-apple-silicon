@@ -53,10 +53,14 @@ def test_full_pipeline_one_asset(db):
     # 2. Process it
     worker = ThumbnailWorker(db=db, upload_dir=UPLOAD_DIR)
 
-    worker.process_asset(asset_id, original_path, owner_id)
+    result = worker.process_asset(asset_id, original_path, owner_id)
 
     assert worker.processed == 1, f"Expected 1 processed, got {worker.processed}"
     assert worker.errors == 0, f"Expected 0 errors, got {worker.errors}"
+    assert result is not None, "process_asset returned None (failure)"
+
+    # Write to DB (process_asset now returns a dict for batch writes)
+    db.mark_complete_batch([result])
 
     # 3. Verify output files exist
     stripped = asset_id.replace("-", "")

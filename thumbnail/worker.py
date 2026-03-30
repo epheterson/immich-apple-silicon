@@ -6,12 +6,30 @@ import logging
 import os
 import signal
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import FrameType
 
 from thumbnail.db import ThumbnailDB
 from thumbnail.resize import generate_all
 
 log = logging.getLogger(__name__)
+
+# Background thread for NFS read-ahead (prefetching next asset's source file).
+_prefetch_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch")
+
+
+def _prefetch_file(path: str) -> None:
+    """Read a file into the OS page cache (best-effort).
+
+    On NFS this hides latency — by the time CIImage opens the file,
+    it's already cached locally.
+    """
+    try:
+        with open(path, "rb") as f:
+            while f.read(1024 * 1024):
+                pass
+    except OSError:
+        pass
 
 # Back off exponentially when consecutive errors exceed this threshold.
 # Handles Postgres restarts (Immich updates, migrations) and schema changes
@@ -90,17 +108,17 @@ class ThumbnailWorker:
             stripped[0:2], stripped[2:4],
         )
 
-    def process_asset(self, asset_id: str, original_path: str, owner_id: str) -> bool:
+    def process_asset(self, asset_id: str, original_path: str, owner_id: str) -> dict | None:
         """Generate preview + thumbnail + thumbhash for a single asset.
 
-        Returns True on success, False on failure.
+        Returns a result dict for batch DB write on success, None on failure.
         """
         host_path = self.db.translate_path(original_path)
 
         if not os.path.isfile(host_path):
             log.error("Source file missing: %s (container: %s)", host_path, original_path)
             self.errors += 1
-            return False
+            return None
 
         out_dir = self._output_dir(owner_id, asset_id)
         preview_path = os.path.join(out_dir, f"{asset_id}_preview.jpeg")
@@ -117,36 +135,29 @@ class ThumbnailWorker:
                 quality=self.JPEG_QUALITY,
             )
 
-            # Container paths for DB
-            preview_container = self.db.container_path(preview_path)
-            thumb_container = self.db.container_path(thumb_path)
-
-            # Write to DB
-            self.db.mark_complete(
-                asset_id=asset_id,
-                preview_container_path=preview_container,
-                thumb_container_path=thumb_container,
-                thumbhash_bytes=thumbhash,
-            )
-
             self.processed += 1
             self._consecutive_errors = 0
             log.info("OK %s (%dx%d preview, %dx%d thumb, %d-byte hash)",
                      asset_id, pw, ph, tw, th, len(thumbhash))
-            return True
+
+            return {
+                "asset_id": asset_id,
+                "preview_path": self.db.container_path(preview_path),
+                "thumb_path": self.db.container_path(thumb_path),
+                "thumbhash": thumbhash,
+            }
 
         except Exception:
             self.errors += 1
             self._consecutive_errors += 1
             log.exception("FAILED %s", asset_id)
-            # Clean up partial output
             for path in (preview_path, thumb_path):
                 if os.path.exists(path):
                     try:
                         os.remove(path)
                     except OSError:
                         pass
-            return False
+            return None
 
     def run(self) -> None:
         """Main loop — poll for pending assets, process, repeat.
@@ -171,6 +182,7 @@ class ThumbnailWorker:
                 pass
 
         batch_start = time.monotonic()
+        assets = None  # will be fetched on first iteration
 
         while self._running:
             # Back off when system memory is low (< 500MB available)
@@ -179,24 +191,26 @@ class ThumbnailWorker:
                 log.warning("Low memory (%dMB available) — pausing for %ds",
                             avail, self.poll_interval * 2)
                 time.sleep(self.poll_interval * 2)
+                assets = None
                 continue
 
-            # Fetch pending assets
-            try:
-                assets = self.db.get_pending_assets(limit=self.batch_size)
-            except Exception:
-                self._consecutive_errors += 1
-                wait = self._backoff_seconds()
-                if self._consecutive_errors <= _MAX_CONSECUTIVE_ERRORS:
-                    log.warning("DB query failed — retrying in %ds (attempt %d)",
-                                wait, self._consecutive_errors)
-                else:
-                    log.error("DB query failed %d times — backing off %ds. "
-                              "Immich may be updating or schema may have changed. "
-                              "Will auto-recover when DB is available.",
-                              self._consecutive_errors, wait)
-                time.sleep(wait)
-                continue
+            # Fetch pending assets (unless we already have a prefetched batch)
+            if assets is None:
+                try:
+                    assets = self.db.get_pending_assets(limit=self.batch_size)
+                except Exception:
+                    self._consecutive_errors += 1
+                    wait = self._backoff_seconds()
+                    if self._consecutive_errors <= _MAX_CONSECUTIVE_ERRORS:
+                        log.warning("DB query failed — retrying in %ds (attempt %d)",
+                                    wait, self._consecutive_errors)
+                    else:
+                        log.error("DB query failed %d times — backing off %ds. "
+                                  "Immich may be updating or schema may have changed. "
+                                  "Will auto-recover when DB is available.",
+                                  self._consecutive_errors, wait)
+                    time.sleep(wait)
+                    continue
 
             # Idle — no pending work
             if not assets:
@@ -209,34 +223,55 @@ class ThumbnailWorker:
                 else:
                     log.info("Idle — no pending assets")
                 time.sleep(self.poll_interval)
+                assets = None
                 continue
 
-            # Process batch
-            batch_success = 0
-            for asset in assets:
+            # Process batch with NFS read-ahead
+            completed = []
+            for i, asset in enumerate(assets):
                 if not self._running:
                     break
-                if self.process_asset(
+
+                # Prefetch next asset's source file while GPU processes this one
+                if i + 1 < len(assets):
+                    next_path = self.db.translate_path(assets[i + 1]["originalPath"])
+                    _prefetch_pool.submit(_prefetch_file, next_path)
+
+                result = self.process_asset(
                     asset_id=asset["id"],
                     original_path=asset["originalPath"],
                     owner_id=asset["ownerId"],
-                ):
-                    batch_success += 1
+                )
+                if result is not None:
+                    completed.append(result)
 
-            # Free CIImage/CGImage/PIL objects from this batch before the next one.
-            # Without this, Python's GC holds onto them until the next collection
-            # cycle, wasting RAM during large imports.
+            # Batch DB write — one commit for all assets instead of per-asset
+            if completed:
+                try:
+                    self.db.mark_complete_batch(completed)
+                except Exception:
+                    failed_ids = [r["asset_id"] for r in completed]
+                    log.exception("Batch DB write failed for %d assets: %s",
+                                  len(completed), failed_ids)
+                    self._consecutive_errors += 1
+                    # Files are on disk but DB not updated — these assets will
+                    # be re-queried (thumbhash still NULL) and reprocessed.
+                    # The upsert in mark_complete_batch is idempotent, so the
+                    # retry will overwrite the same files safely.
+                    completed = []
+
+            # Free CIImage/CGImage/PIL objects between batches
             gc.collect()
 
-            # If entire batch failed, back off (likely DB/schema issue, not bad images).
-            # Use a separate counter so per-asset errors don't jump straight to max backoff.
-            if batch_success == 0 and len(assets) > 0:
+            # If entire batch failed, back off
+            if not completed and len(assets) > 0:
                 self._consecutive_batch_failures += 1
                 wait = min(self.poll_interval * (2 ** self._consecutive_batch_failures),
                            _MAX_BACKOFF_SECONDS)
                 log.warning("Entire batch failed (%d assets, streak %d) — backing off %ds",
                             len(assets), self._consecutive_batch_failures, wait)
                 time.sleep(wait)
+                assets = None
                 continue
             else:
                 self._consecutive_batch_failures = 0
@@ -246,6 +281,8 @@ class ThumbnailWorker:
             rate = self.processed / max(elapsed, 0.001)
             log.info("Batch done — %d processed, %d errors, %.1f assets/sec",
                      self.processed, self.errors, rate)
+
+            assets = None  # query fresh next iteration
 
         log.info("Worker stopped — %d processed, %d errors total",
                  self.processed, self.errors)

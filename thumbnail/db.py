@@ -129,6 +129,41 @@ class ThumbnailDB:
             self._conn = None
             raise
 
+    def mark_complete_batch(self, results: list[dict]) -> None:
+        """Batch-write thumbnails for multiple assets in one transaction.
+
+        Much faster than per-asset commits over the network — one commit
+        for the entire batch instead of one per asset.
+
+        Each result dict: {asset_id, preview_path, thumb_path, thumbhash}
+        """
+        if not results:
+            return
+        upsert_sql = """
+            INSERT INTO asset_file ("assetId", type, path, "updateId", "isEdited", "isProgressive", "isTransparent")
+            VALUES (%s, %s, %s, immich_uuid_v7(), false, false, false)
+            ON CONFLICT ("assetId", type, "isEdited") DO UPDATE SET
+                path = EXCLUDED.path, "updateId" = immich_uuid_v7(), "updatedAt" = now()
+        """
+        thumbhash_sql = """
+            UPDATE asset SET thumbhash = %s, "updateId" = immich_uuid_v7() WHERE id = %s
+        """
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                for r in results:
+                    cur.execute(upsert_sql, (r["asset_id"], "preview", r["preview_path"]))
+                    cur.execute(upsert_sql, (r["asset_id"], "thumbnail", r["thumb_path"]))
+                    cur.execute(thumbhash_sql, (psycopg2.Binary(r["thumbhash"]), r["asset_id"]))
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            self._conn = None
+            raise
+
     def get_stats(self) -> dict:
         """Return thumbnail generation stats.
 
