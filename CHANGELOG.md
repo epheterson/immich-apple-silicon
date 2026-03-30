@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.7 — 2026-03-29
+
+### Thumbnail Worker
+- Batch DB writes: single commit per batch instead of per asset (80→4 RTTs for batch of 20)
+- NFS read-ahead: prefetch next asset's source file in background thread
+- Thumbhash computed from temp JPEG already in memory (eliminates extra file read)
+
 ## 0.1.6 — 2026-03-29
 
 ### ML Service (upstream PR [sebastianfredette/immich-ml-metal#4](https://github.com/sebastianfredette/immich-ml-metal/pull/4))

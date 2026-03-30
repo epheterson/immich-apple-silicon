@@ -138,18 +138,35 @@ def _write_jpeg(ctx: CIContext, ci_image: CIImage, output_path: str, quality: in
         raise RuntimeError("CGImageDestinationFinalize failed for %s" % output_path)
 
 
-def _write_webp(ctx: CIContext, ci_image: CIImage, output_path: str, quality: int) -> None:
-    """Render via temp JPEG then convert to WebP with PIL."""
+def _write_webp(
+    ctx: CIContext, ci_image: CIImage, output_path: str, quality: int,
+    thumbhash_size: int = 0,
+) -> bytes | None:
+    """Render via temp JPEG then convert to WebP with PIL.
+
+    If thumbhash_size > 0, computes thumbhash while the image is already
+    in memory (avoids reopening the saved WebP). Returns thumbhash bytes
+    or None.
+    """
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
     os.close(tmp_fd)
+    thumbhash = None
     try:
         _write_jpeg(ctx, ci_image, tmp_path, quality=_WEBP_INTERMEDIATE_QUALITY)
         with Image.open(tmp_path) as img:
+            if thumbhash_size > 0:
+                from thumbhash import rgba_to_thumb_hash
+                hash_img = img.convert("RGBA")
+                hash_img.thumbnail((thumbhash_size, thumbhash_size))
+                hw, hh = hash_img.size
+                thumbhash = bytes(rgba_to_thumb_hash(hw, hh, list(hash_img.tobytes())))
+
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
             img.save(output_path, "WEBP", quality=quality)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+    return thumbhash
 
 
 def generate_all(
@@ -169,8 +186,6 @@ def generate_all(
 
     Returns (preview_w, preview_h, thumb_w, thumb_h, thumbhash_bytes).
     """
-    from thumbhash import rgba_to_thumb_hash
-
     # --- Load source once ---
     # Hint macOS not to cache this file — we read each image exactly once
     # during import. Without this, the buffer cache fills with one-time reads
@@ -211,15 +226,9 @@ def generate_all(
     te = thumb_ci.extent()
     tw, th_ = int(round(te.size.width)), int(round(te.size.height))
 
-    # Write WebP via temp JPEG (GPU JPEG encode → PIL WebP encode)
-    _write_webp(ctx, thumb_ci, thumb_path, quality)
-
-    # --- Thumbhash from saved thumbnail (tiny file, fast open) ---
-    with Image.open(thumb_path) as thumb_img:
-        thumb_img = thumb_img.convert("RGBA")
-        thumb_img.thumbnail((thumbhash_size, thumbhash_size))
-        hw, hh = thumb_img.size
-        rgba_flat = list(thumb_img.tobytes())
-        thumbhash = bytes(rgba_to_thumb_hash(hw, hh, rgba_flat))
+    # Write WebP via temp JPEG and compute thumbhash in the same pass
+    # (the image is already in memory for the WebP conversion)
+    thumbhash = _write_webp(ctx, thumb_ci, thumb_path, quality,
+                            thumbhash_size=thumbhash_size)
 
     return (pw, ph, tw, th_, thumbhash)
