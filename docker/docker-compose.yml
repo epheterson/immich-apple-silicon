@@ -11,7 +11,6 @@ services:
     environment:
       - DB_HOSTNAME=immich_postgres
       - IMMICH_MACHINE_LEARNING_URL=http://host.internal:3004
-      - IMMICH_WORKERS_EXCLUDE=thumbnailGeneration  # native thumbnail worker handles this
       - DB_USERNAME=postgres
       - DB_PASSWORD=${DB_PASSWORD}  # set in .env file or export before running
       - DB_DATABASE_NAME=immich

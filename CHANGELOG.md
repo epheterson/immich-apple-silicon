@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.8 — 2026-03-30
+
+### Fixed
+- Removed invalid `IMMICH_WORKERS_EXCLUDE=thumbnailGeneration` from docker-compose and README. `IMMICH_WORKERS_EXCLUDE` only accepts worker types (`api`, `microservices`, `maintenance`), not queue names — the setting was a silent no-op. Documented the actual behavior: both Immich and the native worker generate thumbnails, with UPSERT ensuring consistent results. (Thanks @flsabourin, [#2](https://github.com/epheterson/immich-apple-silicon/issues/2))
+
 ## 0.1.7 — 2026-03-29
 
 ### Thumbnail Worker
