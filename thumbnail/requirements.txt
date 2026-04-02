@@ -1,6 +1,0 @@
-psycopg2-binary>=2.9
-Pillow>=10.0
-thumbhash>=0.1
-pyobjc-core>=10.0
-pyobjc-framework-Cocoa>=10.0
-pyobjc-framework-Quartz>=10.0

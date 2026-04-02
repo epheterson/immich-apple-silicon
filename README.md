@@ -1,324 +1,211 @@
-# immich-apple-silicon
+# Immich Accelerator
 
-[![Version](https://img.shields.io/badge/version-0.1.5-blue)]()
+> **Alpha — use at your own risk.** Tested on Mac Mini M4 (24GB) with Immich v2.6.3 and OrbStack. Back up your Immich database before trying this.
 
-GPU-accelerated [Immich](https://immich.app) on Apple Silicon. Offloads CPU-bound Docker processing to native macOS services using Metal GPU, Neural Engine, and VideoToolbox.
+Run Immich's compute natively on Apple Silicon. Thumbnails use the fast M-series CPU, video transcoding uses VideoToolbox hardware encoding, and ML runs on Metal GPU, Neural Engine, and CoreML.
 
-> **Alpha — use at your own risk.** This has been tested on exactly one setup (Mac Mini M4, 24GB, Immich v2.6.1, OrbStack). It works great there. Your mileage may vary. Back up your Immich database before trying this.
+Docker handles the lightweight parts (API server, Postgres, Redis). The accelerator runs Immich's own microservices worker natively on macOS, giving it access to hardware that Docker can't reach.
 
-## How It Works
-
-Immich runs in Docker, but Docker on macOS can't access the GPU. This project runs three small native services alongside Docker that handle the heavy processing:
+## How it works
 
 ```
-Docker (unchanged Immich image)              Native macOS services
-┌─────────────────────────────┐             ┌──────────────────────────┐
-│ immich-server               │  ──HTTP──▶  │ ML service (port 3004)   │
-│   "do face detection"       │             │   Apple Vision + MLX     │
-│                             │             │   21x faster than Docker │
-│   "transcode this video"    │             ├──────────────────────────┤
-│     └─ calls /usr/bin/ffmpeg│  ──HTTP──▶  │ ffmpeg proxy (port 3005) │
-│        (our wrapper script) │             │   VideoToolbox HW encode │
-│                             │             ├──────────────────────────┤
-│ postgres ◀────────────────────────SQL───  │ thumbnail worker         │
-│   (thumbhash, asset_file)   │             │   Core Image Metal GPU   │
-└─────────────────────────────┘             └──────────────────────────┘
-         Shared filesystem (bind mount)
+Docker (lightweight)                 Native macOS (compute)
++-----------------------+           +-------------------------------+
+|  immich-server (API)  |           |  Immich Accelerator           |
+|  postgres             |<--------->|  +- Microservices worker      |
+|  redis                |  DB+Redis |  |  +- Sharp (thumbnails)     |
+|                       |           |  |  +- ffmpeg (VideoToolbox)  |
+|  WORKERS_INCLUDE=api  |           |  +- ML service                |
+|  ML_URL=host:3003     |           |     +- CLIP (MLX/Metal)       |
++-----------------------+           |     +- Faces (Vision/ANE)     |
+                                    |     +- OCR (Vision/ANE)       |
+                                    +-------------------------------+
 ```
 
-## What We Modify (and How to Undo It)
+The microservices worker is extracted directly from your running Immich Docker image. Always the exact same version, no source builds. The only modification is installing the macOS-native Sharp binary for image processing. Video transcoding is intercepted by a lightweight ffmpeg wrapper that remaps software encoders to VideoToolbox hardware encoders.
+
+## What we modify (and how to undo it)
 
 **Nothing inside Docker is modified.** We don't patch Immich, rebuild images, or replace containers. All changes are to your `docker-compose.yml` and can be reverted by removing a few lines.
 
 | What we change | How | Reversible? | Risk |
 |---------------|-----|-------------|------|
-| Add env var to docker-compose | `IMMICH_MACHINE_LEARNING_URL` | Remove the line | None |
-| Mount 2 shell scripts into container | Bind mount over `/usr/bin/ffmpeg` and `/usr/bin/ffprobe` | Remove the mount lines | None — scripts fall back to container ffmpeg if proxy is down |
-| Expose Postgres port to localhost | `127.0.0.1:5432:5432` in docker-compose | Remove the port line | None |
-| 3 native macOS services via launchd | Standard launchd plists, auto-start on boot | `launchctl bootout` to stop, delete plist to remove | None — all use off-the-shelf tools (Python, ffmpeg, launchd) |
-| **Thumbnail worker writes to Immich's DB** | UPSERTs into `asset_file`, updates `asset.thumbhash` | Stop the service; Immich can regenerate all thumbnails itself | **Medium** — if Immich changes its DB schema, the worker's queries could fail |
-| Spotlight indexing suppressed | Creates `.metadata_never_index` in `thumbs/` and `encoded-video/` | Delete the files | None — prevents macOS from wasting CPU analyzing generated thumbnails |
+| Add env vars to docker-compose | `IMMICH_WORKERS_INCLUDE`, `IMMICH_MACHINE_LEARNING_URL`, `IMMICH_MEDIA_LOCATION` | Remove the lines | None |
+| Expose Postgres/Redis ports | `5432:5432`, `6379:6379` in docker-compose | Remove the port lines | None |
+| Native microservices worker | Extracted from Docker image, runs via `node` | Stop the accelerator | None |
+| Native ML service | Separate Python service | Stop the accelerator | None |
 
-**To fully revert:** Stop the 3 native services, restore your original docker-compose.yml, re-add the `immich-machine-learning` container, `docker compose up -d`. Immich is back to stock.
-
-## Safety
-
-- **Off-the-shelf tools only.** Python, Homebrew ffmpeg, macOS Core Image, launchd. No kernel extensions, no system modifications, no root access needed.
-- **Immich's Docker image is unmodified.** We don't build custom images or patch Immich code.
-- **The ffmpeg proxy is passthrough.** Unknown flags and arguments are passed through unchanged. If the proxy is unreachable, the wrapper falls back to the container's own ffmpeg.
-- **The thumbnail worker uses UPSERT.** If it processes an asset that Immich already handled, it safely overwrites. No duplicate rows, no corruption. Immich can regenerate everything the worker has done via the admin "Generate Thumbnails" job.
-- **All services are stateless.** Stop any of them at any time. No cleanup needed.
-
-## Performance
-
-Benchmarks on Mac Mini M4 (24GB RAM), Immich v2.6.1, photos on NFS (Synology NAS over gigabit).
-
-| Component | Docker (baseline) | Current (v0.1, NFS) | Theoretical max (local SSD) |
-|-----------|------------------|---------------------|----------------------------|
-| **ML** | 58/min, CPU | 1,218/min, GPU | ~1,500/min (larger batches) |
-| **Video encode** | libx264, 434% CPU | h264_videotoolbox, <1% CPU | Already at hardware max |
-| **Video decode** | Software, 100% CPU | VideoToolbox hardware | Already at hardware max |
-| **Thumbnails** | ~60/min, 100% CPU | **318/min, 30% CPU** | **~830/min, ~15% CPU** |
-
-The gap between "current" and "theoretical max" for thumbnails is storage I/O. The GPU resize itself takes ~10ms per image — the rest is waiting for NFS. Users with photos on a local SSD will hit the theoretical ceiling.
+**To fully revert:** Stop the accelerator, remove the env vars and port mappings from docker-compose, `docker compose up -d`. Immich is back to stock.
 
 ## Requirements
 
-- macOS 14+ (Sonoma) on Apple Silicon (M1/M2/M3/M4)
-- Python 3.11+ with Pillow (`brew install python@3.11`)
-- Homebrew ffmpeg (`brew install ffmpeg`)
-- An existing Immich installation running in Docker
-- **Docker runtime:** [OrbStack](https://orbstack.dev) (recommended) or Docker Desktop
+- macOS on Apple Silicon (M1/M2/M3/M4)
+- Docker with Immich already running ([OrbStack](https://orbstack.dev) recommended, Docker Desktop works too)
+- Node.js (`brew install node`)
+- FFmpeg with VideoToolbox (`brew install ffmpeg`)
+- Python 3.11+ for the ML service
 
-For Docker Desktop users: set `FFMPEG_PROXY_URL=http://host.docker.internal:3005/ffmpeg` in your container environment. OrbStack uses `host.internal` by default.
+## Quick start
 
-## Quick Start
-
-### 1. Install
+### 1. Set up the ML service
 
 ```bash
 git clone --recursive https://github.com/epheterson/immich-apple-silicon.git
-cd immich-apple-silicon
-
+cd immich-apple-silicon/ml
 python3.11 -m venv venv
 source venv/bin/activate
-pip install -r thumbnail/requirements.txt
-pip install -r ml/requirements.txt
+pip install -r requirements.txt
 ```
 
-### 2. Configure Docker
+### 2. Run setup
 
-Add these lines to your existing Immich `docker-compose.yml`:
+```bash
+cd ..
+python -m accelerator setup
+```
+
+This detects your Immich instance, extracts the server from Docker, installs the native Sharp binary, and tells you exactly what to change in your `docker-compose.yml`.
+
+### 3. Configure Docker
+
+The setup command prints the required changes. The key settings:
 
 ```yaml
 services:
   immich-server:
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
     environment:
-      - IMMICH_MACHINE_LEARNING_URL=http://host.internal:3004
+      - IMMICH_WORKERS_INCLUDE=api
+      - IMMICH_MACHINE_LEARNING_URL=http://host.internal:3003  # OrbStack
+      # Docker Desktop: use http://host.docker.internal:3003 instead
+      - IMMICH_MEDIA_LOCATION=/your/upload/path
     volumes:
-      # Bind mount for uploads (required — native services need filesystem access)
-      - /path/to/upload:/usr/src/app/upload
-      # External photos via Docker SMB volume (NOT a host NFS bind mount — see note below)
-      - nas-photos:/mnt/photos:ro
-      # ffmpeg wrappers (intercept calls to use VideoToolbox)
-      - /path/to/immich-apple-silicon/ffmpeg-proxy/wrappers/ffmpeg.sh:/usr/bin/ffmpeg:ro
-      - /path/to/immich-apple-silicon/ffmpeg-proxy/wrappers/ffprobe.sh:/usr/bin/ffprobe:ro
-
-  database:
-    volumes:
-      # IMPORTANT: use a bind mount, not a Docker volume.
-      # Docker volumes can be lost to 'docker compose down -v' or volume pruning.
-      - /path/to/immich/pgdata:/var/lib/postgresql/data
-    ports:
-      - "127.0.0.1:5432:5432"   # localhost only — for native thumbnail worker
-
-# Create the SMB volume once:
-#   docker volume create --driver local \
-#     --opt type=cifs \
-#     --opt device=//NAS_IP/share/Photos \
-#     --opt "o=username=USER,password=PASS,vers=3.0,uid=1000,gid=1000" \
-#     nas-photos
-volumes:
-  nas-photos:
-    external: true
+      # IMPORTANT: use the same absolute path on both sides (not the Docker default)
+      - /your/upload/path:/your/upload/path
+      - /your/photos:/your/photos:ro
 ```
 
-**Important:**
-- **NAS photos must use a Docker SMB volume**, not a host NFS bind mount. NFS through OrbStack/Docker causes file handle exhaustion (`ENFILE`) during large library scans. SMB doesn't have this issue.
-- **Use bind mounts for Postgres**, not Docker volumes. Docker volumes can be lost to `docker compose down -v` or `docker volume prune`. A bind mount keeps your database safe on disk.
+Then: `docker compose up -d`
 
-Then `docker compose up -d` to apply.
+### Understanding path mapping
 
-### 2b. Recommended Immich settings
+The native worker and Docker must agree on file paths. Immich stores paths in Postgres — if Docker writes `/usr/src/app/upload/thumb.jpg` but the native worker looks for `/Users/you/immich/upload/thumb.jpg`, things break.
 
-In the Immich admin UI (**Administration → Settings → Video Transcoding**), change these to avoid unnecessary re-encoding:
+The fix: `IMMICH_MEDIA_LOCATION` tells Immich where files live. Set it to the real host path (like `/Users/you/immich/upload`), and mount that same path in Docker (`-v /Users/you/immich/upload:/Users/you/immich/upload`). Now both sides see the same paths.
 
-- **Transcode policy:** `Optimal` (default `Required` re-encodes everything, even compatible files)
-- **Accepted video codecs:** Add `HEVC` and `AV1` (most iPhone videos are already HEVC — no need to transcode them)
+**New installs:** Set this from the start. The setup command detects your upload directory and tells you exactly what to use.
 
-This alone can eliminate 80-90% of your video transcoding queue.
+**Existing installs:** If you're changing from the Docker default (`/usr/src/app/upload`), Immich automatically rewrites all file paths in the database on the first restart with the new `IMMICH_MEDIA_LOCATION`. This is safe (it's Immich's own migration), but back up your database first.
 
-### 3. Start native services
+**External photo libraries:** If you imported photos from an external library (e.g., NAS mount), those paths are stored as-is from when Docker scanned them. If Docker saw them at `/mnt/photos/...`, that's what's in the DB. The native worker needs to see them at the same path. For same-machine setups, mount the library with the same path on both sides (like uploads). For cross-machine setups (NAS + Mac), this requires both machines to see the library at the same path — which may require NFS/SMB mounts that match.
+
+### 4. Start the accelerator
 
 ```bash
-# ML service (face detection, CLIP embeddings, face recognition)
-cd ml && python -m src.main &
-
-# FFmpeg proxy (VideoToolbox hardware transcoding)
-cd .. && UPLOAD_DIR=/path/to/upload PHOTOS_DIR=/path/to/photos python ffmpeg-proxy/server.py &
-
-# Thumbnail worker (Core Image Metal GPU)
-DB_HOST=localhost DB_PASS=YOUR_DB_PASSWORD UPLOAD_DIR=/path/to/upload PHOTOS_DIR=/path/to/photos python -m thumbnail &
+python -m accelerator start
 ```
 
-**Split deployment (Immich on NAS, native services on Mac):** If your Immich Docker uses non-standard volume mounts (e.g., Synology NAS with `/data/upload` instead of `/usr/src/app/upload`), add `CONTAINER_UPLOAD_PATH` and `CONTAINER_PHOTOS_PATH` to match your Docker volume configuration. See the [Configuration](#configuration) table for details.
+Starts the native microservices worker and ML service. Immich's web UI works as usual. Uploads go through Docker's API, compute happens natively.
 
-For persistent services that auto-start on boot:
+## Commands
+
+| Command | What it does |
+|---------|-------------|
+| `python -m accelerator setup` | Detect Immich, extract server, configure |
+| `python -m accelerator start` | Start native worker + ML |
+| `python -m accelerator stop` | Stop native services |
+| `python -m accelerator status` | Show what's running |
+| `python -m accelerator logs [worker\|ml]` | Tail service logs |
+| `python -m accelerator update` | Update to match new Immich version |
+| `python -m accelerator watch` | Monitor + auto-restart on crash (for launchd) |
+
+## Updates
+
+The accelerator handles Immich updates automatically:
+
+- **On every `start`:** checks the Docker container version, re-extracts if it changed
+- **In `watch` mode:** checks every 5 minutes. If Watchtower or a manual `docker compose pull` updates Immich, the watchdog stops the worker, re-extracts the new server, and restarts. No manual intervention needed.
+- **Manual:** `python -m accelerator update` if you prefer to control the timing
+
+## Performance tuning
+
+In the Immich admin UI (Administration → Jobs), tune the per-queue concurrency for your hardware. Recommended for M4 with 24GB:
+
+| Queue | Concurrency | Why |
+|-------|-------------|-----|
+| Thumbnail Generation | 4 | CPU-bound (Sharp/libvips with NEON SIMD) |
+| Smart Search | 2 | GPU-serialized (MLX Metal, no benefit higher) |
+| Face Detection | 3 | Neural Engine (Vision framework) |
+| OCR | 3 | Neural Engine (Vision framework) |
+| Metadata Extraction | 4 | I/O-bound (exiftool) |
+| Video Conversion | 1 | Hardware-accelerated via VideoToolbox |
+
+Higher isn't always better — oversubscribing the CPU causes thrashing and actually reduces throughput.
+
+## Split deployment (NAS + Mac)
+
+For setups where Immich's Docker runs on a NAS and the Mac handles compute:
+
+- Docker runs on the NAS (API + Postgres + Redis)
+- Accelerator runs on the Mac (microservices + ML)
+- Expose Postgres and Redis ports in docker-compose (not just localhost)
+- Mount the NAS photo directory on the Mac via NFS or SMB
+
+The tricky part is path consistency. The native worker on the Mac needs to see files at the same absolute paths that Docker on the NAS used. For uploads, `IMMICH_MEDIA_LOCATION` handles this. For external libraries, you may need to ensure the Mac's NFS/SMB mount path matches what Docker sees.
+
+For example, if Docker on the NAS mounts photos at `/mnt/photos`, the Mac needs an NFS mount at `/mnt/photos` too (or you migrate the DB paths to match your Mac's mount point — see [issue #2](https://github.com/epheterson/immich-apple-silicon/issues/2) for an example of this).
+
+This is an advanced setup. Start with same-machine (Docker + accelerator on the same Mac) first.
+
+## ML service
+
+The ML service is a managed fork of [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) by [@sebastianfredette](https://github.com/sebastianfredette), included as a git submodule. It replaces Immich's Docker ML container with native macOS inference. Upstream changes are reviewed before merging.
+
+| Task | Hardware | Framework |
+|------|----------|-----------|
+| CLIP embeddings | GPU (Metal) | MLX |
+| Face detection | Neural Engine | Apple Vision |
+| Face recognition | CPU / CoreML | InsightFace ONNX |
+| OCR | Neural Engine | Apple Vision |
+
+Contributions to the ML service are made via [upstream PRs](https://github.com/sebastianfredette/immich-ml-metal/pulls).
+
+## Running as a service
+
+The `watch` command monitors services and auto-restarts on crash. Use it with launchd for unattended operation:
 
 ```bash
-cp launchd/*.plist ~/Library/LaunchAgents/
-# Edit paths in each plist to match your setup, then:
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.immich.ml-metal.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.immich.ffmpeg-proxy.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.immich.thumbnail.plist
+cp launchd/com.immich.accelerator.plist ~/Library/LaunchAgents/
+# Edit the plist: update WorkingDirectory to your repo path
+launchctl load ~/Library/LaunchAgents/com.immich.accelerator.plist
 ```
 
-### 4. Verify
+The plist uses `watch` (not `start`) with `KeepAlive` so launchd restarts the monitor if it dies. The monitor in turn restarts ML and the worker if they crash.
 
-```bash
-curl http://localhost:3004/ping        # → pong (ML service)
-curl http://localhost:3005/ping        # → pong (ffmpeg proxy)
-curl http://localhost:3005/stats       # → JSON with hw_encode/hw_decode counts
-tail -f /tmp/immich-thumbnail.err      # → "OK <asset-id>" lines
-```
+## Safety
 
-## Initial Import
-
-If you have a large existing library (100K+ assets), the initial scan and processing will take several hours and use significant memory. This is normal.
-
-The native services add ~2GB of overhead (ML models + Python processes) on top of Docker. On a 24GB Mac Mini, expect swap usage during the import — the system handles it, but it won't be instant. 32GB+ machines will have a smoother experience.
-
-Tips:
-- Reduce Immich job concurrency in **Administration → Settings → Job & Workers** if you see heavy swap (20GB+)
-- Smart search (CLIP) and OCR are the most memory-hungry — they can be paused during import and run after thumbnails finish
-- The thumbnail worker automatically backs off when available memory drops below 500MB
-
-## Updating Immich
-
-**All three native services survive Immich restarts and updates automatically.** No manual stop/start needed — including with Watchtower or auto-update setups.
-
-- **FFmpeg proxy & ML service:** Stateless HTTP services. Immich reconnects after restart.
-- **Thumbnail worker:** Has built-in resilience. When Postgres restarts during an update, the worker detects the connection drop, backs off with exponential retry, and auto-recovers when the database is available again. No manual intervention required.
-
-Just update Immich however you normally do:
-```bash
-docker compose pull && docker compose up -d   # or let Watchtower handle it
-```
-
-**If a major Immich version changes the database schema** (rare), the thumbnail worker will detect sustained query failures, back off to 5-minute intervals, and log a clear message. To verify manually:
-```bash
-cd /path/to/immich-apple-silicon
-python -m pytest thumbnail/tests/test_db.py -v
-```
-
-**Worst case rollback:** Stop the native thumbnail worker → Immich handles thumbnails itself. No data loss — Immich regenerates anything it needs.
-
-### Note: Thumbnail generation and Immich
-
-Immich doesn't support disabling individual job queues via environment variables. `IMMICH_WORKERS_EXCLUDE` only accepts worker *types* (`api`, `microservices`, `maintenance`), not queue names like `thumbnailGeneration`.
-
-This means **both Immich and the native thumbnail worker will generate thumbnails** for newly uploaded photos. This is safe — our worker uses UPSERT, so whichever finishes last wins, and the output is equivalent. During large library imports, our Metal-accelerated worker processes the backlog much faster than Immich's container-based Sharp, so most thumbnails are generated by us first. Immich may overwrite some, but the result is identical.
-
-For manual re-runs (Administration → Jobs → Generate Thumbnails), Immich's batch query skips assets that already have thumbnails and thumbhash set — so our work is respected there.
-
-## Components
-
-**Built by this project:**
-
-### FFmpeg Proxy (`ffmpeg-proxy/`)
-
-HTTP proxy that intercepts ffmpeg calls from the Docker container and runs them through native macOS ffmpeg with VideoToolbox hardware acceleration.
-
-- Translates container paths to host paths
-- Remaps software encoders to hardware: `h264`/`libx264` → `h264_videotoolbox`
-- Injects `-hwaccel videotoolbox` for hardware video decoding
-- WebP output fallback via PIL (Homebrew ffmpeg typically lacks libwebp)
-- Falls back to container ffmpeg if proxy is unreachable
-- Threaded server: handles parallel transcodes without blocking
-- Stats endpoint with session tracking: `curl http://localhost:3005/stats`
-
-### Thumbnail Worker (`thumbnail/`)
-
-Generates Immich thumbnails using Core Image on the Metal GPU.
-
-- Polls Postgres for IMAGE assets missing thumbnails
-- Single-pass pipeline: load image once → GPU resize to both sizes → thumbhash
-- Generates preview (1440px JPEG) + thumbnail (250px WebP)
-- Computes thumbhash (perceptual blur placeholder)
-- Persistent DB connection for throughput
-- Memory-aware: pauses when available RAM drops below 500MB
-- `F_NOCACHE` on source reads — prevents macOS buffer cache from filling with one-time image data
-- `gc.collect()` between batches — frees GPU/PIL objects promptly
-- Suppresses Spotlight indexing on output directories automatically
-- Self-healing: exponential backoff on DB errors, auto-recovers after Immich restarts
-- UPSERT-safe: reruns don't create duplicate data
-
-**Integrated from the community:**
-
-### ML Service (`ml/`) — forked from [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal)
-
-Maintained fork of the immich-ml-metal project, included as a git submodule. Replaces Immich's Docker ML container with native macOS inference using Apple Vision (face detection), MLX (CLIP embeddings), and CoreML (face recognition). Upstream changes are reviewed before merging. 21x faster than Docker ML.
-
-- Fixed face recognition: landmark coordinates correctly mapped through face bounding box ([upstream PR](https://github.com/sebastianfredette/immich-ml-metal/pull/3))
-- Idle model unloading: CLIP and ArcFace models freed after 120s inactive (~700MB recovered)
-
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DB_HOST` | `localhost` | Postgres host |
-| `DB_PORT` | `5432` | Postgres port |
-| `DB_NAME` | `immich` | Database name |
-| `DB_USER` | `postgres` | Database user |
-| `DB_PASS` | *(required)* | Database password |
-| `UPLOAD_DIR` | *(required)* | Host path to Immich upload directory |
-| `PHOTOS_DIR` | *(required)* | Host path to external photo library |
-| `CONTAINER_UPLOAD_PATH` | `/usr/src/app/upload` | Upload path inside the Immich Docker container |
-| `CONTAINER_PHOTOS_PATH` | `/mnt/photos` | Photos path inside the Immich Docker container |
-| `FFMPEG_PROXY_PORT` | `3005` | FFmpeg proxy listen port |
-| `FFMPEG_PROXY_BIND` | `0.0.0.0` | FFmpeg proxy bind address |
-| `BATCH_SIZE` | `20` | Thumbnail worker batch size |
-| `POLL_INTERVAL` | `5` | Seconds between DB polls when idle |
+- **Immich's Docker image is unmodified.** No custom images, no patches.
+- **The native worker runs Immich's own code.** Extracted from the Docker image, not reimplemented.
+- **UPSERT-safe database writes.** The native worker uses Immich's own job pipeline with the same UPSERT logic.
+- **Version-matched.** The extracted server always matches the Docker image version exactly.
 
 ## Security
 
-The ffmpeg proxy listens on all interfaces (`0.0.0.0`) because Docker containers reach the host via a bridge IP. On untrusted networks, restrict access:
+- Config file (`~/.immich-accelerator/config.json`) is chmod 600
+- Postgres exposed on `127.0.0.1:5432` (localhost only) by default
+- Redis exposed on `127.0.0.1:6379` (localhost only) by default
 
-```bash
-# macOS firewall
-sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /opt/homebrew/bin/python3.11
-```
+## Migrating from v0.x
 
-Or set `FFMPEG_PROXY_BIND=127.0.0.1` if not using Docker.
+If you were using the previous version with the custom thumbnail worker and ffmpeg proxy:
 
-The example `docker-compose.yml` binds Postgres to `127.0.0.1` only.
+1. Stop old services: `launchctl bootout gui/$(id -u) com.immich.thumbnail com.immich.ffmpeg-proxy`
+2. Remove old plists from `~/Library/LaunchAgents/`
+3. Remove `IMMICH_WORKERS_EXCLUDE` from your docker-compose (it never worked)
+4. Follow the Quick Start above
 
-## macOS Permissions
+## On agentic engineering
 
-On first run, macOS may prompt to allow network access for Python. Click **Allow**.
-
-## Updating This Project
-
-```bash
-cd /path/to/immich-apple-silicon
-git pull --recurse-submodules
-# Services run from the repo directory — new code takes effect on next restart.
-# Your launchd plists in ~/Library/LaunchAgents are your own copies and are not overwritten.
-```
-
-To restart services after an update:
-```bash
-launchctl kickstart -k gui/$(id -u)/com.immich.ffmpeg-proxy
-launchctl kickstart -k gui/$(id -u)/com.immich.thumbnail
-```
-
-## Credits
-
-- [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) — ML service for Apple Silicon
-- [Immich](https://immich.app) — The photo management platform
-- [Jellyfin Docker macOS HW accel](https://oliverbley.github.io/posts/2022-12-27-jellyfin-in-docker-hardware-acceleration-on-macos/) — FFmpeg proxy pattern inspiration
-
-## On Agentic Engineering
-
-This project was built in one day, by one person, in one Claude Code Opus 4.6 session. After noticing inefficiency, and with zero knowledge of the codebase, today it is possible to improve the world around us and enrich the lives of others as well. Inspect and improve the codebase yourself, use it and share it, or not.
-
-## License
-
-MIT
+This project was built iteratively across several sessions with [Claude Code](https://claude.ai/code) (Opus 4.6). From zero knowledge of the Immich codebase to a working native accelerator, including upstream contributions to the ML service and a feature discussion with the Immich maintainers. Inspect the code yourself, use it and share it, or don't.
 
 ---
 

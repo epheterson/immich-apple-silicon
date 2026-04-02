@@ -28,3 +28,6 @@ ml/.venv/
 
 # Internal planning docs
 docs/plans/
+
+# Accelerator runtime data
+.immich-accelerator/

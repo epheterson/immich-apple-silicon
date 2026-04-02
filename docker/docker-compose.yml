@@ -2,17 +2,24 @@ services:
   immich-server:
     container_name: immich_server
     image: ghcr.io/immich-app/immich-server:release
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
-      - /path/to/your/upload:/usr/src/app/upload          # CHANGE THIS: Immich upload directory
-      - /path/to/your/photos:/mnt/photos:ro                # CHANGE THIS: external photo library
-      - /path/to/your/ffmpeg-wrapper.sh:/usr/bin/ffmpeg:ro # CHANGE THIS: ffmpeg proxy wrapper
-      - /path/to/your/ffprobe-wrapper.sh:/usr/bin/ffprobe:ro # CHANGE THIS: ffprobe proxy wrapper
+      # IMPORTANT: use the same absolute path on both sides so the native
+      # worker and Docker agree on file locations. The accelerator setup
+      # command will tell you the exact paths to use.
+      - /path/to/upload:/path/to/upload
+      - /path/to/photos:/path/to/photos:ro
       - /etc/localtime:/etc/localtime:ro
     environment:
       - DB_HOSTNAME=immich_postgres
-      - IMMICH_MACHINE_LEARNING_URL=http://host.internal:3004
+      - IMMICH_WORKERS_INCLUDE=api
+      - IMMICH_MACHINE_LEARNING_URL=http://host.internal:3003  # OrbStack; Docker Desktop: host.docker.internal
+      - IMMICH_MEDIA_LOCATION=/path/to/upload
       - DB_USERNAME=postgres
-      - DB_PASSWORD=${DB_PASSWORD}  # set in .env file or export before running
+      - DB_PASSWORD=${DB_PASSWORD}
       - DB_DATABASE_NAME=immich
       - REDIS_HOSTNAME=immich_redis
     depends_on:
@@ -22,13 +29,12 @@ services:
     ports:
       - "2283:2283"
 
-  # ML runs natively on macOS for GPU/Neural Engine acceleration (see ml/)
-  # Video transcoding runs natively via ffmpeg proxy for VideoToolbox (see ffmpeg-proxy/)
-
   redis:
     container_name: immich_redis
     image: redis:6.2-alpine
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: redis-cli ping || exit 1
 
@@ -36,20 +42,18 @@ services:
     container_name: immich_postgres
     image: tensorchord/pgvecto-rs:pg14-v0.2.0
     environment:
-      - POSTGRES_PASSWORD=${DB_PASSWORD}  # set in .env file or export before running
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
       - POSTGRES_USER=postgres
       - POSTGRES_DB=immich
       - POSTGRES_INITDB_ARGS=--data-checksums
     volumes:
-      - pgdata:/var/lib/postgresql/data
-    restart: unless-stopped
+      # IMPORTANT: use a bind mount, not a Docker volume.
+      - /path/to/pgdata:/var/lib/postgresql/data
     ports:
-      - "127.0.0.1:5432:5432"  # localhost only — for native thumbnail worker
+      - "127.0.0.1:5432:5432"
+    restart: unless-stopped
     healthcheck:
       test: pg_isready --dbname=immich
       interval: 10s
       timeout: 5s
       retries: 5
-
-volumes:
-  pgdata:
