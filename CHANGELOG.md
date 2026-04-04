@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 — 2026-04-04
+
+- Remove PLAN.md from repo (local planning doc, gitignored)
+- Pre-push hook enforces version > remote + CHANGELOG entry
+
 ## 1.1.0 — 2026-04-03
 
 ### Setup: remote and manual modes
