@@ -48,44 +48,19 @@ The microservices worker is extracted directly from your running Immich Docker i
 
 ## Quick start
 
-### 1. Set up the ML service
+### 1. Clone and run setup
 
 ```bash
 git clone --recursive https://github.com/epheterson/immich-apple-silicon.git
-cd immich-apple-silicon/ml
-python3.11 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+cd immich-apple-silicon
+python3 -m immich_accelerator setup
 ```
 
-### 2. Run setup
+Setup handles everything: installs Homebrew/Node.js/libvips if missing, downloads jellyfin-ffmpeg, creates the ML service venv, extracts the server from Docker, and tells you what to change in `docker-compose.yml`.
 
-**Same-machine (Docker + accelerator on one Mac):**
+For NAS + Mac or manual setups, see [Split deployment](#split-deployment-nas--mac) below.
 
-```bash
-cd ..
-python -m accelerator setup
-```
-
-Auto-detects your Immich instance, extracts the server from Docker, installs the native Sharp binary, and tells you what to change in `docker-compose.yml`.
-
-**NAS + Mac (Docker on NAS, compute on Mac):**
-
-```bash
-python -m accelerator setup --url http://nas:2283 --api-key YOUR_KEY
-```
-
-Queries the Immich API for version info, prompts for DB/Redis connection details. Generate an API key in Immich (Administration > API Keys). Make sure Postgres and Redis ports are exposed on the NAS (not just localhost). If Docker is on the Mac it pulls the image automatically; if not, it guides you through extracting the server on your NAS.
-
-**Manual config (full control):**
-
-```bash
-python -m accelerator setup --manual
-```
-
-Creates a config template at `~/.immich-accelerator/config.json`. Edit the connection details, extract the server on your Docker host, and import with `setup --import-server ./server.tar.gz`.
-
-### 3. Configure Docker
+### 2. Configure Docker
 
 The setup command prints the required changes. The key settings:
 
@@ -117,10 +92,10 @@ The fix: `IMMICH_MEDIA_LOCATION` tells Immich where files live. Set it to the re
 
 **External photo libraries:** If you imported photos from an external library (e.g., NAS mount), those paths are stored as-is from when Docker scanned them. If Docker saw them at `/mnt/photos/...`, that's what's in the DB. The native worker needs to see them at the same path. For same-machine setups, mount the library with the same path on both sides (like uploads). For cross-machine setups (NAS + Mac), this requires both machines to see the library at the same path — which may require NFS/SMB mounts that match.
 
-### 4. Start the accelerator
+### 3. Start the accelerator
 
 ```bash
-python -m accelerator start
+python3 -m immich_accelerator start
 ```
 
 Starts the native microservices worker and ML service. Immich's web UI works as usual. Uploads go through Docker's API, compute happens natively.
@@ -129,23 +104,24 @@ Starts the native microservices worker and ML service. Immich's web UI works as 
 
 | Command | What it does |
 |---------|-------------|
-| `python -m accelerator setup` | Auto-detect local Docker, extract server, configure |
-| `python -m accelerator setup --url URL` | Setup from remote Immich instance |
-| `python -m accelerator setup --manual` | Create config template for manual editing |
-| `python -m accelerator start` | Start native worker + ML |
-| `python -m accelerator stop` | Stop native services |
-| `python -m accelerator status` | Show what's running |
-| `python -m accelerator logs [worker\|ml]` | Tail service logs |
-| `python -m accelerator update` | Update to match new Immich version |
-| `python -m accelerator watch` | Monitor + auto-restart on crash (for launchd) |
-| `python -m accelerator dashboard` | Web UI at http://localhost:8420 |
+| `python3 -m immich_accelerator setup` | Auto-detect local Docker, extract server, configure |
+| `python3 -m immich_accelerator setup --url URL` | Setup from remote Immich instance |
+| `python3 -m immich_accelerator setup --manual` | Create config template for manual editing |
+| `python3 -m immich_accelerator start` | Start native worker + ML |
+| `python3 -m immich_accelerator stop` | Stop native services |
+| `python3 -m immich_accelerator status` | Show what's running |
+| `python3 -m immich_accelerator logs [worker\|ml]` | Tail service logs |
+| `python3 -m immich_accelerator update` | Update to match new Immich version |
+| `python3 -m immich_accelerator watch` | Monitor + auto-restart on crash (for launchd) |
+| `python3 -m immich_accelerator dashboard` | Web UI at http://localhost:8420 |
+| `python3 -m immich_accelerator uninstall` | Remove services, data, and launchd config |
 
 ## Dashboard
 
 Real-time monitoring at `http://your-mac:8420`:
 
 ```bash
-python -m accelerator dashboard
+python3 -m immich_accelerator dashboard
 ```
 
 Shows service health, processing progress with live rates and ETAs, Apple Silicon hardware utilization, and system metrics. Mobile-friendly — check from your phone.
@@ -158,7 +134,7 @@ The accelerator handles Immich updates automatically:
 
 - **On every `start`:** checks the Docker container version, re-extracts if it changed
 - **In `watch` mode:** checks every 5 minutes. If Watchtower or a manual `docker compose pull` updates Immich, the watchdog stops the worker, re-extracts the new server, and restarts. No manual intervention needed.
-- **Manual:** `python -m accelerator update` if you prefer to control the timing
+- **Manual:** `python3 -m immich_accelerator update` if you prefer to control the timing
 
 ## Performance tuning
 
@@ -184,10 +160,10 @@ For setups where Immich's Docker runs on a NAS and the Mac handles compute:
 
 ```bash
 # Setup from the Mac, pointing at the NAS
-python -m accelerator setup --url http://nas:2283 --api-key YOUR_KEY
+python3 -m immich_accelerator setup --url http://nas:2283 --api-key YOUR_KEY
 
 # Or fully manual
-python -m accelerator setup --manual
+python3 -m immich_accelerator setup --manual
 ```
 
 Docker is **not required on the Mac**. If Docker isn't installed, setup will guide you through extracting the server on the NAS:
@@ -198,7 +174,7 @@ docker cp immich_server:/usr/src/app/server - | gzip > immich-server.tar.gz
 docker cp immich_server:/build - | gzip > immich-build.tar.gz
 
 # Copy to Mac and import:
-python -m accelerator setup --import-server ./immich-server.tar.gz
+python3 -m immich_accelerator setup --import-server ./immich-server.tar.gz
 ```
 
 **Path consistency**: The native worker on the Mac needs to see files at the same absolute paths that Docker on the NAS used. Mount the NAS photo directory on the Mac via NFS or SMB. For uploads, `IMMICH_MEDIA_LOCATION` handles this. For external libraries, ensure the Mac's mount path matches what Docker sees.
@@ -220,15 +196,13 @@ Contributions to the ML service are made via [upstream PRs](https://github.com/s
 
 ## Running as a service
 
-The `watch` command monitors services and auto-restarts on crash. Use it with launchd for unattended operation:
+Setup offers to install a launchd service automatically. If you skipped that prompt:
 
 ```bash
-cp launchd/com.immich.accelerator.plist ~/Library/LaunchAgents/
-# Edit the plist: update WorkingDirectory to your repo path
-launchctl load ~/Library/LaunchAgents/com.immich.accelerator.plist
+python3 -m immich_accelerator setup  # re-run, it will offer again
 ```
 
-The plist uses `watch` (not `start`) with `KeepAlive` so launchd restarts the monitor if it dies. The monitor in turn restarts ML and the worker if they crash.
+The service uses `watch` mode with `KeepAlive` — launchd restarts the monitor if it dies, and the monitor restarts worker, ML, and dashboard if they crash.
 
 ## Safety
 
@@ -273,6 +247,16 @@ If you were using the previous version with the custom thumbnail worker and ffmp
 2. Remove old plists from `~/Library/LaunchAgents/`
 3. Remove `IMMICH_WORKERS_EXCLUDE` from your docker-compose (it never worked)
 4. Follow the Quick Start above
+
+## Migrating from v1.2.x
+
+The module was renamed from `accelerator` to `immich_accelerator` in v1.3.0:
+
+1. Stop services: `launchctl unload ~/Library/LaunchAgents/com.immich.accelerator.plist`
+2. Remove old plist: `rm ~/Library/LaunchAgents/com.immich.accelerator.plist`
+3. Re-run setup: `python3 -m immich_accelerator setup` (re-installs launchd with correct module name)
+
+Your config (`~/.immich-accelerator/config.json`) is fully compatible — no changes needed.
 
 ## On agentic engineering
 

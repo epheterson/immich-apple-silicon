@@ -1,10 +1,10 @@
 """Immich Accelerator — run Immich microservices natively on macOS.
 
 Usage:
-    python -m accelerator setup     # detect Immich, checkout code, configure
-    python -m accelerator start     # start native worker + ML service
-    python -m accelerator stop      # stop native services
-    python -m accelerator status    # show what's running
+    python -m immich_accelerator setup     # detect Immich, checkout code, configure
+    python -m immich_accelerator start     # start native worker + ML service
+    python -m immich_accelerator stop      # stop native services
+    python -m immich_accelerator status    # show what's running
 """
 from __future__ import annotations
 
@@ -335,7 +335,7 @@ def save_config(config: dict) -> None:
 
 def load_config() -> dict:
     if not CONFIG_FILE.exists():
-        raise RuntimeError("Not set up yet. Run: python -m accelerator setup")
+        raise RuntimeError("Not set up yet. Run: python -m immich_accelerator setup")
     with open(CONFIG_FILE) as f:
         return json.load(f)
 
@@ -580,8 +580,37 @@ def _finalize_config(config: dict) -> None:
         log.info("  Generate a key in Immich → Administration → API Keys")
 
     save_config(config)
+
+    # Auto-start services
     log.info("")
-    log.info("Setup complete. Run: python -m accelerator start")
+    try:
+        answer = input("  Start Immich Accelerator now? [Y/n] ").strip().lower()
+    except EOFError:
+        answer = "n"
+    if not answer or answer == "y":
+        cmd_start(argparse.Namespace(force=True))
+
+    # Offer to install launchd service (watch mode — manages worker, ML, and dashboard)
+    plist_src = Path(__file__).parent.parent / "launchd" / "com.immich.accelerator.plist"
+    plist_dst = Path.home() / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
+
+    if plist_src.exists() and not plist_dst.exists():
+        try:
+            answer = input("  Install as system service (auto-starts on login)? [Y/n] ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if not answer or answer == "y":
+            content = plist_src.read_text()
+            repo_dir = str(Path(__file__).parent.parent.resolve())
+            content = content.replace("/path/to/immich-apple-silicon", repo_dir)
+            content = content.replace("/opt/homebrew/bin/python3", sys.executable)
+            plist_dst.parent.mkdir(parents=True, exist_ok=True)
+            plist_dst.write_text(content)
+            subprocess.run(["launchctl", "load", str(plist_dst)], capture_output=True, timeout=10)
+            log.info("  Installed (auto-starts worker, ML, and dashboard on login)")
+
+    log.info("")
+    log.info("Immich Accelerator is running.")
 
 
 def _query_immich_api(base_url: str, api_key: str) -> dict:
@@ -686,6 +715,95 @@ def _import_server(source: str, version: str) -> Path:
     return server_dir
 
 
+def _find_compose_file(docker: str) -> Path | None:
+    """Find the docker-compose.yml for the Immich stack."""
+    # Ask Docker for the compose file path
+    try:
+        r = subprocess.run(
+            [docker, "inspect", "--format", "{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}",
+             "immich_server"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            compose_dir = Path(r.stdout.strip())
+            for name in ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"]:
+                f = compose_dir / name
+                if f.exists():
+                    return f
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return None
+
+
+def _configure_docker(docker: str, immich: dict, upload: str | None) -> None:
+    """Show required docker-compose changes, offer to open editor, retry until connected."""
+    compose_file = _find_compose_file(docker)
+    ml_url = "http://host.internal:3003"  # OrbStack; Docker Desktop uses host.docker.internal
+
+    log.info("")
+    log.info("Add these to your docker-compose.yml (immich-server service):")
+    log.info("")
+    log.info("  environment:")
+    log.info("    - IMMICH_WORKERS_INCLUDE=api")
+    log.info("    - IMMICH_MACHINE_LEARNING_URL=%s", ml_url)
+    if upload:
+        log.info("    - IMMICH_MEDIA_LOCATION=%s", upload)
+        log.info("  volumes:")
+        log.info("    - %s:%s", upload, upload)
+    log.info("")
+    log.info("  And expose ports on database and redis services:")
+    log.info("    ports: ['127.0.0.1:5432:5432']   # database")
+    log.info("    ports: ['127.0.0.1:6379:6379']   # redis")
+    log.info("")
+    log.info("  Docker Desktop users: use http://host.docker.internal:3003 instead")
+
+    # Offer to open in editor
+    if compose_file:
+        log.info("")
+        log.info("  Found: %s", compose_file)
+        try:
+            answer = input("  Open in your editor? [Y/n] ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if not answer or answer == "y":
+            editor = os.environ.get("EDITOR", "nano")
+            subprocess.run([editor, str(compose_file)])
+
+    # Retry loop — wait for user to apply changes and restart Docker
+    log.info("")
+    log.info("After editing, run 'docker compose up -d' in another terminal.")
+    while True:
+        try:
+            answer = input("  Press Enter to check connection (q to finish later)... ").strip().lower()
+        except EOFError:
+            break
+        if answer == "q":
+            log.info("  Run 'python -m immich_accelerator start' when Docker is ready.")
+            break
+
+        # Check connectivity
+        db_ok = check_port("localhost", int(immich.get("db_port", "5432")), "Postgres")
+        redis_ok = check_port("localhost", int(immich.get("redis_port", "6379")), "Redis")
+
+        if db_ok and redis_ok:
+            # Re-detect to check config
+            try:
+                fresh = detect_immich(docker)
+                if fresh["workers_include"] == "api":
+                    log.info("  ✓ Connected! Docker configured correctly.")
+                    return
+                else:
+                    log.info("  ✗ Ports OK but IMMICH_WORKERS_INCLUDE not set to 'api'.")
+                    log.info("    Add it to docker-compose.yml and restart.")
+            except RuntimeError:
+                log.info("  ✗ Docker may still be restarting — try again in a few seconds.")
+        else:
+            if not db_ok:
+                log.info("  ✗ Postgres not reachable at localhost:5432")
+            if not redis_ok:
+                log.info("  ✗ Redis not reachable at localhost:6379")
+
+
 def _setup_local(args):
     """Setup from local Docker (original behavior)."""
     log.info("Detecting Immich instance...")
@@ -704,37 +822,23 @@ def _setup_local(args):
     log.info("  Redis: localhost:%s", immich["redis_port"])
     log.info("  Upload: %s", immich["upload_mount"] or "not detected")
 
-    # Verify connectivity
-    ok = True
-    if not check_port("localhost", int(immich["db_port"]), "Postgres"):
-        log.error("  Add to docker-compose database service: ports: ['127.0.0.1:5432:5432']")
-        ok = False
-    if not check_port("localhost", int(immich["redis_port"]), "Redis"):
-        log.error("  Add to docker-compose redis service: ports: ['127.0.0.1:6379:6379']")
-        ok = False
-    if not ok:
-        log.error("Fix the above, run 'docker compose up -d', then re-run setup.")
-        return
-
-    # Check Docker config
+    # Install dependencies and extract server first (doesn't need Docker config)
     upload = immich["upload_mount"]
-    if immich["workers_include"] != "api" or not immich["media_location"]:
-        log.warning("")
-        log.warning("Docker config needed — add to your Immich docker-compose.yml:")
-        log.warning("  environment:")
-        log.warning("    - IMMICH_WORKERS_INCLUDE=api")
-        log.warning("    - IMMICH_MACHINE_LEARNING_URL=http://host.internal:3003")
-        if upload:
-            log.warning("    - IMMICH_MEDIA_LOCATION=%s", upload)
-            log.warning("  volumes:")
-            log.warning("    - %s:%s", upload, upload)
-        log.warning("")
-        log.warning("After updating: docker compose up -d && python -m accelerator setup")
-    else:
-        log.info("  Docker: API-only mode, IMMICH_MEDIA_LOCATION=%s", immich["media_location"])
 
     node, ffmpeg_path, ml_dir = _check_local_tools()
     server_dir = extract_immich_server(docker, immich["container"], immich["version"])
+
+    # Now handle Docker config — guide user through compose changes if needed
+    if immich["workers_include"] != "api" or not immich["media_location"]:
+        _configure_docker(docker, immich, upload)
+    else:
+        log.info("  Docker: API-only mode, IMMICH_MEDIA_LOCATION=%s", immich["media_location"])
+
+    # Re-detect after potential Docker restart
+    try:
+        immich = detect_immich(docker)
+    except RuntimeError:
+        pass
 
     config = {
         "version": immich["version"],
@@ -825,7 +929,7 @@ def _setup_remote(args):
             log.info("  docker cp immich_server:/build - | gzip > immich-build.tar.gz")
             log.info("")
             log.info("  # Copy to this Mac and re-run:")
-            log.info("  python -m accelerator setup --url %s --import-server ./immich-server.tar.gz", url)
+            log.info("  python -m immich_accelerator setup --url %s --import-server ./immich-server.tar.gz", url)
             return
 
     if server_dir is None:
@@ -895,10 +999,10 @@ def _setup_manual(_args):
     log.info("  docker cp immich_server:/build - | gzip > immich-build.tar.gz")
     log.info("")
     log.info("  # Copy to this Mac, then import:")
-    log.info("  python -m accelerator setup --import-server ./immich-server.tar.gz")
+    log.info("  python -m immich_accelerator setup --import-server ./immich-server.tar.gz")
     log.info("")
     log.info("  # Then start:")
-    log.info("  python -m accelerator start")
+    log.info("  python -m immich_accelerator start")
 
 
 def cmd_setup(args):
@@ -911,24 +1015,96 @@ def cmd_setup(args):
         server_dir = _import_server(args.import_server, config["version"])
         config["server_dir"] = str(server_dir)
         save_config(config)
-        log.info("Server imported. Run: python -m accelerator start")
+        log.info("Server imported. Run: python -m immich_accelerator start")
     elif args.url:
         _setup_remote(args)
     else:
         _setup_local(args)
 
 
-def _find_ml_dir() -> Path | None:
-    """Find the immich-ml-metal service directory."""
-    candidates = [
-        Path.home() / "immich-ml-metal",
-        Path(__file__).parent.parent / "ml",
-    ]
-    for d in candidates:
-        venv_python = d / "venv" / "bin" / "python3"
-        if venv_python.exists() and (d / "src" / "main.py").exists():
-            return d
+def _find_python() -> str | None:
+    """Find Python 3.11+, or offer to install it."""
+    # Check versioned binaries first
+    for p in ["/opt/homebrew/bin/python3.11", "/usr/local/bin/python3.11",
+              "/opt/homebrew/bin/python3.12", "/usr/local/bin/python3.12",
+              "/opt/homebrew/bin/python3.13", "/usr/local/bin/python3.13"]:
+        if os.path.isfile(p):
+            return p
+    # Check system python3
+    try:
+        r = subprocess.run(["python3", "--version"], capture_output=True, text=True, timeout=5)
+        version = r.stdout.strip() + r.stderr.strip()  # some builds print to stderr
+        import re
+        m = re.search(r"3\.(\d+)", version)
+        if m and int(m.group(1)) >= 11:
+            return "python3"
+    except (subprocess.SubprocessError, OSError):
+        pass
+    if _brew_install("python@3.11"):
+        for p in ["/opt/homebrew/bin/python3.11", "/usr/local/bin/python3.11"]:
+            if os.path.isfile(p):
+                return p
     return None
+
+
+def _find_ml_dir() -> Path | None:
+    """Find the immich-ml-metal service directory. Sets up venv if needed."""
+    candidates = [
+        Path(__file__).parent.parent / "ml",
+        Path.home() / "immich-ml-metal",
+    ]
+
+    # Find a directory with ML source code
+    ml_dir = None
+    for d in candidates:
+        if (d / "src" / "main.py").exists():
+            ml_dir = d
+            break
+    if not ml_dir:
+        return None
+
+    # Check if venv already exists and works
+    venv_python = ml_dir / "venv" / "bin" / "python3"
+    if venv_python.exists():
+        return ml_dir
+
+    # Venv missing — offer to set it up
+    log.info("ML service found at %s but venv is missing.", ml_dir)
+    python = _find_python()
+    if not python:
+        log.warning("  Python 3.11+ not found. ML service won't be available.")
+        log.warning("  Install with: brew install python@3.11")
+        return None
+
+    try:
+        answer = input("  Set up ML service venv? [Y/n] ").strip().lower()
+    except EOFError:
+        return None
+    if answer and answer != "y":
+        return None
+
+    log.info("  Creating venv with %s...", python)
+    result = subprocess.run([python, "-m", "venv", str(ml_dir / "venv")],
+                           capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        log.error("  Venv creation failed: %s", result.stderr[-300:])
+        return None
+
+    log.info("  Installing ML dependencies (this may take a few minutes)...")
+    pip = str(ml_dir / "venv" / "bin" / "pip")
+    req = ml_dir / "requirements.txt"
+    if not req.exists():
+        log.error("  requirements.txt not found in %s", ml_dir)
+        return None
+
+    result = subprocess.run([pip, "install", "-r", str(req)],
+                           capture_output=False, timeout=600)
+    if result.returncode != 0:
+        log.error("  pip install failed")
+        return None
+
+    log.info("  ML service ready")
+    return ml_dir
 
 
 def _kill_stale_processes():
@@ -993,7 +1169,7 @@ def cmd_start(args):
         if immich["workers_include"] != "api":
             log.error("Docker is still running microservices. Two workers will conflict.")
             log.error("Set IMMICH_WORKERS_INCLUDE=api in docker-compose.yml first.")
-            log.error("Run 'python -m accelerator setup' for full instructions.")
+            log.error("Run 'python -m immich_accelerator setup' for full instructions.")
             return
         if config.get("upload_mount") and immich["media_location"] != config["upload_mount"]:
             log.error("IMMICH_MEDIA_LOCATION mismatch — Docker has '%s', we expect '%s'.",
@@ -1056,7 +1232,10 @@ def cmd_start(args):
     # VideoToolbox hardware encoders (h264 → h264_videotoolbox, etc.)
     wrapper_dir = DATA_DIR / "bin"
     wrapper_src = Path(__file__).parent / "ffmpeg-wrapper.sh"
-    if config.get("ffmpeg_path") and wrapper_src.exists():
+    if not config.get("ffmpeg_path"):
+        log.warning("No ffmpeg configured — video transcoding and thumbnails may fail.")
+        log.warning("  Re-run setup to download jellyfin-ffmpeg.")
+    elif wrapper_src.exists():
         wrapper_dir.mkdir(parents=True, exist_ok=True)
         wrapper_dst = wrapper_dir / "ffmpeg"
         # Inject the real ffmpeg path into the wrapper (may differ from /opt/homebrew/bin)
@@ -1111,12 +1290,10 @@ def cmd_start(args):
 
 def cmd_stop(_args):
     stopped = False
-    if kill_pid("worker"):
-        log.info("Worker stopped")
-        stopped = True
-    if kill_pid("ml"):
-        log.info("ML service stopped")
-        stopped = True
+    for name in ("worker", "ml", "dashboard"):
+        if kill_pid(name):
+            log.info("%s stopped", name.capitalize())
+            stopped = True
     if not stopped:
         log.info("Nothing running")
 
@@ -1185,7 +1362,7 @@ def cmd_update(_args):
     config.update(updates)
     save_config(config)
 
-    log.info("Updated to %s. Run: python -m accelerator start", running)
+    log.info("Updated to %s. Run: python -m immich_accelerator start", running)
 
 
 def cmd_watch(_args):
@@ -1199,6 +1376,24 @@ def cmd_watch(_args):
     if not read_pid("worker") or not read_pid("ml"):
         log.info("Services not running, starting...")
         cmd_start(argparse.Namespace(force=True))
+
+    # Start dashboard in background if not already running
+    try:
+        config = load_config()
+        import urllib.request as _urlreq
+        _urlreq.urlopen("http://localhost:8420/", timeout=2)
+    except Exception:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        dash_log = open(LOG_DIR / "dashboard.log", "a")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", __package__ or "immich_accelerator", "dashboard"],
+            cwd=str(Path(__file__).parent.parent),
+            stdout=dash_log, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        dash_log.close()
+        write_pid("dashboard", proc.pid)
+        log.info("Dashboard started: http://localhost:8420")
 
     check_count = 0
     while True:
@@ -1257,8 +1452,6 @@ def cmd_watch(_args):
 def cmd_dashboard(args):
     """Start the web dashboard."""
     config = load_config()
-    # Import relative to this package (works whether package is named
-    # 'accelerator' or 'accelerator-test' during development)
     import importlib
     dashboard_mod = importlib.import_module(".dashboard", package=__package__)
     log.info("Starting dashboard on port %d...", args.port)
@@ -1266,6 +1459,66 @@ def cmd_dashboard(args):
 
 
 # --- Main ---
+
+def cmd_uninstall(_args):
+    """Remove services, data, and launchd config."""
+    plist = Path.home() / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
+    ml_venv = Path(__file__).parent.parent / "ml" / "venv"
+
+    log.info("")
+    log.info("This will remove:")
+    log.info("  - Running services (worker, ML, dashboard)")
+    if plist.exists():
+        log.info("  - Launchd service (auto-start on login)")
+    log.info("  - Accelerator data (~/.immich-accelerator)")
+    if ml_venv.exists():
+        log.info("  - ML venv (./ml/venv)")
+    log.info("")
+    log.info("Your Immich data, Docker containers, and Homebrew packages are NOT affected.")
+    log.info("")
+
+    try:
+        answer = input("Proceed? [y/N] ").strip().lower()
+    except EOFError:
+        return
+    if answer != "y":
+        log.info("Cancelled.")
+        return
+
+    # Stop services
+    cmd_stop(None)
+
+    # Kill dashboard
+    try:
+        result = subprocess.run(["pgrep", "-f", "immich_accelerator.*dashboard"],
+                               capture_output=True, text=True, timeout=5)
+        for line in result.stdout.strip().split("\n"):
+            if line.strip():
+                os.kill(int(line.strip()), signal.SIGTERM)
+    except (subprocess.SubprocessError, ValueError, OSError):
+        pass
+
+    # Unload and remove launchd plist
+    if plist.exists():
+        subprocess.run(["launchctl", "unload", str(plist)], capture_output=True, timeout=10)
+        plist.unlink()
+        log.info("Launchd service removed")
+
+    # Remove data directory
+    if DATA_DIR.exists():
+        shutil.rmtree(DATA_DIR)
+        log.info("Removed %s", DATA_DIR)
+
+    # Remove ML venv
+    if ml_venv.exists():
+        shutil.rmtree(ml_venv)
+        log.info("Removed ML venv")
+
+    log.info("")
+    log.info("Uninstalled. To restore Immich to stock:")
+    log.info("  Remove IMMICH_WORKERS_INCLUDE and port mappings from docker-compose.yml")
+    log.info("  docker compose up -d")
+
 
 def main():
     logging.basicConfig(
@@ -1275,7 +1528,7 @@ def main():
     )
 
     parser = argparse.ArgumentParser(
-        prog="accelerator",
+        prog="immich-accelerator",
         description="Immich Accelerator — native macOS microservices worker",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -1296,6 +1549,7 @@ def main():
     sub.add_parser("watch", help="Monitor services, restart on crash (for launchd)")
     dash_p = sub.add_parser("dashboard", help="Web dashboard (http://localhost:8420)")
     dash_p.add_argument("--port", type=int, default=8420, help="Dashboard port")
+    sub.add_parser("uninstall", help="Remove services, data, and launchd config")
 
     args = parser.parse_args()
     if not args.command:
@@ -1306,6 +1560,7 @@ def main():
         {"setup": cmd_setup, "start": cmd_start, "stop": cmd_stop,
          "status": cmd_status, "logs": cmd_logs, "update": cmd_update,
          "watch": cmd_watch, "dashboard": cmd_dashboard,
+         "uninstall": cmd_uninstall,
          }[args.command](args)
     except RuntimeError as e:
         log.error("%s", e)

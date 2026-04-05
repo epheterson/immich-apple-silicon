@@ -8,7 +8,7 @@
     <array>
         <string>/opt/homebrew/bin/python3</string>
         <string>-m</string>
-        <string>accelerator</string>
+        <string>immich_accelerator</string>
         <string>watch</string>
     </array>
     <key>WorkingDirectory</key>
@@ -21,8 +21,8 @@
         <false/>
     </dict>
     <key>StandardOutPath</key>
-    <string>/tmp/immich-accelerator.log</string>
+    <string>/tmp/immich-immich_accelerator.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/immich-accelerator-error.log</string>
+    <string>/tmp/immich-immich_accelerator-error.log</string>
 </dict>
 </plist>

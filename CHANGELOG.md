@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.0 — 2026-04-04
+
+### Module renamed
+- `python3 -m immich_accelerator` (was `python3 -m accelerator`). Clearer what it is.
+
+### One-command setup
+- `git clone --recursive && cd && python3 -m immich_accelerator setup` does everything.
+- Auto-installs: Homebrew, Node.js, libvips, Python 3.11, ML venv + dependencies, jellyfin-ffmpeg.
+- Extracts server from Docker, rebuilds Sharp for macOS.
+- Shows docker-compose changes, opens editor, retries connection until Docker is configured.
+- Auto-starts worker + ML service after setup.
+- Offers to install launchd services (worker + dashboard) for auto-start on login.
+- Quick start reduced from 4 manual steps to: clone, setup, done.
+- `uninstall` command: cleanly removes services, launchd config, accelerator data, and ML venv. Immich data and Docker untouched.
+
 ## 1.2.2 — 2026-04-04
 
 - Setup offers to install Homebrew, Node.js, and libvips if missing. Zero manual prerequisites beyond Python 3.11.
