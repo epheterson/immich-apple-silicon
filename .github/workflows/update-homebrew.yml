@@ -1,0 +1,111 @@
+name: Update Homebrew Formula
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  update-tap:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Get version from tag
+        id: version
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Get source tarball sha256
+        id: sha
+        run: |
+          SHA=$(curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz" | sha256sum | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Get ML submodule info
+        id: ml
+        run: |
+          ML_COMMIT=$(curl -sL "https://api.github.com/repos/${{ github.repository }}/contents/ml?ref=${TAG}" \
+            -H "Accept: application/vnd.github.v3+json" | jq -r '.sha')
+          ML_SHA=$(curl -sL "https://github.com/${{ github.repository_owner }}/immich-ml-metal/archive/${ML_COMMIT}.tar.gz" | sha256sum | cut -d' ' -f1)
+          echo "commit=$ML_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "sha256=$ML_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-immich-accelerator
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SRC_SHA: ${{ steps.sha.outputs.sha256 }}
+          ML_COMMIT: ${{ steps.ml.outputs.commit }}
+          ML_SHA: ${{ steps.ml.outputs.sha256 }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          cat > tap/Formula/immich-accelerator.rb << EOF
+          class ImmichAccelerator < Formula
+            desc "Run Immich compute natively on Apple Silicon"
+            homepage "https://github.com/${REPO}"
+            url "https://github.com/${REPO}/archive/refs/tags/v${VERSION}.tar.gz"
+            sha256 "${SRC_SHA}"
+            license "MIT"
+
+            resource "ml" do
+              url "https://github.com/${OWNER}/immich-ml-metal/archive/${ML_COMMIT}.tar.gz"
+              sha256 "${ML_SHA}"
+            end
+
+            depends_on :macos
+            depends_on arch: :arm64
+            depends_on "node"
+            depends_on "vips"
+            depends_on "python@3.11"
+
+            def install
+              libexec.install Dir["*"]
+              resource("ml").stage do
+                (libexec/"ml").install Dir["*"]
+              end
+              ml_dir = libexec/"ml"
+              system Formula["python@3.11"].opt_bin/"python3.11", "-m", "venv", ml_dir/"venv"
+              system ml_dir/"venv/bin/pip", "install", "-r", ml_dir/"requirements.txt"
+              (bin/"immich-accelerator").write <<~SH
+                #!/bin/bash
+                export PYTHONPATH="#{libexec}:\\\$PYTHONPATH"
+                cd "#{libexec}"
+                exec "#{Formula["python@3.11"].opt_bin}/python3.11" -m immich_accelerator "\\\$@"
+              SH
+            end
+
+            def caveats
+              <<~EOS
+                To get started:
+                  immich-accelerator setup
+              EOS
+            end
+
+            service do
+              run [bin/"immich-accelerator", "watch"]
+              keep_alive true
+              log_path var/"log/immich-accelerator.log"
+              error_log_path var/"log/immich-accelerator-error.log"
+            end
+
+            test do
+              assert_match "immich-accelerator", shell_output("#{bin}/immich-accelerator --version")
+            end
+          end
+          EOF
+
+      - name: Push updated formula
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/immich-accelerator.rb
+          git commit -m "Update formula to v${TAG#v}"
+          git push
