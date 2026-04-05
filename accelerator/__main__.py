@@ -400,48 +400,82 @@ def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
 
 # --- Commands ---
 
+_JF_FFMPEG_URL = "https://repo.jellyfin.org/files/ffmpeg/macos/latest-7.x/arm64/jellyfin-ffmpeg_7.1.3-4_portable_macarm64-gpl.tar.xz"
+
+
+def _ensure_jellyfin_ffmpeg() -> str:
+    """Download jellyfin-ffmpeg if not present. Returns path to ffmpeg binary.
+
+    Uses jellyfin-ffmpeg instead of Homebrew ffmpeg because it includes:
+    - tonemapx filter (Immich's HDR→SDR, not in upstream ffmpeg)
+    - VideoToolbox encoders
+    - libwebp encoder
+    All matching what Immich's Docker image uses.
+    """
+    jf_dir = DATA_DIR / "jellyfin-ffmpeg"
+    jf_ffmpeg = jf_dir / "ffmpeg"
+
+    if jf_ffmpeg.exists():
+        # Verify it runs
+        try:
+            r = subprocess.run([str(jf_ffmpeg), "-version"],
+                              capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                return str(jf_ffmpeg)
+        except (subprocess.SubprocessError, OSError):
+            pass
+        log.warning("Cached jellyfin-ffmpeg is broken, re-downloading...")
+
+    log.info("Downloading jellyfin-ffmpeg (same ffmpeg Immich uses in Docker)...")
+    jf_dir.mkdir(parents=True, exist_ok=True)
+
+    import urllib.request
+    tar_path = jf_dir / "jellyfin-ffmpeg.tar.xz"
+    try:
+        urllib.request.urlretrieve(_JF_FFMPEG_URL, str(tar_path))
+    except Exception as e:
+        raise RuntimeError(f"Failed to download jellyfin-ffmpeg: {e}")
+
+    # Extract
+    result = subprocess.run(
+        ["tar", "xf", str(tar_path), "-C", str(jf_dir)],
+        capture_output=True, text=True, timeout=60,
+    )
+    tar_path.unlink(missing_ok=True)
+
+    if result.returncode != 0 or not jf_ffmpeg.exists():
+        raise RuntimeError(f"Failed to extract jellyfin-ffmpeg: {result.stderr}")
+
+    os.chmod(jf_ffmpeg, 0o755)
+    ffprobe = jf_dir / "ffprobe"
+    if ffprobe.exists():
+        os.chmod(ffprobe, 0o755)
+
+    log.info("  jellyfin-ffmpeg installed: %s", jf_ffmpeg)
+    return str(jf_ffmpeg)
+
+
 def _check_local_tools() -> tuple[str, str | None, Path | None]:
     """Check for Node.js, ffmpeg, and ML service. Returns (node, ffmpeg_path, ml_dir)."""
     node = find_node()
     log.info("Node.js: %s",
              subprocess.run([node, "--version"], capture_output=True, text=True).stdout.strip())
 
-    ffmpeg_path = None
-    for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]:
-        if os.path.isfile(p):
-            result = subprocess.run([p, "-hwaccels"], capture_output=True, text=True, timeout=5)
-            if "videotoolbox" in result.stdout.lower():
+    # Use jellyfin-ffmpeg (same as Immich's Docker image) — has tonemapx, VideoToolbox, libwebp
+    try:
+        ffmpeg_path = _ensure_jellyfin_ffmpeg()
+        log.info("FFmpeg: %s (jellyfin-ffmpeg, tonemapx + VideoToolbox)", ffmpeg_path)
+    except RuntimeError as e:
+        log.warning("Could not install jellyfin-ffmpeg: %s", e)
+        # Fall back to Homebrew ffmpeg
+        ffmpeg_path = None
+        for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]:
+            if os.path.isfile(p):
                 ffmpeg_path = p
-                log.info("FFmpeg: %s (VideoToolbox)", ffmpeg_path)
+                log.warning("  Falling back to %s (may lack tonemapx for HDR)", p)
                 break
-    if not ffmpeg_path:
-        log.warning("No FFmpeg with VideoToolbox found. Install: brew install ffmpeg")
-
-    if ffmpeg_path:
-        enc_result = subprocess.run(
-            [ffmpeg_path, "-encoders"], capture_output=True, text=True, timeout=5)
-        encoders = enc_result.stdout if enc_result.returncode == 0 else ""
-        required = {
-            "libwebp": "Video thumbnails (WebP format)",
-            "h264_videotoolbox": "H.264 hardware transcode",
-            "hevc_videotoolbox": "HEVC hardware transcode",
-        }
-        missing = [name for name in required if name not in encoders]
-        if missing:
-            log.warning("")
-            log.warning("FFmpeg is missing required encoders:")
-            for name in missing:
-                log.warning("  ✗ %s — %s", name, required[name])
-            if "libwebp" in missing:
-                log.warning("")
-                log.warning("Without libwebp, ALL video thumbnails will fail.")
-                log.warning("Fix: edit the Homebrew ffmpeg formula to add libwebp:")
-                log.warning("  1. brew edit ffmpeg")
-                log.warning("  2. Add: depends_on \"webp\"")
-                log.warning("  3. Add: --enable-libwebp (in the configure args)")
-                log.warning("  4. HOMEBREW_NO_INSTALL_FROM_API=1 brew reinstall --build-from-source ffmpeg")
-        else:
-            log.info("  Encoders: libwebp, h264_videotoolbox, hevc_videotoolbox ✓")
+        if not ffmpeg_path:
+            log.warning("No FFmpeg found. Install: brew install ffmpeg")
 
     ml_dir = _find_ml_dir()
     if ml_dir:

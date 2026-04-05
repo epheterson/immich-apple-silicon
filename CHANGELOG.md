@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1 — 2026-04-04
+
+- **jellyfin-ffmpeg**: Setup now downloads the same ffmpeg binary Immich uses in Docker (jellyfin-ffmpeg, macOS arm64). Includes `tonemapx` natively — HDR video thumbnails are now identical to Docker output. No more Homebrew ffmpeg patching or formula editing.
+- **Simplified ffmpeg wrapper**: With jellyfin-ffmpeg handling `tonemapx` natively, the wrapper only remaps encoders to VideoToolbox. Reduced from 120 lines to 50.
+- **Requirements simplified**: No longer need `brew install ffmpeg` or libwebp formula patching. Just Node.js, libvips, and Python 3.11+.
+- **Known differences reduced**: ffmpeg row in the differences table now shows "Identical" — same binary, same filters, same output.
+
 ## 1.2.0 — 2026-04-04
 
 ### Dashboard

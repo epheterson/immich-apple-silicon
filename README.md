@@ -42,11 +42,10 @@ The microservices worker is extracted directly from your running Immich Docker i
 - macOS on Apple Silicon (M1/M2/M3/M4)
 - Immich already running in Docker (on this Mac or a remote host like a NAS)
 - Node.js (`brew install node`)
-- FFmpeg with VideoToolbox and libwebp (`brew install ffmpeg` — see note below)
 - libvips for image processing (`brew install vips`)
 - Python 3.11+ for the ML service
 
-> **FFmpeg note:** Homebrew's ffmpeg may not include the `libwebp` encoder, which is required for video thumbnails. Run `ffmpeg -encoders | grep libwebp` to check. If missing, you need to patch the formula — setup will detect this and print instructions.
+> **FFmpeg:** Setup automatically downloads [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) — the same ffmpeg Immich uses in Docker. Includes `tonemapx` (HDR tone mapping), `libwebp`, and VideoToolbox hardware encoding. No Homebrew ffmpeg required.
 
 ## Quick start
 
@@ -241,28 +240,24 @@ The plist uses `watch` (not `start`) with `KeepAlive` so launchd restarts the mo
 
 ## Known differences from Docker
 
-The native worker runs Immich's unmodified code, but the surrounding toolchain differs. These differences are transparent to Immich — it sees the same results — but they affect how compute happens under the hood.
+The native worker runs Immich's unmodified code. The ffmpeg and image processing toolchain match Docker. The only differences are in the ML service, which uses Apple-native frameworks instead of ONNX Runtime.
 
 | Area | Docker | Native (Accelerator) | Impact |
 |------|--------|---------------------|--------|
-| **ffmpeg** | Jellyfin-ffmpeg (custom build with `tonemapx` filter) | Homebrew ffmpeg 8.x with wrapper script | HDR→SDR tone mapping uses upstream `tonemap` filter instead of `tonemapx`. Color space params (primaries, transfer, matrix) from `tonemapx` are dropped — upstream `tonemap` handles the transfer internally. Visually close for thumbnails, but HDR content may show slight color differences. Not bit-identical. |
-| **ffmpeg encoders** | Software H.264/HEVC | VideoToolbox hardware H.264/HEVC via wrapper | Hardware-encoded output has slightly different bitstream characteristics. Immich doesn't notice — it just gets valid H.264/HEVC. |
-| **libwebp** | Built-in | Requires Homebrew formula patch (`--enable-libwebp`) | Video thumbnails are WebP; setup validates this encoder exists. |
+| **ffmpeg** | Jellyfin-ffmpeg | Jellyfin-ffmpeg (same binary, macOS arm64 build) | **Identical.** Same `tonemapx` filter, same encoders, same behavior. Downloaded automatically during setup. |
+| **ffmpeg encoders** | Software H.264/HEVC | VideoToolbox hardware H.264/HEVC via wrapper | Hardware-encoded output has slightly different bitstream characteristics. Visually equivalent. A lightweight wrapper remaps Immich's software encoder requests to VideoToolbox hardware equivalents. |
 | **Sharp / libvips** | Prebuilt linux-arm64 Sharp | Rebuilt against Homebrew system libvips | Identical image output. System libvips handles corrupt HEIF files more gracefully (matches Docker's error handling). |
 | **ML: CLIP** | ONNX Runtime | MLX on Metal GPU | Same model, different runtime. Embeddings are numerically close but not identical (floating-point differences). Search results are equivalent. |
 | **ML: Face detection** | ONNX Runtime | Apple Vision framework (Neural Engine) | Different model entirely. Detection accuracy is comparable; bounding boxes may differ slightly. |
 | **ML: Face recognition** | ONNX Runtime | ONNX Runtime with CoreML | Same model, CoreML acceleration. Numerically close embeddings. |
 | **ML: OCR** | PaddleOCR via ONNX | Apple Vision framework (Neural Engine) | Different engine. Vision framework OCR is generally more accurate for Latin text, may differ for CJK. |
-| **Video thumbnails (HDR)** | `tonemapx` (all-in-one HDR→SDR) | `tonemap` + `format` (upstream equivalent) | Color rendition may differ slightly on HDR content. Non-HDR videos are identical. |
-| **`-preset` handling** | Software presets (ultrafast, medium, etc.) | Stripped for VideoToolbox (HW encoder ignores presets) | No quality impact — VideoToolbox uses its own quality control. |
 
 ### What this means in practice
 
-- **Thumbnails and previews**: Visually identical for SDR content. HDR content uses a different tone mapping path (`tonemap` instead of `tonemapx`) — color rendition will differ, especially for wide-gamut content. Proper `tonemapx` support requires an upstream Immich change to fall back to standard filters.
+- **Thumbnails, previews, and video**: Identical to Docker. Same jellyfin-ffmpeg binary, same `tonemapx` HDR tone mapping, same output. VideoToolbox hardware encoding is faster but visually equivalent.
 - **CLIP search**: Search results are equivalent but not identical. A search that returns 20 results in Docker will return ~18-20 of the same results natively, possibly in slightly different order.
 - **Face grouping**: Faces are detected and grouped correctly. The grouping boundaries may differ slightly (e.g., a borderline face might be grouped differently).
 - **OCR**: Text extraction is at least as good as Docker for English/Latin text.
-- **Video transcoding**: Hardware-accelerated via VideoToolbox. Quality is equivalent at the same bitrate; encoding is significantly faster.
 
 ## Security
 
