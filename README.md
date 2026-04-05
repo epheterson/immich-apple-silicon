@@ -41,11 +41,10 @@ The microservices worker is extracted directly from your running Immich Docker i
 
 - macOS on Apple Silicon (M1/M2/M3/M4)
 - Immich already running in Docker (on this Mac or a remote host like a NAS)
-- Node.js (`brew install node`)
-- libvips for image processing (`brew install vips`)
+- [Homebrew](https://brew.sh) (setup will offer to install Node.js and libvips if missing)
 - Python 3.11+ for the ML service
 
-> **FFmpeg:** Setup automatically downloads [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) — the same ffmpeg Immich uses in Docker. Includes `tonemapx` (HDR tone mapping), `libwebp`, and VideoToolbox hardware encoding. No Homebrew ffmpeg required.
+> **FFmpeg:** Downloaded automatically during setup ([jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) — the same ffmpeg Immich uses in Docker).
 
 ## Quick start
 

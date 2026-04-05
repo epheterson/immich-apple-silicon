@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.2 — 2026-04-04
+
+- Setup offers to install Node.js and libvips via Homebrew if missing. No more manual `brew install` prerequisites.
+- OrbStack Docker path detected automatically.
+
 ## 1.2.1 — 2026-04-04
 
 - **jellyfin-ffmpeg**: Setup now downloads the same ffmpeg binary Immich uses in Docker (jellyfin-ffmpeg, macOS arm64). Includes `tonemapx` natively — HDR video thumbnails are now identical to Docker output. No more Homebrew ffmpeg patching or formula editing.
