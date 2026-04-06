@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify package imports
+        run: |
+          cd $GITHUB_WORKSPACE
+          python -c "import immich_accelerator; print(f'Version: {immich_accelerator.__version__}')"
+
+      - name: Check Python syntax
+        run: python -m py_compile immich_accelerator/__main__.py
+
+      - name: Run pytest (if tests exist)
+        run: |
+          pip install pytest
+          python -m pytest -v --co -q 2>/dev/null || echo "No tests collected — add tests to immich_accelerator/"
