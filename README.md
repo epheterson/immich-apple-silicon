@@ -174,16 +174,7 @@ immich-accelerator setup --url http://nas:2283 --api-key YOUR_KEY
 immich-accelerator setup --manual
 ```
 
-Docker is **not required on the Mac**. If Docker isn't installed, setup will guide you through extracting the server on the NAS:
-
-```bash
-# Run on your NAS:
-docker cp immich_server:/usr/src/app/server - | gzip > immich-server.tar.gz
-docker cp immich_server:/build - | gzip > immich-build.tar.gz
-
-# Copy to Mac and import:
-immich-accelerator setup --import-server ./immich-server.tar.gz
-```
+Docker is **not required on the Mac**. Setup downloads the Immich server directly from the container registry (ghcr.io) — no Docker, no SSH, no manual steps. Auto-updates work the same way: the watchdog checks the Immich API for version changes and downloads the new server automatically.
 
 **Path consistency**: The native worker on the Mac needs to see files at the same absolute paths that Docker on the NAS used. Mount the NAS photo directory on the Mac via NFS or SMB. For uploads, `IMMICH_MEDIA_LOCATION` handles this. For external libraries, ensure the Mac's mount path matches what Docker sees.
 

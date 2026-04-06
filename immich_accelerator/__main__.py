@@ -260,6 +260,149 @@ def _rebuild_sharp(server_dir: Path) -> None:
         log.warning("Sharp not found in node_modules — thumbnail generation may fail")
 
 
+def download_immich_server(version: str) -> Path:
+    """Download Immich server directly from ghcr.io — no Docker needed.
+
+    Fetches the container image layers from GitHub Container Registry,
+    extracts the server and build data. Works without Docker installed.
+    """
+    import urllib.request as urlreq
+    import tarfile
+
+    bare_version = version.lstrip("v")
+    server_dir = DATA_DIR / "server" / bare_version
+
+    if server_dir.exists() and (server_dir / "dist" / "main.js").exists():
+        log.info("Using cached Immich server %s", bare_version)
+        return server_dir
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    registry = "https://ghcr.io"
+    image = "immich-app/immich-server"
+    tag = f"v{bare_version}"
+
+    log.info("Downloading Immich server %s from ghcr.io...", tag)
+
+    # Get anonymous auth token
+    token_resp = urlreq.urlopen(f"{registry}/token?service=ghcr.io&scope=repository:{image}:pull", timeout=10)
+    token = json.loads(token_resp.read())["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def _get(url, accept=None):
+        hdrs = {**headers}
+        if accept:
+            hdrs["Accept"] = accept
+        req = urlreq.Request(url, headers=hdrs)
+        return urlreq.urlopen(req, timeout=300)
+
+    # Get image index → find amd64 manifest (server is JS, arch doesn't matter)
+    index = json.loads(_get(
+        f"{registry}/v2/{image}/manifests/{tag}",
+        accept="application/vnd.oci.image.index.v1+json",
+    ).read())
+
+    platform_digest = None
+    for m in index.get("manifests", []):
+        p = m.get("platform", {})
+        if p.get("architecture") == "amd64" and p.get("os") == "linux":
+            platform_digest = m["digest"]
+            break
+    if not platform_digest:
+        raise RuntimeError("Could not find amd64 manifest for Immich server")
+
+    # Get image manifest → layer list
+    manifest = json.loads(_get(
+        f"{registry}/v2/{image}/manifests/{platform_digest}",
+        accept="application/vnd.oci.image.manifest.v1+json",
+    ).read())
+
+    layers = manifest.get("layers", [])
+    staging = DATA_DIR / "server" / f"{bare_version}.staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+
+    build_data = DATA_DIR / "build-data"
+    if build_data.exists():
+        shutil.rmtree(build_data)
+    build_data.mkdir(parents=True, exist_ok=True)
+
+    # Download and extract layers containing server and build data
+    # Check layers >1MB, largest first (server is usually in the bigger ones)
+    found_server = False
+    found_build = False
+    sized_layers = [(i, l) for i, l in enumerate(layers) if l["size"] > 1024 * 1024]
+    sized_layers.sort(key=lambda x: x[1]["size"], reverse=True)
+
+    for i, layer in sized_layers:
+        if found_server and found_build:
+            break
+        size_mb = layer["size"] / 1024 / 1024
+        digest = layer["digest"]
+        log.info("  Downloading layer %d/%d (%.0fMB)...", i + 1, len(layers), size_mb)
+
+        try:
+            resp = _get(f"{registry}/v2/{image}/blobs/{digest}")
+            data = resp.read()
+            log.debug("    Downloaded %.0fMB", len(data) / 1024 / 1024)
+
+            import io
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+                names = tf.getnames()
+                has_server = any(n.startswith("usr/src/app/server/") for n in names)
+                has_build = any(n.startswith("build/") for n in names)
+
+                if has_server and not found_server:
+                    log.info("    Extracting server...")
+                    # Extract all server members at once — pnpm symlinks need
+                    # their targets to exist, so per-member extract breaks.
+                    # Extract full archive to temp dir, then move server/ out.
+                    import tempfile
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        try:
+                            tf.extractall(tmpdir, filter='tar')
+                        except TypeError:
+                            tf.extractall(tmpdir)
+                        src = Path(tmpdir) / "usr" / "src" / "app" / "server"
+                        if src.exists():
+                            if staging.exists():
+                                shutil.rmtree(staging)
+                            shutil.copytree(str(src), str(staging), symlinks=True)
+                    found_server = True
+
+                if has_build:
+                    log.info("    Extracting build data...")
+                    for member in tf.getmembers():
+                        if member.name.startswith("build/"):
+                            try:
+                                tf.extract(member, str(build_data.parent), filter='data')
+                            except TypeError:
+                                tf.extract(member, str(build_data.parent))
+                    found_build = True
+
+        except Exception as e:
+            log.warning("  Layer %d failed: %s", i, e)
+            continue
+
+    if not found_server:
+        shutil.rmtree(staging)
+        raise RuntimeError("Could not find server in image layers")
+
+    if not (staging / "dist" / "main.js").exists():
+        shutil.rmtree(staging)
+        raise RuntimeError("Downloaded server is missing dist/main.js")
+
+    _rebuild_sharp(staging)
+
+    # Move to final location
+    if server_dir.exists():
+        shutil.rmtree(server_dir)
+    staging.rename(server_dir)
+
+    log.info("Immich server %s ready (downloaded from ghcr.io)", bare_version)
+    return server_dir
+
+
 def extract_immich_server(docker: str, container: str, version: str) -> Path:
     """Extract Immich server and build data from the running Docker container.
 
@@ -921,16 +1064,14 @@ def _setup_remote(args):
             finally:
                 subprocess.run([docker, "rm", container], capture_output=True, timeout=10)
         except (RuntimeError, subprocess.SubprocessError, FileNotFoundError, OSError):
-            log.info("")
-            log.info("Docker not available on this Mac. Extract the server on your remote host:")
-            log.info("")
-            log.info("  # Run on the machine where Immich's Docker runs:")
-            log.info("  docker cp immich_server:/usr/src/app/server - | gzip > immich-server.tar.gz")
-            log.info("  docker cp immich_server:/build - | gzip > immich-build.tar.gz")
-            log.info("")
-            log.info("  # Copy to this Mac and re-run:")
-            log.info("  python -m immich_accelerator setup --url %s --import-server ./immich-server.tar.gz", url)
-            return
+            # No local Docker — download directly from ghcr.io
+            log.info("  No local Docker — downloading server from ghcr.io...")
+            try:
+                server_dir = download_immich_server(version)
+            except RuntimeError as e:
+                log.error("Download failed: %s", e)
+                log.info("  Manual alternative: extract on your NAS and use --import-server")
+                return
 
     if server_dir is None:
         raise RuntimeError("Server extraction failed. Use --import-server to provide server files.")
@@ -1395,7 +1536,14 @@ def cmd_watch(_args):
         write_pid("dashboard", proc.pid)
         log.info("Dashboard started: http://localhost:8420")
 
+    # Warn if auto-update won't work for remote setups
+    _watch_config = load_config()
+    if _watch_config.get("immich_url") and not _watch_config.get("api_key"):
+        log.warning("Auto-update disabled: immich_url is set but api_key is missing.")
+        log.warning("  Add api_key to %s to enable version checking.", CONFIG_FILE)
+
     check_count = 0
+    self_update_notified = False
     while True:
         try:
             time.sleep(30)
@@ -1422,27 +1570,64 @@ def cmd_watch(_args):
                 except RuntimeError:
                     log.error("  Worker restart failed, will retry in 30s")
 
-            # Every 5 min, check if Docker updated Immich
+            # Every 5 min, check if Immich updated
             check_count += 1
             if check_count >= 10:
                 check_count = 0
                 try:
-                    docker = find_docker()
-                    immich = detect_immich(docker)
                     cached = config.get("version", "").lstrip("v")
-                    running = immich["version"].lstrip("v")
-                    if is_valid_version(immich["version"]) and running != cached:
+                    running = None
+
+                    # Try local Docker first, fall back to Immich API
+                    try:
+                        docker = find_docker()
+                        immich = detect_immich(docker)
+                        running = immich["version"].lstrip("v")
+                    except RuntimeError:
+                        immich_url = config.get("immich_url")
+                        api_key = config.get("api_key")
+                        if immich_url and api_key:
+                            try:
+                                info = _query_immich_api(immich_url, api_key)
+                                running = info["version"].lstrip("v")
+                            except RuntimeError:
+                                pass
+
+                    if running and is_valid_version(running) and running != cached:
                         log.info("Immich updated: %s -> %s. Restarting with new version...",
                                  cached, running)
                         cmd_stop(None)
-                        # Re-extract server for new version
-                        server_dir = extract_immich_server(docker, immich["container"], immich["version"])
-                        config["version"] = immich["version"]
+                        # Re-extract server — try Docker, fall back to ghcr.io download
+                        try:
+                            docker = find_docker()
+                            immich = detect_immich(docker)
+                            server_dir = extract_immich_server(docker, immich["container"], running)
+                        except RuntimeError:
+                            server_dir = download_immich_server(running)
+                        config["version"] = running
                         config["server_dir"] = str(server_dir)
                         save_config(config)
                         cmd_start(argparse.Namespace(force=True))
                 except RuntimeError:
-                    pass  # Docker might be mid-restart, try again next cycle
+                    pass  # Mid-restart or network issue, try again next cycle
+
+                # Check for accelerator self-update (once per watch session)
+                if not self_update_notified:
+                    try:
+                        import urllib.request as _urlreq3
+                        req = _urlreq3.Request(
+                            "https://api.github.com/repos/epheterson/immich-apple-silicon/releases/latest",
+                            headers={"Accept": "application/vnd.github.v3+json"},
+                        )
+                        latest = json.loads(_urlreq3.urlopen(req, timeout=10).read())
+                        latest_ver = latest.get("tag_name", "").lstrip("v")
+                        if latest_ver and latest_ver != __version__:
+                            log.info("Accelerator update available: %s -> %s", __version__, latest_ver)
+                            log.info("  brew upgrade immich-accelerator")
+                            log.info("  or: git pull && immich-accelerator setup")
+                        self_update_notified = True
+                    except Exception:
+                        self_update_notified = True  # Don't retry on failure
 
         except KeyboardInterrupt:
             log.info("Watch stopped")
