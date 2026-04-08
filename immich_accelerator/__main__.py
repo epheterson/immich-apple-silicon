@@ -448,15 +448,22 @@ def download_immich_server(version: str) -> Path:
     # a separate layer — corePlugin (WASM) may be in a small layer, so we
     # can't skip by size. Build data accumulates across multiple layers.
     found_server = False
+    found_build = False
     sorted_layers = list(enumerate(layers))
     sorted_layers.sort(key=lambda x: x[1]["size"], reverse=True)
 
     import io
 
     for i, layer in sorted_layers:
-        if found_server and (build_data / "corePlugin" / "manifest.json").exists():
-            break
         size_mb = layer["size"] / 1024 / 1024
+        # Break when we have server + build data. For Immich 2.7+ we also
+        # need corePlugin, which may be in a separate small layer.
+        has_core = (build_data / "corePlugin" / "manifest.json").exists()
+        if found_server and found_build and has_core:
+            break
+        # For pre-2.7 images (no corePlugin), skip remaining small layers
+        if found_server and found_build and size_mb < 1:
+            break
         digest = layer["digest"]
         if size_mb >= 1:
             log.info(
@@ -513,6 +520,7 @@ def download_immich_server(version: str) -> Path:
                                 )
                             except TypeError:
                                 tf.extract(member, str(build_data.parent))
+                    found_build = True
 
         except Exception as e:
             log.warning("  Layer %d failed: %s", i, e)
