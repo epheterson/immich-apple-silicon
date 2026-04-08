@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.4 — 2026-04-08
+
+### Bug fixes
+- **Homebrew install fix**: Drop `orjson` dependency — binary wheel broke Homebrew's dylib fixup. Not imported by our code; FastAPI uses stdlib json as fallback. Fixes #7.
+- **Synthetic link migration**: Migrate legacy `/etc/synthetic.conf` entry to `/etc/synthetic.d/immich-accelerator`. Uninstall now cleans both locations.
+
 ## 1.3.3 — 2026-04-07
 
 ### Bug fixes
