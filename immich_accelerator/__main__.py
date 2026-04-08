@@ -6,6 +6,7 @@ Usage:
     python -m immich_accelerator stop      # stop native services
     python -m immich_accelerator status    # show what's running
 """
+
 from __future__ import annotations
 
 import argparse
@@ -21,12 +22,14 @@ import sys
 import time
 from pathlib import Path
 
+
 def _read_version() -> str:
     """Read version from VERSION file (single source of truth)."""
     try:
         return (Path(__file__).parent.parent / "VERSION").read_text().strip()
     except OSError:
         return "1.0.0"
+
 
 __version__ = _read_version()
 
@@ -39,6 +42,7 @@ LOG_DIR = DATA_DIR / "logs"
 
 
 # --- Utility ---
+
 
 def find_binary(name: str, paths: list[str], install_hint: str) -> str:
     for p in paths:
@@ -60,9 +64,13 @@ def _ensure_homebrew() -> str | None:
         return None
     log.info("  Installing Homebrew...")
     result = subprocess.run(
-        ["/bin/bash", "-c",
-         'curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh | /bin/bash'],
-        capture_output=False, timeout=600,
+        [
+            "/bin/bash",
+            "-c",
+            "curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh | /bin/bash",
+        ],
+        capture_output=False,
+        timeout=600,
     )
     if result.returncode == 0:
         for p in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]:
@@ -79,22 +87,33 @@ def _brew_install(package: str) -> bool:
         return False
 
     try:
-        answer = input(f"  {package} not found. Install with Homebrew? [Y/n] ").strip().lower()
+        answer = (
+            input(f"  {package} not found. Install with Homebrew? [Y/n] ")
+            .strip()
+            .lower()
+        )
     except EOFError:
         return False
     if answer and answer != "y":
         return False
 
     log.info("  Installing %s...", package)
-    result = subprocess.run([brew, "install", package],
-                           capture_output=False, timeout=300)
+    result = subprocess.run(
+        [brew, "install", package], capture_output=False, timeout=300
+    )
     return result.returncode == 0
 
 
 def find_docker() -> str:
-    return find_binary("Docker", ["/usr/local/bin/docker", "/opt/homebrew/bin/docker",
-                                   "/Applications/OrbStack.app/Contents/MacOS/xbin/docker"],
-                       "Install Docker Desktop or OrbStack.")
+    return find_binary(
+        "Docker",
+        [
+            "/usr/local/bin/docker",
+            "/opt/homebrew/bin/docker",
+            "/Applications/OrbStack.app/Contents/MacOS/xbin/docker",
+        ],
+        "Install Docker Desktop or OrbStack.",
+    )
 
 
 def find_node() -> str:
@@ -110,8 +129,11 @@ def find_node() -> str:
 
 
 def find_npm() -> str:
-    return find_binary("npm", ["/opt/homebrew/bin/npm", "/usr/local/bin/npm"],
-                       "Install with: brew install node")
+    return find_binary(
+        "npm",
+        ["/opt/homebrew/bin/npm", "/usr/local/bin/npm"],
+        "Install with: brew install node",
+    )
 
 
 def check_port(host: str, port: int, label: str) -> bool:
@@ -130,14 +152,19 @@ def is_valid_version(version: str) -> bool:
 
 # --- Docker detection ---
 
+
 def detect_immich(docker: str) -> dict:
     """Detect running Immich instance from Docker."""
     result = subprocess.run(
         [docker, "ps", "--format", "{{.Names}}\t{{.Image}}"],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"Docker not running or not accessible: {result.stderr.strip()}")
+        raise RuntimeError(
+            f"Docker not running or not accessible: {result.stderr.strip()}"
+        )
 
     server_container = None
     for line in result.stdout.strip().split("\n"):
@@ -152,13 +179,17 @@ def detect_immich(docker: str) -> dict:
             break
 
     if not server_container:
-        raise RuntimeError("No Immich server container found. Is Immich running in Docker?")
+        raise RuntimeError(
+            "No Immich server container found. Is Immich running in Docker?"
+        )
 
     # Get version from package.json inside the container
     version = "unknown"
     version_result = subprocess.run(
         [docker, "exec", server_container, "cat", "/usr/src/app/server/package.json"],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     if version_result.returncode == 0:
         try:
@@ -169,7 +200,9 @@ def detect_immich(docker: str) -> dict:
     if not is_valid_version(version):
         inspect = subprocess.run(
             [docker, "inspect", server_container, "--format", "{{.Config.Image}}"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if inspect.returncode == 0:
             tag = inspect.stdout.strip().split(":")[-1]
@@ -179,7 +212,9 @@ def detect_immich(docker: str) -> dict:
     # Get env vars
     env_result = subprocess.run(
         [docker, "exec", server_container, "env"],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     env = {}
     for line in env_result.stdout.strip().split("\n"):
@@ -191,9 +226,15 @@ def detect_immich(docker: str) -> dict:
     try:
         mounts_result = subprocess.run(
             [docker, "inspect", server_container, "--format", "{{json .Mounts}}"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
-        mounts = json.loads(mounts_result.stdout.strip()) if mounts_result.returncode == 0 else []
+        mounts = (
+            json.loads(mounts_result.stdout.strip())
+            if mounts_result.returncode == 0
+            else []
+        )
     except (json.JSONDecodeError, subprocess.SubprocessError):
         mounts = []
 
@@ -227,7 +268,9 @@ def _find_exposed_port(docker: str, container_names: list[str], default: str) ->
     for name in container_names:
         result = subprocess.run(
             [docker, "port", name, default],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip().split(":")[-1]
@@ -235,6 +278,7 @@ def _find_exposed_port(docker: str, container_names: list[str], default: str) ->
 
 
 # --- Server management ---
+
 
 def _rebuild_sharp(server_dir: Path) -> None:
     """Rebuild Sharp native bindings against system libvips (Homebrew).
@@ -247,9 +291,15 @@ def _rebuild_sharp(server_dir: Path) -> None:
     sharp_dirs = list(server_dir.glob("node_modules/.pnpm/sharp@*/node_modules/sharp"))
     if sharp_dirs:
         result = subprocess.run(
-            [npm, "rebuild"], cwd=str(sharp_dirs[0]),
-            capture_output=True, text=True, timeout=180,
-            env={**os.environ, "PATH": f"/opt/homebrew/bin:{os.environ.get('PATH', '')}"},
+            [npm, "rebuild"],
+            cwd=str(sharp_dirs[0]),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env={
+                **os.environ,
+                "PATH": f"/opt/homebrew/bin:{os.environ.get('PATH', '')}",
+            },
         )
         if result.returncode != 0:
             log.error("Sharp rebuild failed: %s", result.stderr[-500:])
@@ -284,7 +334,9 @@ def download_immich_server(version: str) -> Path:
     log.info("Downloading Immich server %s from ghcr.io...", tag)
 
     # Get anonymous auth token
-    token_resp = urlreq.urlopen(f"{registry}/token?service=ghcr.io&scope=repository:{image}:pull", timeout=10)
+    token_resp = urlreq.urlopen(
+        f"{registry}/token?service=ghcr.io&scope=repository:{image}:pull", timeout=10
+    )
     token = json.loads(token_resp.read())["token"]
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -296,10 +348,12 @@ def download_immich_server(version: str) -> Path:
         return urlreq.urlopen(req, timeout=300)
 
     # Get image index → find amd64 manifest (server is JS, arch doesn't matter)
-    index = json.loads(_get(
-        f"{registry}/v2/{image}/manifests/{tag}",
-        accept="application/vnd.oci.image.index.v1+json",
-    ).read())
+    index = json.loads(
+        _get(
+            f"{registry}/v2/{image}/manifests/{tag}",
+            accept="application/vnd.oci.image.index.v1+json",
+        ).read()
+    )
 
     platform_digest = None
     for m in index.get("manifests", []):
@@ -311,10 +365,12 @@ def download_immich_server(version: str) -> Path:
         raise RuntimeError("Could not find amd64 manifest for Immich server")
 
     # Get image manifest → layer list
-    manifest = json.loads(_get(
-        f"{registry}/v2/{image}/manifests/{platform_digest}",
-        accept="application/vnd.oci.image.manifest.v1+json",
-    ).read())
+    manifest = json.loads(
+        _get(
+            f"{registry}/v2/{image}/manifests/{platform_digest}",
+            accept="application/vnd.oci.image.manifest.v1+json",
+        ).read()
+    )
 
     layers = manifest.get("layers", [])
     staging = DATA_DIR / "server" / f"{bare_version}.staging"
@@ -347,6 +403,7 @@ def download_immich_server(version: str) -> Path:
             log.debug("    Downloaded %.0fMB", len(data) / 1024 / 1024)
 
             import io
+
             with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
                 names = tf.getnames()
                 has_server = any(n.startswith("usr/src/app/server/") for n in names)
@@ -358,9 +415,10 @@ def download_immich_server(version: str) -> Path:
                     # their targets to exist, so per-member extract breaks.
                     # Extract full archive to temp dir, then move server/ out.
                     import tempfile
+
                     with tempfile.TemporaryDirectory() as tmpdir:
                         try:
-                            tf.extractall(tmpdir, filter='tar')
+                            tf.extractall(tmpdir, filter="tar")
                         except TypeError:
                             tf.extractall(tmpdir)
                         src = Path(tmpdir) / "usr" / "src" / "app" / "server"
@@ -375,7 +433,9 @@ def download_immich_server(version: str) -> Path:
                     for member in tf.getmembers():
                         if member.name.startswith("build/"):
                             try:
-                                tf.extract(member, str(build_data.parent), filter='data')
+                                tf.extract(
+                                    member, str(build_data.parent), filter="data"
+                                )
                             except TypeError:
                                 tf.extract(member, str(build_data.parent))
                     found_build = True
@@ -432,7 +492,9 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
     log.info("Extracting server from Docker container...")
     result = subprocess.run(
         [docker, "cp", f"{container}:/usr/src/app/server", str(staging)],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     if result.returncode != 0:
         raise RuntimeError(f"Failed to extract server: {result.stderr.strip()}")
@@ -447,7 +509,9 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
     log.info("Extracting build data...")
     result = subprocess.run(
         [docker, "cp", f"{container}:/build", str(build_data)],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     if result.returncode != 0:
         log.warning("Could not extract build data: %s", result.stderr.strip())
@@ -465,6 +529,7 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
 
 
 # --- Process management ---
+
 
 def save_config(config: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -488,7 +553,9 @@ def _get_process_start_time(pid: int) -> str | None:
     try:
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "lstart="],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
@@ -567,8 +634,11 @@ def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
     fh = open(log_file, "a")
     try:
         proc = subprocess.Popen(
-            cmd, cwd=cwd, env=env,
-            stdout=fh, stderr=subprocess.STDOUT,
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=fh,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
     except Exception:
@@ -613,8 +683,9 @@ def _ensure_jellyfin_ffmpeg() -> str:
     if jf_ffmpeg.exists():
         # Verify it runs
         try:
-            r = subprocess.run([str(jf_ffmpeg), "-version"],
-                              capture_output=True, text=True, timeout=5)
+            r = subprocess.run(
+                [str(jf_ffmpeg), "-version"], capture_output=True, text=True, timeout=5
+            )
             if r.returncode == 0:
                 return str(jf_ffmpeg)
         except (subprocess.SubprocessError, OSError):
@@ -625,6 +696,7 @@ def _ensure_jellyfin_ffmpeg() -> str:
     jf_dir.mkdir(parents=True, exist_ok=True)
 
     import urllib.request
+
     tar_path = jf_dir / "jellyfin-ffmpeg.tar.xz"
     try:
         urllib.request.urlretrieve(_JF_FFMPEG_URL, str(tar_path))
@@ -634,7 +706,9 @@ def _ensure_jellyfin_ffmpeg() -> str:
     # Extract
     result = subprocess.run(
         ["tar", "xf", str(tar_path), "-C", str(jf_dir)],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     tar_path.unlink(missing_ok=True)
 
@@ -657,18 +731,26 @@ def _ensure_vips() -> None:
         if os.path.isfile(p):
             return
     # Also check via pkg-config
-    r = subprocess.run(["pkg-config", "--exists", "vips"], capture_output=True, timeout=5)
+    r = subprocess.run(
+        ["pkg-config", "--exists", "vips"], capture_output=True, timeout=5
+    )
     if r.returncode == 0:
         return
     if not _brew_install("vips"):
-        log.warning("libvips not found. Sharp rebuild may fail. Install: brew install vips")
+        log.warning(
+            "libvips not found. Sharp rebuild may fail. Install: brew install vips"
+        )
 
 
 def _check_local_tools() -> tuple[str, str | None, Path | None]:
     """Check for Node.js, ffmpeg, libvips, and ML service. Returns (node, ffmpeg_path, ml_dir)."""
     node = find_node()
-    log.info("Node.js: %s",
-             subprocess.run([node, "--version"], capture_output=True, text=True).stdout.strip())
+    log.info(
+        "Node.js: %s",
+        subprocess.run(
+            [node, "--version"], capture_output=True, text=True
+        ).stdout.strip(),
+    )
 
     _ensure_vips()
 
@@ -692,7 +774,9 @@ def _check_local_tools() -> tuple[str, str | None, Path | None]:
     if ml_dir:
         log.info("ML service: %s", ml_dir)
     else:
-        log.warning("ML service not found — CLIP/face/OCR will use Docker ML if available")
+        log.warning(
+            "ML service not found — CLIP/face/OCR will use Docker ML if available"
+        )
 
     return node, ffmpeg_path, ml_dir
 
@@ -718,8 +802,10 @@ def _finalize_config(config: dict) -> None:
 
     if "api_key" not in config:
         log.info("")
-        log.info("Optional: add your Immich API key to enable the dashboard Re-queue button:")
-        log.info("  Edit %s and add: \"api_key\": \"your-key-here\"", CONFIG_FILE)
+        log.info(
+            "Optional: add your Immich API key to enable the dashboard Re-queue button:"
+        )
+        log.info('  Edit %s and add: "api_key": "your-key-here"', CONFIG_FILE)
         log.info("  Generate a key in Immich → Administration → API Keys")
 
     save_config(config)
@@ -734,12 +820,20 @@ def _finalize_config(config: dict) -> None:
         cmd_start(argparse.Namespace(force=True))
 
     # Offer to install launchd service (watch mode — manages worker, ML, and dashboard)
-    plist_src = Path(__file__).parent.parent / "launchd" / "com.immich.accelerator.plist"
-    plist_dst = Path.home() / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
+    plist_src = (
+        Path(__file__).parent.parent / "launchd" / "com.immich.accelerator.plist"
+    )
+    plist_dst = (
+        Path.home() / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
+    )
 
     if plist_src.exists() and not plist_dst.exists():
         try:
-            answer = input("  Install as system service (auto-starts on login)? [Y/n] ").strip().lower()
+            answer = (
+                input("  Install as system service (auto-starts on login)? [Y/n] ")
+                .strip()
+                .lower()
+            )
         except EOFError:
             answer = "n"
         if not answer or answer == "y":
@@ -749,7 +843,9 @@ def _finalize_config(config: dict) -> None:
             content = content.replace("/opt/homebrew/bin/python3", sys.executable)
             plist_dst.parent.mkdir(parents=True, exist_ok=True)
             plist_dst.write_text(content)
-            subprocess.run(["launchctl", "load", str(plist_dst)], capture_output=True, timeout=10)
+            subprocess.run(
+                ["launchctl", "load", str(plist_dst)], capture_output=True, timeout=10
+            )
             log.info("  Installed (auto-starts worker, ML, and dashboard on login)")
 
     log.info("")
@@ -759,6 +855,7 @@ def _finalize_config(config: dict) -> None:
 def _query_immich_api(base_url: str, api_key: str) -> dict:
     """Query Immich API for server info. Returns version and config."""
     import urllib.request, urllib.error
+
     headers = {"x-api-key": api_key} if api_key else {}
 
     # Get version
@@ -781,6 +878,7 @@ def _import_server(source: str, version: str) -> Path:
     - .tar.gz file (from docker cp ... | gzip)
     """
     import tarfile
+
     source_path = Path(source)
     bare_version = version.lstrip("v")
     server_dir = DATA_DIR / "server" / bare_version
@@ -788,7 +886,9 @@ def _import_server(source: str, version: str) -> Path:
     if source_path.is_dir():
         # Direct directory — check it has what we need
         if not (source_path / "dist" / "main.js").exists():
-            raise RuntimeError(f"Not a valid server directory: {source_path} (missing dist/main.js)")
+            raise RuntimeError(
+                f"Not a valid server directory: {source_path} (missing dist/main.js)"
+            )
         if server_dir.exists():
             shutil.rmtree(server_dir)
         shutil.copytree(str(source_path), str(server_dir))
@@ -804,7 +904,7 @@ def _import_server(source: str, version: str) -> Path:
         with tarfile.open(str(source_path), "r:gz") as tf:
             # Prevent path traversal from crafted tarballs
             try:
-                tf.extractall(str(staging), filter='data')
+                tf.extractall(str(staging), filter="data")
             except TypeError:
                 # Python < 3.11.4 doesn't support filter=
                 for member in tf.getmembers():
@@ -829,7 +929,9 @@ def _import_server(source: str, version: str) -> Path:
         if staging.exists():
             shutil.rmtree(staging)
     else:
-        raise RuntimeError(f"Unsupported format: {source_path}. Use a directory or .tar.gz")
+        raise RuntimeError(
+            f"Unsupported format: {source_path}. Use a directory or .tar.gz"
+        )
 
     _rebuild_sharp(server_dir)
 
@@ -845,14 +947,16 @@ def _import_server(source: str, version: str) -> Path:
                 build_data.mkdir(parents=True, exist_ok=True)
                 with tarfile.open(str(build_tar), "r:gz") as bf:
                     try:
-                        bf.extractall(str(build_data), filter='data')
+                        bf.extractall(str(build_data), filter="data")
                     except TypeError:
                         bf.extractall(str(build_data))
                 break
         else:
             if not build_data.exists():
                 log.warning("Build data not found. Geodata/plugins may be missing.")
-                log.warning("  Extract: docker cp immich_server:/build - | gzip > immich-build.tar.gz")
+                log.warning(
+                    "  Extract: docker cp immich_server:/build - | gzip > immich-build.tar.gz"
+                )
 
     log.info("Immich server %s ready", bare_version)
     return server_dir
@@ -863,13 +967,25 @@ def _find_compose_file(docker: str) -> Path | None:
     # Ask Docker for the compose file path
     try:
         r = subprocess.run(
-            [docker, "inspect", "--format", "{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}",
-             "immich_server"],
-            capture_output=True, text=True, timeout=10,
+            [
+                docker,
+                "inspect",
+                "--format",
+                '{{index .Config.Labels "com.docker.compose.project.working_dir"}}',
+                "immich_server",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if r.returncode == 0 and r.stdout.strip():
             compose_dir = Path(r.stdout.strip())
-            for name in ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"]:
+            for name in [
+                "docker-compose.yml",
+                "docker-compose.yaml",
+                "compose.yml",
+                "compose.yaml",
+            ]:
                 f = compose_dir / name
                 if f.exists():
                     return f
@@ -917,7 +1033,11 @@ def _configure_docker(docker: str, immich: dict, upload: str | None) -> None:
     log.info("After editing, run 'docker compose up -d' in another terminal.")
     while True:
         try:
-            answer = input("  Press Enter to check connection (q to finish later)... ").strip().lower()
+            answer = (
+                input("  Press Enter to check connection (q to finish later)... ")
+                .strip()
+                .lower()
+            )
         except EOFError:
             break
         if answer == "q":
@@ -926,7 +1046,9 @@ def _configure_docker(docker: str, immich: dict, upload: str | None) -> None:
 
         # Check connectivity
         db_ok = check_port("localhost", int(immich.get("db_port", "5432")), "Postgres")
-        redis_ok = check_port("localhost", int(immich.get("redis_port", "6379")), "Redis")
+        redis_ok = check_port(
+            "localhost", int(immich.get("redis_port", "6379")), "Redis"
+        )
 
         if db_ok and redis_ok:
             # Re-detect to check config
@@ -936,10 +1058,14 @@ def _configure_docker(docker: str, immich: dict, upload: str | None) -> None:
                     log.info("  ✓ Connected! Docker configured correctly.")
                     return
                 else:
-                    log.info("  ✗ Ports OK but IMMICH_WORKERS_INCLUDE not set to 'api'.")
+                    log.info(
+                        "  ✗ Ports OK but IMMICH_WORKERS_INCLUDE not set to 'api'."
+                    )
                     log.info("    Add it to docker-compose.yml and restart.")
             except RuntimeError:
-                log.info("  ✗ Docker may still be restarting — try again in a few seconds.")
+                log.info(
+                    "  ✗ Docker may still be restarting — try again in a few seconds."
+                )
         else:
             if not db_ok:
                 log.info("  ✗ Postgres not reachable at localhost:5432")
@@ -960,8 +1086,12 @@ def _setup_local(args):
         )
 
     log.info("Found: %s (version %s)", immich["container"], immich["version"])
-    log.info("  DB: localhost:%s (user: %s, db: %s)",
-             immich["db_port"], immich["db_username"], immich["db_name"])
+    log.info(
+        "  DB: localhost:%s (user: %s, db: %s)",
+        immich["db_port"],
+        immich["db_username"],
+        immich["db_name"],
+    )
     log.info("  Redis: localhost:%s", immich["redis_port"])
     log.info("  Upload: %s", immich["upload_mount"] or "not detected")
 
@@ -975,7 +1105,10 @@ def _setup_local(args):
     if immich["workers_include"] != "api" or not immich["media_location"]:
         _configure_docker(docker, immich, upload)
     else:
-        log.info("  Docker: API-only mode, IMMICH_MEDIA_LOCATION=%s", immich["media_location"])
+        log.info(
+            "  Docker: API-only mode, IMMICH_MEDIA_LOCATION=%s",
+            immich["media_location"],
+        )
 
     # Re-detect after potential Docker restart
     try:
@@ -1015,7 +1148,9 @@ def _setup_remote(args):
     # Interactive prompts for DB/Redis connection
     log.info("")
     log.info("Enter connection details for the Immich database and Redis.")
-    log.info("These must be reachable from this Mac (expose ports or use network routing).")
+    log.info(
+        "These must be reachable from this Mac (expose ports or use network routing)."
+    )
     log.info("")
 
     def prompt(label: str, default: str = "") -> str:
@@ -1027,6 +1162,7 @@ def _setup_remote(args):
     db_port = prompt("Postgres port", "5432")
     db_username = prompt("Postgres user", "postgres")
     import getpass
+
     db_password = getpass.getpass("  Postgres password: ").strip()
     db_name = prompt("Database name", "immich")
     redis_hostname = prompt("Redis host", db_hostname)
@@ -1035,8 +1171,10 @@ def _setup_remote(args):
 
     # Check connectivity
     config = {
-        "db_hostname": db_hostname, "db_port": db_port,
-        "redis_hostname": redis_hostname, "redis_port": redis_port,
+        "db_hostname": db_hostname,
+        "db_port": db_port,
+        "redis_hostname": redis_hostname,
+        "redis_port": redis_port,
     }
     if not _validate_connectivity(config):
         log.error("Cannot reach DB or Redis. Check the host/port and try again.")
@@ -1057,12 +1195,18 @@ def _setup_remote(args):
             subprocess.run([docker, "pull", image], check=True, timeout=300)
             # Create temp container and extract
             container = f"immich-extract-{version}"
-            subprocess.run([docker, "create", "--name", container, image],
-                          capture_output=True, check=True, timeout=30)
+            subprocess.run(
+                [docker, "create", "--name", container, image],
+                capture_output=True,
+                check=True,
+                timeout=30,
+            )
             try:
                 server_dir = extract_immich_server(docker, container, version)
             finally:
-                subprocess.run([docker, "rm", container], capture_output=True, timeout=10)
+                subprocess.run(
+                    [docker, "rm", container], capture_output=True, timeout=10
+                )
         except (RuntimeError, subprocess.SubprocessError, FileNotFoundError, OSError):
             # No local Docker — download directly from ghcr.io
             log.info("  No local Docker — downloading server from ghcr.io...")
@@ -1070,11 +1214,15 @@ def _setup_remote(args):
                 server_dir = download_immich_server(version)
             except RuntimeError as e:
                 log.error("Download failed: %s", e)
-                log.info("  Manual alternative: extract on your NAS and use --import-server")
+                log.info(
+                    "  Manual alternative: extract on your NAS and use --import-server"
+                )
                 return
 
     if server_dir is None:
-        raise RuntimeError("Server extraction failed. Use --import-server to provide server files.")
+        raise RuntimeError(
+            "Server extraction failed. Use --import-server to provide server files."
+        )
 
     config = {
         "version": version,
@@ -1104,7 +1252,9 @@ def _setup_manual(_args):
 
     if CONFIG_FILE.exists():
         log.info("Config already exists: %s", CONFIG_FILE)
-        log.info("Edit it directly, or delete it and re-run --manual for a fresh template.")
+        log.info(
+            "Edit it directly, or delete it and re-run --manual for a fresh template."
+        )
         return
 
     template = {
@@ -1133,14 +1283,20 @@ def _setup_manual(_args):
 
     log.info("Config template created: %s", CONFIG_FILE)
     log.info("")
-    log.info("Edit the config with your Immich connection details, then extract the server:")
+    log.info(
+        "Edit the config with your Immich connection details, then extract the server:"
+    )
     log.info("")
     log.info("  # On the machine where Immich's Docker runs:")
-    log.info("  docker cp immich_server:/usr/src/app/server - | gzip > immich-server.tar.gz")
+    log.info(
+        "  docker cp immich_server:/usr/src/app/server - | gzip > immich-server.tar.gz"
+    )
     log.info("  docker cp immich_server:/build - | gzip > immich-build.tar.gz")
     log.info("")
     log.info("  # Copy to this Mac, then import:")
-    log.info("  python -m immich_accelerator setup --import-server ./immich-server.tar.gz")
+    log.info(
+        "  python -m immich_accelerator setup --import-server ./immich-server.tar.gz"
+    )
     log.info("")
     log.info("  # Then start:")
     log.info("  python -m immich_accelerator start")
@@ -1166,16 +1322,24 @@ def cmd_setup(args):
 def _find_python() -> str | None:
     """Find Python 3.11+, or offer to install it."""
     # Check versioned binaries first
-    for p in ["/opt/homebrew/bin/python3.11", "/usr/local/bin/python3.11",
-              "/opt/homebrew/bin/python3.12", "/usr/local/bin/python3.12",
-              "/opt/homebrew/bin/python3.13", "/usr/local/bin/python3.13"]:
+    for p in [
+        "/opt/homebrew/bin/python3.11",
+        "/usr/local/bin/python3.11",
+        "/opt/homebrew/bin/python3.12",
+        "/usr/local/bin/python3.12",
+        "/opt/homebrew/bin/python3.13",
+        "/usr/local/bin/python3.13",
+    ]:
         if os.path.isfile(p):
             return p
     # Check system python3
     try:
-        r = subprocess.run(["python3", "--version"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(
+            ["python3", "--version"], capture_output=True, text=True, timeout=5
+        )
         version = r.stdout.strip() + r.stderr.strip()  # some builds print to stderr
         import re
+
         m = re.search(r"3\.(\d+)", version)
         if m and int(m.group(1)) >= 11:
             return "python3"
@@ -1225,8 +1389,12 @@ def _find_ml_dir() -> Path | None:
         return None
 
     log.info("  Creating venv with %s...", python)
-    result = subprocess.run([python, "-m", "venv", str(ml_dir / "venv")],
-                           capture_output=True, text=True, timeout=60)
+    result = subprocess.run(
+        [python, "-m", "venv", str(ml_dir / "venv")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
     if result.returncode != 0:
         log.error("  Venv creation failed: %s", result.stderr[-300:])
         return None
@@ -1238,8 +1406,9 @@ def _find_ml_dir() -> Path | None:
         log.error("  requirements.txt not found in %s", ml_dir)
         return None
 
-    result = subprocess.run([pip, "install", "-r", str(req)],
-                           capture_output=False, timeout=600)
+    result = subprocess.run(
+        [pip, "install", "-r", str(req)], capture_output=False, timeout=600
+    )
     if result.returncode != 0:
         log.error("  pip install failed")
         return None
@@ -1264,7 +1433,12 @@ def _kill_stale_processes():
 
     # Find all immich-related processes
     try:
-        result = subprocess.run(["pgrep", "-f", "immich|src.main"], capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            ["pgrep", "-f", "immich|src.main"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
         for line in result.stdout.strip().split("\n"):
             if not line.strip():
                 continue
@@ -1280,7 +1454,12 @@ def _kill_stale_processes():
 
     # Also kill old ffmpeg-proxy/server.py if still running from v0.x
     try:
-        result = subprocess.run(["pgrep", "-f", "ffmpeg-proxy/server.py"], capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            ["pgrep", "-f", "ffmpeg-proxy/server.py"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
         for line in result.stdout.strip().split("\n"):
             if line.strip():
                 try:
@@ -1308,23 +1487,38 @@ def cmd_start(args):
         docker = find_docker()
         immich = detect_immich(docker)
         if immich["workers_include"] != "api":
-            log.error("Docker is still running microservices. Two workers will conflict.")
+            log.error(
+                "Docker is still running microservices. Two workers will conflict."
+            )
             log.error("Set IMMICH_WORKERS_INCLUDE=api in docker-compose.yml first.")
             log.error("Run 'python -m immich_accelerator setup' for full instructions.")
             return
-        if config.get("upload_mount") and immich["media_location"] != config["upload_mount"]:
-            log.error("IMMICH_MEDIA_LOCATION mismatch — Docker has '%s', we expect '%s'.",
-                      immich["media_location"] or "(not set)", config["upload_mount"])
-            log.error("This WILL corrupt file paths in the database. Fix docker-compose.yml first.")
+        if (
+            config.get("upload_mount")
+            and immich["media_location"] != config["upload_mount"]
+        ):
+            log.error(
+                "IMMICH_MEDIA_LOCATION mismatch — Docker has '%s', we expect '%s'.",
+                immich["media_location"] or "(not set)",
+                config["upload_mount"],
+            )
+            log.error(
+                "This WILL corrupt file paths in the database. Fix docker-compose.yml first."
+            )
             return
 
         # Auto-update: if Docker image version changed, re-extract
         running_version = immich["version"].lstrip("v")
         cached_version = config.get("version", "").lstrip("v")
         if is_valid_version(immich["version"]) and running_version != cached_version:
-            log.info("Immich updated: %s -> %s. Re-extracting server...",
-                     cached_version, running_version)
-            server_dir = extract_immich_server(docker, immich["container"], immich["version"])
+            log.info(
+                "Immich updated: %s -> %s. Re-extracting server...",
+                cached_version,
+                running_version,
+            )
+            server_dir = extract_immich_server(
+                docker, immich["container"], immich["version"]
+            )
             config["version"] = immich["version"]
             config["server_dir"] = str(server_dir)
             # Refresh connection info in case it changed
@@ -1347,18 +1541,20 @@ def cmd_start(args):
 
     # Worker environment
     worker_env = os.environ.copy()
-    worker_env.update({
-        "IMMICH_WORKERS_INCLUDE": "microservices",
-        "DB_HOSTNAME": config["db_hostname"],
-        "DB_PORT": config["db_port"],
-        "DB_USERNAME": config["db_username"],
-        "DB_PASSWORD": config.get("db_password", ""),
-        "DB_DATABASE_NAME": config["db_name"],
-        "REDIS_HOSTNAME": config["redis_hostname"],
-        "REDIS_PORT": config["redis_port"],
-        "IMMICH_MACHINE_LEARNING_URL": f"http://localhost:{config['ml_port']}",
-        "PATH": str(Path(node).parent) + ":" + os.environ.get("PATH", ""),
-    })
+    worker_env.update(
+        {
+            "IMMICH_WORKERS_INCLUDE": "microservices",
+            "DB_HOSTNAME": config["db_hostname"],
+            "DB_PORT": config["db_port"],
+            "DB_USERNAME": config["db_username"],
+            "DB_PASSWORD": config.get("db_password", ""),
+            "DB_DATABASE_NAME": config["db_name"],
+            "REDIS_HOSTNAME": config["redis_hostname"],
+            "REDIS_PORT": config["redis_port"],
+            "IMMICH_MACHINE_LEARNING_URL": f"http://localhost:{config['ml_port']}",
+            "PATH": str(Path(node).parent) + ":" + os.environ.get("PATH", ""),
+        }
+    )
 
     if config.get("upload_mount"):
         worker_env["IMMICH_MEDIA_LOCATION"] = config["upload_mount"]
@@ -1388,10 +1584,14 @@ def cmd_start(args):
             wrapper_dst.write_text(wrapper_content)
             os.chmod(wrapper_dst, 0o755)
         # Wrapper dir first in PATH, and set FFMPEG_PATH so fluent-ffmpeg uses our wrapper
-        worker_env["PATH"] = f"{wrapper_dir}:{Path(config['ffmpeg_path']).parent}:{worker_env['PATH']}"
+        worker_env["PATH"] = (
+            f"{wrapper_dir}:{Path(config['ffmpeg_path']).parent}:{worker_env['PATH']}"
+        )
         worker_env["FFMPEG_PATH"] = str(wrapper_dst)
     elif config.get("ffmpeg_path"):
-        worker_env["PATH"] = str(Path(config["ffmpeg_path"]).parent) + ":" + worker_env["PATH"]
+        worker_env["PATH"] = (
+            str(Path(config["ffmpeg_path"]).parent) + ":" + worker_env["PATH"]
+        )
 
     # Start ML service
     ml_started_here = False
@@ -1402,8 +1602,12 @@ def cmd_start(args):
         if ml_python.exists():
             log.info("Starting ML service...")
             try:
-                ml_pid = start_service("ml", [str(ml_python), "-m", "src.main"],
-                                       os.environ.copy(), str(ml_dir))
+                ml_pid = start_service(
+                    "ml",
+                    [str(ml_python), "-m", "src.main"],
+                    os.environ.copy(),
+                    str(ml_dir),
+                )
                 ml_started_here = True
                 log.info("  ML service running (PID %d)", ml_pid)
             except RuntimeError:
@@ -1414,8 +1618,9 @@ def cmd_start(args):
     # Start native Immich microservices worker
     log.info("Starting Immich worker (version %s)...", config["version"])
     try:
-        worker_pid = start_service("worker", [node, "dist/main.js"],
-                                   worker_env, server_dir)
+        worker_pid = start_service(
+            "worker", [node, "dist/main.js"], worker_env, server_dir
+        )
     except RuntimeError:
         if ml_started_here:
             log.info("Stopping ML service (worker failed)...")
@@ -1447,7 +1652,9 @@ def cmd_status(_args):
         log.info("Not running")
         return
 
-    log.info("Worker:     %s", f"running (PID {worker_pid})" if worker_pid else "stopped")
+    log.info(
+        "Worker:     %s", f"running (PID {worker_pid})" if worker_pid else "stopped"
+    )
     log.info("ML service: %s", f"running (PID {ml_pid})" if ml_pid else "stopped")
 
     if CONFIG_FILE.exists():
@@ -1522,6 +1729,7 @@ def cmd_watch(_args):
     try:
         config = load_config()
         import urllib.request as _urlreq
+
         _urlreq.urlopen("http://localhost:8420/", timeout=2)
     except Exception:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1529,7 +1737,8 @@ def cmd_watch(_args):
         proc = subprocess.Popen(
             [sys.executable, "-m", __package__ or "immich_accelerator", "dashboard"],
             cwd=str(Path(__file__).parent.parent),
-            stdout=dash_log, stderr=subprocess.STDOUT,
+            stdout=dash_log,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
         dash_log.close()
@@ -1556,8 +1765,12 @@ def cmd_watch(_args):
                 ml_python = ml_dir / "venv" / "bin" / "python3"
                 if ml_python.exists():
                     try:
-                        pid = start_service("ml", [str(ml_python), "-m", "src.main"],
-                                            os.environ.copy(), str(ml_dir))
+                        pid = start_service(
+                            "ml",
+                            [str(ml_python), "-m", "src.main"],
+                            os.environ.copy(),
+                            str(ml_dir),
+                        )
                         log.info("  ML restarted (PID %d)", pid)
                     except RuntimeError:
                         log.error("  ML restart failed")
@@ -1594,14 +1807,19 @@ def cmd_watch(_args):
                                 pass
 
                     if running and is_valid_version(running) and running != cached:
-                        log.info("Immich updated: %s -> %s. Restarting with new version...",
-                                 cached, running)
+                        log.info(
+                            "Immich updated: %s -> %s. Restarting with new version...",
+                            cached,
+                            running,
+                        )
                         cmd_stop(None)
                         # Re-extract server — try Docker, fall back to ghcr.io download
                         try:
                             docker = find_docker()
                             immich = detect_immich(docker)
-                            server_dir = extract_immich_server(docker, immich["container"], running)
+                            server_dir = extract_immich_server(
+                                docker, immich["container"], running
+                            )
                         except RuntimeError:
                             server_dir = download_immich_server(running)
                         config["version"] = running
@@ -1615,6 +1833,7 @@ def cmd_watch(_args):
                 if not self_update_notified:
                     try:
                         import urllib.request as _urlreq3
+
                         req = _urlreq3.Request(
                             "https://api.github.com/repos/epheterson/immich-apple-silicon/releases/latest",
                             headers={"Accept": "application/vnd.github.v3+json"},
@@ -1622,7 +1841,11 @@ def cmd_watch(_args):
                         latest = json.loads(_urlreq3.urlopen(req, timeout=10).read())
                         latest_ver = latest.get("tag_name", "").lstrip("v")
                         if latest_ver and latest_ver != __version__:
-                            log.info("Accelerator update available: %s -> %s", __version__, latest_ver)
+                            log.info(
+                                "Accelerator update available: %s -> %s",
+                                __version__,
+                                latest_ver,
+                            )
                             log.info("  brew upgrade immich-accelerator")
                             log.info("  or: git pull && immich-accelerator setup")
                         self_update_notified = True
@@ -1638,12 +1861,14 @@ def cmd_dashboard(args):
     """Start the web dashboard."""
     config = load_config()
     import importlib
+
     dashboard_mod = importlib.import_module(".dashboard", package=__package__)
     log.info("Starting dashboard on port %d...", args.port)
     dashboard_mod.run_dashboard(config, port=args.port)
 
 
 # --- Main ---
+
 
 def cmd_uninstall(_args):
     """Remove services, data, and launchd config."""
@@ -1659,7 +1884,9 @@ def cmd_uninstall(_args):
     if ml_venv.exists():
         log.info("  - ML venv (./ml/venv)")
     log.info("")
-    log.info("Your Immich data, Docker containers, and Homebrew packages are NOT affected.")
+    log.info(
+        "Your Immich data, Docker containers, and Homebrew packages are NOT affected."
+    )
     log.info("")
 
     try:
@@ -1675,8 +1902,12 @@ def cmd_uninstall(_args):
 
     # Kill dashboard
     try:
-        result = subprocess.run(["pgrep", "-f", "immich_accelerator.*dashboard"],
-                               capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            ["pgrep", "-f", "immich_accelerator.*dashboard"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
         for line in result.stdout.strip().split("\n"):
             if line.strip():
                 os.kill(int(line.strip()), signal.SIGTERM)
@@ -1685,7 +1916,9 @@ def cmd_uninstall(_args):
 
     # Unload and remove launchd plist
     if plist.exists():
-        subprocess.run(["launchctl", "unload", str(plist)], capture_output=True, timeout=10)
+        subprocess.run(
+            ["launchctl", "unload", str(plist)], capture_output=True, timeout=10
+        )
         plist.unlink()
         log.info("Launchd service removed")
 
@@ -1701,7 +1934,9 @@ def cmd_uninstall(_args):
 
     log.info("")
     log.info("Uninstalled. To restore Immich to stock:")
-    log.info("  Remove IMMICH_WORKERS_INCLUDE and port mappings from docker-compose.yml")
+    log.info(
+        "  Remove IMMICH_WORKERS_INCLUDE and port mappings from docker-compose.yml"
+    )
     log.info("  docker compose up -d")
 
 
@@ -1716,20 +1951,32 @@ def main():
         prog="immich-accelerator",
         description="Immich Accelerator — native macOS microservices worker",
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
     sub = parser.add_subparsers(dest="command")
 
     setup_p = sub.add_parser("setup", help="Detect Immich, download server, configure")
     setup_p.add_argument("--url", help="Remote Immich URL (e.g. http://nas:2283)")
     setup_p.add_argument("--api-key", help="Immich API key (for remote setup)")
-    setup_p.add_argument("--manual", action="store_true", help="Create config template for manual editing")
-    setup_p.add_argument("--import-server", metavar="DIR", help="Import server from extracted directory or tarball")
+    setup_p.add_argument(
+        "--manual",
+        action="store_true",
+        help="Create config template for manual editing",
+    )
+    setup_p.add_argument(
+        "--import-server",
+        metavar="DIR",
+        help="Import server from extracted directory or tarball",
+    )
     start_p = sub.add_parser("start", help="Start native worker + ML")
     start_p.add_argument("--force", action="store_true", help="Restart if running")
     sub.add_parser("stop", help="Stop native services")
     sub.add_parser("status", help="Show what's running")
     logs_p = sub.add_parser("logs", help="Tail service logs")
-    logs_p.add_argument("service", nargs="?", choices=["worker", "ml"], default="worker")
+    logs_p.add_argument(
+        "service", nargs="?", choices=["worker", "ml"], default="worker"
+    )
     sub.add_parser("update", help="Update to match Immich version")
     sub.add_parser("watch", help="Monitor services, restart on crash (for launchd)")
     dash_p = sub.add_parser("dashboard", help="Web dashboard (http://localhost:8420)")
@@ -1742,11 +1989,17 @@ def main():
         sys.exit(1)
 
     try:
-        {"setup": cmd_setup, "start": cmd_start, "stop": cmd_stop,
-         "status": cmd_status, "logs": cmd_logs, "update": cmd_update,
-         "watch": cmd_watch, "dashboard": cmd_dashboard,
-         "uninstall": cmd_uninstall,
-         }[args.command](args)
+        {
+            "setup": cmd_setup,
+            "start": cmd_start,
+            "stop": cmd_stop,
+            "status": cmd_status,
+            "logs": cmd_logs,
+            "update": cmd_update,
+            "watch": cmd_watch,
+            "dashboard": cmd_dashboard,
+            "uninstall": cmd_uninstall,
+        }[args.command](args)
     except RuntimeError as e:
         log.error("%s", e)
         sys.exit(1)
