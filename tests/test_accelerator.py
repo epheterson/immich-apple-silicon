@@ -1,4 +1,5 @@
 """Tests for immich_accelerator.__main__ — utility functions, config, CLI parsing, detection."""
+
 from __future__ import annotations
 
 import argparse
@@ -24,6 +25,10 @@ from immich_accelerator.__main__ import (
     detect_immich,
     _find_exposed_port,
     _read_version,
+    _build_link_ok,
+    _ensure_build_link,
+    _remove_build_link,
+    SYNTHETIC_CONF,
     main,
     cmd_stop,
     cmd_status,
@@ -35,24 +40,28 @@ from immich_accelerator.__main__ import (
     LOG_DIR,
 )
 
-
 # ---------------------------------------------------------------------------
 # _read_version
 # ---------------------------------------------------------------------------
+
 
 class TestReadVersion:
     def test_reads_version_file(self, tmp_path):
         version_file = tmp_path / "VERSION"
         version_file.write_text("1.3.1\n")
         with patch("immich_accelerator.__main__.Path") as mock_path:
-            mock_path.return_value.parent.parent.__truediv__ = lambda self, x: version_file
+            mock_path.return_value.parent.parent.__truediv__ = (
+                lambda self, x: version_file
+            )
             # Direct test: just call the real file logic
             result = version_file.read_text().strip()
             assert result == "1.3.1"
 
     def test_fallback_on_missing_file(self):
         with patch("immich_accelerator.__main__.Path") as mock_path:
-            mock_path.return_value.parent.parent.__truediv__.return_value.read_text.side_effect = OSError
+            mock_path.return_value.parent.parent.__truediv__.return_value.read_text.side_effect = (
+                OSError
+            )
             result = _read_version()
             assert result == "1.0.0"
 
@@ -60,6 +69,7 @@ class TestReadVersion:
 # ---------------------------------------------------------------------------
 # find_binary
 # ---------------------------------------------------------------------------
+
 
 class TestFindBinary:
     def test_finds_existing_binary(self, tmp_path):
@@ -99,6 +109,7 @@ class TestFindBinary:
 # check_port
 # ---------------------------------------------------------------------------
 
+
 class TestCheckPort:
     def test_returns_true_when_port_open(self):
         with patch("socket.create_connection") as mock_conn:
@@ -119,29 +130,36 @@ class TestCheckPort:
 # is_valid_version
 # ---------------------------------------------------------------------------
 
+
 class TestIsValidVersion:
-    @pytest.mark.parametrize("version", [
-        "1.2.3",
-        "v1.2.3",
-        "2.6.3",
-        "v2.6.3",
-        "10.20.30",
-        "v0.0.1",
-        "1.2.3-beta",
-        "v1.2.3-rc1",
-    ])
+    @pytest.mark.parametrize(
+        "version",
+        [
+            "1.2.3",
+            "v1.2.3",
+            "2.6.3",
+            "v2.6.3",
+            "10.20.30",
+            "v0.0.1",
+            "1.2.3-beta",
+            "v1.2.3-rc1",
+        ],
+    )
     def test_valid_versions(self, version):
         assert is_valid_version(version) is True
 
-    @pytest.mark.parametrize("version", [
-        "unknown",
-        "",
-        "latest",
-        "abc",
-        "1.2",
-        "v1.2",
-        "release-1",
-    ])
+    @pytest.mark.parametrize(
+        "version",
+        [
+            "unknown",
+            "",
+            "latest",
+            "abc",
+            "1.2",
+            "v1.2",
+            "release-1",
+        ],
+    )
     def test_invalid_versions(self, version):
         assert is_valid_version(version) is False
 
@@ -149,6 +167,7 @@ class TestIsValidVersion:
 # ---------------------------------------------------------------------------
 # Config management (save_config / load_config)
 # ---------------------------------------------------------------------------
+
 
 class TestConfigManagement:
     def test_save_and_load_roundtrip(self, tmp_data_dir, sample_config):
@@ -202,11 +221,15 @@ class TestConfigManagement:
 # PID management (write_pid / read_pid / kill_pid)
 # ---------------------------------------------------------------------------
 
+
 class TestPidManagement:
     def test_write_and_read_pid(self, tmp_data_dir):
         current_pid = os.getpid()
         start_time = "Mon Apr  1 10:00:00 2026"
-        with patch("immich_accelerator.__main__._get_process_start_time", return_value=start_time):
+        with patch(
+            "immich_accelerator.__main__._get_process_start_time",
+            return_value=start_time,
+        ):
             write_pid("worker", current_pid)
             pid = read_pid("worker")
         assert pid == current_pid
@@ -227,7 +250,10 @@ class TestPidManagement:
         pid_file = tmp_data_dir["pid_dir"] / "worker.pid"
         pid_file.write_text(f"{current_pid}\nOLD START TIME")
 
-        with patch("immich_accelerator.__main__._get_process_start_time", return_value="DIFFERENT START TIME"):
+        with patch(
+            "immich_accelerator.__main__._get_process_start_time",
+            return_value="DIFFERENT START TIME",
+        ):
             result = read_pid("worker")
             assert result is None
 
@@ -237,7 +263,10 @@ class TestPidManagement:
         pid_file = tmp_data_dir["pid_dir"] / "worker.pid"
         pid_file.write_text(f"{current_pid}\n{start_time}")
 
-        with patch("immich_accelerator.__main__._get_process_start_time", return_value=start_time):
+        with patch(
+            "immich_accelerator.__main__._get_process_start_time",
+            return_value=start_time,
+        ):
             result = read_pid("worker")
             assert result == current_pid
 
@@ -246,10 +275,13 @@ class TestPidManagement:
 
     def test_kill_pid_sends_sigterm(self, tmp_data_dir):
         current_pid = os.getpid()
-        with patch("immich_accelerator.__main__.read_pid", return_value=current_pid), \
-             patch("os.getpgid", return_value=current_pid), \
-             patch("os.killpg") as mock_killpg, \
-             patch("os.kill", side_effect=OSError):  # process "gone" immediately
+        with patch(
+            "immich_accelerator.__main__.read_pid", return_value=current_pid
+        ), patch("os.getpgid", return_value=current_pid), patch(
+            "os.killpg"
+        ) as mock_killpg, patch(
+            "os.kill", side_effect=OSError
+        ):  # process "gone" immediately
             kill_pid("worker")
             mock_killpg.assert_called_with(current_pid, signal.SIGTERM)
 
@@ -258,12 +290,17 @@ class TestPidManagement:
 # detect_immich
 # ---------------------------------------------------------------------------
 
+
 class TestDetectImmich:
     def test_detects_server_by_image_name(self):
         docker_ps_output = "my-immich\tghcr.io/immich-app/immich-server:v2.6.3\n"
         package_json = json.dumps({"version": "2.6.3"})
-        env_output = "DB_PASSWORD=secret\nDB_USERNAME=postgres\nDB_DATABASE_NAME=immich\n"
-        mounts_json = json.dumps([{"Destination": "/usr/src/app/upload", "Source": "/photos/upload"}])
+        env_output = (
+            "DB_PASSWORD=secret\nDB_USERNAME=postgres\nDB_DATABASE_NAME=immich\n"
+        )
+        mounts_json = json.dumps(
+            [{"Destination": "/usr/src/app/upload", "Source": "/photos/upload"}]
+        )
 
         def run_side_effect(cmd, **kwargs):
             result = MagicMock()
@@ -369,13 +406,16 @@ class TestDetectImmich:
 # _find_exposed_port
 # ---------------------------------------------------------------------------
 
+
 class TestFindExposedPort:
     def test_returns_exposed_port(self):
         result = MagicMock()
         result.returncode = 0
         result.stdout = "0.0.0.0:15432\n"
         with patch("subprocess.run", return_value=result):
-            port = _find_exposed_port("/usr/local/bin/docker", ["immich_postgres"], "5432")
+            port = _find_exposed_port(
+                "/usr/local/bin/docker", ["immich_postgres"], "5432"
+            )
             assert port == "15432"
 
     def test_returns_default_when_not_exposed(self):
@@ -383,11 +423,14 @@ class TestFindExposedPort:
         result.returncode = 1
         result.stdout = ""
         with patch("subprocess.run", return_value=result):
-            port = _find_exposed_port("/usr/local/bin/docker", ["immich_postgres"], "5432")
+            port = _find_exposed_port(
+                "/usr/local/bin/docker", ["immich_postgres"], "5432"
+            )
             assert port == "5432"
 
     def test_tries_multiple_container_names(self):
         call_count = 0
+
         def run_side_effect(cmd, **kwargs):
             nonlocal call_count
             call_count += 1
@@ -401,7 +444,9 @@ class TestFindExposedPort:
             return result
 
         with patch("subprocess.run", side_effect=run_side_effect):
-            port = _find_exposed_port("/usr/local/bin/docker", ["redis1", "redis2"], "6379")
+            port = _find_exposed_port(
+                "/usr/local/bin/docker", ["redis1", "redis2"], "6379"
+            )
             assert port == "6380"
             assert call_count == 2
 
@@ -409,6 +454,7 @@ class TestFindExposedPort:
 # ---------------------------------------------------------------------------
 # CLI argument parsing
 # ---------------------------------------------------------------------------
+
 
 class TestCLIParsing:
     def test_setup_command(self):
@@ -426,7 +472,9 @@ class TestCLIParsing:
 
     def test_setup_with_api_key(self):
         parser = self._build_parser()
-        args = parser.parse_args(["setup", "--url", "http://nas:2283", "--api-key", "key123"])
+        args = parser.parse_args(
+            ["setup", "--url", "http://nas:2283", "--api-key", "key123"]
+        )
         assert args.api_key == "key123"
 
     def test_setup_manual(self):
@@ -498,8 +546,7 @@ class TestCLIParsing:
         assert args.command == "uninstall"
 
     def test_no_command_exits(self):
-        with patch("sys.argv", ["prog"]), \
-             pytest.raises(SystemExit) as exc:
+        with patch("sys.argv", ["prog"]), pytest.raises(SystemExit) as exc:
             main()
         assert exc.value.code == 1
 
@@ -519,7 +566,9 @@ class TestCLIParsing:
         sub.add_parser("stop")
         sub.add_parser("status")
         logs_p = sub.add_parser("logs")
-        logs_p.add_argument("service", nargs="?", choices=["worker", "ml"], default="worker")
+        logs_p.add_argument(
+            "service", nargs="?", choices=["worker", "ml"], default="worker"
+        )
         sub.add_parser("update")
         sub.add_parser("watch")
         dash_p = sub.add_parser("dashboard")
@@ -531,6 +580,7 @@ class TestCLIParsing:
 # ---------------------------------------------------------------------------
 # cmd_stop
 # ---------------------------------------------------------------------------
+
 
 class TestCmdStop:
     def test_stops_all_services(self, tmp_data_dir):
@@ -551,6 +601,7 @@ class TestCmdStop:
 # cmd_status
 # ---------------------------------------------------------------------------
 
+
 class TestCmdStatus:
     def test_status_when_not_running(self, tmp_data_dir):
         with patch("immich_accelerator.__main__.read_pid", return_value=None):
@@ -566,15 +617,16 @@ class TestCmdStatus:
 # start_service
 # ---------------------------------------------------------------------------
 
+
 class TestStartService:
     def test_start_service_success(self, tmp_data_dir):
         mock_proc = MagicMock()
         mock_proc.pid = 12345
         mock_proc.poll.return_value = None  # still running
 
-        with patch("subprocess.Popen", return_value=mock_proc), \
-             patch("immich_accelerator.__main__.write_pid") as mock_write, \
-             patch("time.sleep"):
+        with patch("subprocess.Popen", return_value=mock_proc), patch(
+            "immich_accelerator.__main__.write_pid"
+        ) as mock_write, patch("time.sleep"):
             pid = start_service("worker", ["node", "main.js"], {}, "/tmp")
             assert pid == 12345
             mock_write.assert_called_once_with("worker", 12345)
@@ -587,16 +639,165 @@ class TestStartService:
         log_file = tmp_data_dir["log_dir"] / "worker.log"
         log_file.write_text("Error: something went wrong\n")
 
-        with patch("subprocess.Popen", return_value=mock_proc), \
-             patch("immich_accelerator.__main__.write_pid"), \
-             patch("time.sleep"), \
-             pytest.raises(RuntimeError, match="worker failed to start"):
+        with patch("subprocess.Popen", return_value=mock_proc), patch(
+            "immich_accelerator.__main__.write_pid"
+        ), patch("time.sleep"), pytest.raises(
+            RuntimeError, match="worker failed to start"
+        ):
             start_service("worker", ["node", "main.js"], {}, "/tmp")
+
+
+# ---------------------------------------------------------------------------
+# Build link functions (_build_link_ok, _ensure_build_link, _remove_build_link)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildLinkOk:
+    def test_returns_false_when_build_missing(self, tmp_data_dir):
+        """No /build → False."""
+        (tmp_data_dir["data_dir"] / "build-data").mkdir(exist_ok=True)
+        with patch("immich_accelerator.__main__.Path") as MockPath:
+            real_path = Path
+
+            def side_effect(p):
+                if p == "/build":
+                    return real_path(tmp_data_dir["data_dir"] / "nonexistent")
+                return real_path(p)
+
+            MockPath.side_effect = side_effect
+        # Simpler: just mock the target check directly
+        with patch("immich_accelerator.__main__.DATA_DIR", tmp_data_dir["data_dir"]):
+            with patch("pathlib.Path.exists", return_value=False):
+                assert _build_link_ok() is False
+
+    def test_returns_true_when_build_resolves_correctly(self, tmp_data_dir):
+        """ "/build" resolves to build-data → True."""
+        build_data = tmp_data_dir["data_dir"] / "build-data"
+        build_data.mkdir(exist_ok=True)
+        with patch("immich_accelerator.__main__.DATA_DIR", tmp_data_dir["data_dir"]):
+            target = tmp_data_dir["data_dir"] / "build-link"
+            target.symlink_to(build_data)
+            with patch("immich_accelerator.__main__.Path") as MockPath:
+
+                def path_factory(p="/build"):
+                    if p == "/build":
+                        return target
+                    return Path(p)
+
+                MockPath.side_effect = path_factory
+                assert _build_link_ok() is True
+
+    def test_returns_false_when_build_points_elsewhere(self, tmp_data_dir):
+        """ "/build" exists but points to wrong dir → False."""
+        build_data = tmp_data_dir["data_dir"] / "build-data"
+        build_data.mkdir(exist_ok=True)
+        wrong_dir = tmp_data_dir["data_dir"] / "wrong"
+        wrong_dir.mkdir()
+        with patch("immich_accelerator.__main__.DATA_DIR", tmp_data_dir["data_dir"]):
+            target = tmp_data_dir["data_dir"] / "build-link"
+            target.symlink_to(wrong_dir)
+            with patch("immich_accelerator.__main__.Path") as MockPath:
+
+                def path_factory(p="/build"):
+                    if p == "/build":
+                        return target
+                    return Path(p)
+
+                MockPath.side_effect = path_factory
+                assert _build_link_ok() is False
+
+
+class TestEnsureBuildLink:
+    def test_returns_true_when_already_ok(self, tmp_data_dir):
+        """If _build_link_ok() → True, return immediately."""
+        with patch(
+            "immich_accelerator.__main__._build_link_ok", return_value=True
+        ), patch("immich_accelerator.__main__.DATA_DIR", tmp_data_dir["data_dir"]):
+            assert _ensure_build_link() is True
+
+    def test_returns_false_when_build_exists_wrong_target(self, tmp_data_dir):
+        """/build exists but wrong target → warn, return False."""
+        (tmp_data_dir["data_dir"] / "build-data").mkdir(exist_ok=True)
+        with patch(
+            "immich_accelerator.__main__._build_link_ok", return_value=False
+        ), patch(
+            "immich_accelerator.__main__.DATA_DIR", tmp_data_dir["data_dir"]
+        ), patch(
+            "immich_accelerator.__main__.Path"
+        ) as MockPath:
+            mock_build = MagicMock()
+            mock_build.exists.return_value = True
+            MockPath.side_effect = lambda p: mock_build if p == "/build" else Path(p)
+            assert _ensure_build_link() is False
+
+    def test_returns_false_when_conf_exists_but_not_active(self, tmp_data_dir):
+        """synthetic.d file exists but /build not active → needs reboot."""
+        (tmp_data_dir["data_dir"] / "build-data").mkdir(exist_ok=True)
+        synth_file = tmp_data_dir["data_dir"] / "synthetic-conf"
+        synth_file.write_text("build\tUsers/test\n")
+        with patch(
+            "immich_accelerator.__main__._build_link_ok", return_value=False
+        ), patch(
+            "immich_accelerator.__main__.DATA_DIR", tmp_data_dir["data_dir"]
+        ), patch(
+            "immich_accelerator.__main__.SYNTHETIC_CONF", synth_file
+        ), patch(
+            "immich_accelerator.__main__.Path"
+        ) as MockPath:
+            mock_build = MagicMock()
+            mock_build.exists.return_value = False
+            MockPath.side_effect = lambda p: mock_build if p == "/build" else Path(p)
+            assert _ensure_build_link() is False
+
+    def test_returns_false_when_user_declines(self, tmp_data_dir):
+        """User says 'n' → return False, no sudo."""
+        (tmp_data_dir["data_dir"] / "build-data").mkdir(exist_ok=True)
+        synth_file = tmp_data_dir["data_dir"] / "synthetic-conf"
+        with patch(
+            "immich_accelerator.__main__._build_link_ok", return_value=False
+        ), patch(
+            "immich_accelerator.__main__.DATA_DIR", tmp_data_dir["data_dir"]
+        ), patch(
+            "immich_accelerator.__main__.SYNTHETIC_CONF", synth_file
+        ), patch(
+            "immich_accelerator.__main__.Path"
+        ) as MockPath, patch(
+            "builtins.input", return_value="n"
+        ):
+            mock_build = MagicMock()
+            mock_build.exists.return_value = False
+            MockPath.side_effect = lambda p: mock_build if p == "/build" else Path(p)
+            assert _ensure_build_link() is False
+
+
+class TestRemoveBuildLink:
+    def test_noop_when_conf_missing(self, tmp_data_dir):
+        """No synthetic.d file → no action."""
+        synth_file = tmp_data_dir["data_dir"] / "nonexistent"
+        with patch("immich_accelerator.__main__.SYNTHETIC_CONF", synth_file):
+            _remove_build_link()  # Should not raise
+
+    def test_removes_conf_file(self, tmp_data_dir):
+        """Calls sudo rm on the synthetic.d file."""
+        synth_file = tmp_data_dir["data_dir"] / "synthetic-conf"
+        synth_file.write_text("build\tUsers/test\n")
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        with patch("immich_accelerator.__main__.SYNTHETIC_CONF", synth_file), patch(
+            "subprocess.run", return_value=mock_result
+        ) as mock_run:
+            _remove_build_link()
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            assert args[0] == "sudo"
+            assert args[1] == "rm"
+            assert str(synth_file) in str(args[2])
 
 
 # ---------------------------------------------------------------------------
 # Path constants
 # ---------------------------------------------------------------------------
+
 
 class TestPathConstants:
     def test_data_dir_is_in_home(self):
@@ -617,27 +818,31 @@ class TestPathConstants:
 # main() dispatch
 # ---------------------------------------------------------------------------
 
+
 class TestMainDispatch:
     def test_stop_dispatches(self):
-        with patch("sys.argv", ["prog", "stop"]), \
-             patch("immich_accelerator.__main__.cmd_stop") as mock:
+        with patch("sys.argv", ["prog", "stop"]), patch(
+            "immich_accelerator.__main__.cmd_stop"
+        ) as mock:
             main()
             mock.assert_called_once()
 
     def test_status_dispatches(self):
-        with patch("sys.argv", ["prog", "status"]), \
-             patch("immich_accelerator.__main__.cmd_status") as mock:
+        with patch("sys.argv", ["prog", "status"]), patch(
+            "immich_accelerator.__main__.cmd_status"
+        ) as mock:
             main()
             mock.assert_called_once()
 
     def test_runtime_error_exits(self):
-        with patch("sys.argv", ["prog", "start"]), \
-             patch("immich_accelerator.__main__.cmd_start", side_effect=RuntimeError("boom")), \
-             pytest.raises(SystemExit) as exc:
+        with patch("sys.argv", ["prog", "start"]), patch(
+            "immich_accelerator.__main__.cmd_start", side_effect=RuntimeError("boom")
+        ), pytest.raises(SystemExit) as exc:
             main()
         assert exc.value.code == 1
 
     def test_keyboard_interrupt_handled(self):
-        with patch("sys.argv", ["prog", "stop"]), \
-             patch("immich_accelerator.__main__.cmd_stop", side_effect=KeyboardInterrupt):
+        with patch("sys.argv", ["prog", "stop"]), patch(
+            "immich_accelerator.__main__.cmd_stop", side_effect=KeyboardInterrupt
+        ):
             main()  # Should not raise

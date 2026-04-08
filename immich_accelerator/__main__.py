@@ -44,64 +44,120 @@ LOG_DIR = DATA_DIR / "logs"
 # --- Utility ---
 
 
-def _fix_plugin_paths(config: dict, build_data: str, server_dir: Path, node: str):
-    """Clear stale plugin rows so the native worker re-registers with correct paths.
+SYNTHETIC_CONF = Path("/etc/synthetic.d/immich-accelerator")
 
-    Immich 2.7+ stores absolute wasmPaths in the shared Postgres DB. In
-    split-worker setups (Docker API on NAS, native microservices on Mac),
-    the Docker worker stores /build/corePlugin/... which doesn't exist on
-    macOS. Deleting mismatched rows forces re-registration on next bootstrap.
+
+def _build_link_ok() -> bool:
+    """Check if /build points to our build-data directory."""
+    build_data = DATA_DIR / "build-data"
+    target = Path("/build")
+    try:
+        return target.exists() and target.resolve() == build_data.resolve()
+    except OSError:
+        return False
+
+
+def _ensure_build_link():
+    """Ensure /build exists on macOS, pointing to our build-data directory.
+
+    Immich stores absolute paths like /build/corePlugin/dist/plugin.wasm in
+    its shared Postgres DB. In split-worker setups, both Docker and native
+    workers need /build to resolve. macOS SIP prevents creating directories
+    at /, but /etc/synthetic.d/ provides Apple's mechanism for root-level
+    synthetic symlinks. Requires sudo once during setup.
     """
-    script = """\
-const {Client} = require('pg');
-const c = new Client({
-  host: process.env.PG_HOST,
-  port: parseInt(process.env.PG_PORT),
-  user: process.env.PG_USER,
-  password: process.env.PG_PASS,
-  database: process.env.PG_DB,
-});
-const prefix = process.env.BUILD_DATA;
-c.connect()
-  .then(() => c.query(
-    'DELETE FROM plugin WHERE "wasmPath" IS NOT NULL AND "wasmPath" NOT LIKE $1',
-    [prefix + '%']
-  ))
-  .then(r => {
-    if (r.rowCount > 0) console.log('Cleared ' + r.rowCount + ' stale plugin path(s)');
-    return c.end();
-  })
-  .catch(e => {
-    console.error('plugin-fix: ' + e.message);
-    c.end().catch(() => {});
-  });
-"""
-    env = os.environ.copy()
-    env.update(
-        {
-            "NODE_PATH": str(server_dir / "node_modules"),
-            "PG_HOST": config["db_hostname"],
-            "PG_PORT": config["db_port"],
-            "PG_USER": config["db_username"],
-            "PG_PASS": config.get("db_password", ""),
-            "PG_DB": config["db_name"],
-            "BUILD_DATA": build_data,
-        }
-    )
+    build_data = DATA_DIR / "build-data"
+    build_data.mkdir(parents=True, exist_ok=True)
+
+    if _build_link_ok():
+        return True
+
+    if Path("/build").exists():
+        log.warning("/build exists but doesn't point to our build-data.")
+        log.warning("  Plugin paths may not resolve correctly.")
+        return False
+
+    # Check if already configured but not yet active (needs reboot)
+    if SYNTHETIC_CONF.exists():
+        log.info("/build link configured but not yet active.")
+        log.info("  Reboot to activate it.")
+        return False
+
+    log.info("")
+    log.info("Immich stores plugin paths as /build/... in its database.")
+    log.info("To make these paths work on macOS, we need to create:")
+    log.info("  /build → ~/.immich-accelerator/build-data")
+    log.info("This uses macOS synthetic links (requires sudo once).")
+    log.info("")
+
+    try:
+        answer = input("Create /build link? [Y/n] ").strip().lower()
+    except EOFError:
+        return False
+    if answer and answer != "y":
+        return False
+
+    # Write our own file in /etc/synthetic.d/ (avoids touching shared synthetic.conf)
+    relative_target = str(build_data).lstrip("/")
+    entry = f"build\t{relative_target}\n"
     try:
         result = subprocess.run(
-            [node, "-e", script],
-            env=env,
+            ["sudo", "mkdir", "-p", "/etc/synthetic.d"],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            log.warning("Failed to create /etc/synthetic.d/")
+            return False
+        result = subprocess.run(
+            ["sudo", "tee", str(SYNTHETIC_CONF)],
+            input=entry,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            log.warning("Failed to write %s: %s", SYNTHETIC_CONF, result.stderr.strip())
+            return False
+    except subprocess.SubprocessError as e:
+        log.warning("Failed to configure /build link: %s", e)
+        return False
+
+    # Try to activate without reboot
+    apfs_util = "/System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util"
+    if Path(apfs_util).exists():
+        result = subprocess.run(
+            ["sudo", apfs_util, "-t"],
             capture_output=True,
             text=True,
             timeout=10,
         )
-        if result.stdout.strip():
-            log.info(result.stdout.strip())
-        if result.returncode != 0 and result.stderr.strip():
-            log.debug("Plugin path fix: %s", result.stderr.strip())
-    except Exception as e:
-        log.debug("Plugin path fix skipped: %s", e)
+        if result.returncode == 0 and _build_link_ok():
+            log.info("/build link created successfully")
+            return True
+
+    log.info("/build link configured. Reboot to activate it.")
+    return False
+
+
+def _remove_build_link():
+    """Remove /build synthetic link during uninstall."""
+    if not SYNTHETIC_CONF.exists():
+        return
+
+    log.info("Removing /build link (requires sudo)...")
+    try:
+        result = subprocess.run(
+            ["sudo", "rm", str(SYNTHETIC_CONF)],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            log.info("  /build link removed. Reboot to fully deactivate.")
+        else:
+            log.warning("  Could not remove %s", SYNTHETIC_CONF)
+    except subprocess.SubprocessError as e:
+        log.warning("  Could not remove %s: %s", SYNTHETIC_CONF, e)
 
 
 def find_binary(name: str, paths: list[str], install_hint: str) -> str:
@@ -892,6 +948,9 @@ def _finalize_config(config: dict) -> None:
 
     save_config(config)
 
+    # Ensure /build firmlink for plugin path compatibility (Immich 2.7+)
+    _ensure_build_link()
+
     # Auto-start services
     log.info("")
     try:
@@ -1641,9 +1700,26 @@ def cmd_start(args):
     if config.get("upload_mount"):
         worker_env["IMMICH_MEDIA_LOCATION"] = config["upload_mount"]
 
-    # Point geodata to our managed directory (avoids needing /build/ on the host)
+    # /build link points to our build-data dir (set up during setup).
+    # Required for Immich 2.7+ plugin WASM paths stored in the shared DB.
     build_data = DATA_DIR / "build-data"
-    worker_env["IMMICH_BUILD_DATA"] = str(build_data)
+    has_plugins = (build_data / "corePlugin" / "manifest.json").exists()
+
+    if _build_link_ok():
+        pass  # /build resolves correctly, both Docker and native see the same paths
+    elif has_plugins:
+        # Plugins exist but /build isn't set up — worker WILL fail on plugin load.
+        # Try to set it up now (handles 2.6→2.7 upgrade case).
+        if sys.stdin.isatty():
+            _ensure_build_link()
+        if not _build_link_ok():
+            log.error("/build link is required for Immich 2.7+ but is not active.")
+            log.error("  Run: immich-accelerator setup")
+            log.error("  Then reboot to activate the /build link.")
+            return
+    else:
+        # Pre-2.7, no plugins — IMMICH_BUILD_DATA fallback is sufficient
+        worker_env["IMMICH_BUILD_DATA"] = str(build_data)
 
     # Set up VideoToolbox ffmpeg wrapper.
     # Immich doesn't support videotoolbox as an accel option, so we put a
@@ -1696,9 +1772,6 @@ def cmd_start(args):
                 log.warning("  ML service failed to start — CLIP/face/OCR unavailable")
     elif ml_pid:
         log.info("ML service already running (PID %d)", ml_pid)
-
-    # Fix plugin paths for split-worker setups (Docker stores /build/... in DB)
-    _fix_plugin_paths(config, str(build_data), Path(server_dir), node)
 
     # Start native Immich microservices worker
     log.info("Starting Immich worker (version %s)...", config["version"])
@@ -2006,6 +2079,9 @@ def cmd_uninstall(_args):
         )
         plist.unlink()
         log.info("Launchd service removed")
+
+    # Remove /build firmlink from synthetic.conf
+    _remove_build_link()
 
     # Remove data directory
     if DATA_DIR.exists():

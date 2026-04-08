@@ -1,11 +1,15 @@
 # Changelog
 
-## 1.3.2 — 2026-04-07
+## 1.3.3 — 2026-04-07
 
 ### Bug fixes
-- **Plugin WASM paths**: Fix Immich 2.7+ crash in split-worker setups (Docker API on NAS + native worker on Mac). The Docker worker stored absolute `/build/corePlugin/...` paths in the shared DB, which the native worker couldn't resolve. Now clears stale plugin rows before native worker start.
+- **Plugin WASM paths**: Fix Immich 2.7+ crash in split-worker setups. Uses macOS synthetic firmlink (`/build` → `~/.immich-accelerator/build-data`) so both Docker and native workers resolve the same plugin paths. No database modifications. Setup prompts for sudo once; `uninstall` cleans it up.
 - **OCI extraction**: Fix build data landing in wrong directory (`build/` instead of `build-data/`). Tar member paths are now rewritten during extraction.
 - **Missing corePlugin**: OCI download no longer skips small image layers, so the corePlugin WASM (in its own Docker COPY layer) is always extracted.
+
+## 1.3.2 — 2026-04-07
+
+- Yanked — used direct DB manipulation for plugin path fix. Replaced by v1.3.3 firmlink approach.
 
 ## 1.3.1 — 2026-04-05
 
