@@ -899,7 +899,37 @@ def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
 
 # --- Commands ---
 
-_JF_FFMPEG_URL = "https://repo.jellyfin.org/files/ffmpeg/macos/latest-7.x/arm64/jellyfin-ffmpeg_7.1.3-4_portable_macarm64-gpl.tar.xz"
+_JF_FFMPEG_BASE = "https://repo.jellyfin.org/files/ffmpeg/macos/latest-7.x/arm64/"
+
+
+def _find_jf_ffmpeg_url() -> str:
+    """Find the latest jellyfin-ffmpeg download URL from the repo directory."""
+    import urllib.request
+    import html.parser
+
+    class LinkParser(html.parser.HTMLParser):
+        links: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "a":
+                for name, val in attrs:
+                    if name == "href" and val and val.endswith(".tar.xz"):
+                        self.links.append(val)
+
+    try:
+        resp = urllib.request.urlopen(_JF_FFMPEG_BASE, timeout=10)
+        parser = LinkParser()
+        parser.links = []
+        parser.feed(resp.read().decode())
+        xz_files = [l for l in parser.links if "macarm64-gpl" in l]
+        if xz_files:
+            url = xz_files[-1]
+            if not url.startswith("http"):
+                url = _JF_FFMPEG_BASE + url
+            return url
+    except Exception:
+        pass
+    raise RuntimeError("Could not find jellyfin-ffmpeg download URL")
 
 
 def _ensure_jellyfin_ffmpeg() -> str:
@@ -931,9 +961,10 @@ def _ensure_jellyfin_ffmpeg() -> str:
 
     import urllib.request
 
+    url = _find_jf_ffmpeg_url()
     tar_path = jf_dir / "jellyfin-ffmpeg.tar.xz"
     try:
-        urllib.request.urlretrieve(_JF_FFMPEG_URL, str(tar_path))
+        urllib.request.urlretrieve(url, str(tar_path))
     except Exception as e:
         raise RuntimeError(f"Failed to download jellyfin-ffmpeg: {e}")
 
