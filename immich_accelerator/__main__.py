@@ -70,6 +70,44 @@ def _ensure_build_link():
     build_data.mkdir(parents=True, exist_ok=True)
 
     if _build_link_ok():
+        # Migrate legacy synthetic.conf entry to synthetic.d if needed
+        if not SYNTHETIC_CONF.exists():
+            legacy = Path("/etc/synthetic.conf")
+            if legacy.exists() and "build\t" in legacy.read_text():
+                relative_target = str(build_data).lstrip("/")
+                entry = f"build\t{relative_target}\n"
+                try:
+                    subprocess.run(
+                        ["sudo", "mkdir", "-p", "/etc/synthetic.d"],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    subprocess.run(
+                        ["sudo", "tee", str(SYNTHETIC_CONF)],
+                        input=entry,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    # Remove from legacy conf
+                    content = legacy.read_text()
+                    lines = [
+                        l
+                        for l in content.splitlines(keepends=True)
+                        if not l.startswith("build\t")
+                    ]
+                    new_content = "".join(lines)
+                    if new_content.strip():
+                        subprocess.run(
+                            ["sudo", "tee", str(legacy)],
+                            input=new_content,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                    log.info("Migrated /build link to /etc/synthetic.d/")
+                except (OSError, subprocess.SubprocessError):
+                    pass  # Non-fatal, link still works
         return True
 
     if Path("/build").exists():
@@ -142,22 +180,60 @@ def _ensure_build_link():
 
 def _remove_build_link():
     """Remove /build synthetic link during uninstall."""
-    if not SYNTHETIC_CONF.exists():
-        return
+    removed = False
 
-    log.info("Removing /build link (requires sudo)...")
-    try:
-        result = subprocess.run(
-            ["sudo", "rm", str(SYNTHETIC_CONF)],
-            capture_output=True,
-            timeout=10,
-        )
-        if result.returncode == 0:
-            log.info("  /build link removed. Reboot to fully deactivate.")
-        else:
-            log.warning("  Could not remove %s", SYNTHETIC_CONF)
-    except subprocess.SubprocessError as e:
-        log.warning("  Could not remove %s: %s", SYNTHETIC_CONF, e)
+    # Remove synthetic.d file (v1.3.3+)
+    if SYNTHETIC_CONF.exists():
+        log.info("Removing /build link (requires sudo)...")
+        try:
+            result = subprocess.run(
+                ["sudo", "rm", str(SYNTHETIC_CONF)],
+                capture_output=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                removed = True
+            else:
+                log.warning("  Could not remove %s", SYNTHETIC_CONF)
+        except subprocess.SubprocessError as e:
+            log.warning("  Could not remove %s: %s", SYNTHETIC_CONF, e)
+
+    # Also clean legacy entry from /etc/synthetic.conf (pre-v1.3.3)
+    legacy_conf = Path("/etc/synthetic.conf")
+    if legacy_conf.exists():
+        try:
+            content = legacy_conf.read_text()
+            if "build\t" in content:
+                lines = [
+                    l
+                    for l in content.splitlines(keepends=True)
+                    if not l.startswith("build\t")
+                ]
+                new_content = "".join(lines)
+                if not removed:
+                    log.info(
+                        "Removing /build link from synthetic.conf (requires sudo)..."
+                    )
+                if new_content.strip():
+                    subprocess.run(
+                        ["sudo", "tee", str(legacy_conf)],
+                        input=new_content,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                else:
+                    subprocess.run(
+                        ["sudo", "rm", str(legacy_conf)],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                removed = True
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning("  Could not clean synthetic.conf: %s", e)
+
+    if removed:
+        log.info("  /build link removed. Reboot to fully deactivate.")
 
 
 def find_binary(name: str, paths: list[str], install_hint: str) -> str:
