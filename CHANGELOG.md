@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.2 — 2026-04-07
+
+### Bug fixes
+- **Plugin WASM paths**: Fix Immich 2.7+ crash in split-worker setups (Docker API on NAS + native worker on Mac). The Docker worker stored absolute `/build/corePlugin/...` paths in the shared DB, which the native worker couldn't resolve. Now clears stale plugin rows before native worker start.
+- **OCI extraction**: Fix build data landing in wrong directory (`build/` instead of `build-data/`). Tar member paths are now rewritten during extraction.
+- **Missing corePlugin**: OCI download no longer skips small image layers, so the corePlugin WASM (in its own Docker COPY layer) is always extracted.
+
 ## 1.3.1 — 2026-04-05
 
 - **Homebrew install**: `brew tap epheterson/immich-accelerator && brew install immich-accelerator`. Installs deps, creates `immich-accelerator` command in PATH, supports `brew services start` for auto-launch.
