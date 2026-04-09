@@ -36,12 +36,23 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check for version bump and tag
+        id: tag
         run: |
           VERSION=$(cat VERSION | tr -d '[:space:]')
           if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
             echo "Tag v${VERSION} already exists — skipping"
+            echo "created=false" >> "$GITHUB_OUTPUT"
           else
             echo "New version ${VERSION} — creating tag"
             git tag "v${VERSION}"
             git push origin "v${VERSION}"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+            echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           fi
+      - name: Trigger Homebrew formula update
+        if: steps.tag.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+        run: |
+          gh workflow run update-homebrew.yml -f tag="$TAG_NAME"
