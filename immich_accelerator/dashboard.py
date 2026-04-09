@@ -78,7 +78,10 @@ def _query_db(sql: str, config: dict) -> str:
     if not os.path.exists(psql):
         psql = "/usr/local/bin/psql"
 
-    if os.path.exists(psql) and (password or host != "localhost"):
+    has_psql = os.path.exists(psql)
+
+    # Try direct psql connection (remote setups, or local with password)
+    if has_psql and (password or host != "localhost"):
         env = {**os.environ}
         if password:
             env["PGPASSWORD"] = password
@@ -89,15 +92,9 @@ def _query_db(sql: str, config: dict) -> str:
         if result:
             _db_error_logged = False
             return result
-        if not _db_error_logged:
-            log.warning("Dashboard: cannot reach Postgres at %s:%s", host, port)
-            log.warning(
-                "  Check that the port is exposed (not bound to 127.0.0.1) and reachable from this Mac"
-            )
-            _db_error_logged = True
-        return ""
+        # Don't return — fall through to docker exec fallback
 
-    # Fallback: docker exec (local setups without psql installed)
+    # Fallback: docker exec (local setups, or psql failed above)
     docker = "/usr/local/bin/docker"
     if not os.path.exists(docker):
         docker = "/opt/homebrew/bin/docker"
@@ -120,15 +117,21 @@ def _query_db(sql: str, config: dict) -> str:
             ]
         )
         if result:
+            _db_error_logged = False
             return result
 
     # Nothing worked — log once
     if not _db_error_logged:
-        if not os.path.exists(psql.rsplit("/", 1)[0] + "/psql"):
+        if not has_psql:
             log.warning("Dashboard: psql not found. Install with: brew install libpq")
+        elif host != "localhost":
+            log.warning("Dashboard: cannot reach Postgres at %s:%s", host, port)
+            log.warning(
+                "  Check that the port is exposed (not 127.0.0.1) and reachable from this Mac"
+            )
         else:
             log.warning(
-                "Dashboard: cannot connect to Postgres. Check config and port exposure."
+                "Dashboard: cannot connect to Postgres. Check that Docker is running."
             )
         _db_error_logged = True
     return ""
