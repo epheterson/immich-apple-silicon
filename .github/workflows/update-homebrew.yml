@@ -1,9 +1,6 @@
 name: Update Homebrew Formula
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
@@ -14,7 +11,7 @@ jobs:
   update-tap:
     runs-on: ubuntu-latest
     env:
-      TAG: ${{ inputs.tag || github.ref_name }}
+      TAG: ${{ inputs.tag }}
     steps:
       - name: Get version from tag
         id: version
