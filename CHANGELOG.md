@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.9 — 2026-04-09
+
+- **Draft GitHub releases**: Merging to main now creates a draft GitHub release with changelog notes and upgrade instructions. Review and publish when ready.
+
 ## 1.3.8 — 2026-04-09
 
 - **Dashboard DB connectivity**: Dashboard now logs clear errors when it can't reach Postgres (missing psql, wrong port binding, unreachable host) instead of silently showing empty data.
