@@ -3,6 +3,8 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
 
 jobs:
   lint:
@@ -21,4 +23,25 @@ jobs:
             pytest -v
           else
             echo "No test files found - skipping"
+          fi
+
+  auto-tag:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check for version bump and tag
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "Tag v${VERSION} already exists — skipping"
+          else
+            echo "New version ${VERSION} — creating tag"
+            git tag "v${VERSION}"
+            git push origin "v${VERSION}"
           fi
