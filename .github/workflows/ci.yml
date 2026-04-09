@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,7 +53,7 @@ jobs:
       - name: Trigger Homebrew formula update
         if: steps.tag.outputs.created == 'true'
         env:
-          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ steps.tag.outputs.tag }}
         run: |
           gh workflow run update-homebrew.yml -f tag="$TAG_NAME"
