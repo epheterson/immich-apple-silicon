@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.0 — 2026-04-09
+
+- **libpq as Homebrew dependency**: `psql` now installed automatically via `depends_on "libpq"` in the formula — works for both new installs and upgrades, not just setup.
+- **Published GitHub releases**: Releases are now published automatically (not draft).
+
 ## 1.3.9 — 2026-04-09
 
 - **Draft GitHub releases**: Merging to main now creates a draft GitHub release with changelog notes and upgrade instructions. Review and publish when ready.

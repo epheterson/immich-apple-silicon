@@ -81,7 +81,7 @@ jobs:
           ENDNOTES
           sed -i 's/^          //' /tmp/release-notes.md
           gh release create "${TAG_NAME}" \
-            --draft \
+            --latest \
             --title "Immich Accelerator ${TAG_NAME}" \
             --notes-file /tmp/release-notes.md
       - name: Trigger Homebrew formula update

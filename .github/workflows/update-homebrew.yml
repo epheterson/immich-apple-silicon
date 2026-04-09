@@ -65,6 +65,7 @@ jobs:
             depends_on arch: :arm64
             depends_on "node"
             depends_on "vips"
+            depends_on "libpq"
             depends_on "python@3.11"
 
             def install
