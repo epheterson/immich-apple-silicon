@@ -57,7 +57,7 @@ jobs:
           TAG_NAME: ${{ steps.tag.outputs.tag }}
         run: |
           VERSION="${TAG_NAME#v}"
-          NOTES=$(awk "/^## ${VERSION}/{found=1; next} /^## /{if(found) exit} found{print}" CHANGELOG.md)
+          NOTES=$(awk "/^## ${VERSION}[[:space:]]/{found=1; next} /^## /{if(found) exit} found{print}" CHANGELOG.md)
           if [ -z "$NOTES" ]; then
             NOTES="Release ${TAG_NAME}"
           fi
