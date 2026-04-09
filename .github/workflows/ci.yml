@@ -50,6 +50,40 @@ jobs:
             echo "created=true" >> "$GITHUB_OUTPUT"
             echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           fi
+      - name: Create draft release with changelog
+        if: steps.tag.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+        run: |
+          VERSION="${TAG_NAME#v}"
+          # Find the previous release tag to capture all changelog sections since then
+          PREV_TAG=$(git tag --sort=-v:refname | grep '^v' | sed -n '2p')
+          PREV_VERSION="${PREV_TAG#v}"
+          if [ -n "$PREV_VERSION" ]; then
+            # Extract all changelog sections from current version down to previous release
+            NOTES=$(awk "/^## ${PREV_VERSION}[[:space:]]/{exit} /^## ${VERSION}[[:space:]]/{found=1; next} found{print}" CHANGELOG.md)
+          else
+            # First release — grab everything after the first ## heading
+            NOTES=$(awk "/^## ${VERSION}[[:space:]]/{found=1; next} found{print}" CHANGELOG.md)
+          fi
+          if [ -z "$NOTES" ]; then
+            NOTES="Release ${TAG_NAME}"
+          fi
+          cat > /tmp/release-notes.md << ENDNOTES
+          ${NOTES}
+
+          ### Upgrade
+          \`\`\`bash
+          brew upgrade immich-accelerator
+          immich-accelerator setup   # if first time or new features require it
+          \`\`\`
+          ENDNOTES
+          sed -i 's/^          //' /tmp/release-notes.md
+          gh release create "${TAG_NAME}" \
+            --draft \
+            --title "Immich Accelerator ${TAG_NAME}" \
+            --notes-file /tmp/release-notes.md
       - name: Trigger Homebrew formula update
         if: steps.tag.outputs.created == 'true'
         env:
