@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.8 — 2026-04-09
+
+- **Dashboard DB connectivity**: Dashboard now logs clear errors when it can't reach Postgres (missing psql, wrong port binding, unreachable host) instead of silently showing empty data.
+- **Setup installs libpq**: `psql` client installed automatically for dashboard DB queries. Previously only worked on same-machine setups via docker exec.
+- **Port instructions**: Setup now suggests open port binding (`5432:5432`) instead of localhost-only (`127.0.0.1:5432:5432`), with a note to restrict if same-machine.
+
 ## 1.3.7 — 2026-04-08
 
 - **Fully automated releases**: Merging to main now auto-tags and updates Homebrew formula — no manual steps.

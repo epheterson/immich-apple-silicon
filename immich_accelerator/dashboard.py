@@ -13,6 +13,7 @@ and system metrics. All data sources are trusted (localhost only). The
 HTML rendering uses template literals with numeric/string data from our
 own API — no user-supplied content is rendered as HTML.
 """
+
 from __future__ import annotations
 
 import json
@@ -46,10 +47,15 @@ def _get_accelerator_version() -> str:
 def _run(cmd: list[str], timeout: int = 5, env: dict | None = None) -> str:
     """Run a command and return stdout, or empty string on failure."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, env=env
+        )
         return r.stdout.strip() if r.returncode == 0 else ""
     except (subprocess.SubprocessError, OSError):
         return ""
+
+
+_db_error_logged = False
 
 
 def _query_db(sql: str, config: dict) -> str:
@@ -58,6 +64,7 @@ def _query_db(sql: str, config: dict) -> str:
     Uses direct psql connection when DB host/password are configured (remote
     setups). Falls back to docker exec for local setups (backwards compat).
     """
+    global _db_error_logged
     host = config.get("db_hostname", "localhost")
     port = config.get("db_port", "5432")
     user = config.get("db_username", "postgres")
@@ -65,23 +72,66 @@ def _query_db(sql: str, config: dict) -> str:
     db = config.get("db_name", "immich")
 
     # Direct psql connection — works for both local and remote setups
-    psql = "/opt/homebrew/bin/psql"
+    psql = "/opt/homebrew/opt/libpq/bin/psql"
+    if not os.path.exists(psql):
+        psql = "/opt/homebrew/bin/psql"
     if not os.path.exists(psql):
         psql = "/usr/local/bin/psql"
+
     if os.path.exists(psql) and (password or host != "localhost"):
         env = {**os.environ}
         if password:
             env["PGPASSWORD"] = password
-        return _run([psql, "-h", host, "-p", port, "-U", user,
-                     "-d", db, "-t", "-A", "-c", sql], env=env)
+        result = _run(
+            [psql, "-h", host, "-p", port, "-U", user, "-d", db, "-t", "-A", "-c", sql],
+            env=env,
+        )
+        if result:
+            _db_error_logged = False
+            return result
+        if not _db_error_logged:
+            log.warning("Dashboard: cannot reach Postgres at %s:%s", host, port)
+            log.warning(
+                "  Check that the port is exposed (not bound to 127.0.0.1) and reachable from this Mac"
+            )
+            _db_error_logged = True
+        return ""
 
     # Fallback: docker exec (local setups without psql installed)
     docker = "/usr/local/bin/docker"
     if not os.path.exists(docker):
         docker = "/opt/homebrew/bin/docker"
-    container = config.get("db_container", "immich_postgres")
-    return _run([docker, "exec", container, "psql",
-                 "-U", user, "-d", db, "-t", "-A", "-c", sql])
+    if os.path.exists(docker):
+        container = config.get("db_container", "immich_postgres")
+        result = _run(
+            [
+                docker,
+                "exec",
+                container,
+                "psql",
+                "-U",
+                user,
+                "-d",
+                db,
+                "-t",
+                "-A",
+                "-c",
+                sql,
+            ]
+        )
+        if result:
+            return result
+
+    # Nothing worked — log once
+    if not _db_error_logged:
+        if not os.path.exists(psql.rsplit("/", 1)[0] + "/psql"):
+            log.warning("Dashboard: psql not found. Install with: brew install libpq")
+        else:
+            log.warning(
+                "Dashboard: cannot connect to Postgres. Check config and port exposure."
+            )
+        _db_error_logged = True
+    return ""
 
 
 def get_status(config: dict) -> dict:
@@ -94,6 +144,7 @@ def get_status(config: dict) -> dict:
 
     # Service health
     import urllib.request as _urlreq
+
     ml_alive = False
     try:
         with _urlreq.urlopen("http://localhost:3003/ping", timeout=2) as r:
@@ -117,18 +168,22 @@ def get_status(config: dict) -> dict:
     counts_raw = _query_db(
         "SELECT COUNT(*) FILTER (WHERE thumbhash IS NOT NULL), COUNT(*), "
         "(SELECT COUNT(*) FROM smart_search), "
-        "(SELECT COUNT(*) FROM asset_job_status WHERE \"facesRecognizedAt\" IS NOT NULL), "
-        "(SELECT COUNT(*) FROM asset_job_status WHERE \"ocrAt\" IS NOT NULL), "
+        '(SELECT COUNT(*) FROM asset_job_status WHERE "facesRecognizedAt" IS NOT NULL), '
+        '(SELECT COUNT(*) FROM asset_job_status WHERE "ocrAt" IS NOT NULL), '
         "COUNT(*) FILTER (WHERE type = 'VIDEO' AND visibility != 'hidden'), "
         "(SELECT COUNT(*) FROM asset_file af JOIN asset a ON a.id = af.\"assetId\" WHERE af.type = 'encoded_video' AND a.visibility != 'hidden') "
-        "FROM asset WHERE \"deletedAt\" IS NULL AND visibility != 'hidden'", config)
+        "FROM asset WHERE \"deletedAt\" IS NULL AND visibility != 'hidden'",
+        config,
+    )
 
     thumbs, total, clip, faces, ocr, total_videos, encoded_videos = 0, 0, 0, 0, 0, 0, 0
     if counts_raw and "|" in counts_raw:
         parts = counts_raw.split("|")
         if len(parts) == 7:
             try:
-                thumbs, total, clip, faces, ocr, total_videos, encoded_videos = [int(p) for p in parts]
+                thumbs, total, clip, faces, ocr, total_videos, encoded_videos = [
+                    int(p) for p in parts
+                ]
             except ValueError:
                 pass
 
@@ -157,9 +212,11 @@ def get_status(config: dict) -> dict:
     immich_url = config.get("immich_url", "http://localhost:2283")
     if api_key:
         import urllib.request as _urlreq2
+
         try:
-            req = _urlreq2.Request(f"{immich_url}/api/jobs",
-                                    headers={"x-api-key": api_key})
+            req = _urlreq2.Request(
+                f"{immich_url}/api/jobs", headers={"x-api-key": api_key}
+            )
             with _urlreq2.urlopen(req, timeout=2) as r:
                 jobs = json.loads(r.read())
                 queue_map = {
@@ -171,7 +228,9 @@ def get_status(config: dict) -> dict:
                 }
                 for immich_name, our_name in queue_map.items():
                     counts = jobs.get(immich_name, {}).get("jobCounts", {})
-                    queue_status[our_name] = counts.get("active", 0) + counts.get("waiting", 0) > 0
+                    queue_status[our_name] = (
+                        counts.get("active", 0) + counts.get("waiting", 0) > 0
+                    )
         except Exception:
             pass
 
@@ -183,10 +242,16 @@ def get_status(config: dict) -> dict:
     # queue data — empty queue_status means API unreachable, not "idle."
     queues_known = bool(queue_status)
     any_active = queues_known and any(queue_status.values())
+
     def prog(done, tot):
         if queues_known and not any_active and done < tot:
             return {"done": done, "total": tot, "pct": 100.0, "skipped": tot - done}
-        return {"done": done, "total": tot, "pct": round(done / max(tot, 1) * 100, 1), "skipped": 0}
+        return {
+            "done": done,
+            "total": tot,
+            "pct": round(done / max(tot, 1) * 100, 1),
+            "skipped": 0,
+        }
 
     # Video transcode: use queue state for pct when active, 100% when idle + transcoded
     vid_active = queue_status.get("video", False)
@@ -208,7 +273,12 @@ def get_status(config: dict) -> dict:
             "clip": prog(clip, total),
             "faces": prog(faces, total),
             "ocr": prog(ocr, total),
-            "video": {"done": encoded_videos, "total": total_videos, "pct": vid_pct, "skipped": 0},
+            "video": {
+                "done": encoded_videos,
+                "total": total_videos,
+                "pct": vid_pct,
+                "skipped": 0,
+            },
         },
         "system": {
             "load_1m": load_1m,
@@ -257,7 +327,13 @@ def create_app(config: dict):
             return JSONResponse({"error": "No API key configured"}, status_code=400)
 
         results = {}
-        for queue in ["thumbnailGeneration", "smartSearch", "faceDetection", "ocr", "videoConversion"]:
+        for queue in [
+            "thumbnailGeneration",
+            "smartSearch",
+            "faceDetection",
+            "ocr",
+            "videoConversion",
+        ]:
             try:
                 data = b'{"command": "start", "force": false}'
                 req = urllib.request.Request(
@@ -285,6 +361,7 @@ def create_app(config: dict):
 def run_dashboard(config: dict, port: int = 8420):
     """Start the dashboard server."""
     import uvicorn
+
     app = create_app(config)
     log.info("Dashboard: http://localhost:%d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")

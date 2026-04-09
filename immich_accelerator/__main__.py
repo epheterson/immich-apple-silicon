@@ -1043,6 +1043,11 @@ def _check_local_tools() -> tuple[str, str | None, Path | None]:
             "ML service not found — CLIP/face/OCR will use Docker ML if available"
         )
 
+    # Install psql client for dashboard DB queries
+    psql_path = "/opt/homebrew/opt/libpq/bin/psql"
+    if not os.path.isfile(psql_path):
+        _brew_install("libpq")
+
     return node, ffmpeg_path, ml_dir
 
 
@@ -1279,8 +1284,10 @@ def _configure_docker(docker: str, immich: dict, upload: str | None) -> None:
         log.info("    - %s:%s", upload, upload)
     log.info("")
     log.info("  And expose ports on database and redis services:")
-    log.info("    ports: ['127.0.0.1:5432:5432']   # database")
-    log.info("    ports: ['127.0.0.1:6379:6379']   # redis")
+    log.info("    ports: ['5432:5432']   # database")
+    log.info("    ports: ['6379:6379']   # redis")
+    log.info("")
+    log.info("  (Use '127.0.0.1:5432:5432' to restrict to localhost if same machine)")
     log.info("")
     log.info("  Docker Desktop users: use http://host.docker.internal:3003 instead")
 
