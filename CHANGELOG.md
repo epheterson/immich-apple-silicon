@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.6 — 2026-04-08
+
+- **Homebrew formula fix**: Move ML pip install to `post_install` phase — fixes dylib fixup errors on all Rust-compiled Python extensions (pydantic_core, tokenizers, etc.), not just orjson.
+- **CI workflow**: Formula template now generates `post_install` correctly so future releases don't regress.
+- **Docs**: Clarify NAS+Mac path mapping with two concrete options — match Mac paths in Docker, or use macOS synthetic links to match Docker paths on Mac (zero Docker changes).
+
 ## 1.3.5 — 2026-04-08
 
 ### Bug fixes

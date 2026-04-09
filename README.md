@@ -1,6 +1,6 @@
 # Immich Accelerator
 
-> **Alpha — use at your own risk.** Tested on Mac Mini M4 (24GB) with Immich v2.6.3 and OrbStack. Back up your Immich database before trying this.
+> **Alpha — use at your own risk.** Tested on Mac Mini M4 (24GB) with Immich v2.7.2 and OrbStack. Back up your Immich database before trying this.
 
 Run Immich's compute natively on Apple Silicon. Thumbnails use the fast M-series CPU, video transcoding uses VideoToolbox hardware encoding, and ML runs on Metal GPU, Neural Engine, and CoreML.
 
@@ -179,9 +179,34 @@ immich-accelerator setup --manual
 
 Docker is **not required on the Mac**. Setup downloads the Immich server directly from the container registry (ghcr.io) — no Docker, no SSH, no manual steps. Auto-updates work the same way: the watchdog checks the Immich API for version changes and downloads the new server automatically.
 
-**Path consistency**: The native worker on the Mac needs to see files at the same absolute paths that Docker on the NAS used. Mount the NAS photo directory on the Mac via NFS or SMB. For uploads, `IMMICH_MEDIA_LOCATION` handles this. For external libraries, ensure the Mac's mount path matches what Docker sees.
+**Path consistency**: Immich stores absolute file paths in Postgres. Both the NAS Docker container and the Mac native worker must resolve the same paths. There are two approaches:
 
-For example, if Docker on the NAS mounts photos at `/mnt/photos`, the Mac needs an NFS mount at `/mnt/photos` too (or migrate the DB paths — see [issue #2](https://github.com/epheterson/immich-apple-silicon/issues/2)).
+**Option A: Match Mac paths in Docker (recommended for new installs)**
+
+Use the Mac's mount path inside Docker. If the Mac sees photos at `/Volumes/photos`:
+
+```yaml
+# NAS docker-compose
+volumes:
+  - /volume1/photos:/Volumes/photos
+environment:
+  - IMMICH_MEDIA_LOCATION=/Volumes/photos
+```
+
+Docker writes `/Volumes/photos/...` in the database, which the Mac worker resolves directly.
+
+**Option B: Match Docker paths on Mac (no Docker changes)**
+
+Use macOS [synthetic links](https://man.cx/synthetic.conf(5)) to create Docker's internal paths on the Mac. If Docker uses `/data` internally:
+
+```bash
+# /etc/synthetic.conf (or /etc/synthetic.d/immich-paths)
+data	Volumes/photos/immich/library
+```
+
+Reboot to activate. Now `/data` on the Mac resolves to your local mount, matching what Docker stores in the database. No `IMMICH_MEDIA_LOCATION` change needed.
+
+**Existing installs**: Changing `IMMICH_MEDIA_LOCATION` triggers Immich's built-in path migration on restart — it rewrites all file paths in the database. This is safe but back up your database first.
 
 ## ML service
 
