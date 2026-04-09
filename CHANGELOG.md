@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.7 — 2026-04-08
+
+- **Fully automated releases**: Merging to main now auto-tags and updates Homebrew formula — no manual steps.
+
 ## 1.3.6 — 2026-04-08
 
 - **Homebrew formula fix**: Move ML pip install to `post_install` phase — fixes dylib fixup errors on all Rust-compiled Python extensions (pydantic_core, tokenizers, etc.), not just orjson.
