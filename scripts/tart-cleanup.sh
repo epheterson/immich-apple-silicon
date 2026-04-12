@@ -35,17 +35,25 @@ run() {
 
 log() { printf '[tart-cleanup] %s\n' "$*"; }
 
-# 1. Every immich-* VM (JSON-safe: tart's text columns are fragile).
-vms=$(tart list --format json 2>/dev/null | python3 -c '
-import sys, json
+# 1. Ephemeral run VMs (always). The bootstrapped base VM
+#    (immich-test-base) is kept between runs so per-PR tests stay
+#    fast — it's only deleted by --all, alongside the OCI image.
+vms=$(DELETE_ALL="$DELETE_BASE" tart list --format json 2>/dev/null | python3 -c "
+import sys, json, os
+delete_all = os.environ.get('DELETE_ALL') == '1'
 for vm in json.load(sys.stdin):
-    if vm.get("Source") == "local" and vm["Name"].startswith("immich-"):
-        print(vm["Name"])
-' 2>/dev/null || true)
+    if vm.get('Source') != 'local':
+        continue
+    name = vm['Name']
+    if name.startswith('immich-test-run-'):
+        print(name)
+    elif delete_all and name == 'immich-test-base':
+        print(name)
+" 2>/dev/null || true)
 if [ -z "$vms" ]; then
-    log "no immich-* VMs found"
+    log "no VMs to delete"
 else
-    log "found VMs:"
+    log "deleting VMs:"
     echo "$vms" | sed 's/^/  /'
     for vm in $vms; do
         run tart stop --timeout 5 "$vm" 2>/dev/null || true

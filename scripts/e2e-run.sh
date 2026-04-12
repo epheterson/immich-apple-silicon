@@ -79,16 +79,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ------------------- Host port forwarders ----------------------
-log "starting host port forwarders (192.168.64.1 -> 127.0.0.1)"
-"$REPO_DIR/scripts/e2e-host-portforward.sh" start
-
-# ------------------- Clone VM ----------------------
+# ------------------- Clone + start VM ----------------------
+# Use default (Shared) networking — softnet requires passwordless
+# sudo and we don't need its layer-2 features.
 log "cloning $BOOTSTRAP_VM -> $TEST_VM"
 tart clone "$BOOTSTRAP_VM" "$TEST_VM"
 
 log "starting $TEST_VM"
-tart run --no-graphics --net-softnet "$TEST_VM" &
+tart run --no-graphics "$TEST_VM" &
 TART_PID=$!
 
 # Wait for IP + SSH
@@ -102,6 +100,17 @@ done
 [ -z "$VM_IP" ] && { log "VM never acquired IP"; exit 3; }
 log "VM IP: $VM_IP"
 
+# Derive the host bridge IP from the VM's subnet (always X.X.X.1 in
+# tart's Shared-mode NAT) so socat can bind to the bridge interface
+# that now exists.
+HOST_BRIDGE_IP="$(echo "$VM_IP" | awk -F. '{print $1"."$2"."$3".1"}')"
+log "host bridge IP from VM's perspective: $HOST_BRIDGE_IP"
+
+# ------------------- Host port forwarders ----------------------
+# Must come AFTER the VM starts so the bridge interface is up.
+log "starting host port forwarders ($HOST_BRIDGE_IP -> 127.0.0.1)"
+HOST_BIND_IP="$HOST_BRIDGE_IP" "$REPO_DIR/scripts/e2e-host-portforward.sh" start
+
 log "waiting for VM SSH..."
 for _ in $(seq 1 30); do
     if sshpass -p "$VM_PASSWORD" ssh "${SSH_OPTS[@]}" "$VM_USER@$VM_IP" "echo ok" 2>/dev/null; then
@@ -110,23 +119,36 @@ for _ in $(seq 1 30); do
     sleep 2
 done
 
-# ------------------- Copy test script into VM ----------------------
-log "copying e2e-fresh-install.sh into VM"
+# ------------------- Package + ship the source under test ----------
+# The E2E script runs against the branch's code directly (not the
+# published tap), so we tar up the checkout and copy it into the VM.
+TARBALL=/tmp/iac-src-$TS.tar.gz
+log "packaging source from $REPO_DIR"
+tar -C "$REPO_DIR" -czf "$TARBALL" \
+    --exclude=.git --exclude=__pycache__ --exclude='*.pyc' \
+    --exclude=.pytest_cache immich_accelerator ml tests VERSION
+
+log "copying sources + e2e script into VM"
 sshpass -p "$VM_PASSWORD" scp "${SSH_OPTS[@]}" \
+    "$TARBALL" \
     "$REPO_DIR/scripts/e2e-fresh-install.sh" \
-    "$VM_USER@$VM_IP:/tmp/e2e-fresh-install.sh"
+    "$VM_USER@$VM_IP:/tmp/"
 
 # ------------------- Run test ----------------------
-log "running E2E inside VM..."
+log "running E2E inside VM (host reachable at $HOST_BRIDGE_IP)..."
 set +e
 sshpass -p "$VM_PASSWORD" ssh "${SSH_OPTS[@]}" "$VM_USER@$VM_IP" \
-    "IMMICH_URL=http://192.168.64.1:12283 \
+    "set -e; \
+     mkdir -p /tmp/iac-src && tar -xzf /tmp/$(basename $TARBALL) -C /tmp/iac-src; \
+     SRC_DIR=/tmp/iac-src \
+     IMMICH_URL=http://$HOST_BRIDGE_IP:12283 \
      IMMICH_API_KEY='$IMMICH_API_KEY' \
-     DB_HOST=192.168.64.1 DB_PORT=15432 DB_PASSWORD='$DB_PASSWORD' \
-     REDIS_HOST=192.168.64.1 REDIS_PORT=16379 \
+     DB_HOST=$HOST_BRIDGE_IP DB_PORT=15432 DB_PASSWORD='$DB_PASSWORD' \
+     REDIS_HOST=$HOST_BRIDGE_IP REDIS_PORT=16379 \
      bash /tmp/e2e-fresh-install.sh"
 RC=$?
 set -e
+rm -f "$TARBALL"
 
 if [ $RC -eq 0 ]; then
     log "E2E PASSED"

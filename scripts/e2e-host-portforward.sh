@@ -11,7 +11,11 @@
 set -euo pipefail
 
 PIDFILE="/tmp/immich-e2e-portforward.pid"
-HOST_BIND="192.168.64.1"
+# HOST_BIND_IP is the bridge interface the VM will reach the host on.
+# In tart's Shared NAT mode this is the X.X.X.1 of the VM's subnet.
+# Caller passes it in so we don't have to guess — VM IP is only
+# known after `tart run` starts.
+HOST_BIND="${HOST_BIND_IP:-192.168.64.1}"
 
 export PATH="/opt/homebrew/bin:$PATH"
 
