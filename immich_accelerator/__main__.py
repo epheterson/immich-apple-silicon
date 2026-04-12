@@ -522,6 +522,40 @@ def _rebuild_sharp(server_dir: Path) -> None:
         log.warning("Sharp not found in node_modules — thumbnail generation may fail")
 
 
+def _needs_core_plugin(version: str) -> bool:
+    """Immich 2.7+ ships a WASM corePlugin we must extract from the image.
+
+    Parses `X.Y.Z` (or `vX.Y.Z`) and returns True when the version is 2.7
+    or later. Unparseable versions default to True — safer to over-fetch
+    than to silently omit plugin files and crash at runtime.
+    """
+    try:
+        parts = version.lstrip("v").split(".")
+        major, minor = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return True
+    return (major, minor) >= (2, 7)
+
+
+def _has_everything(
+    version: str,
+    found_server: bool,
+    found_build: bool,
+    has_core_plugin: bool,
+) -> bool:
+    """Decide whether we've extracted enough to stop processing layers.
+
+    Pure function so the break logic can be unit-tested without mocking
+    the registry. Previously a broken size-based shortcut here caused
+    corePlugin (which lives in a small layer) to be skipped.
+    """
+    if not (found_server and found_build):
+        return False
+    if _needs_core_plugin(version):
+        return has_core_plugin
+    return True
+
+
 def download_immich_server(version: str) -> Path:
     """Download Immich server directly from ghcr.io — no Docker needed.
 
@@ -596,9 +630,11 @@ def download_immich_server(version: str) -> Path:
     build_data.mkdir(parents=True, exist_ok=True)
 
     # Download and extract layers containing server and build data.
-    # Process all layers largest-first. Docker COPY instructions each create
-    # a separate layer — corePlugin (WASM) may be in a small layer, so we
-    # can't skip by size. Build data accumulates across multiple layers.
+    # Process layers largest-first because server + bulk build data live
+    # in the biggest layers — most runs exit long before touching the
+    # small trailing metadata layers. Never skip layers by size: the
+    # corePlugin WASM sits in its own sub-megabyte COPY layer and would
+    # be dropped, stranding Immich 2.7+ without plugin files.
     found_server = False
     found_build = False
     sorted_layers = list(enumerate(layers))
@@ -608,13 +644,8 @@ def download_immich_server(version: str) -> Path:
 
     for i, layer in sorted_layers:
         size_mb = layer["size"] / 1024 / 1024
-        # Break when we have server + build data. For Immich 2.7+ we also
-        # need corePlugin, which may be in a separate small layer.
         has_core = (build_data / "corePlugin" / "manifest.json").exists()
-        if found_server and found_build and has_core:
-            break
-        # For pre-2.7 images (no corePlugin), skip remaining small layers
-        if found_server and found_build and size_mb < 1:
+        if _has_everything(bare_version, found_server, found_build, has_core):
             break
         digest = layer["digest"]
         if size_mb >= 1:

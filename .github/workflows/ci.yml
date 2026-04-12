@@ -16,18 +16,41 @@ jobs:
           python-version: "3.11"
       - name: Syntax check
         run: python -m py_compile immich_accelerator/__init__.py
-      - name: Run pytest (if tests exist)
+      - name: Run pytest (fast)
         run: |
           pip install pytest
-          if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then
-            pytest -v
-          else
-            echo "No test files found - skipping"
-          fi
+          pytest -v -m "not slow"
+
+  fresh-install-macos:
+    # Runs on a clean macOS Apple Silicon runner — no global pip
+    # packages, no leftover venvs. Catches the "works on my machine"
+    # class of bug (issue #17: dashboard ModuleNotFoundError) before
+    # it reaches users. The slow marker enables the venv+pip
+    # integration test that builds a pristine fastapi+uvicorn env.
+    #
+    # EMERGENCY OVERRIDE: if macos-14 runners become flaky and this
+    # blocks a release, trigger `update-homebrew.yml` manually via
+    # `gh workflow run update-homebrew.yml -f tag=vX.Y.Z` — that
+    # workflow bypasses CI entirely.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install pytest only (simulate fresh Mac)
+        run: pip install pytest
+      - name: Run fast fresh-install regression checks
+        run: pytest -v tests/test_fresh_install.py -m "not slow"
+      - name: Run slow integration test (real venv + pip install)
+        # Separate step so a failure here is still visible as
+        # "slow step failed" rather than masking the fast ones.
+        run: pytest -v tests/test_fresh_install.py -m slow
 
   auto-tag:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: lint
+    needs: [lint, fresh-install-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
