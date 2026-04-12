@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.1 — 2026-04-12
+
+### Fresh-install fixes
+- **Dashboard ModuleNotFoundError** (#17): Homebrew formula wrapper now runs the CLI under the ML venv's Python instead of stock `python@3.11`. The dashboard's lazy `fastapi`/`uvicorn` imports now resolve on any fresh Mac — previously they only worked if the user happened to have the packages installed globally. Also added a `brew test` block that force-loads `dashboard.create_app` so this class of bug gets caught at audit time, not in the wild.
+- **Missing corePlugin on OCI download** (#18): Re-fix of a regression from the v1.3.3 fix. The layer loop had a `size_mb < 1` early-break shortcut that fired *before* examining the current layer — stranding the tiny corePlugin COPY layer. Replaced with a version-aware break (`_has_everything`) that requires `corePlugin/manifest.json` for Immich 2.7+. Verified end-to-end against a live ghcr.io pull.
+
+### Test coverage
+- Added `tests/test_fresh_install.py` — unit tests for the layer-break logic, a static check that `fastapi`/`uvicorn` stay pinned in `ml/requirements.txt`, an AST check that `dashboard.py` has no top-level third-party imports, and a slow integration test that builds a pristine venv and confirms `create_app` works with only `fastapi`+`uvicorn` installed.
+- **CI now runs on macOS 14** (Apple Silicon) in addition to Ubuntu. The `fresh-install-macos` job catches "works on my machine" bugs before shipping.
+
 ## 1.4.0 — 2026-04-09
 
 - **libpq as Homebrew dependency**: `psql` now installed automatically via `depends_on "libpq"` in the formula — works for both new installs and upgrades, not just setup.

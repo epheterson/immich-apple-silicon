@@ -125,6 +125,7 @@ Starts the native microservices worker and ML service. Immich's web UI works as 
 | `immich-accelerator update` | Update to match new Immich version |
 | `immich-accelerator watch` | Monitor + auto-restart on crash (for launchd) |
 | `immich-accelerator dashboard` | Web UI at http://localhost:8420 |
+| `immich-accelerator ml-test` | Diagnose the ML service (health + CLIP + OCR round-trip) |
 | `immich-accelerator uninstall` | Remove services, data, and launchd config |
 
 ## Dashboard
@@ -258,6 +259,44 @@ The native worker runs Immich's unmodified code. The ffmpeg and image processing
 - **CLIP search**: Search results are equivalent but not identical. A search that returns 20 results in Docker will return ~18-20 of the same results natively, possibly in slightly different order.
 - **Face grouping**: Faces are detected and grouped correctly. The grouping boundaries may differ slightly (e.g., a borderline face might be grouped differently).
 - **OCR**: Text extraction is at least as good as Docker for English/Latin text.
+
+## Troubleshooting
+
+The accelerator will tell you what's wrong, but here are the four most common split-setup friction points and the one-command fixes.
+
+### Thumbnails 404 in the Immich web UI
+
+Symptom — the native worker runs happily, but Immich's API server logs `ENOENT: /data/thumbs/.../xxx_thumbnail.webp` and thumbnails never show up.
+
+Cause — split-setup path mismatch. Docker Immich stores absolute paths like `/data/library/<uuid>/...` in Postgres; the native worker writes to your `upload_mount` which is something else. Docker API then 404s the stored path.
+
+Fix — run `immich-accelerator setup --url http://your-nas:2283 --api-key YOUR_KEY` again. v1.4.1+ detects Docker's media root via the API and refuses to save a broken config. You'll see the mismatch explicitly with both walkthroughs (match Docker, or synthetic link on Mac). See [Split deployment](#split-deployment-nas--mac) above for the two options.
+
+### ML jobs fail with "Machine learning request failed for all URLs"
+
+Symptom — Immich's worker log shows ML requests failing with HTTP 500 on every URL, even though `immich-accelerator status` says the ML service is running.
+
+Diagnose — run:
+
+```bash
+immich-accelerator ml-test
+```
+
+This exercises `/ping`, `/health`, CLIP visual, and OCR with a synthetic image. On any failure it tails the last 30 lines of `~/.immich-accelerator/logs/ml.log` and prints the three most common root-cause fixes. Paste the output in a GitHub issue if you're stuck.
+
+Common causes:
+
+- **Partial HuggingFace model cache** — `rm -rf ~/.cache/huggingface/hub/models--mlx-community--clip-vit-base-patch32` then `immich-accelerator start`
+- **mlx / mlx-clip version mismatch** — `brew reinstall immich-accelerator`
+- **Stale model files** — `rm -rf ~/.immich-accelerator/ml/models` then restart
+
+### Dashboard crashes with `ModuleNotFoundError: No module named 'uvicorn'`
+
+Fixed in v1.4.1. If you're on an older release, `brew upgrade immich-accelerator` and re-run. The formula wrapper now runs the CLI under the ML venv's Python, which has fastapi + uvicorn installed.
+
+### `immich-accelerator setup` fails with `ENOENT: /build/corePlugin/manifest.json`
+
+Fixed in v1.4.1. The OCI image extractor used to skip small layers that contained the Immich 2.7+ `corePlugin` WASM files. Upgrade and re-run setup.
 
 ## Security
 
