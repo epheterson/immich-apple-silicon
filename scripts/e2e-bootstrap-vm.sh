@@ -78,7 +78,7 @@ log "VM IP: $VM_IP"
 # Wait for SSH
 log "Waiting for SSH..."
 for _ in $(seq 1 30); do
-    if sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    if sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=password -o IdentitiesOnly=yes \
         -o ConnectTimeout=3 "$VM_USER@$VM_IP" "echo ok" 2>/dev/null; then
         break
     fi
@@ -86,7 +86,7 @@ for _ in $(seq 1 30); do
 done
 
 # Check for bootstrap marker — if present, we're already done
-if sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+if sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=password -o IdentitiesOnly=yes \
     "$VM_USER@$VM_IP" "test -f /Users/$VM_USER/.bootstrapped" 2>/dev/null; then
     log "VM is already bootstrapped. Stopping and exiting."
     tart stop "$BOOTSTRAP_VM"
@@ -95,7 +95,7 @@ if sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFi
 fi
 
 log "Installing Homebrew + python@3.11 + git inside VM..."
-sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=password -o IdentitiesOnly=yes \
     "$VM_USER@$VM_IP" 'bash -s' <<'INNER'
 set -euo pipefail
 if ! command -v brew >/dev/null; then
@@ -108,7 +108,7 @@ touch ~/.bootstrapped
 INNER
 
 log "Stopping VM and saving snapshot..."
-sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=password -o IdentitiesOnly=yes \
     "$VM_USER@$VM_IP" "sudo shutdown -h now" 2>/dev/null || true
 sleep 5
 tart stop --timeout 5 "$BOOTSTRAP_VM" 2>/dev/null || true

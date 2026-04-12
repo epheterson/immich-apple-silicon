@@ -23,7 +23,18 @@ TS=$(date +%Y%m%d-%H%M%S)
 TEST_VM="immich-test-run-$TS"
 VM_USER="admin"
 VM_PASSWORD="admin"
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
+SSH_OPTS=(
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o ConnectTimeout=5
+    # The next three force sshpass's password path instead of trying
+    # every key in the caller's ssh-agent first — otherwise SSH hits
+    # "Too many authentication failures" before it reaches password
+    # auth. Learned the hard way during bootstrap failure.
+    -o PubkeyAuthentication=no
+    -o PreferredAuthentications=password
+    -o IdentitiesOnly=yes
+)
 
 log() { printf '[e2e-run %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
