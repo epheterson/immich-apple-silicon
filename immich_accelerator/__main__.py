@@ -522,6 +522,45 @@ def _rebuild_sharp(server_dir: Path) -> None:
         log.warning("Sharp not found in node_modules — thumbnail generation may fail")
 
 
+def _ghcr_urlopen_with_retry(req, timeout: int = 300, max_attempts: int = 4):
+    """urlopen wrapper that retries on ghcr.io rate-limit responses.
+
+    Anonymous ghcr.io pulls are rate-limited per-IP and respond with
+    HTTP 429. A single image fetch may issue 30+ requests (index +
+    platform manifest + each layer blob), so one transient limit used
+    to fail the whole run. Retry up to `max_attempts` times with
+    exponential backoff + jitter, honoring Retry-After when present.
+
+    503 is retried too (ghcr.io's usual way of signalling "busy").
+    Any other HTTP error bubbles up immediately — no retry on 404.
+
+    Module-level for testability: mocking a closure-defined _get was
+    brittle, this is not.
+    """
+    import random
+    import urllib.error
+    import urllib.request
+
+    for attempt in range(max_attempts):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 503) or attempt == max_attempts - 1:
+                raise
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            if retry_after and str(retry_after).isdigit():
+                delay = min(int(retry_after), 60)
+            else:
+                delay = (2**attempt) + random.random()
+            log.warning(
+                "  ghcr.io rate-limited (%d), sleeping %.1fs and retrying...",
+                e.code,
+                delay,
+            )
+            time.sleep(delay)
+    raise RuntimeError("unreachable")
+
+
 def _needs_core_plugin(version: str) -> bool:
     """Immich 2.7+ ships a WASM corePlugin we must extract from the image.
 
@@ -591,7 +630,7 @@ def download_immich_server(version: str) -> Path:
         if accept:
             hdrs["Accept"] = accept
         req = urlreq.Request(url, headers=hdrs)
-        return urlreq.urlopen(req, timeout=300)
+        return _ghcr_urlopen_with_retry(req)
 
     # Get image index → find amd64 manifest (server is JS, arch doesn't matter)
     index = json.loads(

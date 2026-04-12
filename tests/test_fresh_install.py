@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from unittest.mock import patch, MagicMock
+
 from immich_accelerator.__main__ import _has_everything, _needs_core_plugin
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -171,6 +173,92 @@ class TestDashboardDependenciesAreAvailable:
                     f"Top-level 'from {node.module} import ...' in "
                     f"dashboard.py pulls in a third-party dep."
                 )
+
+
+# --- ghcr.io rate-limit retry -------------------------------------------
+#
+# The first real VM E2E run hit HTTP 429 on a ghcr.io manifest fetch
+# during download_immich_server. Anonymous pulls are rate-limited
+# per-IP, and a full Immich image fetch involves 20+ requests. A
+# single 429 used to fail the whole run. The _get helper now retries
+# with exponential backoff.
+
+
+class TestGhcrRetry:
+    """The retry helper is module-level so mocking is trivial. We
+    patch `urllib.request.urlopen` and `time.sleep` and exercise the
+    helper directly — no need to drive the full download function."""
+
+    def _make_http_error(self, code, headers=None):
+        import urllib.error
+
+        return urllib.error.HTTPError(
+            url="https://ghcr.io/v2/x/manifests/t",
+            code=code,
+            msg="err",
+            hdrs=headers or {},  # type: ignore[arg-type]
+            fp=None,
+        )
+
+    def test_retries_429_then_succeeds(self):
+        from immich_accelerator.__main__ import _ghcr_urlopen_with_retry
+
+        err_429 = self._make_http_error(429, {"Retry-After": "1"})
+        ok_resp = MagicMock(name="ok")
+
+        with patch(
+            "urllib.request.urlopen", side_effect=[err_429, ok_resp]
+        ) as mock_urlopen, patch("time.sleep") as mock_sleep:
+            result = _ghcr_urlopen_with_retry(MagicMock(), timeout=5)
+
+        assert result is ok_resp
+        assert mock_urlopen.call_count == 2
+        mock_sleep.assert_called_once()
+        # Retry-After of "1" flows through verbatim
+        assert mock_sleep.call_args[0][0] == 1
+
+    def test_retries_503(self):
+        from immich_accelerator.__main__ import _ghcr_urlopen_with_retry
+
+        err_503 = self._make_http_error(503)
+        ok_resp = MagicMock()
+
+        with patch("urllib.request.urlopen", side_effect=[err_503, ok_resp]), patch(
+            "time.sleep"
+        ):
+            result = _ghcr_urlopen_with_retry(MagicMock(), timeout=5)
+        assert result is ok_resp
+
+    def test_404_is_not_retried(self):
+        import urllib.error
+
+        from immich_accelerator.__main__ import _ghcr_urlopen_with_retry
+
+        err_404 = self._make_http_error(404)
+
+        with patch("urllib.request.urlopen", side_effect=err_404), patch(
+            "time.sleep"
+        ) as mock_sleep:
+            with pytest.raises(urllib.error.HTTPError) as excinfo:
+                _ghcr_urlopen_with_retry(MagicMock(), timeout=5)
+
+        assert excinfo.value.code == 404
+        mock_sleep.assert_not_called()
+
+    def test_gives_up_after_max_attempts(self):
+        import urllib.error
+
+        from immich_accelerator.__main__ import _ghcr_urlopen_with_retry
+
+        err_429 = self._make_http_error(429)
+
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=[err_429, err_429, err_429, err_429],
+        ) as mock_urlopen, patch("time.sleep"):
+            with pytest.raises(urllib.error.HTTPError):
+                _ghcr_urlopen_with_retry(MagicMock(), timeout=5, max_attempts=4)
+        assert mock_urlopen.call_count == 4
 
 
 # --- Brew-install detection (plist + uninstall safety) -----------------
