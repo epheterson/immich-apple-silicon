@@ -404,8 +404,88 @@ class TestWarnOnPathMismatch:
         with patch(
             "immich_accelerator.__main__._detect_docker_media_prefix",
             return_value=None,
+        ), patch(
+            "immich_accelerator.__main__._fetch_external_libraries",
+            return_value=[],
         ):
             assert not _warn_on_path_mismatch("http://x", "k", "/anywhere")
+
+
+class TestExternalLibraryValidation:
+    """External-library importPaths must resolve on the Mac filesystem
+    or the worker will 404 on those assets. Missing external paths
+    are NON-FATAL — they just produce warnings. The worker can still
+    process upload and non-missing libraries."""
+
+    def test_missing_external_libs_warn_but_dont_block(self, tmp_path, caplog):
+        import logging
+
+        from immich_accelerator.__main__ import _warn_on_path_mismatch
+
+        missing = "/definitely-not-a-real-mount-xyz-test"
+        libs = [
+            {"name": "NAS Photos", "importPaths": [missing]},
+            {"name": "Other", "importPaths": ["/another/missing/path-xyz"]},
+        ]
+        with patch(
+            "immich_accelerator.__main__._detect_docker_media_prefix",
+            return_value=None,
+        ), patch(
+            "immich_accelerator.__main__._fetch_external_libraries",
+            return_value=libs,
+        ), caplog.at_level(
+            logging.WARNING
+        ):
+            result = _warn_on_path_mismatch("http://x", "k", "/data")
+
+        assert result is False, "missing external libs must not block start"
+        joined = "\n".join(caplog.messages)
+        assert "NAS Photos" in joined
+        assert missing in joined
+        assert "not accessible" in joined.lower()
+
+    def test_existing_external_libs_produce_no_warning(self, tmp_path, caplog):
+        import logging
+
+        from immich_accelerator.__main__ import _warn_on_path_mismatch
+
+        # tmp_path always exists — use it as a library that IS accessible.
+        libs = [{"name": "Local", "importPaths": [str(tmp_path)]}]
+        with patch(
+            "immich_accelerator.__main__._detect_docker_media_prefix",
+            return_value=None,
+        ), patch(
+            "immich_accelerator.__main__._fetch_external_libraries",
+            return_value=libs,
+        ), caplog.at_level(
+            logging.WARNING
+        ):
+            result = _warn_on_path_mismatch("http://x", "k", "/data")
+
+        assert result is False
+        joined = "\n".join(caplog.messages)
+        assert "not accessible" not in joined.lower()
+
+    def test_upload_mismatch_is_fatal_even_when_external_libs_missing(self, caplog):
+        import logging
+
+        from immich_accelerator.__main__ import _warn_on_path_mismatch
+
+        with patch(
+            "immich_accelerator.__main__._detect_docker_media_prefix",
+            return_value="/real-docker-upload-root",
+        ), patch(
+            "immich_accelerator.__main__._fetch_external_libraries",
+            return_value=[{"name": "Missing", "importPaths": ["/does-not-exist-here"]}],
+        ), caplog.at_level(
+            logging.DEBUG
+        ):
+            result = _warn_on_path_mismatch("http://x", "k", "/wrong-mount")
+
+        assert result is True, "upload mismatch is fatal regardless of extlibs"
+        joined = "\n".join(caplog.messages)
+        assert "Upload path mismatch" in joined
+        assert "Missing" in joined  # external warning still appears
 
 
 # --- Brew-install detection (plist + uninstall safety) -----------------
