@@ -270,9 +270,16 @@ class TestGhcrRetry:
 
 
 class TestDetectDockerMediaPrefix:
-    """The prefix detector strips the per-library UUID from a sample
-    asset's originalPath. Covers Immich's two response shapes (nested
-    under assets.items vs flat items list)."""
+    """The detector parses an upload-library asset's originalPath to
+    recover Docker's IMMICH_MEDIA_LOCATION. Upload-library assets have
+    libraryId=null; external-library assets get filtered out because
+    their paths don't reflect the upload root.
+
+    v1.4.1 shipped a version that picked external library importPaths
+    from /api/libraries, which false-positived on installs with
+    external libs plus a correctly-set upload_mount. This test class
+    guards against that regression.
+    """
 
     def _patch_urlopen(self, body, raises=None):
         response = MagicMock()
@@ -283,88 +290,59 @@ class TestDetectDockerMediaPrefix:
             return patch("urllib.request.urlopen", side_effect=raises)
         return patch("urllib.request.urlopen", return_value=response)
 
-    def test_prefers_libraries_import_paths(self):
-        """The primary signal is /api/libraries[*].importPaths[0]."""
+    def test_extracts_media_root_from_upload_asset(self):
+        """Upload-library assets have libraryId=null and the standard
+        layout <MEDIA_LOCATION>/upload/<userUUID>/<year>/<filename>."""
+        from immich_accelerator.__main__ import _detect_docker_media_prefix
+
+        body = b'{"assets":{"items":[{"libraryId":null,"originalPath":"/data/upload/c37f6663-c090-4262-bcf3-f91a642abcb4/2026/DSC.nef"}]}}'
+        with self._patch_urlopen(body):
+            result = _detect_docker_media_prefix("http://nas:2283", "fake-key")
+        assert result == "/data"
+
+    def test_skips_external_library_assets(self):
+        """External-library assets have libraryId set — they must be
+        skipped because their paths are library roots, not the
+        IMMICH_MEDIA_LOCATION upload root. This is the exact v1.4.1
+        regression that false-positived on issue #19's reporter."""
+        from immich_accelerator.__main__ import _detect_docker_media_prefix
+
+        body = b'{"assets":{"items":[{"libraryId":"ext-uuid","originalPath":"/external/library/some.jpg"}]}}'
+        with self._patch_urlopen(body):
+            result = _detect_docker_media_prefix("http://nas:2283", "k")
+        assert result is None
+
+    def test_mixed_results_prefers_upload_asset(self):
+        """If the response mixes external and upload assets, we find
+        and use the upload one (libraryId=null)."""
         from immich_accelerator.__main__ import _detect_docker_media_prefix
 
         body = (
-            b'[{"id":"lib1","name":"My Library","importPaths":["/mnt/photos/library"]}]'
+            b'{"assets":{"items":['
+            b'{"libraryId":"ext","originalPath":"/ext/library/a.jpg"},'
+            b'{"libraryId":null,"originalPath":"/data/upload/abcdefab-1234-5678-9abc-def012345678/2026/b.jpg"}'
+            b"]}}"
         )
         with self._patch_urlopen(body):
-            result = _detect_docker_media_prefix("http://nas:2283", "fake-key")
-        assert result == "/mnt/photos/library"
+            result = _detect_docker_media_prefix("http://nas:2283", "k")
+        assert result == "/data"
 
-    def test_libraries_strips_trailing_slash(self):
+    def test_returns_none_when_library_is_empty(self):
+        """No assets at all -> None (caller treats as 'don't know')."""
         from immich_accelerator.__main__ import _detect_docker_media_prefix
 
-        body = b'[{"importPaths":["/data/library/"]}]'
-        with self._patch_urlopen(body):
-            result = _detect_docker_media_prefix("http://x", "k")
-        assert result == "/data/library"
-
-    def test_libraries_skips_empty_import_paths(self):
-        """A library with no importPaths (upload-only) should not
-        produce a false detection — should fall back to metadata."""
-        import urllib.error
-
-        from immich_accelerator.__main__ import _detect_docker_media_prefix
-
-        def make_mock(body):
-            m = MagicMock()
-            m.__enter__ = lambda s: s
-            m.__exit__ = lambda s, *a: None
-            m.read.return_value = body
-            return m
-
-        responses: list = [make_mock(b"[]"), urllib.error.URLError("no assets")]
-        idx = {"i": 0}
-
-        def side_effect(req, timeout=None):
-            r = responses[idx["i"]]
-            idx["i"] += 1
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        with patch("urllib.request.urlopen", side_effect=side_effect):
-            result = _detect_docker_media_prefix("http://x", "k")
+        with self._patch_urlopen(b'{"assets":{"items":[]}}'):
+            result = _detect_docker_media_prefix("http://nas:2283", "k")
         assert result is None
 
-    def test_extracts_prefix_from_uuid_library_path(self):
-        """Fallback: if /api/libraries is empty, parse an asset's
-        originalPath."""
-        from immich_accelerator.__main__ import _detect_docker_media_prefix
-
-        # First call: libraries (empty). Second: search/metadata (asset).
-        idx = {"i": 0}
-        responses = [
-            b"[]",
-            b'{"assets":{"items":[{"originalPath":"/data/library/c37f6663-c090-4262-bcf3-f91a642abcb4/2026/DSC.nef"}]}}',
-        ]
-
-        def make_mock(body):
-            m = MagicMock()
-            m.__enter__ = lambda s: s
-            m.__exit__ = lambda s, *a: None
-            m.read.return_value = body
-            return m
-
-        def side_effect(req, timeout=None):
-            r = make_mock(responses[idx["i"]])
-            idx["i"] += 1
-            return r
-
-        with patch("urllib.request.urlopen", side_effect=side_effect):
-            result = _detect_docker_media_prefix("http://nas:2283", "fake-key")
-        assert result == "/data/library"
-
     def test_handles_flat_items_response(self):
+        """Older Immich versions return a flat items list."""
         from immich_accelerator.__main__ import _detect_docker_media_prefix
 
-        body = b'{"items":[{"originalPath":"/mnt/photos/abcdefab-1234-5678-9abc-def012345678/file.jpg"}]}'
+        body = b'{"items":[{"libraryId":null,"originalPath":"/data/upload/abcdefab-1234-5678-9abc-def012345678/file.jpg"}]}'
         with self._patch_urlopen(body):
             result = _detect_docker_media_prefix("http://nas:2283", "k")
-        assert result == "/mnt/photos"
+        assert result == "/data"
 
     def test_returns_none_without_api_key(self):
         from immich_accelerator.__main__ import _detect_docker_media_prefix
@@ -383,13 +361,6 @@ class TestDetectDockerMediaPrefix:
         err = urllib.error.URLError("unreachable")
         with self._patch_urlopen(b"", raises=err):
             result = _detect_docker_media_prefix("http://down:2283", "k")
-        assert result is None
-
-    def test_returns_none_when_library_is_empty(self):
-        from immich_accelerator.__main__ import _detect_docker_media_prefix
-
-        with self._patch_urlopen(b'{"assets":{"items":[]}}'):
-            result = _detect_docker_media_prefix("http://nas:2283", "k")
         assert result is None
 
 

@@ -1205,21 +1205,30 @@ def _finalize_config(config: dict) -> None:
 
 
 def _detect_docker_media_prefix(base_url: str, api_key: str) -> str | None:
-    """Ask the remote Immich API for Docker's view of the media root.
+    """Detect Docker's IMMICH_MEDIA_LOCATION via the Immich API.
 
-    Split setups break when the native worker writes to a path that
-    doesn't match what Docker stores in Postgres (issue #19). We
-    detect Docker's prefix two ways:
+    This is the path where the Docker side writes user uploads —
+    NOT the path of any external library. Immich has two kinds of
+    libraries:
 
-      1. /api/libraries → first entry's importPaths[0]. Works even
-         on empty libraries and doesn't require any assets. Gives
-         the EXACT configured library root.
-      2. /api/search/metadata → first asset's originalPath, stripped
-         to the library root. Fallback if no libraries are defined
-         (uploads-only Immich).
+      UPLOAD library   — implicit, rooted at IMMICH_MEDIA_LOCATION,
+                         NOT returned by /api/libraries
+      EXTERNAL library — user-defined folders with importPaths[],
+                         returned by /api/libraries
 
-    Returns None if neither signal is available — caller treats that
-    as "don't know, don't block".
+    An earlier version of this probe used /api/libraries as the
+    primary signal. That always returned an EXTERNAL library path
+    (since upload libraries don't appear there), which is unrelated
+    to upload_mount and produced false positives on any install
+    with external libraries plus a correctly-configured upload root.
+
+    The only reliable way to find the upload library's root is to
+    parse an upload-library asset's originalPath. We filter for
+    `libraryId: null` so external-library assets are skipped.
+
+    Returns None if no upload-library assets exist yet (fresh
+    install with external libs only) — caller treats None as
+    "don't know, don't block".
     """
     import urllib.error
     import urllib.request
@@ -1227,29 +1236,22 @@ def _detect_docker_media_prefix(base_url: str, api_key: str) -> str | None:
     if not api_key:
         return None
 
-    headers = {"x-api-key": api_key, "Accept": "application/json"}
+    headers = {
+        "x-api-key": api_key,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
-    # 1. Libraries (preferred). Admin-scoped but any api key on the
-    #    owning user can see their own libraries.
+    # Ask /api/search/metadata for assets with no libraryId — those
+    # are upload-library assets (user uploaded via web UI or API).
+    # External-library assets always have a libraryId set, so this
+    # filter cleanly separates the two cases.
     try:
-        req = urllib.request.Request(f"{base_url}/api/libraries", headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            libs = json.loads(resp.read())
-        if isinstance(libs, list):
-            for lib in libs:
-                paths = lib.get("importPaths") or [] if isinstance(lib, dict) else []
-                if paths:
-                    return str(paths[0]).rstrip("/")
-    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, TimeoutError):
-        pass
-
-    # 2. Fall back to probing an uploaded asset's originalPath.
-    try:
-        body = json.dumps({"size": 1}).encode()
+        body = json.dumps({"size": 5, "isNotInAlbum": False}).encode()
         req = urllib.request.Request(
             f"{base_url}/api/search/metadata",
             data=body,
-            headers={**headers, "Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -1264,13 +1266,29 @@ def _detect_docker_media_prefix(base_url: str, api_key: str) -> str | None:
         items = data
 
     for asset in items:
-        original = asset.get("originalPath") if isinstance(asset, dict) else None
+        if not isinstance(asset, dict):
+            continue
+        # Skip external-library assets — we can't infer upload-root
+        # from them, and they're what caused the false positive in
+        # v1.4.1. libraryId is None/null/missing for upload assets.
+        if asset.get("libraryId"):
+            continue
+        original = asset.get("originalPath")
         if not original:
             continue
         parts = Path(original).parts
+        # Immich's upload path layout: <MEDIA_LOCATION>/upload/<userUUID>/<year>/<filename>
+        # The user UUID is a 36-char 4-dash string. Everything above
+        # that UUID is IMMICH_MEDIA_LOCATION/upload — strip the
+        # `upload` segment to get the media root.
         for i, p in enumerate(parts):
             if len(p) == 36 and p.count("-") == 4:
-                return str(Path(*parts[:i])) if i > 0 else None
+                before = parts[:i]
+                # Strip trailing "upload" if present
+                if before and before[-1] == "upload":
+                    before = before[:-1]
+                return str(Path(*before)) if before else None
+        # Fallback for non-standard layouts.
         if len(parts) >= 3:
             return str(Path(*parts[:-2]))
     return None

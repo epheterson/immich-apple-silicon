@@ -2,6 +2,9 @@
 
 ## 1.4.2 — 2026-04-13
 
+### Fixes
+- **Path-mismatch probe false positive (#19 follow-up)**: The v1.4.1 split-setup probe queried `/api/libraries` as its primary signal, but that endpoint only returns **external** libraries in Immich 2.7+ — the upload library (where web-UI uploads land) is implicit at `IMMICH_MEDIA_LOCATION` and doesn't appear there. Result: any install with an external library plus a correctly-set `upload_mount` got blocked at `immich-accelerator start` with a false "path mismatch" error. The probe now parses an upload-library asset's `originalPath` (filtering `libraryId: null`) and skips external-library assets entirely. If no upload assets exist yet, the check is skipped — nothing to compare against.
+
 ### Docs
 - **Split deployment clarity**: Reworked the Split deployment section of the README to lead with the one requirement everyone needs to get right — both machines see the same files at the same absolute paths via a shared filesystem (NFS/SMB). There is no HTTP transport of thumbnails between hosts; the worker reads/writes directly to disk. Surfaced because a v1.4.1 user interpreted "match paths" as string matching. Also dropped the long-stale v0.x and v1.2.x migration sections.
 
