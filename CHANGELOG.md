@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.2 — 2026-04-13
+
+### Docs
+- **Split deployment clarity**: Reworked the Split deployment section of the README to lead with the one requirement everyone needs to get right — both machines see the same files at the same absolute paths via a shared filesystem (NFS/SMB). There is no HTTP transport of thumbnails between hosts; the worker reads/writes directly to disk. Surfaced because a v1.4.1 user interpreted "match paths" as string matching. Also dropped the long-stale v0.x and v1.2.x migration sections.
+
+### Test infrastructure
+- **VM bootstrap script**: Fixed three edge cases that kept the tart-based E2E harness from running cleanly — trap composition bug that left stale VMs behind, stdin-race on heredoc-over-ssh that silently dropped pip install commands, and `brew update` network flakiness aborting bootstrap. The harness is now proven end-to-end against live Immich.
+
 ## 1.4.1 — 2026-04-12
 
 ### Fresh-install fixes

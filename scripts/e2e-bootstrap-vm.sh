@@ -59,10 +59,24 @@ if [ "$running" = "yes" ]; then
     exit 2
 fi
 
+# Generate a throwaway ed25519 key BEFORE starting the VM so the
+# single EXIT trap can always clean up both the key and the VM in
+# one place. Earlier bug: appending to an existing trap via
+# `trap -p` produced a malformed command string and crashed cleanup.
+KEY_FILE="/tmp/iac-bootstrap-key-$$"
+ssh-keygen -t ed25519 -N '' -f "$KEY_FILE" -q
+KEY_PUB=$(cat "$KEY_FILE.pub")
+
 log "Starting $BOOTSTRAP_VM (headless)..."
 tart run --no-graphics "$BOOTSTRAP_VM" &
 TART_PID=$!
-trap 'tart stop --timeout 5 "$BOOTSTRAP_VM" 2>/dev/null || true; kill $TART_PID 2>/dev/null || true' EXIT
+# One trap, one place. Order matters: stop VM → kill tart proc →
+# remove key files. Any step failing won't block the others.
+trap '
+    tart stop --timeout 5 "$BOOTSTRAP_VM" 2>/dev/null || true
+    kill $TART_PID 2>/dev/null || true
+    rm -f "$KEY_FILE" "$KEY_FILE.pub"
+' EXIT
 
 # Wait for VM IP
 log "Waiting for VM to boot and acquire IP..."
@@ -77,16 +91,6 @@ if [ -z "$VM_IP" ]; then
     exit 3
 fi
 log "VM IP: $VM_IP"
-
-# Generate a throwaway ed25519 key for this bootstrap run. Same
-# sshpass pty/stdin fragility as e2e-run.sh — we use the key for
-# every call after the initial password-auth install, which frees
-# us to use heredocs and any stdin redirection we want.
-KEY_FILE="/tmp/iac-bootstrap-key-$$"
-ssh-keygen -t ed25519 -N '' -f "$KEY_FILE" -q
-KEY_PUB=$(cat "$KEY_FILE.pub")
-KEY_TRAP_OLD=$(trap -p EXIT)
-trap "${KEY_TRAP_OLD#trap -- }; rm -f $KEY_FILE $KEY_FILE.pub" EXIT
 
 SSH_PW_OPTS=(
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
@@ -129,24 +133,51 @@ if ssh "${SSH_KEY_OPTS[@]}" "$VM_USER@$VM_IP" "test -f /Users/$VM_USER/.bootstra
     exit 0
 fi
 
-log "Installing Homebrew + python@3.11 + git + deps inside VM..."
-ssh "${SSH_KEY_OPTS[@]}" "$VM_USER@$VM_IP" 'bash -s' <<'INNER'
+log "Installing Homebrew + python@3.11 + deps inside VM..."
+# Write the bootstrap commands to a file on the VM first, then run
+# the file. Heredoc-over-ssh is fragile: brew install reads/discards
+# stdin during its parallel bottle downloads, which can eat or echo
+# later heredoc lines before bash -s ever executes them. The bug was
+# that `pip install fastapi uvicorn[standard]` showed up in the log
+# as LITERAL text instead of being executed — never installed.
+INNER_SCRIPT=$(mktemp -t iac-bootstrap-inner.XXXXXX)
+cat > "$INNER_SCRIPT" <<'INNER'
+#!/bin/bash
 set -euo pipefail
-if ! command -v brew >/dev/null; then
+# Skip brew's auto-update on every command — it flaky-fails on
+# transient network issues and aborts the bootstrap when set -e
+# is in effect. The cirruslabs base image is fresh enough that
+# we don't need an update to find bottles.
+export HOMEBREW_NO_AUTO_UPDATE=1
+export HOMEBREW_NO_INSTALL_CLEANUP=1
+export HOMEBREW_NO_ENV_HINTS=1
+if ! command -v brew >/dev/null 2>&1; then
     NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
     echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
 fi
 eval "$(/opt/homebrew/bin/brew shellenv)"
 brew install --quiet python@3.11 git vips node libpq
-# Pre-install dashboard deps into system python@3.11 so per-run
-# E2E tests don't hit PyPI (which has flaky DNS inside the VM).
-# Same package composition as ml/requirements.txt, so this is a
-# faithful proxy for what the Homebrew formula's ml venv ships.
+# Dashboard deps pre-installed so per-run E2E doesn't hit PyPI.
+# Same composition as ml/requirements.txt — faithful proxy for the
+# Homebrew formula's ml venv.
 /opt/homebrew/opt/python@3.11/bin/python3.11 -m pip install \
     --break-system-packages --quiet \
     fastapi 'uvicorn[standard]'
+# Verify install before writing the marker — fail loud if anything
+# didn't land where it should.
+/opt/homebrew/bin/python3.11 -c "import fastapi, uvicorn; print('bootstrap deps OK', fastapi.__version__, uvicorn.__version__)"
 touch ~/.bootstrapped
+echo "bootstrap inner script complete"
 INNER
+chmod +x "$INNER_SCRIPT"
+
+# scp the file, then run it with a plain ssh — no stdin piping.
+scp -i "$KEY_FILE" \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o IdentitiesOnly=yes \
+    "$INNER_SCRIPT" "$VM_USER@$VM_IP:/tmp/bootstrap-inner.sh"
+ssh "${SSH_KEY_OPTS[@]}" "$VM_USER@$VM_IP" "bash /tmp/bootstrap-inner.sh"
+rm -f "$INNER_SCRIPT"
 
 log "Stopping VM and saving snapshot..."
 ssh "${SSH_KEY_OPTS[@]}" "$VM_USER@$VM_IP" "sudo shutdown -h now" 2>/dev/null || true

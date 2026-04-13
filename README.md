@@ -93,15 +93,9 @@ Then: `docker compose up -d`
 
 ### Understanding path mapping
 
-The native worker and Docker must agree on file paths. Immich stores paths in Postgres — if Docker writes `/usr/src/app/upload/thumb.jpg` but the native worker looks for `/Users/you/immich/upload/thumb.jpg`, things break.
+Immich stores absolute file paths in Postgres. Docker and the native worker must resolve those paths to the same files. `IMMICH_MEDIA_LOCATION` is the lever: set it to the real host path (like `/Users/you/immich/upload`) and mount that same path inside Docker with `-v /Users/you/immich/upload:/Users/you/immich/upload`. Both sides now see the same bytes at the same path.
 
-The fix: `IMMICH_MEDIA_LOCATION` tells Immich where files live. Set it to the real host path (like `/Users/you/immich/upload`), and mount that same path in Docker (`-v /Users/you/immich/upload:/Users/you/immich/upload`). Now both sides see the same paths.
-
-**New installs:** Set this from the start. The setup command detects your upload directory and tells you exactly what to use.
-
-**Existing installs:** If you're changing from the Docker default (`/usr/src/app/upload`), Immich automatically rewrites all file paths in the database on the first restart with the new `IMMICH_MEDIA_LOCATION`. This is safe (it's Immich's own migration), but back up your database first.
-
-**External photo libraries:** If you imported photos from an external library (e.g., NAS mount), those paths are stored as-is from when Docker scanned them. If Docker saw them at `/mnt/photos/...`, that's what's in the DB. The native worker needs to see them at the same path. For same-machine setups, mount the library with the same path on both sides (like uploads). For cross-machine setups (NAS + Mac), this requires both machines to see the library at the same path — which may require NFS/SMB mounts that match.
+Setup detects your upload directory and tells you exactly what to use. For cross-machine setups see [Split deployment](#split-deployment-nas--mac-or-any-two-hosts) — the requirements are stricter.
 
 ### 3. Start the accelerator
 
@@ -163,51 +157,53 @@ In the Immich admin UI (Administration → Jobs), tune the per-queue concurrency
 
 Higher isn't always better — oversubscribing the CPU causes thrashing and actually reduces throughput.
 
-## Split deployment (NAS + Mac)
+## Split deployment (NAS + Mac, or any two hosts)
 
-For setups where Immich's Docker runs on a NAS and the Mac handles compute:
+### The one thing you have to get right
 
-1. **On the NAS**: Docker runs Immich server (API-only), Postgres, Redis. Expose Postgres and Redis ports (not just localhost).
-2. **On the Mac**: The accelerator runs the microservices worker and ML service natively.
+**Both machines need to see the same files at the same absolute paths, via a shared filesystem.** The native worker reads and writes directly to disk — there is no HTTP transport of thumbnails between machines. If the NAS mounts `/volume1/photos` and the Mac mounts that same share over SMB/NFS at `/Volumes/photos`, you now have two different absolute paths for the same bytes, and Immich's database will only know one of them.
+
+You need one absolute path that resolves to the same files on both sides. See "Two ways to get there" below.
+
+### Topology
+
+1. **On the NAS (or wherever Docker lives)**: Immich Docker runs server (API-only), Postgres, and Redis. Expose Postgres and Redis on the LAN (not just localhost).
+2. **On the Mac**: The accelerator runs the microservices worker and ML service. Setup pulls the Immich server directly from ghcr.io — no Docker required on the Mac.
 
 ```bash
-# Setup from the Mac, pointing at the NAS
 immich-accelerator setup --url http://nas:2283 --api-key YOUR_KEY
-
-# Or fully manual
-immich-accelerator setup --manual
 ```
 
-Docker is **not required on the Mac**. Setup downloads the Immich server directly from the container registry (ghcr.io) — no Docker, no SSH, no manual steps. Auto-updates work the same way: the watchdog checks the Immich API for version changes and downloads the new server automatically.
+### Two ways to get there
 
-**Path consistency**: Immich stores absolute file paths in Postgres. Both the NAS Docker container and the Mac native worker must resolve the same paths. There are two approaches:
+**Option A — match the Mac's path inside Docker** (recommended for new installs).
 
-**Option A: Match Mac paths in Docker (recommended for new installs)**
-
-Use the Mac's mount path inside Docker. If the Mac sees photos at `/Volumes/photos`:
+Mount your Mac's shared-filesystem path on both sides with the same absolute path. Say the Mac mounts the NAS share at `/Volumes/photos`:
 
 ```yaml
-# NAS docker-compose
+# NAS docker-compose — bind the storage to the same absolute path Docker uses
 volumes:
   - /volume1/photos:/Volumes/photos
 environment:
   - IMMICH_MEDIA_LOCATION=/Volumes/photos
 ```
 
-Docker writes `/Volumes/photos/...` in the database, which the Mac worker resolves directly.
+Docker writes `/Volumes/photos/...` to Postgres. The Mac worker opens the exact same path via its SMB/NFS mount. Same bytes, same path.
 
-**Option B: Match Docker paths on Mac (no Docker changes)**
+**Option B — match Docker's path on the Mac** (zero Docker changes).
 
-Use macOS [synthetic links](https://man.cx/synthetic.conf(5)) to create Docker's internal paths on the Mac. If Docker uses `/data` internally:
+Use a macOS [synthetic link](https://man.cx/synthetic.conf(5)) to make the Mac resolve Docker's internal path to your local mount:
 
 ```bash
-# /etc/synthetic.conf (or /etc/synthetic.d/immich-paths)
+# /etc/synthetic.d/immich-accelerator
 data	Volumes/photos/immich/library
 ```
 
-Reboot to activate. Now `/data` on the Mac resolves to your local mount, matching what Docker stores in the database. No `IMMICH_MEDIA_LOCATION` change needed.
+Reboot. Now `/data` on the Mac resolves to the SMB/NFS mount, matching what Docker already stores in the database. No `IMMICH_MEDIA_LOCATION` change needed.
 
-**Existing installs**: Changing `IMMICH_MEDIA_LOCATION` triggers Immich's built-in path migration on restart — it rewrites all file paths in the database. This is safe but back up your database first.
+### Changing IMMICH_MEDIA_LOCATION on an existing install
+
+Immich automatically rewrites all file paths in the database on restart when `IMMICH_MEDIA_LOCATION` changes. It's safe — **but back up your database first**.
 
 ## ML service
 
@@ -304,25 +300,6 @@ Fixed in v1.4.1. The OCI image extractor used to skip small layers that containe
 - Postgres exposed on `127.0.0.1:5432` (localhost only) by default
 - Redis exposed on `127.0.0.1:6379` (localhost only) by default
 - Dashboard binds on `0.0.0.0:8420` (LAN-accessible) — the Re-queue button triggers job processing via the Immich API. If you're on an untrusted network, don't run the dashboard or bind to localhost only
-
-## Migrating from v0.x
-
-If you were using the previous version with the custom thumbnail worker and ffmpeg proxy:
-
-1. Stop old services: `launchctl bootout gui/$(id -u) com.immich.thumbnail com.immich.ffmpeg-proxy`
-2. Remove old plists from `~/Library/LaunchAgents/`
-3. Remove `IMMICH_WORKERS_EXCLUDE` from your docker-compose (it never worked)
-4. Follow the Quick Start above
-
-## Migrating from v1.2.x
-
-The module was renamed from `accelerator` to `immich_accelerator` in v1.3.0:
-
-1. Stop services: `launchctl unload ~/Library/LaunchAgents/com.immich.accelerator.plist`
-2. Remove old plist: `rm ~/Library/LaunchAgents/com.immich.accelerator.plist`
-3. Re-run setup: `immich-accelerator setup` (re-installs launchd with correct module name)
-
-Your config (`~/.immich-accelerator/config.json`) is fully compatible — no changes needed.
 
 ## On agentic engineering
 
