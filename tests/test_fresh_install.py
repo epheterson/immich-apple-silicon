@@ -411,6 +411,71 @@ class TestWarnOnPathMismatch:
             assert not _warn_on_path_mismatch("http://x", "k", "/anywhere")
 
 
+class TestPgDumpShim:
+    """The JS shim rewrites Immich's hardcoded Linux pg_dump path to
+    the Homebrew libpq bin dir at runtime via `--require`. Immich's
+    source on disk is never touched — the README's 'unmodified'
+    invariant stays true."""
+
+    SHIM_PATH = REPO_ROOT / "immich_accelerator" / "hooks" / "pg_dump_shim.js"
+
+    def test_shim_file_exists(self):
+        assert self.SHIM_PATH.exists(), (
+            f"hook shim missing: {self.SHIM_PATH}. "
+            "cmd_start sets NODE_OPTIONS to require this file; if "
+            "it's absent the backup job will still fail with ENOENT."
+        )
+
+    def test_shim_is_referenced_by_cmd_start(self):
+        """cmd_start must pass the shim to the worker via NODE_OPTIONS.
+        Static check against __main__.py so the wiring can't silently
+        be removed in a refactor."""
+        src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()
+        assert "pg_dump_shim.js" in src
+        assert "NODE_OPTIONS" in src
+        assert "--require" in src
+
+    @pytest.mark.slow
+    def test_shim_rewrites_linux_path_via_node_require(self, tmp_path):
+        """Real end-to-end check: run node with --require against our
+        shim, then call child_process.spawn with the Linux postgres
+        path, confirm it rewrites to /opt/homebrew/opt/libpq/bin/.
+
+        Marked slow because it spawns node. Only runs on macOS with
+        node installed AND libpq present; skips otherwise."""
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        libpq_bin = Path("/opt/homebrew/opt/libpq/bin/pg_dump")
+        if not libpq_bin.exists():
+            pytest.skip("libpq not installed — brew install libpq")
+
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { spawn } = require('node:child_process');\n"
+            "const p = spawn('/usr/lib/postgresql/14/bin/pg_dump', ['--version']);\n"
+            "let out = '';\n"
+            "p.stdout.on('data', d => out += d);\n"
+            "p.on('exit', c => { console.log('exit=' + c + ' out=' + out.trim()); "
+            "process.exit(c); });\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, (
+            f"shim rewrite failed:\nstdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )
+        assert "pg_dump (PostgreSQL)" in result.stdout
+        # The shim writes its rewrite notice to stderr.
+        assert "postgres client interpose" in result.stderr
+
+
 class TestExternalLibraryValidation:
     """External-library importPaths must resolve on the Mac filesystem
     or the worker will 404 on those assets. Missing external paths

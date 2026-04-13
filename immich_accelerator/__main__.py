@@ -2170,6 +2170,23 @@ def cmd_start(args):
     if config.get("upload_mount"):
         worker_env["IMMICH_MEDIA_LOCATION"] = config["upload_mount"]
 
+    # pg_dump shim (issue #24): Immich hardcodes the Linux postgres
+    # client path `/usr/lib/postgresql/<ver>/bin/pg_dump` in its
+    # DatabaseBackupService. On macOS that path doesn't exist and
+    # there's no env-var escape hatch in the upstream code. Instead
+    # of patching Immich's source (which would break our "unmodified"
+    # invariant), we preload a tiny Node module via `--require` that
+    # monkey-patches child_process.spawn to rewrite that path to the
+    # Homebrew libpq bin dir at call time. Immich's JS on disk is
+    # never touched.
+    shim_path = Path(__file__).parent / "hooks" / "pg_dump_shim.js"
+    if shim_path.exists():
+        existing = worker_env.get("NODE_OPTIONS", "").strip()
+        require_arg = f"--require {shim_path}"
+        worker_env["NODE_OPTIONS"] = (
+            f"{existing} {require_arg}".strip() if existing else require_arg
+        )
+
     # /build link points to our build-data dir (set up during setup).
     # Required for Immich 2.7+ plugin WASM paths stored in the shared DB.
     build_data = DATA_DIR / "build-data"
