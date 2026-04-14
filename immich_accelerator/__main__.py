@@ -1246,6 +1246,15 @@ def _detect_docker_media_prefix(base_url: str, api_key: str) -> str | None:
     # are upload-library assets (user uploaded via web UI or API).
     # External-library assets always have a libraryId set, so this
     # filter cleanly separates the two cases.
+    #
+    # Note on size=5: we request 5 to give ourselves margin, but we
+    # filter client-side — Immich doesn't accept a libraryId=null
+    # filter in this endpoint. On pathological libraries where the
+    # first 5 results happen to all be external-library assets,
+    # we'll return None (silent "don't know"). That's a false
+    # negative (no block when one might have been correct) rather
+    # than a false positive, so it's safe — worst case the user
+    # discovers a mismatch at first upload instead of at setup.
     try:
         body = json.dumps({"size": 5, "isNotInAlbum": False}).encode()
         req = urllib.request.Request(
@@ -2179,10 +2188,15 @@ def cmd_start(args):
     # monkey-patches child_process.spawn to rewrite that path to the
     # Homebrew libpq bin dir at call time. Immich's JS on disk is
     # never touched.
+    # Node splits NODE_OPTIONS on whitespace, so any space in the
+    # shim path (possible for dev installs under `/Users/Eric Pheterson/…`
+    # style paths; brew Cellar paths are safe today) would silently
+    # drop the argument. Single-quote the path so Node parses it as
+    # one token.
     shim_path = Path(__file__).parent / "hooks" / "pg_dump_shim.js"
     if shim_path.exists():
         existing = worker_env.get("NODE_OPTIONS", "").strip()
-        require_arg = f"--require {shim_path}"
+        require_arg = f"--require '{shim_path}'"
         worker_env["NODE_OPTIONS"] = (
             f"{existing} {require_arg}".strip() if existing else require_arg
         )
