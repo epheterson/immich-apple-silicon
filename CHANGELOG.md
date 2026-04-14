@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.3 — 2026-04-14
+
+### Fixes
+- **NODE_OPTIONS shim path broken in v1.4.2 (#24 follow-up)**: The v1.4.2 commit that "polished" the pg_dump shim wrapping wrapped the path in single quotes, thinking Node would unquote them. Node doesn't — it splits `NODE_OPTIONS` on whitespace and takes the literal characters. The quotes became part of the filename and every worker start failed with `Cannot find module ''/opt/homebrew/Cellar/…/pg_dump_shim.js''`. Fix: backslash-escape spaces (which Node does honor) instead of quoting. Verified against a real v1.4.2 brew install on an M4 Mac — rewrite works, worker boots, no ENOENT.
+- **ORJSONResponse crash in ML service (#20 tail)**: The v1.3.4 commit dropped `orjson` from `ml/requirements.txt` with an incorrect commit message claiming "not imported by our code." `main.py` imports `ORJSONResponse` from `fastapi.responses` and uses it in 3 places, and FastAPI's `ORJSONResponse.render()` asserts `orjson is not None` at render time — every `/predict` request crashed with `AssertionError: orjson must be installed to use ORJSONResponse`. Fix: swap to stdlib-backed `JSONResponse`, keeping the `orjson` drop (which was correct — its wheel broke Homebrew's dylib fixup). Verified end-to-end: ml-test passes 4/4 on real CLIP + OCR requests with no orjson in the venv.
+
+### Regression guards (test coverage the v1.4.2 VM E2E didn't have)
+- Static check: `ml/src` uses `ORJSONResponse` only if `ml/requirements.txt` pins `orjson` — would have caught the v1.3.4 half-fix instantly.
+- Real-node integration: generate the exact `NODE_OPTIONS` string `cmd_start` builds, spawn `node --require` against a sentinel shim, assert it loads. Would have caught the v1.4.2 quoting bug before merge.
+- Static check: `cmd_start`'s shim-path escaping uses backslash form, not shell quoting.
+
 ## 1.4.2 — 2026-04-13
 
 ### Fixes
