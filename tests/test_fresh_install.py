@@ -270,9 +270,16 @@ class TestGhcrRetry:
 
 
 class TestDetectDockerMediaPrefix:
-    """The prefix detector strips the per-library UUID from a sample
-    asset's originalPath. Covers Immich's two response shapes (nested
-    under assets.items vs flat items list)."""
+    """The detector parses an upload-library asset's originalPath to
+    recover Docker's IMMICH_MEDIA_LOCATION. Upload-library assets have
+    libraryId=null; external-library assets get filtered out because
+    their paths don't reflect the upload root.
+
+    v1.4.1 shipped a version that picked external library importPaths
+    from /api/libraries, which false-positived on installs with
+    external libs plus a correctly-set upload_mount. This test class
+    guards against that regression.
+    """
 
     def _patch_urlopen(self, body, raises=None):
         response = MagicMock()
@@ -283,88 +290,59 @@ class TestDetectDockerMediaPrefix:
             return patch("urllib.request.urlopen", side_effect=raises)
         return patch("urllib.request.urlopen", return_value=response)
 
-    def test_prefers_libraries_import_paths(self):
-        """The primary signal is /api/libraries[*].importPaths[0]."""
+    def test_extracts_media_root_from_upload_asset(self):
+        """Upload-library assets have libraryId=null and the standard
+        layout <MEDIA_LOCATION>/upload/<userUUID>/<year>/<filename>."""
+        from immich_accelerator.__main__ import _detect_docker_media_prefix
+
+        body = b'{"assets":{"items":[{"libraryId":null,"originalPath":"/data/upload/c37f6663-c090-4262-bcf3-f91a642abcb4/2026/DSC.nef"}]}}'
+        with self._patch_urlopen(body):
+            result = _detect_docker_media_prefix("http://nas:2283", "fake-key")
+        assert result == "/data"
+
+    def test_skips_external_library_assets(self):
+        """External-library assets have libraryId set — they must be
+        skipped because their paths are library roots, not the
+        IMMICH_MEDIA_LOCATION upload root. This is the exact v1.4.1
+        regression that false-positived on issue #19's reporter."""
+        from immich_accelerator.__main__ import _detect_docker_media_prefix
+
+        body = b'{"assets":{"items":[{"libraryId":"ext-uuid","originalPath":"/external/library/some.jpg"}]}}'
+        with self._patch_urlopen(body):
+            result = _detect_docker_media_prefix("http://nas:2283", "k")
+        assert result is None
+
+    def test_mixed_results_prefers_upload_asset(self):
+        """If the response mixes external and upload assets, we find
+        and use the upload one (libraryId=null)."""
         from immich_accelerator.__main__ import _detect_docker_media_prefix
 
         body = (
-            b'[{"id":"lib1","name":"My Library","importPaths":["/mnt/photos/library"]}]'
+            b'{"assets":{"items":['
+            b'{"libraryId":"ext","originalPath":"/ext/library/a.jpg"},'
+            b'{"libraryId":null,"originalPath":"/data/upload/abcdefab-1234-5678-9abc-def012345678/2026/b.jpg"}'
+            b"]}}"
         )
         with self._patch_urlopen(body):
-            result = _detect_docker_media_prefix("http://nas:2283", "fake-key")
-        assert result == "/mnt/photos/library"
+            result = _detect_docker_media_prefix("http://nas:2283", "k")
+        assert result == "/data"
 
-    def test_libraries_strips_trailing_slash(self):
+    def test_returns_none_when_library_is_empty(self):
+        """No assets at all -> None (caller treats as 'don't know')."""
         from immich_accelerator.__main__ import _detect_docker_media_prefix
 
-        body = b'[{"importPaths":["/data/library/"]}]'
-        with self._patch_urlopen(body):
-            result = _detect_docker_media_prefix("http://x", "k")
-        assert result == "/data/library"
-
-    def test_libraries_skips_empty_import_paths(self):
-        """A library with no importPaths (upload-only) should not
-        produce a false detection — should fall back to metadata."""
-        import urllib.error
-
-        from immich_accelerator.__main__ import _detect_docker_media_prefix
-
-        def make_mock(body):
-            m = MagicMock()
-            m.__enter__ = lambda s: s
-            m.__exit__ = lambda s, *a: None
-            m.read.return_value = body
-            return m
-
-        responses: list = [make_mock(b"[]"), urllib.error.URLError("no assets")]
-        idx = {"i": 0}
-
-        def side_effect(req, timeout=None):
-            r = responses[idx["i"]]
-            idx["i"] += 1
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        with patch("urllib.request.urlopen", side_effect=side_effect):
-            result = _detect_docker_media_prefix("http://x", "k")
+        with self._patch_urlopen(b'{"assets":{"items":[]}}'):
+            result = _detect_docker_media_prefix("http://nas:2283", "k")
         assert result is None
 
-    def test_extracts_prefix_from_uuid_library_path(self):
-        """Fallback: if /api/libraries is empty, parse an asset's
-        originalPath."""
-        from immich_accelerator.__main__ import _detect_docker_media_prefix
-
-        # First call: libraries (empty). Second: search/metadata (asset).
-        idx = {"i": 0}
-        responses = [
-            b"[]",
-            b'{"assets":{"items":[{"originalPath":"/data/library/c37f6663-c090-4262-bcf3-f91a642abcb4/2026/DSC.nef"}]}}',
-        ]
-
-        def make_mock(body):
-            m = MagicMock()
-            m.__enter__ = lambda s: s
-            m.__exit__ = lambda s, *a: None
-            m.read.return_value = body
-            return m
-
-        def side_effect(req, timeout=None):
-            r = make_mock(responses[idx["i"]])
-            idx["i"] += 1
-            return r
-
-        with patch("urllib.request.urlopen", side_effect=side_effect):
-            result = _detect_docker_media_prefix("http://nas:2283", "fake-key")
-        assert result == "/data/library"
-
     def test_handles_flat_items_response(self):
+        """Older Immich versions return a flat items list."""
         from immich_accelerator.__main__ import _detect_docker_media_prefix
 
-        body = b'{"items":[{"originalPath":"/mnt/photos/abcdefab-1234-5678-9abc-def012345678/file.jpg"}]}'
+        body = b'{"items":[{"libraryId":null,"originalPath":"/data/upload/abcdefab-1234-5678-9abc-def012345678/file.jpg"}]}'
         with self._patch_urlopen(body):
             result = _detect_docker_media_prefix("http://nas:2283", "k")
-        assert result == "/mnt/photos"
+        assert result == "/data"
 
     def test_returns_none_without_api_key(self):
         from immich_accelerator.__main__ import _detect_docker_media_prefix
@@ -383,13 +361,6 @@ class TestDetectDockerMediaPrefix:
         err = urllib.error.URLError("unreachable")
         with self._patch_urlopen(b"", raises=err):
             result = _detect_docker_media_prefix("http://down:2283", "k")
-        assert result is None
-
-    def test_returns_none_when_library_is_empty(self):
-        from immich_accelerator.__main__ import _detect_docker_media_prefix
-
-        with self._patch_urlopen(b'{"assets":{"items":[]}}'):
-            result = _detect_docker_media_prefix("http://nas:2283", "k")
         assert result is None
 
 
@@ -433,8 +404,153 @@ class TestWarnOnPathMismatch:
         with patch(
             "immich_accelerator.__main__._detect_docker_media_prefix",
             return_value=None,
+        ), patch(
+            "immich_accelerator.__main__._fetch_external_libraries",
+            return_value=[],
         ):
             assert not _warn_on_path_mismatch("http://x", "k", "/anywhere")
+
+
+class TestPgDumpShim:
+    """The JS shim rewrites Immich's hardcoded Linux pg_dump path to
+    the Homebrew libpq bin dir at runtime via `--require`. Immich's
+    source on disk is never touched — the README's 'unmodified'
+    invariant stays true."""
+
+    SHIM_PATH = REPO_ROOT / "immich_accelerator" / "hooks" / "pg_dump_shim.js"
+
+    def test_shim_file_exists(self):
+        assert self.SHIM_PATH.exists(), (
+            f"hook shim missing: {self.SHIM_PATH}. "
+            "cmd_start sets NODE_OPTIONS to require this file; if "
+            "it's absent the backup job will still fail with ENOENT."
+        )
+
+    def test_shim_is_referenced_by_cmd_start(self):
+        """cmd_start must pass the shim to the worker via NODE_OPTIONS.
+        Static check against __main__.py so the wiring can't silently
+        be removed in a refactor."""
+        src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()
+        assert "pg_dump_shim.js" in src
+        assert "NODE_OPTIONS" in src
+        assert "--require" in src
+
+    @pytest.mark.slow
+    def test_shim_rewrites_linux_path_via_node_require(self, tmp_path):
+        """Real end-to-end check: run node with --require against our
+        shim, then call child_process.spawn with the Linux postgres
+        path, confirm it rewrites to /opt/homebrew/opt/libpq/bin/.
+
+        Marked slow because it spawns node. Only runs on macOS with
+        node installed AND libpq present; skips otherwise."""
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        libpq_bin = Path("/opt/homebrew/opt/libpq/bin/pg_dump")
+        if not libpq_bin.exists():
+            pytest.skip("libpq not installed — brew install libpq")
+
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { spawn } = require('node:child_process');\n"
+            "const p = spawn('/usr/lib/postgresql/14/bin/pg_dump', ['--version']);\n"
+            "let out = '';\n"
+            "p.stdout.on('data', d => out += d);\n"
+            "p.on('exit', c => { console.log('exit=' + c + ' out=' + out.trim()); "
+            "process.exit(c); });\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, (
+            f"shim rewrite failed:\nstdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )
+        assert "pg_dump (PostgreSQL)" in result.stdout
+        # The shim writes its rewrite notice to stderr.
+        assert "postgres client interpose" in result.stderr
+
+
+class TestExternalLibraryValidation:
+    """External-library importPaths must resolve on the Mac filesystem
+    or the worker will 404 on those assets. Missing external paths
+    are NON-FATAL — they just produce warnings. The worker can still
+    process upload and non-missing libraries."""
+
+    def test_missing_external_libs_warn_but_dont_block(self, tmp_path, caplog):
+        import logging
+
+        from immich_accelerator.__main__ import _warn_on_path_mismatch
+
+        missing = "/definitely-not-a-real-mount-xyz-test"
+        libs = [
+            {"name": "NAS Photos", "importPaths": [missing]},
+            {"name": "Other", "importPaths": ["/another/missing/path-xyz"]},
+        ]
+        with patch(
+            "immich_accelerator.__main__._detect_docker_media_prefix",
+            return_value=None,
+        ), patch(
+            "immich_accelerator.__main__._fetch_external_libraries",
+            return_value=libs,
+        ), caplog.at_level(
+            logging.WARNING
+        ):
+            result = _warn_on_path_mismatch("http://x", "k", "/data")
+
+        assert result is False, "missing external libs must not block start"
+        joined = "\n".join(caplog.messages)
+        assert "NAS Photos" in joined
+        assert missing in joined
+        assert "not accessible" in joined.lower()
+
+    def test_existing_external_libs_produce_no_warning(self, tmp_path, caplog):
+        import logging
+
+        from immich_accelerator.__main__ import _warn_on_path_mismatch
+
+        # tmp_path always exists — use it as a library that IS accessible.
+        libs = [{"name": "Local", "importPaths": [str(tmp_path)]}]
+        with patch(
+            "immich_accelerator.__main__._detect_docker_media_prefix",
+            return_value=None,
+        ), patch(
+            "immich_accelerator.__main__._fetch_external_libraries",
+            return_value=libs,
+        ), caplog.at_level(
+            logging.WARNING
+        ):
+            result = _warn_on_path_mismatch("http://x", "k", "/data")
+
+        assert result is False
+        joined = "\n".join(caplog.messages)
+        assert "not accessible" not in joined.lower()
+
+    def test_upload_mismatch_is_fatal_even_when_external_libs_missing(self, caplog):
+        import logging
+
+        from immich_accelerator.__main__ import _warn_on_path_mismatch
+
+        with patch(
+            "immich_accelerator.__main__._detect_docker_media_prefix",
+            return_value="/real-docker-upload-root",
+        ), patch(
+            "immich_accelerator.__main__._fetch_external_libraries",
+            return_value=[{"name": "Missing", "importPaths": ["/does-not-exist-here"]}],
+        ), caplog.at_level(
+            logging.DEBUG
+        ):
+            result = _warn_on_path_mismatch("http://x", "k", "/wrong-mount")
+
+        assert result is True, "upload mismatch is fatal regardless of extlibs"
+        joined = "\n".join(caplog.messages)
+        assert "Upload path mismatch" in joined
+        assert "Missing" in joined  # external warning still appears
 
 
 # --- Brew-install detection (plist + uninstall safety) -----------------

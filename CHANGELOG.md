@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.2 — 2026-04-13
+
+### Fixes
+- **Path-mismatch probe false positive (#19 follow-up)**: The v1.4.1 split-setup probe queried `/api/libraries` as its primary signal, but that endpoint only returns **external** libraries in Immich 2.7+ — the upload library (where web-UI uploads land) is implicit at `IMMICH_MEDIA_LOCATION` and doesn't appear there. Result: any install with an external library plus a correctly-set `upload_mount` got blocked at `immich-accelerator start` with a false "path mismatch" error. The probe now parses an upload-library asset's `originalPath` (filtering `libraryId: null`) and skips external-library assets entirely. If no upload assets exist yet, the check is skipped — nothing to compare against.
+- **External library path validation**: The probe now also checks every external library's `importPath` against the Mac filesystem. Missing paths produce a non-fatal warning per library with the library name and guidance to mount or synthetic-link them. Upload-library mismatch remains fatal (thumbnails WILL 404), external-library inaccessibility is advisory (worker can still process uploads + any libraries whose paths do resolve).
+- **pg_dump ENOENT on database backup (#24)**: Immich's `DatabaseBackupService` hardcodes `/usr/lib/postgresql/${version}/bin/pg_dump` in its dist, and on macOS that path doesn't exist, so the native microservices worker fails every backup cycle with ENOENT. `/usr/lib/` is SIP-protected and there's no env-var escape hatch in Immich's code. Fix: a tiny Node runtime shim (`immich_accelerator/hooks/pg_dump_shim.js`) that monkey-patches `child_process.spawn`/`spawnSync`/`execFile` to rewrite the Linux postgres client path to `/opt/homebrew/opt/libpq/bin/` at call time. The shim is preloaded via `NODE_OPTIONS=--require …` when we launch the worker. **Immich's JS source on disk is never touched** — the same interposition pattern we already use for the ffmpeg wrapper, applied at the Node module layer. Verified end-to-end on a real Mac with node + libpq 18.3.
+
+### Docs
+- **Split deployment clarity**: Reworked the Split deployment section of the README to lead with the one requirement everyone needs to get right — both machines see the same files at the same absolute paths via a shared filesystem (NFS/SMB). There is no HTTP transport of thumbnails between hosts; the worker reads/writes directly to disk. Surfaced because a v1.4.1 user interpreted "match paths" as string matching. Also dropped the long-stale v0.x and v1.2.x migration sections.
+
+### Test infrastructure
+- **VM bootstrap script**: Fixed three edge cases that kept the tart-based E2E harness from running cleanly — trap composition bug that left stale VMs behind, stdin-race on heredoc-over-ssh that silently dropped pip install commands, and `brew update` network flakiness aborting bootstrap. The harness is now proven end-to-end against live Immich.
+
 ## 1.4.1 — 2026-04-12
 
 ### Fresh-install fixes

@@ -1205,21 +1205,30 @@ def _finalize_config(config: dict) -> None:
 
 
 def _detect_docker_media_prefix(base_url: str, api_key: str) -> str | None:
-    """Ask the remote Immich API for Docker's view of the media root.
+    """Detect Docker's IMMICH_MEDIA_LOCATION via the Immich API.
 
-    Split setups break when the native worker writes to a path that
-    doesn't match what Docker stores in Postgres (issue #19). We
-    detect Docker's prefix two ways:
+    This is the path where the Docker side writes user uploads —
+    NOT the path of any external library. Immich has two kinds of
+    libraries:
 
-      1. /api/libraries → first entry's importPaths[0]. Works even
-         on empty libraries and doesn't require any assets. Gives
-         the EXACT configured library root.
-      2. /api/search/metadata → first asset's originalPath, stripped
-         to the library root. Fallback if no libraries are defined
-         (uploads-only Immich).
+      UPLOAD library   — implicit, rooted at IMMICH_MEDIA_LOCATION,
+                         NOT returned by /api/libraries
+      EXTERNAL library — user-defined folders with importPaths[],
+                         returned by /api/libraries
 
-    Returns None if neither signal is available — caller treats that
-    as "don't know, don't block".
+    An earlier version of this probe used /api/libraries as the
+    primary signal. That always returned an EXTERNAL library path
+    (since upload libraries don't appear there), which is unrelated
+    to upload_mount and produced false positives on any install
+    with external libraries plus a correctly-configured upload root.
+
+    The only reliable way to find the upload library's root is to
+    parse an upload-library asset's originalPath. We filter for
+    `libraryId: null` so external-library assets are skipped.
+
+    Returns None if no upload-library assets exist yet (fresh
+    install with external libs only) — caller treats None as
+    "don't know, don't block".
     """
     import urllib.error
     import urllib.request
@@ -1227,29 +1236,31 @@ def _detect_docker_media_prefix(base_url: str, api_key: str) -> str | None:
     if not api_key:
         return None
 
-    headers = {"x-api-key": api_key, "Accept": "application/json"}
+    headers = {
+        "x-api-key": api_key,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
-    # 1. Libraries (preferred). Admin-scoped but any api key on the
-    #    owning user can see their own libraries.
+    # Ask /api/search/metadata for assets with no libraryId — those
+    # are upload-library assets (user uploaded via web UI or API).
+    # External-library assets always have a libraryId set, so this
+    # filter cleanly separates the two cases.
+    #
+    # Note on size=5: we request 5 to give ourselves margin, but we
+    # filter client-side — Immich doesn't accept a libraryId=null
+    # filter in this endpoint. On pathological libraries where the
+    # first 5 results happen to all be external-library assets,
+    # we'll return None (silent "don't know"). That's a false
+    # negative (no block when one might have been correct) rather
+    # than a false positive, so it's safe — worst case the user
+    # discovers a mismatch at first upload instead of at setup.
     try:
-        req = urllib.request.Request(f"{base_url}/api/libraries", headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            libs = json.loads(resp.read())
-        if isinstance(libs, list):
-            for lib in libs:
-                paths = lib.get("importPaths") or [] if isinstance(lib, dict) else []
-                if paths:
-                    return str(paths[0]).rstrip("/")
-    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, TimeoutError):
-        pass
-
-    # 2. Fall back to probing an uploaded asset's originalPath.
-    try:
-        body = json.dumps({"size": 1}).encode()
+        body = json.dumps({"size": 5, "isNotInAlbum": False}).encode()
         req = urllib.request.Request(
             f"{base_url}/api/search/metadata",
             data=body,
-            headers={**headers, "Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -1264,67 +1275,139 @@ def _detect_docker_media_prefix(base_url: str, api_key: str) -> str | None:
         items = data
 
     for asset in items:
-        original = asset.get("originalPath") if isinstance(asset, dict) else None
+        if not isinstance(asset, dict):
+            continue
+        # Skip external-library assets — we can't infer upload-root
+        # from them, and they're what caused the false positive in
+        # v1.4.1. libraryId is None/null/missing for upload assets.
+        if asset.get("libraryId"):
+            continue
+        original = asset.get("originalPath")
         if not original:
             continue
         parts = Path(original).parts
+        # Immich's upload path layout: <MEDIA_LOCATION>/upload/<userUUID>/<year>/<filename>
+        # The user UUID is a 36-char 4-dash string. Everything above
+        # that UUID is IMMICH_MEDIA_LOCATION/upload — strip the
+        # `upload` segment to get the media root.
         for i, p in enumerate(parts):
             if len(p) == 36 and p.count("-") == 4:
-                return str(Path(*parts[:i])) if i > 0 else None
+                before = parts[:i]
+                # Strip trailing "upload" if present
+                if before and before[-1] == "upload":
+                    before = before[:-1]
+                return str(Path(*before)) if before else None
+        # Fallback for non-standard layouts.
         if len(parts) >= 3:
             return str(Path(*parts[:-2]))
     return None
 
 
-def _warn_on_path_mismatch(immich_url: str, api_key: str, upload_mount: str) -> bool:
-    """Compare Docker's media prefix against upload_mount. Returns
-    True if a real mismatch was detected (so callers can error out),
-    False if no mismatch or the probe couldn't determine an answer.
-    Always logs a clear warning/error with actionable instructions.
+def _fetch_external_libraries(base_url: str, api_key: str) -> list[dict]:
+    """Return the list of external-library dicts from /api/libraries.
+
+    Immich's /api/libraries only includes EXTERNAL libraries — the
+    upload library is implicit at IMMICH_MEDIA_LOCATION. Each entry
+    has `name` and `importPaths`.
     """
+    import urllib.error
+    import urllib.request
+
+    if not api_key:
+        return []
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/api/libraries",
+            headers={"x-api-key": api_key, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        if isinstance(data, list):
+            return [lib for lib in data if isinstance(lib, dict)]
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, TimeoutError):
+        pass
+    return []
+
+
+def _warn_on_path_mismatch(immich_url: str, api_key: str, upload_mount: str) -> bool:
+    """Validate that Docker-side paths resolve on this Mac.
+
+    Two classes of check:
+      (a) Upload library root — parsed from an upload asset's
+          originalPath. Must match `upload_mount`. A real mismatch
+          is FATAL and the caller should refuse to start — thumbnails
+          will 404 for every web-UI upload.
+      (b) External library importPaths — must exist on the local
+          filesystem. Any missing path is a WARNING (not fatal):
+          the worker can still process uploads and other libraries;
+          it will just fail when it tries to touch the missing one.
+
+    Returns True only for fatal (a) cases so the caller can block.
+    Logs actionable guidance for both (a) and (b).
+    """
+    has_fatal = False
+
+    # --- (a) upload root ---
     detected = _detect_docker_media_prefix(immich_url, api_key)
-    if not detected:
-        return False
+    if detected:
+        detected_norm = detected.rstrip("/")
+        mount_norm = upload_mount.rstrip("/")
+        # upload_mount being a parent of detected is also fine
+        # (e.g. upload_mount=/data matching detected /data/library).
+        compatible = detected_norm == mount_norm or detected_norm.startswith(
+            mount_norm + "/"
+        )
+        if not compatible:
+            has_fatal = True
+            log.error("")
+            log.error("⚠  Upload path mismatch — thumbnails will 404")
+            log.error("")
+            log.error("   Docker Immich stores uploads under: %s", detected_norm)
+            log.error("   Your upload_mount is set to:        %s", mount_norm)
+            log.error("")
+            log.error("   Two ways to fix this (see README 'Split deployment'):")
+            log.error("")
+            log.error("     A. Reconfigure Docker's IMMICH_MEDIA_LOCATION to:")
+            log.error("          %s", mount_norm)
+            log.error("")
+            log.error("     B. Create a synthetic link so the Mac sees Docker's path:")
+            log.error(
+                "          echo '%s\\t%s' | sudo tee -a /etc/synthetic.d/immich-accelerator",
+                detected_norm.lstrip("/"),
+                mount_norm.lstrip("/"),
+            )
+            log.error(
+                "        Reboot, then re-run setup with upload_mount=%s", detected_norm
+            )
+            log.error("")
 
-    # Normalize both paths for comparison — strip trailing slashes.
-    detected_norm = detected.rstrip("/")
-    mount_norm = upload_mount.rstrip("/")
-    if detected_norm == mount_norm:
-        return False
-    # Also allow upload_mount being a suffix-compatible mount (e.g.
-    # /data/library vs /data): if upload_mount is a parent of detected,
-    # that's actually correct and the worker will write into the right
-    # sub-path.
-    if detected_norm.startswith(mount_norm + "/"):
-        return False
+    # --- (b) external library paths ---
+    missing_libs = []
+    for lib in _fetch_external_libraries(immich_url, api_key):
+        name = lib.get("name", "(unnamed)")
+        for p in lib.get("importPaths", []) or []:
+            if not isinstance(p, str) or not p:
+                continue
+            if not Path(p).exists():
+                missing_libs.append((name, p))
 
-    log.error("")
-    log.error("⚠  Path mismatch detected — split setup will 404 thumbnails!")
-    log.error("")
-    log.error("   Docker Immich stores paths under:   %s", detected_norm)
-    log.error("   Your upload_mount is set to:        %s", mount_norm)
-    log.error("")
-    log.error("   The native worker will write thumbnails to YOUR mount, but the")
-    log.error("   Docker API will look for them under DOCKER'S path and 404.")
-    log.error("")
-    log.error("   Two ways to fix this (pick one — see README 'Split deployment'):")
-    log.error("")
-    log.error("     A. Reconfigure Docker's IMMICH_MEDIA_LOCATION to match:")
-    log.error(
-        "          services.immich-server.environment.IMMICH_MEDIA_LOCATION=%s",
-        mount_norm,
-    )
-    log.error("        Then restart the Docker stack.")
-    log.error("")
-    log.error("     B. Create a macOS synthetic link so your Mac sees the same path:")
-    log.error(
-        "          echo '%s\\t%s' | sudo tee -a /etc/synthetic.d/immich-accelerator",
-        detected_norm.lstrip("/"),
-        mount_norm.lstrip("/"),
-    )
-    log.error("        Reboot, then re-run setup with upload_mount=%s", detected_norm)
-    log.error("")
-    return True
+    if missing_libs:
+        log.warning("")
+        log.warning(
+            "⚠  External library paths not accessible on this Mac (%d):",
+            len(missing_libs),
+        )
+        for name, p in missing_libs:
+            log.warning("     %r → %s", name, p)
+        log.warning("")
+        log.warning(
+            "   The worker will fail when processing assets from these libraries."
+        )
+        log.warning("   Mount each path on this Mac at the same absolute path, or add")
+        log.warning("   a synthetic link so the Mac resolves it to your local mount.")
+        log.warning("")
+
+    return has_fatal
 
 
 def _query_immich_api(base_url: str, api_key: str) -> dict:
@@ -2095,6 +2178,28 @@ def cmd_start(args):
 
     if config.get("upload_mount"):
         worker_env["IMMICH_MEDIA_LOCATION"] = config["upload_mount"]
+
+    # pg_dump shim (issue #24): Immich hardcodes the Linux postgres
+    # client path `/usr/lib/postgresql/<ver>/bin/pg_dump` in its
+    # DatabaseBackupService. On macOS that path doesn't exist and
+    # there's no env-var escape hatch in the upstream code. Instead
+    # of patching Immich's source (which would break our "unmodified"
+    # invariant), we preload a tiny Node module via `--require` that
+    # monkey-patches child_process.spawn to rewrite that path to the
+    # Homebrew libpq bin dir at call time. Immich's JS on disk is
+    # never touched.
+    # Node splits NODE_OPTIONS on whitespace, so any space in the
+    # shim path (possible for dev installs under `/Users/Eric Pheterson/…`
+    # style paths; brew Cellar paths are safe today) would silently
+    # drop the argument. Single-quote the path so Node parses it as
+    # one token.
+    shim_path = Path(__file__).parent / "hooks" / "pg_dump_shim.js"
+    if shim_path.exists():
+        existing = worker_env.get("NODE_OPTIONS", "").strip()
+        require_arg = f"--require '{shim_path}'"
+        worker_env["NODE_OPTIONS"] = (
+            f"{existing} {require_arg}".strip() if existing else require_arg
+        )
 
     # /build link points to our build-data dir (set up during setup).
     # Required for Immich 2.7+ plugin WASM paths stored in the shared DB.
