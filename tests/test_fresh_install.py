@@ -20,7 +20,15 @@ import pytest
 
 from unittest.mock import patch, MagicMock
 
-from immich_accelerator.__main__ import _has_everything, _needs_core_plugin
+from immich_accelerator.__main__ import (
+    SUPPORTED_NODE_MAJORS,
+    _check_node_engines_compat,
+    _has_everything,
+    _needs_core_plugin,
+    _node_major_version,
+    _verify_sharp_loads,
+    find_node,
+)
 
 REPO_ROOT = Path(__file__).parent.parent
 
@@ -206,9 +214,12 @@ class TestGhcrRetry:
         err_429 = self._make_http_error(429, {"Retry-After": "1"})
         ok_resp = MagicMock(name="ok")
 
-        with patch(
-            "urllib.request.urlopen", side_effect=[err_429, ok_resp]
-        ) as mock_urlopen, patch("time.sleep") as mock_sleep:
+        with (
+            patch(
+                "urllib.request.urlopen", side_effect=[err_429, ok_resp]
+            ) as mock_urlopen,
+            patch("time.sleep") as mock_sleep,
+        ):
             result = _ghcr_urlopen_with_retry(MagicMock(), timeout=5)
 
         assert result is ok_resp
@@ -223,8 +234,9 @@ class TestGhcrRetry:
         err_503 = self._make_http_error(503)
         ok_resp = MagicMock()
 
-        with patch("urllib.request.urlopen", side_effect=[err_503, ok_resp]), patch(
-            "time.sleep"
+        with (
+            patch("urllib.request.urlopen", side_effect=[err_503, ok_resp]),
+            patch("time.sleep"),
         ):
             result = _ghcr_urlopen_with_retry(MagicMock(), timeout=5)
         assert result is ok_resp
@@ -236,9 +248,10 @@ class TestGhcrRetry:
 
         err_404 = self._make_http_error(404)
 
-        with patch("urllib.request.urlopen", side_effect=err_404), patch(
-            "time.sleep"
-        ) as mock_sleep:
+        with (
+            patch("urllib.request.urlopen", side_effect=err_404),
+            patch("time.sleep") as mock_sleep,
+        ):
             with pytest.raises(urllib.error.HTTPError) as excinfo:
                 _ghcr_urlopen_with_retry(MagicMock(), timeout=5)
 
@@ -252,10 +265,13 @@ class TestGhcrRetry:
 
         err_429 = self._make_http_error(429)
 
-        with patch(
-            "urllib.request.urlopen",
-            side_effect=[err_429, err_429, err_429, err_429],
-        ) as mock_urlopen, patch("time.sleep"):
+        with (
+            patch(
+                "urllib.request.urlopen",
+                side_effect=[err_429, err_429, err_429, err_429],
+            ) as mock_urlopen,
+            patch("time.sleep"),
+        ):
             with pytest.raises(urllib.error.HTTPError):
                 _ghcr_urlopen_with_retry(MagicMock(), timeout=5, max_attempts=4)
         assert mock_urlopen.call_count == 4
@@ -401,12 +417,15 @@ class TestWarnOnPathMismatch:
         just don't know. Caller gets False (no mismatch detected)."""
         from immich_accelerator.__main__ import _warn_on_path_mismatch
 
-        with patch(
-            "immich_accelerator.__main__._detect_docker_media_prefix",
-            return_value=None,
-        ), patch(
-            "immich_accelerator.__main__._fetch_external_libraries",
-            return_value=[],
+        with (
+            patch(
+                "immich_accelerator.__main__._detect_docker_media_prefix",
+                return_value=None,
+            ),
+            patch(
+                "immich_accelerator.__main__._fetch_external_libraries",
+                return_value=[],
+            ),
         ):
             assert not _warn_on_path_mismatch("http://x", "k", "/anywhere")
 
@@ -651,14 +670,16 @@ class TestExternalLibraryValidation:
             {"name": "NAS Photos", "importPaths": [missing]},
             {"name": "Other", "importPaths": ["/another/missing/path-xyz"]},
         ]
-        with patch(
-            "immich_accelerator.__main__._detect_docker_media_prefix",
-            return_value=None,
-        ), patch(
-            "immich_accelerator.__main__._fetch_external_libraries",
-            return_value=libs,
-        ), caplog.at_level(
-            logging.WARNING
+        with (
+            patch(
+                "immich_accelerator.__main__._detect_docker_media_prefix",
+                return_value=None,
+            ),
+            patch(
+                "immich_accelerator.__main__._fetch_external_libraries",
+                return_value=libs,
+            ),
+            caplog.at_level(logging.WARNING),
         ):
             result = _warn_on_path_mismatch("http://x", "k", "/data")
 
@@ -675,14 +696,16 @@ class TestExternalLibraryValidation:
 
         # tmp_path always exists — use it as a library that IS accessible.
         libs = [{"name": "Local", "importPaths": [str(tmp_path)]}]
-        with patch(
-            "immich_accelerator.__main__._detect_docker_media_prefix",
-            return_value=None,
-        ), patch(
-            "immich_accelerator.__main__._fetch_external_libraries",
-            return_value=libs,
-        ), caplog.at_level(
-            logging.WARNING
+        with (
+            patch(
+                "immich_accelerator.__main__._detect_docker_media_prefix",
+                return_value=None,
+            ),
+            patch(
+                "immich_accelerator.__main__._fetch_external_libraries",
+                return_value=libs,
+            ),
+            caplog.at_level(logging.WARNING),
         ):
             result = _warn_on_path_mismatch("http://x", "k", "/data")
 
@@ -695,14 +718,18 @@ class TestExternalLibraryValidation:
 
         from immich_accelerator.__main__ import _warn_on_path_mismatch
 
-        with patch(
-            "immich_accelerator.__main__._detect_docker_media_prefix",
-            return_value="/real-docker-upload-root",
-        ), patch(
-            "immich_accelerator.__main__._fetch_external_libraries",
-            return_value=[{"name": "Missing", "importPaths": ["/does-not-exist-here"]}],
-        ), caplog.at_level(
-            logging.DEBUG
+        with (
+            patch(
+                "immich_accelerator.__main__._detect_docker_media_prefix",
+                return_value="/real-docker-upload-root",
+            ),
+            patch(
+                "immich_accelerator.__main__._fetch_external_libraries",
+                return_value=[
+                    {"name": "Missing", "importPaths": ["/does-not-exist-here"]}
+                ],
+            ),
+            caplog.at_level(logging.DEBUG),
         ):
             result = _warn_on_path_mismatch("http://x", "k", "/wrong-mount")
 
@@ -750,6 +777,157 @@ class TestBrewInstallDetection:
             "Both _finalize_config and cmd_uninstall must detect brew "
             "installs and avoid touching Cellar-owned files."
         )
+
+
+class TestNodeVersionPreflight:
+    """Regression guards for the Sharp-on-node-25 bug class.
+
+    v1.4.x shipped with `depends_on "node"` in the Homebrew formula
+    and `find_node()` falling back to `brew install node`. Both pull
+    Homebrew's default node (25.x as of Apr 2026), which breaks
+    sharp@0.34.5 native addons with NODE_MODULE_VERSION mismatches.
+    The worker crashes mid-Nest-bootstrap at `require('sharp')` with
+    a stack trace that looks like an Immich bug.
+
+    These tests lock in the fix so the next regression is caught at
+    PR time instead of in the wild.
+    """
+
+    def test_supported_majors_includes_22(self):
+        # node@22 is the keg-only LTS we depend_on in the formula.
+        # If we ever drop 22, the formula must be updated in lockstep.
+        assert 22 in SUPPORTED_NODE_MAJORS
+
+    def test_supported_majors_excludes_25(self):
+        # The whole point of this module-level constant is to refuse
+        # node 25+. If someone accidentally adds it here they've
+        # defeated the guard.
+        assert 25 not in SUPPORTED_NODE_MAJORS
+        assert 26 not in SUPPORTED_NODE_MAJORS
+
+    def test_node_major_version_parses_real_output(self):
+        # Empirical — if node isn't installed, skip. On CI the macos
+        # runner has it; on dev machines we all have it.
+        import shutil as _shutil
+
+        node = _shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        major = _node_major_version(node)
+        assert major is not None and major > 0
+
+    def test_node_major_version_handles_missing_binary(self):
+        # Nonexistent path — must return None, not raise.
+        assert _node_major_version("/nonexistent/node/binary") is None
+
+    def test_check_engines_compat_accepts_supported_node(self, tmp_path):
+        # Simulate a package.json with engines.node = 22.x and a
+        # fake node binary reporting v22.5.1 via a stub shell script.
+        pkg = tmp_path / "package.json"
+        pkg.write_text('{"engines":{"node":"22.5.1"}}')
+        fake = tmp_path / "node"
+        fake.write_text('#!/bin/bash\necho "v22.5.1"\n')
+        fake.chmod(0o755)
+        ok, msg = _check_node_engines_compat(tmp_path, str(fake))
+        assert ok, f"should accept v22 with engines.node=22.5.1, got: {msg}"
+
+    def test_check_engines_compat_rejects_node_25(self, tmp_path):
+        # node 25 must be rejected with a message mentioning node@22.
+        pkg = tmp_path / "package.json"
+        pkg.write_text('{"engines":{"node":"24.14.1"}}')
+        fake = tmp_path / "node"
+        fake.write_text('#!/bin/bash\necho "v25.9.0"\n')
+        fake.chmod(0o755)
+        ok, msg = _check_node_engines_compat(tmp_path, str(fake))
+        assert not ok, "node 25 must be rejected"
+        assert "node@22" in msg, (
+            "rejection message must point users at the correct install "
+            "command — the whole point of the error is actionability"
+        )
+
+    def test_check_engines_compat_missing_package_json_is_ok(self, tmp_path):
+        # No package.json (e.g. pre-server-download) — we can't evaluate
+        # the constraint, so don't block. The rebuild path catches it.
+        fake = tmp_path / "node"
+        fake.write_text('#!/bin/bash\necho "v22.5.1"\n')
+        fake.chmod(0o755)
+        ok, _ = _check_node_engines_compat(tmp_path, str(fake))
+        assert ok
+
+    def test_verify_sharp_loads_reports_failure_for_missing_package(self, tmp_path):
+        # A cwd with no node_modules — require('sharp') will throw
+        # MODULE_NOT_FOUND. The helper must report the failure
+        # instead of swallowing it.
+        import shutil as _shutil
+
+        node = _shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        ok, err = _verify_sharp_loads(str(tmp_path), node)
+        assert not ok
+        assert err  # we want actionable stderr back
+
+    def test_formula_template_pins_node_22(self):
+        """Static check: the CI-generated Homebrew formula must pin
+        node@22. A regression to `depends_on "node"` re-ships the bug.
+        """
+        template = (
+            REPO_ROOT / ".github" / "workflows" / "update-homebrew.yml"
+        ).read_text()
+        assert 'depends_on "node@22"' in template, (
+            "Formula template must pin node@22 — "
+            '`depends_on "node"` pulls mainline which breaks sharp.'
+        )
+        # And the bare version must be GONE — no lingering duplicate.
+        # (Count occurrences to allow the pinned form to exist alongside
+        # comments that mention "node" as text.)
+        assert 'depends_on "node"\n' not in template
+
+    def test_find_node_prefers_node_22_keg(self):
+        """find_node must prefer /opt/homebrew/opt/node@22/bin/node
+        when it exists. Simulated by patching os.path.isfile.
+        """
+        with patch("immich_accelerator.__main__.os.path.isfile") as mock_isfile:
+            # Only node@22 keg exists.
+            def fake_isfile(p):
+                return p == "/opt/homebrew/opt/node@22/bin/node"
+
+            mock_isfile.side_effect = fake_isfile
+            assert find_node() == "/opt/homebrew/opt/node@22/bin/node"
+
+    def test_find_node_rejects_default_node_if_version_unsupported(self):
+        """If only /opt/homebrew/bin/node exists and it reports v25,
+        find_node must skip it and install node@22. Exercises the
+        version-filter, not just the path check.
+        """
+        with (
+            patch("immich_accelerator.__main__.os.path.isfile") as mock_isfile,
+            patch("immich_accelerator.__main__._node_major_version") as mock_ver,
+            patch("immich_accelerator.__main__._brew_install") as mock_brew,
+        ):
+
+            # Only /opt/homebrew/bin/node exists BEFORE brew install,
+            # plus the node@22 keg appears AFTER brew install succeeds.
+            state = {"after_install": False}
+
+            def fake_isfile(p):
+                if p == "/opt/homebrew/bin/node":
+                    return True
+                if p == "/opt/homebrew/opt/node@22/bin/node":
+                    return state["after_install"]
+                return False
+
+            def fake_brew_install(pkg):
+                assert pkg == "node@22", f"expected brew install node@22, got {pkg}"
+                state["after_install"] = True
+                return True
+
+            mock_isfile.side_effect = fake_isfile
+            mock_ver.return_value = 25  # brew default node is too new
+            mock_brew.side_effect = fake_brew_install
+            result = find_node()
+            assert result == "/opt/homebrew/opt/node@22/bin/node"
+            mock_brew.assert_called_once_with("node@22")
 
 
 @pytest.mark.slow

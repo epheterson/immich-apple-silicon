@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.4.4 — 2026-04-14
+
+### Fixes
+- **Homebrew formula pulled node 25, breaking sharp on every fresh install**: v1.4.x shipped with `depends_on "node"` in the generated formula. Homebrew's default `node` formula tracks mainline (currently 25.x), but Immich 2.7.x pins `engines.node = 24.14.1` and `sharp@0.34.5`'s native addons fail to load on node 25 with a `NODE_MODULE_VERSION` mismatch. Every fresh `brew install immich-accelerator` + `immich-accelerator start` hit an opaque worker crash at `require('sharp')` mid-Nest-bootstrap that looked like an Immich bug. Fix: pin `depends_on "node@22"` in the formula template and teach `find_node()` to look under `/opt/homebrew/opt/node@22/bin/node` (keg-only — no `/opt/homebrew/bin` symlink).
+- **`find_node()` accepted unsupported node majors silently**: previously it returned the first `node` binary it found, regardless of version. Now filters to `SUPPORTED_NODE_MAJORS = (22, 24)` and installs `node@22` if nothing compatible is present.
+- **`_rebuild_sharp()` swallowed rebuild failures**: logged `log.error` and returned, letting the worker start and crash later with an unrelated-looking stack. Now raises `RuntimeError` with the rebuild stderr tail and a remediation pointing at `brew install node@22`.
+
+### Upgrade resilience (catches future drift)
+- **Node preflight in `start`**: every `immich-accelerator start` now re-resolves node via `find_node()`, updates `config["node"]` if the path changed, and compares against Immich's `engines.node` parsed from `package.json`. Catches the `brew upgrade` drift pattern where node silently jumps majors and breaks sharp, with a clear "install node@22" error before the worker ever spawns.
+- **Sharp load preflight in `start`**: spawns `node -e "require('sharp')"` against the server dir. If it fails, auto-attempts a rebuild and retries. If the retry still fails, hard-errors with remediation. This turns "opaque worker crash 10+ seconds into Nest bootstrap" into a 1-second clearly-labeled check.
+
+### Test coverage
+- `tests/test_fresh_install.py::TestNodeVersionPreflight` — 11 new unit tests covering `_node_major_version`, `find_node` version filtering, `_check_node_engines_compat` with real stubbed node binaries, `_verify_sharp_loads` error reporting, and a static check that the CI-generated Homebrew formula pins `node@22`.
+- `scripts/e2e-fresh-install.sh` step 1b — asserts `find_node()` on a real VM returns a node in `SUPPORTED_NODE_MAJORS`. Would have caught the v1.4.x regression on the first E2E run.
+- `scripts/e2e-fresh-install.sh` step 3b — runs the full sharp preflight (`_check_node_engines_compat` + `_verify_sharp_loads`) against the extracted Immich server in the VM.
+- `scripts/e2e-fresh-install.sh` steps 9–16 — **real execution coverage**: start ML in `STUB_MODE`, hit `/ping` + `/health` + `/predict` for actual JSON render (catches any `ORJSONResponse` regression), run `immich-accelerator ml-test` against the stub, verify the `NODE_OPTIONS` pg_dump shim actually loads in a real node process, start the real worker and wait for the `Immich Microservices is running` Nest-bootstrap marker, run the dashboard against the live worker and confirm `worker.alive=true`, verify the `status` subcommand reports the running PID, verify `stop` cleanly terminates + is idempotent, verify a second `start` after `stop` reaches Nest bootstrap again.
+- `scripts/e2e-bootstrap-vm.sh` — installs `node@22` instead of Homebrew-default `node`, sets up the `/build` synthetic firmlink via dual `/etc/synthetic.d/` + `/etc/synthetic.conf` entries (some macOS VM images only honor the legacy location), reboots the VM to activate the firmlink, and verifies `/build` resolves post-reboot before saving the base snapshot. pip install now retries 3× on VM DNS flakes.
+
 ## 1.4.3 — 2026-04-14
 
 ### Fixes

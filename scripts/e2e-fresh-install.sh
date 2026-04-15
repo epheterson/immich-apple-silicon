@@ -112,6 +112,25 @@ fi
 log "  CLI --version reports $ACTUAL_VER (matches VERSION file)"
 
 # -------------------------------------------------------------------
+# 1b. find_node() returns a node in SUPPORTED_NODE_MAJORS.
+#     Regression guard: v1.4.x shipped find_node() that would happily
+#     return /opt/homebrew/bin/node pointing at node 25, which breaks
+#     sharp. The fix filters by major version and installs node@22
+#     if nothing compatible is present. This asserts the guard works
+#     on a real brew-bottled layout — not just mocked in unit tests.
+# -------------------------------------------------------------------
+log "step 1b: find_node() selects a node in SUPPORTED_NODE_MAJORS"
+PYTHONPATH="$SRC_DIR" "$PY" -c "
+from immich_accelerator.__main__ import find_node, _node_major_version, SUPPORTED_NODE_MAJORS
+node = find_node()
+major = _node_major_version(node)
+print(f'  find_node -> {node} (major={major})')
+assert major in SUPPORTED_NODE_MAJORS, \
+    f'node major {major} not in {SUPPORTED_NODE_MAJORS}'
+print('  OK')
+" || fail "find_node returned an unsupported node — sharp regression risk" 2
+
+# -------------------------------------------------------------------
 # 2. Dashboard create_app smoke — direct regression for issue #17.
 # -------------------------------------------------------------------
 log "step 2: dashboard.create_app resolves fastapi/uvicorn in fresh venv"
@@ -149,6 +168,32 @@ if size == 0:
 print(f'corePlugin/manifest.json extracted: {size} bytes')
 print(f'server_dir: {server_dir}')
 " || fail "corePlugin extraction failed (issue #18 class)" 4
+
+# -------------------------------------------------------------------
+# 3b. _verify_sharp_loads + _check_node_engines_compat against the
+#     extracted server. This is the direct regression guard for the
+#     sharp-breaks-on-node-25 class. download_immich_server already
+#     calls _rebuild_sharp, so by this point Sharp should load
+#     cleanly under node@22. If not, the worker can't start.
+# -------------------------------------------------------------------
+log "step 3b: sharp preflight against extracted server"
+PYTHONPATH="$SRC_DIR" "$PY" -c "
+import sys
+from pathlib import Path
+from immich_accelerator.__main__ import (
+    _verify_sharp_loads, _check_node_engines_compat, find_node,
+)
+server_dir = '$DATA/server/2.7.4'
+node = find_node()
+ok, msg = _check_node_engines_compat(Path(server_dir), node)
+if not ok:
+    print(f'FAIL: engines compat: {msg}', file=sys.stderr); sys.exit(1)
+print('  engines compat OK')
+ok, err = _verify_sharp_loads(server_dir, node)
+if not ok:
+    print(f'FAIL: sharp load: {err}', file=sys.stderr); sys.exit(1)
+print('  sharp loads via require() in node')
+" || fail "sharp preflight failed — worker will not start" 4
 
 # -------------------------------------------------------------------
 # 4. Write config + launch the dashboard for real. Serves HTML 200.
