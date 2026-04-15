@@ -157,15 +157,29 @@ if ! command -v brew >/dev/null 2>&1; then
 fi
 eval "$(/opt/homebrew/bin/brew shellenv)"
 brew install --quiet python@3.11 git vips node libpq
-# Dashboard deps pre-installed so per-run E2E doesn't hit PyPI.
-# Same composition as ml/requirements.txt — faithful proxy for the
-# Homebrew formula's ml venv.
+# Dashboard + stub ML service deps pre-installed so per-run E2E
+# doesn't hit PyPI and doesn't need to build heavy ML wheels at
+# test time. This set covers:
+#   fastapi, uvicorn[standard] — dashboard (issue #17 coverage)
+#   numpy, Pillow              — top-level imports of ml/src/main.py
+#   python-multipart           — FastAPI multipart form handling
+# Running `ml/src/main.py` in STUB_MODE is how we exercise the real
+# /predict render path in the VM E2E without pulling ~2GB of mlx /
+# onnxruntime / coreml. The stub mode is a first-class feature of
+# the ml service, not a test hack.
 /opt/homebrew/opt/python@3.11/bin/python3.11 -m pip install \
     --break-system-packages --quiet \
-    fastapi 'uvicorn[standard]'
+    fastapi 'uvicorn[standard]' numpy Pillow python-multipart
 # Verify install before writing the marker — fail loud if anything
 # didn't land where it should.
-/opt/homebrew/bin/python3.11 -c "import fastapi, uvicorn; print('bootstrap deps OK', fastapi.__version__, uvicorn.__version__)"
+/opt/homebrew/bin/python3.11 -c "
+import fastapi, uvicorn, numpy, PIL
+print('bootstrap deps OK:',
+      'fastapi', fastapi.__version__,
+      'uvicorn', uvicorn.__version__,
+      'numpy', numpy.__version__,
+      'Pillow', PIL.__version__)
+"
 touch ~/.bootstrapped
 echo "bootstrap inner script complete"
 INNER

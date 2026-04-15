@@ -244,25 +244,181 @@ fi
 fi  # end AUTH_OK gate
 
 # -------------------------------------------------------------------
-# 8. Issue #20 — ml-test CLI is registered. We can't exercise the
-#    full ML service inside the VM (no model downloads, no venv),
-#    but we CAN verify the subcommand is wired up and produces a
-#    recognizable failure shape when the service is unreachable.
+# 8. Start the ML service in STUB_MODE so the rest of the E2E can
+#    call a real /predict without pulling 2GB of mlx/onnxruntime.
+#    STUB_MODE is a first-class feature of ml/src/main.py — the
+#    service returns fake data but the FULL response pipeline runs,
+#    including FastAPI JSON rendering. Any render-time regression
+#    (e.g. reintroducing ORJSONResponse without orjson — issue #20)
+#    fires here at the first /predict call.
 # -------------------------------------------------------------------
-log "step 8: ml-test subcommand is registered and surfaces unreachable ML"
-set +e
-ML_OUT=$(
-    PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator ml-test 2>&1
-)
-ML_RC=$?
-set -e
-if [ $ML_RC -eq 0 ]; then
-    log "  ml-test passed (unlikely in VM but fine)"
-elif echo "$ML_OUT" | grep -q "ML service FAILED"; then
-    log "  ml-test surfaced the expected failure with diagnostic output"
-else
-    echo "$ML_OUT" | tail -20 >&2
-    fail "ml-test did not emit the expected diagnostic on failure" 10
+log "step 8: start ML service in STUB_MODE"
+ML_LOG=/tmp/e2e-ml.log
+STUB_MODE=true "$PY" -m uvicorn src.main:app \
+    --app-dir "$SRC_DIR/ml" --host 127.0.0.1 --port 3003 \
+    > "$ML_LOG" 2>&1 &
+ML_PID=$!
+trap 'kill $ML_PID 2>/dev/null || true' EXIT
+
+# Wait for /ping (up to 15s — first FastAPI startup is slow)
+for _ in $(seq 1 15); do
+    if curl -sf http://127.0.0.1:3003/ping >/dev/null 2>&1; then break; fi
+    sleep 1
+done
+if ! curl -sf http://127.0.0.1:3003/ping >/dev/null; then
+    tail -30 "$ML_LOG" >&2 || true
+    fail "stub ML service did not answer /ping within 15s" 10
 fi
+log "  stub ML service up at :3003"
+
+# -------------------------------------------------------------------
+# 9. Real /ping + /health + /predict call chain. Runs the FULL
+#    FastAPI response rendering pipeline in the real ml/src/main.py
+#    — this is the test that would have caught issue #20.
+# -------------------------------------------------------------------
+log "step 9: /ping + /health + /predict (stubbed) return well-formed JSON"
+PING=$(curl -sf http://127.0.0.1:3003/ping)
+[ "$PING" = "pong" ] || fail "/ping returned $PING not 'pong'" 11
+
+HEALTH=$(curl -sf http://127.0.0.1:3003/health)
+echo "$HEALTH" | grep -q '"stub_mode":true' \
+    || fail "/health JSON missing stub_mode=true: $HEALTH" 11
+log "  /health OK (stub_mode=true)"
+
+# Build a multipart /predict call with a synthetic JPEG and verify
+# the stubbed response renders through JSONResponse cleanly. This is
+# the exact code path that crashed with AssertionError: orjson must
+# be installed — v1.4.2 and earlier would fail this test.
+PREDICT_PY=$(mktemp)
+cat > "$PREDICT_PY" <<'PYEOF'
+import base64, json, sys, urllib.request
+# 10x10 grey JPEG
+tiny_jpeg = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a"
+    "HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIy"
+    "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAAKAAoDASIA"
+    "AhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAj/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEB"
+    "AQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCdABn/"
+    "2Q=="
+)
+boundary = "----e2e"
+entries = json.dumps({"clip": {"visual": {"modelName": "ViT-B-32__openai"}}})
+body = (
+    f"--{boundary}\r\n"
+    f'Content-Disposition: form-data; name="entries"\r\n\r\n'
+    f"{entries}\r\n"
+    f"--{boundary}\r\n"
+    f'Content-Disposition: form-data; name="image"; filename="t.jpg"\r\n'
+    f"Content-Type: image/jpeg\r\n\r\n"
+).encode() + tiny_jpeg + f"\r\n--{boundary}--\r\n".encode()
+
+req = urllib.request.Request(
+    "http://127.0.0.1:3003/predict",
+    data=body,
+    headers={
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Accept": "application/json",
+    },
+)
+with urllib.request.urlopen(req, timeout=30) as resp:
+    raw = resp.read()
+result = json.loads(raw)
+if not isinstance(result, dict) or "clip" not in result:
+    print(f"unexpected predict shape: {result}", file=sys.stderr)
+    sys.exit(1)
+print(f"predict OK keys={list(result.keys())}")
+PYEOF
+"$PY" "$PREDICT_PY" 2>&1 || {
+    tail -30 "$ML_LOG" >&2
+    fail "/predict failed against stub ML — render pipeline broken" 11
+}
+rm -f "$PREDICT_PY"
+log "  /predict JSON render OK"
+
+# -------------------------------------------------------------------
+# 10. ml-test CLI against the running stub service. Exercises the
+#     immich-accelerator ml-test subcommand end-to-end, including
+#     the wire-format parsing of the stringified-list CLIP embedding.
+# -------------------------------------------------------------------
+log "step 10: immich-accelerator ml-test against stub service"
+# Point ml-test at our stub by writing a config with ml_port=3003.
+mkdir -p "$HOME/.immich-accelerator"
+cat > "$HOME/.immich-accelerator/config.json" <<JSON
+{
+  "version": "2.7.4",
+  "server_dir": "$DATA/server/2.7.4",
+  "node": "$(which node)",
+  "immich_url": "$IMMICH_URL",
+  "db_hostname": "$DB_HOST",
+  "db_port": "$DB_PORT",
+  "db_username": "postgres",
+  "db_password": "$DB_PASSWORD",
+  "db_name": "immich",
+  "redis_hostname": "$REDIS_HOST",
+  "redis_port": "$REDIS_PORT",
+  "upload_mount": "/tmp/e2e-upload",
+  "ffmpeg_path": "/opt/homebrew/bin/ffmpeg",
+  "ml_port": 3003,
+  "api_key": "$IMMICH_API_KEY"
+}
+JSON
+chmod 600 "$HOME/.immich-accelerator/config.json"
+
+set +e
+ML_TEST_OUT=$(PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator ml-test 2>&1)
+ML_TEST_RC=$?
+set -e
+if [ $ML_TEST_RC -eq 0 ]; then
+    log "  ml-test passed 4/4 against stub service"
+elif echo "$ML_TEST_OUT" | grep -q "ML service OK"; then
+    log "  ml-test surfaced an OK status (stub partial success)"
+else
+    echo "$ML_TEST_OUT" | tail -20 >&2
+    fail "ml-test failed against running stub service" 12
+fi
+
+# Stop the stub ML service — the next step runs the real
+# immich-accelerator start which spawns its own ML service.
+kill "$ML_PID" 2>/dev/null || true
+wait "$ML_PID" 2>/dev/null || true
+trap - EXIT
+log "  stub ML service stopped"
+
+# -------------------------------------------------------------------
+# 11. NODE_OPTIONS shim: spawn a real node subprocess with the same
+#     NODE_OPTIONS string cmd_start builds, pointing at the pg_dump
+#     shim, and assert the shim loads. Would have caught issue #24
+#     quoting bugs (v1.4.2 single quotes, v1.4.3 pre-fix backslash).
+# -------------------------------------------------------------------
+log "step 11: NODE_OPTIONS shim is parseable by real node"
+SHIM="$SRC_DIR/immich_accelerator/hooks/pg_dump_shim.js"
+[ -f "$SHIM" ] || fail "shim not found at $SHIM" 13
+
+# Build the exact NODE_OPTIONS string cmd_start produces (double-
+# quoted path). Any regression to single-quote or backslash escape
+# here means node will fail MODULE_NOT_FOUND and the test fails.
+NODE_OPTS="--require \"$SHIM\""
+SPAWN_TEST=$(mktemp)
+cat > "$SPAWN_TEST" <<'JSEOF'
+const { spawn } = require('node:child_process');
+const p = spawn('/usr/lib/postgresql/14/bin/pg_dump', ['--version']);
+let out = '';
+p.stdout.on('data', (d) => (out += d));
+p.on('exit', (c) => {
+    console.log(`exit=${c} out=${out.trim()}`);
+    process.exit(c);
+});
+JSEOF
+
+SPAWN_OUT=$(NODE_OPTIONS="$NODE_OPTS" node "$SPAWN_TEST" 2>&1) || {
+    echo "$SPAWN_OUT" >&2
+    fail "node shim load failed under real NODE_OPTIONS" 13
+}
+rm -f "$SPAWN_TEST"
+echo "$SPAWN_OUT" | grep -q "postgres client interpose" \
+    || fail "shim did not emit interpose log: $SPAWN_OUT" 13
+echo "$SPAWN_OUT" | grep -q "pg_dump (PostgreSQL)" \
+    || fail "pg_dump did not run through shim: $SPAWN_OUT" 13
+log "  NODE_OPTIONS shim interpose working"
 
 log "ALL CHECKS PASSED"
