@@ -421,4 +421,143 @@ echo "$SPAWN_OUT" | grep -q "pg_dump (PostgreSQL)" \
     || fail "pg_dump did not run through shim: $SPAWN_OUT" 13
 log "  NODE_OPTIONS shim interpose working"
 
+# -------------------------------------------------------------------
+# 12. Real `immich-accelerator start` — the ACTUAL CLI command users
+#     run, against a valid config. Spawns the native worker with the
+#     worker env set exactly as production does, including NODE_OPTIONS
+#     with the pg_dump shim. Waits for the Nest bootstrap log line to
+#     appear, then stops. This is the test that would have caught
+#     #24 at the exact symptom the user saw: module-not-found on the
+#     shim path. It also catches DB/Redis/env-var wiring bugs and
+#     anything else that crashes the worker during the first 15s.
+#
+#     We need a running ML service for the worker to finish bootstrap,
+#     so we re-start the stub (step 8 stopped it) and leave it running
+#     for this step.
+# -------------------------------------------------------------------
+log "step 12: start stub ML for the worker to connect to"
+STUB_MODE=true "$PY" -m uvicorn src.main:app \
+    --app-dir "$SRC_DIR/ml" --host 127.0.0.1 --port 3003 \
+    > "$ML_LOG" 2>&1 &
+ML_PID=$!
+trap 'kill $ML_PID 2>/dev/null || true; \
+      PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator stop 2>/dev/null || true' EXIT
+for _ in $(seq 1 15); do
+    if curl -sf http://127.0.0.1:3003/ping >/dev/null 2>&1; then break; fi
+    sleep 1
+done
+curl -sf http://127.0.0.1:3003/ping >/dev/null \
+    || fail "stub ML did not restart for worker test" 14
+log "  stub ML ready for worker"
+
+log "step 12: immich-accelerator start runs a worker that survives bootstrap"
+# Write the final valid config. We've already tested the path-probe
+# refusal in step 7 — here we deliberately write a config that will
+# pass all probes, using an upload_mount that exists on the VM.
+mkdir -p /tmp/e2e-upload
+cat > "$HOME/.immich-accelerator/config.json" <<JSON
+{
+  "version": "2.7.4",
+  "server_dir": "$DATA/server/2.7.4",
+  "node": "$(which node)",
+  "immich_url": "$IMMICH_URL",
+  "db_hostname": "$DB_HOST",
+  "db_port": "$DB_PORT",
+  "db_username": "postgres",
+  "db_password": "$DB_PASSWORD",
+  "db_name": "immich",
+  "redis_hostname": "$REDIS_HOST",
+  "redis_port": "$REDIS_PORT",
+  "upload_mount": "/tmp/e2e-upload",
+  "ffmpeg_path": "/opt/homebrew/bin/ffmpeg",
+  "ml_port": 3003,
+  "api_key": "$IMMICH_API_KEY"
+}
+JSON
+chmod 600 "$HOME/.immich-accelerator/config.json"
+
+# Spawn the start command. cmd_start detaches the worker as a
+# subprocess and returns — this call is non-blocking and we check
+# the worker PID file afterwards.
+set +e
+START_OUT=$(
+    PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator start 2>&1
+)
+START_RC=$?
+set -e
+if [ $START_RC -ne 0 ]; then
+    echo "$START_OUT" | tail -30 >&2
+    fail "immich-accelerator start returned non-zero: rc=$START_RC" 14
+fi
+
+# Poll for the worker PID file to appear (up to 20s for Nest init).
+WORKER_PID_FILE="$HOME/.immich-accelerator/pids/worker.pid"
+WORKER_LOG="$HOME/.immich-accelerator/logs/worker.log"
+for _ in $(seq 1 20); do
+    [ -f "$WORKER_PID_FILE" ] && break
+    sleep 1
+done
+if [ ! -f "$WORKER_PID_FILE" ]; then
+    tail -30 "$WORKER_LOG" 2>/dev/null >&2 || true
+    fail "worker PID file never appeared at $WORKER_PID_FILE" 14
+fi
+WORKER_PID=$(cat "$WORKER_PID_FILE")
+log "  worker spawned (PID $WORKER_PID)"
+
+# Wait up to 30s for the Nest bootstrap log line. Any crash before
+# this (e.g. shim MODULE_NOT_FOUND) means the worker dies and the
+# log file will NOT contain this marker.
+for _ in $(seq 1 30); do
+    if [ -f "$WORKER_LOG" ] && grep -q "Immich Microservices is running" "$WORKER_LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+if ! grep -q "Immich Microservices is running" "$WORKER_LOG" 2>/dev/null; then
+    tail -40 "$WORKER_LOG" 2>/dev/null >&2 || true
+    fail "worker did not reach 'Microservices is running' within 30s" 14
+fi
+log "  worker reached Nest bootstrap: 'Immich Microservices is running'"
+
+# Verify the process is still alive after the bootstrap marker.
+if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+    tail -40 "$WORKER_LOG" 2>/dev/null >&2 || true
+    fail "worker exited after bootstrap (PID $WORKER_PID gone)" 14
+fi
+log "  worker PID $WORKER_PID alive after bootstrap"
+
+# -------------------------------------------------------------------
+# 13. Verify the status command reports the running worker + ML.
+# -------------------------------------------------------------------
+log "step 13: immich-accelerator status shows worker + ml running"
+STATUS_OUT=$(PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator status 2>&1)
+if ! echo "$STATUS_OUT" | grep -qiE "worker.*running|worker.*PID"; then
+    echo "$STATUS_OUT" >&2
+    fail "status output does not show worker running" 15
+fi
+log "  status: $(echo "$STATUS_OUT" | tr '\n' ' ' | head -c 200)"
+
+# -------------------------------------------------------------------
+# 14. Verify stop cleanly terminates everything and the PID file is
+#     removed.
+# -------------------------------------------------------------------
+log "step 14: immich-accelerator stop cleanly terminates the worker"
+PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator stop >/dev/null 2>&1 || {
+    fail "immich-accelerator stop returned non-zero" 16
+}
+# Give the worker a moment to exit
+sleep 2
+if kill -0 "$WORKER_PID" 2>/dev/null; then
+    fail "worker PID $WORKER_PID still alive after stop" 16
+fi
+if [ -f "$WORKER_PID_FILE" ]; then
+    fail "worker pidfile still exists after stop: $WORKER_PID_FILE" 16
+fi
+log "  worker terminated and pidfile removed"
+
+# Final cleanup: kill our stub ML.
+kill "$ML_PID" 2>/dev/null || true
+wait "$ML_PID" 2>/dev/null || true
+trap - EXIT
+
 log "ALL CHECKS PASSED"
