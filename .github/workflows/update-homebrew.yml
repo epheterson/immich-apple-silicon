@@ -73,6 +73,14 @@ jobs:
             depends_on "vips"
             depends_on "libpq"
             depends_on "python@3.11"
+            # GNU gzip for `gzip --rsyncable`. Apple's BSD gzip
+            # doesn't support that flag, and Immich's database-
+            # backup service pipes pg_dump stdout through it. Without
+            # GNU gzip the pg_dump_shim falls back to stripping
+            # --rsyncable (output is valid but loses rsync-friendly
+            # block boundaries) — installing it is the honest
+            # default that matches upstream Immich's behavior.
+            depends_on "gzip"
 
             def install
               libexec.install Dir["*"]

@@ -657,6 +657,171 @@ class TestPgDumpShim:
         # The shim writes its rewrite notice to stderr.
         assert "postgres client interpose" in result.stderr
 
+    # --- gzip --rsyncable regression (issue #24 tail) ---
+
+    @pytest.mark.slow
+    def test_shim_rewrites_gzip_rsyncable_to_gnu_gzip(self, tmp_path):
+        """Issue #24 final tail: Immich's DatabaseBackupService pipes
+        pg_dump output through `gzip --rsyncable`. Apple's BSD gzip
+        does NOT support --rsyncable, so the `gzip` child errors out
+        immediately and emits zero bytes. Upstream's spawnDuplexStream
+        doesn't check gzip's exit code — the pipeline resolves
+        "cleanly" and Immich logs 'Database Backup Success' on top
+        of a 0-byte file.
+
+        The shim reroutes `gzip --rsyncable` calls to Homebrew's
+        GNU gzip (which supports --rsyncable) if installed, and
+        falls back to stripping the flag otherwise. This test runs
+        the "preferred" path against a real /opt/homebrew/bin/gzip.
+        """
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        gnu_gzip = Path("/opt/homebrew/bin/gzip")
+        if not gnu_gzip.exists():
+            pytest.skip("brew gzip not installed — brew install gzip")
+
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { spawnSync } = require('node:child_process');\n"
+            "const res = spawnSync('gzip', ['--rsyncable'], {\n"
+            "  input: 'hello rsyncable world',\n"
+            "});\n"
+            "console.log('exit=' + res.status);\n"
+            "console.log('bytes=' + res.stdout.length);\n"
+            "if (res.status !== 0) { process.exit(1); }\n"
+            "if (res.stdout.length === 0) { process.exit(2); }\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, (
+            f"shim gzip rewrite failed:\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "exit=0" in result.stdout
+        # Non-zero byte count proves the pipeline actually wrote data,
+        # which is the bug-that-was: exit=0 alone can coexist with a
+        # zero-byte output file (which is exactly how the silent
+        # failure shipped to users).
+        assert "bytes=0" not in result.stdout, (
+            "shim-rewritten gzip produced 0 bytes — this is the "
+            "exact regression that shipped to users in v1.4.2-1.4.5"
+        )
+        assert "gzip interpose" in result.stderr
+
+    @pytest.mark.slow
+    def test_shim_gzip_without_rsyncable_is_untouched(self, tmp_path):
+        """Regression guard: if someone calls `gzip` without
+        --rsyncable, the shim must not touch the call. We don't want
+        to silently reroute every gzip in the worker process — only
+        the specific failure case that triggers Immich's backup bug.
+        """
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { spawnSync } = require('node:child_process');\n"
+            "const res = spawnSync('gzip', ['-c'], {\n"
+            "  input: 'plain gzip call',\n"
+            "});\n"
+            "console.log('exit=' + res.status);\n"
+            "console.log('bytes=' + res.stdout.length);\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0
+        # No interpose message — bare `gzip -c` should pass through.
+        assert "gzip interpose" not in result.stderr
+        assert "exit=0" in result.stdout
+
+    @pytest.mark.slow
+    def test_full_pipeline_produces_valid_gzipped_sql_against_db(self, tmp_path):
+        """The integration test Eric asked for: `pg_dump | gzip
+        --rsyncable > file`, exactly the shape upstream
+        DatabaseBackupService uses, executed through the shim against
+        a REAL postgres and verified that the output is (a) non-empty
+        and (b) valid gzipped SQL.
+
+        Requires an isolated e2e stack to be up (scripts/e2e-stack.sh
+        up). Skips otherwise — we're not going anywhere near prod.
+        """
+        import gzip as _gzip
+        import shutil
+        import socket
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        libpq_bin = Path("/opt/homebrew/opt/libpq/bin/pg_dump")
+        if not libpq_bin.exists():
+            pytest.skip("libpq not installed — brew install libpq")
+        # Isolated stack defaults from scripts/e2e-stack.yml
+        try:
+            with socket.create_connection(("127.0.0.1", 25432), timeout=1):
+                pass
+        except OSError:
+            pytest.skip(
+                "isolated e2e stack not running on 127.0.0.1:25432 — "
+                "bring it up with scripts/e2e-stack.sh up"
+            )
+
+        out = tmp_path / "backup.sql.gz"
+        # Reproduce Immich's exact spawn shape inside node + shim.
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { spawn } = require('node:child_process');\n"
+            "const fs = require('fs');\n"
+            "const pgdump = spawn('/usr/lib/postgresql/14/bin/pg_dump', [\n"
+            "  '--username', 'postgres', '--host', '127.0.0.1',\n"
+            "  '--port', '25432', 'immich', '--clean', '--if-exists'\n"
+            "], { env: { PATH: process.env.PATH, PGPASSWORD: 'e2epass' } });\n"
+            "pgdump.stderr.on('data', c => process.stderr.write('pg: '+c));\n"
+            "const gz = spawn('gzip', ['--rsyncable']);\n"
+            "gz.stderr.on('data', c => process.stderr.write('gz: '+c));\n"
+            f"const out = fs.createWriteStream({str(out)!r});\n"
+            "pgdump.stdout.pipe(gz.stdin);\n"
+            "gz.stdout.pipe(out);\n"
+            "out.on('close', () => { console.log('done'); });\n"
+            "out.on('error', e => { console.error('out err', e); "
+            "process.exit(1); });\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"backup pipeline failed:\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert out.exists(), "backup file was not created"
+        assert out.stat().st_size > 0, (
+            "backup file is 0 bytes — the exact regression that "
+            "shipped in v1.4.2-1.4.5. Shim routing of `gzip "
+            "--rsyncable` is broken."
+        )
+        # Validate the file is real gzipped SQL.
+        with _gzip.open(out, "rt") as fh:
+            head = fh.read(4096)
+        assert (
+            "PostgreSQL database dump" in head
+        ), f"backup content doesn't look like a pg_dump:\n{head[:500]}"
+
 
 class TestExternalLibraryValidation:
     """External-library importPaths must resolve on the Mac filesystem
