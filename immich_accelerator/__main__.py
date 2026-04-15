@@ -2006,7 +2006,11 @@ def _setup_manual(_args):
     template = {
         "version": "IMMICH_VERSION (e.g. 2.6.3)",
         "server_dir": str(DATA_DIR / "server" / "VERSION"),
-        "node": "/opt/homebrew/bin/node",
+        # node@22 is the LTS we pin for sharp ABI compat. `start`
+        # re-resolves via find_node() on every run, so setting this
+        # to the wrong path is self-healing — but picking the right
+        # default keeps the manual config honest.
+        "node": "/opt/homebrew/opt/node@22/bin/node",
         "immich_url": "http://YOUR_IMMICH_HOST:2283",
         "db_hostname": "YOUR_DB_HOST",
         "db_port": "5432",

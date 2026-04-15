@@ -26,6 +26,7 @@ from immich_accelerator.__main__ import (
     _has_everything,
     _needs_core_plugin,
     _node_major_version,
+    _rebuild_sharp,
     _verify_sharp_loads,
     find_node,
 )
@@ -894,6 +895,27 @@ class TestNodeVersionPreflight:
 
             mock_isfile.side_effect = fake_isfile
             assert find_node() == "/opt/homebrew/opt/node@22/bin/node"
+
+    def test_rebuild_sharp_raises_when_sharp_missing(self, tmp_path):
+        """_rebuild_sharp used to swallow failures and log a warning,
+        letting the worker crash opaquely later. The fix makes it raise.
+        This test locks in the raise for the trivially-mockable
+        "sharp dir doesn't exist" branch.
+
+        We mock find_npm (which transitively calls find_node and
+        potentially _brew_install → input()) so the test runs in a
+        non-interactive environment without hitting real binaries.
+        """
+        (tmp_path / "package.json").write_text("{}")
+        with patch(
+            "immich_accelerator.__main__.find_npm",
+            return_value="/usr/bin/false",
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                _rebuild_sharp(tmp_path)
+        assert "Sharp not found" in str(exc_info.value)
+        # Remediation must point at setup, not a dead-end error.
+        assert "setup" in str(exc_info.value).lower()
 
     def test_find_node_rejects_default_node_if_version_unsupported(self):
         """If only /opt/homebrew/bin/node exists and it reports v25,
