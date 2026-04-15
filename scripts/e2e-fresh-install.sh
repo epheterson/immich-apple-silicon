@@ -600,6 +600,58 @@ if [ -f "$WORKER_PID_FILE" ]; then
 fi
 log "  worker terminated and pidfile removed"
 
+# -------------------------------------------------------------------
+# 15. Idempotent stop: running `stop` when already stopped must
+#     succeed cleanly (no error, no hang).
+# -------------------------------------------------------------------
+log "step 15: immich-accelerator stop is idempotent"
+set +e
+PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator stop 2>/dev/null
+STOP2_RC=$?
+set -e
+if [ $STOP2_RC -ne 0 ]; then
+    fail "second stop returned non-zero rc=$STOP2_RC" 17
+fi
+log "  stop exits cleanly when already stopped"
+
+# -------------------------------------------------------------------
+# 16. Restart cycle: after stop, a second `start` must work the same
+#     as the first. Catches regressions in pidfile cleanup, stale
+#     socket lingering, and worker env re-computation.
+# -------------------------------------------------------------------
+log "step 16: second start after stop reaches Nest bootstrap again"
+# Stub ML is still running (from step 12). Truncate the worker log
+# so we can grep for a fresh bootstrap marker.
+: > "$WORKER_LOG"
+set +e
+PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator start >/dev/null 2>&1
+START2_RC=$?
+set -e
+if [ $START2_RC -ne 0 ]; then
+    fail "second start returned non-zero rc=$START2_RC" 18
+fi
+# Re-poll for pidfile and bootstrap marker.
+for _ in $(seq 1 20); do
+    [ -f "$WORKER_PID_FILE" ] && break
+    sleep 1
+done
+[ -f "$WORKER_PID_FILE" ] || fail "second start did not create pidfile" 18
+WORKER_PID2=$(cat "$WORKER_PID_FILE")
+for _ in $(seq 1 30); do
+    if grep -q "Immich Microservices is running" "$WORKER_LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+grep -q "Immich Microservices is running" "$WORKER_LOG" 2>/dev/null \
+    || fail "second start did not reach Nest bootstrap" 18
+kill -0 "$WORKER_PID2" 2>/dev/null \
+    || fail "second start PID $WORKER_PID2 exited" 18
+log "  restart cycle clean (new PID $WORKER_PID2)"
+
+# Final stop to leave the VM in a clean state.
+PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator stop >/dev/null 2>&1 || true
+
 # Final cleanup: kill our stub ML.
 kill "$ML_PID" 2>/dev/null || true
 wait "$ML_PID" 2>/dev/null || true
