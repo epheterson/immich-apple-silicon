@@ -2188,15 +2188,20 @@ def cmd_start(args):
     # monkey-patches child_process.spawn to rewrite that path to the
     # Homebrew libpq bin dir at call time. Immich's JS on disk is
     # never touched.
-    # Node splits NODE_OPTIONS on whitespace, so any space in the
-    # shim path (possible for dev installs under `/Users/Eric Pheterson/…`
-    # style paths; brew Cellar paths are safe today) would silently
-    # drop the argument. Single-quote the path so Node parses it as
-    # one token.
+    # NODE_OPTIONS parsing reference (empirically verified with
+    # Node 25.2, which matches the behavior back to 16+):
+    #   unquoted    — splits on whitespace (fails for spaces)
+    #   single '..' — FAILS, literals land in the filename (v1.4.2 bug)
+    #   backslash \ — FAILS, Node does not honor shell-style escapes
+    #   double  ".." — WORKS for all paths, with or without spaces
+    #
+    # So we wrap the shim path in double quotes unconditionally.
+    # Brew Cellar paths are space-free in practice but double quotes
+    # are still the portable correct form.
     shim_path = Path(__file__).parent / "hooks" / "pg_dump_shim.js"
     if shim_path.exists():
         existing = worker_env.get("NODE_OPTIONS", "").strip()
-        require_arg = f"--require '{shim_path}'"
+        require_arg = f'--require "{shim_path}"'
         worker_env["NODE_OPTIONS"] = (
             f"{existing} {require_arg}".strip() if existing else require_arg
         )
