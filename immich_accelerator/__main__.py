@@ -2580,7 +2580,15 @@ def cmd_ml_test(_args):
             data = json.loads(r.read())
         status = data.get("status", "unknown")
         checks = data.get("checks", {})
-        failed = [k for k, v in checks.items() if v != "ok"]
+        # A check value is a failure only if it starts with "error" —
+        # the ml service uses "error: <detail>" for real failures,
+        # "ok" for normal healthy state, and "active" for stub mode.
+        # Anything else (including "active") is acceptable.
+        failed = [
+            k
+            for k, v in checks.items()
+            if isinstance(v, str) and v.lower().startswith("error")
+        ]
         if failed:
             detail = ", ".join(f"{k}={checks[k]}" for k in failed)
             raise RuntimeError(f"status={status}, failing: {detail}")

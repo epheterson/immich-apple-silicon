@@ -40,12 +40,46 @@ set -euo pipefail
 
 eval "$(/opt/homebrew/bin/brew shellenv)"
 
-DATA="/tmp/e2e-data"
+# Ensure node@22 is on PATH. Immich 2.7.4's package.json pins
+# engines.node = 24.14.1; sharp@0.34.5's prebuilt native bindings
+# and node-gyp builds are tested up to node 24. node 25 (the default
+# `brew install node` ships) breaks sharp's native addon load with
+# NODE_MODULE_VERSION mismatch, which surfaces later as a worker
+# crash at `require('sharp')` that LOOKS like a Sharp-install bug
+# but is really a node-version incompat. Homebrew has no node@24
+# bottle yet — node@22 is the closest LTS that passes Immich's
+# engines check and compiles sharp cleanly. One-time install
+# (~60s); subsequent runs in the same clone are no-ops.
+if [ ! -x "/opt/homebrew/opt/node@22/bin/node" ]; then
+    printf '[e2e] installing node@22 (Immich engines.node=24, fresh node=25 breaks sharp)\n'
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 \
+        brew install --quiet node@22 || {
+            echo "node@22 install failed"
+            exit 2
+        }
+fi
+# node@22 is keg-only — prepend its bin dir so the plain `node`
+# name resolves to 22, not the 25 that `brew install node` shipped.
+export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
+NODE_VER=$(node --version 2>/dev/null || echo "missing")
+printf '[e2e] node version on PATH: %s\n' "$NODE_VER"
+case "$NODE_VER" in
+    v22.*) : ;;
+    *) echo "expected node v22.x, got $NODE_VER"; exit 2 ;;
+esac
+
+# DATA must match immich-accelerator's default (~/.immich-accelerator)
+# because step 12 runs `immich-accelerator start` which looks for
+# server_dir and build-data at the hard-coded default path. Using
+# a /tmp/* path instead splits build-data across two locations and
+# the worker's MapRepository.init fails with ENOENT on geodata.
+DATA="$HOME/.immich-accelerator"
 UPLOAD="/tmp/e2e-upload"
 
 log() { printf '[e2e] %s\n' "$*"; }
 fail() { printf '[e2e FAIL] %s\n' "$*" >&2; exit "${2:-1}"; }
 
+# Clean the data dir completely to simulate a fresh install.
 rm -rf "$DATA" "$UPLOAD"
 mkdir -p "$DATA" "$UPLOAD"
 
@@ -188,19 +222,26 @@ if [ "$AUTH_RESP" != "200" ]; then
 fi
 
 # -------------------------------------------------------------------
-# 6. Issue #19 — split-setup path probe. Only runs with valid auth.
+# 6. Issue #19 — split-setup path probe. The v1.4.3 probe
+#    intentionally returns None when there are no upload-library
+#    assets (a user with ONLY external libraries has nothing to
+#    probe), which is the correct "don't know, don't block"
+#    behavior. So we just call the probe, record the result, and
+#    let step 7 branch on it — there's no single right answer here.
 # -------------------------------------------------------------------
+PROBE=""
 if [ $AUTH_OK -eq 1 ]; then
-    log "step 6: _detect_docker_media_prefix resolves Docker's media root"
+    log "step 6: _detect_docker_media_prefix"
     PROBE=$(PYTHONPATH="$SRC_DIR" "$PY" -c "
 from immich_accelerator.__main__ import _detect_docker_media_prefix
 p = _detect_docker_media_prefix('$IMMICH_URL', '$IMMICH_API_KEY')
 print(p or '')
     ") || fail "path probe call raised" 8
-    if [ -z "$PROBE" ]; then
-        fail "probe returned None — expected a Docker-side path prefix" 8
+    if [ -n "$PROBE" ]; then
+        log "  probe detected upload-library prefix: $PROBE"
+    else
+        log "  probe returned None — no upload assets (external-only install)"
     fi
-    log "  detected Docker media prefix: $PROBE"
 else
     log "step 6: SKIPPED (api key invalid)"
 fi
@@ -213,6 +254,8 @@ fi
 # -------------------------------------------------------------------
 if [ $AUTH_OK -eq 0 ]; then
     log "step 7: SKIPPED (api key invalid — probe can't run)"
+elif [ -z "$PROBE" ]; then
+    log "step 7: SKIPPED (probe returned None — no upload assets to trigger mismatch)"
 else
 log "step 7: cmd_start refuses broken upload_mount (issue #19 guard)"
 cat > "$HOME/.immich-accelerator/config.json" <<JSON
@@ -466,7 +509,22 @@ log "step 12: immich-accelerator start runs a worker that survives bootstrap"
 # Write the final valid config. We've already tested the path-probe
 # refusal in step 7 — here we deliberately write a config that will
 # pass all probes, using an upload_mount that exists on the VM.
-mkdir -p /tmp/e2e-upload
+#
+# Immich's StorageService runs a "folder checks" verification on
+# startup that requires a .immich marker file in each of the
+# standard subdirectories (encoded-video, thumbs, upload, library,
+# profile, backups). Without these the worker exits with ENOENT
+# before reaching Nest bootstrap. Pre-create them.
+for sub in encoded-video thumbs upload library profile backups; do
+    mkdir -p "/tmp/e2e-upload/$sub"
+    : > "/tmp/e2e-upload/$sub/.immich"
+done
+
+# /build synthetic link is already active (created during bootstrap
+# via /etc/synthetic.d/immich-accelerator → build-data). The E2E's
+# step 3 extracted corePlugin and geodata under build-data, and
+# /build resolves to the same files, so Immich's PluginService
+# and MapRepository both find what they need on disk.
 cat > "$HOME/.immich-accelerator/config.json" <<JSON
 {
   "version": "2.7.4",
@@ -503,6 +561,8 @@ if [ $START_RC -ne 0 ]; then
 fi
 
 # Poll for the worker PID file to appear (up to 20s for Nest init).
+# The pidfile format is "<pid>\n<start_time>" — take only the first
+# line as the integer PID.
 WORKER_PID_FILE="$HOME/.immich-accelerator/pids/worker.pid"
 WORKER_LOG="$HOME/.immich-accelerator/logs/worker.log"
 for _ in $(seq 1 20); do
@@ -510,24 +570,45 @@ for _ in $(seq 1 20); do
     sleep 1
 done
 if [ ! -f "$WORKER_PID_FILE" ]; then
-    tail -30 "$WORKER_LOG" 2>/dev/null >&2 || true
+    echo "--- immich-accelerator start stdout (pidfile never appeared) ---" >&2
+    echo "$START_OUT" | tail -40 >&2
+    echo "--- worker log (no pidfile) ---" >&2
+    tail -60 "$WORKER_LOG" 2>/dev/null >&2 || echo "(no worker log)" >&2
     fail "worker PID file never appeared at $WORKER_PID_FILE" 14
 fi
-WORKER_PID=$(cat "$WORKER_PID_FILE")
+WORKER_PID=$(head -n1 "$WORKER_PID_FILE" | tr -d '[:space:]')
 log "  worker spawned (PID $WORKER_PID)"
 
-# Wait up to 30s for the Nest bootstrap log line. Any crash before
-# this (e.g. shim MODULE_NOT_FOUND) means the worker dies and the
-# log file will NOT contain this marker.
-for _ in $(seq 1 30); do
+# Wait up to 60s for the Nest bootstrap log line. Nest init on a
+# cold VM includes loading ~200MB of node_modules and connecting to
+# Postgres+Redis, which can take 30-45s on first boot.
+for _ in $(seq 1 60); do
     if [ -f "$WORKER_LOG" ] && grep -q "Immich Microservices is running" "$WORKER_LOG" 2>/dev/null; then
         break
     fi
     sleep 1
 done
 if ! grep -q "Immich Microservices is running" "$WORKER_LOG" 2>/dev/null; then
-    tail -40 "$WORKER_LOG" 2>/dev/null >&2 || true
-    fail "worker did not reach 'Microservices is running' within 30s" 14
+    echo "--- immich-accelerator start stdout ---" >&2
+    echo "$START_OUT" | tail -40 >&2
+    echo "--- ~/.immich-accelerator/logs directory ---" >&2
+    ls -la "$HOME/.immich-accelerator/logs" 2>&1 >&2 || echo "(no logs dir)" >&2
+    echo "--- worker log tail (no bootstrap marker) ---" >&2
+    if [ -f "$WORKER_LOG" ]; then
+        wc -l "$WORKER_LOG" >&2
+        tail -80 "$WORKER_LOG" >&2
+    else
+        echo "(worker log not created at $WORKER_LOG)" >&2
+    fi
+    echo "--- ml log tail ---" >&2
+    if [ -f "$HOME/.immich-accelerator/logs/ml.log" ]; then
+        tail -30 "$HOME/.immich-accelerator/logs/ml.log" >&2
+    fi
+    echo "--- worker process state ---" >&2
+    ps -p "$WORKER_PID" -o pid,state,command 2>/dev/null >&2 || echo "PID $WORKER_PID gone" >&2
+    echo "--- all node processes ---" >&2
+    pgrep -fl node 2>&1 >&2 || echo "(no node processes)" >&2
+    fail "worker did not reach 'Microservices is running' within 60s" 14
 fi
 log "  worker reached Nest bootstrap: 'Immich Microservices is running'"
 
@@ -624,10 +705,11 @@ log "step 16: second start after stop reaches Nest bootstrap again"
 # so we can grep for a fresh bootstrap marker.
 : > "$WORKER_LOG"
 set +e
-PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator start >/dev/null 2>&1
+START2_OUT=$(PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator start 2>&1)
 START2_RC=$?
 set -e
 if [ $START2_RC -ne 0 ]; then
+    echo "$START2_OUT" | tail -40 >&2
     fail "second start returned non-zero rc=$START2_RC" 18
 fi
 # Re-poll for pidfile and bootstrap marker.
@@ -636,17 +718,33 @@ for _ in $(seq 1 20); do
     sleep 1
 done
 [ -f "$WORKER_PID_FILE" ] || fail "second start did not create pidfile" 18
-WORKER_PID2=$(cat "$WORKER_PID_FILE")
-for _ in $(seq 1 30); do
+# Pidfile is "<pid>\n<start_time>" — take the first line.
+WORKER_PID2=$(head -n1 "$WORKER_PID_FILE" | tr -d '[:space:]')
+for _ in $(seq 1 60); do
     if grep -q "Immich Microservices is running" "$WORKER_LOG" 2>/dev/null; then
         break
     fi
     sleep 1
 done
-grep -q "Immich Microservices is running" "$WORKER_LOG" 2>/dev/null \
-    || fail "second start did not reach Nest bootstrap" 18
-kill -0 "$WORKER_PID2" 2>/dev/null \
-    || fail "second start PID $WORKER_PID2 exited" 18
+if ! grep -q "Immich Microservices is running" "$WORKER_LOG" 2>/dev/null; then
+    echo "--- second start stdout ---" >&2
+    echo "$START2_OUT" | tail -40 >&2
+    echo "--- worker log tail (no bootstrap marker on restart) ---" >&2
+    if [ -f "$WORKER_LOG" ]; then
+        wc -l "$WORKER_LOG" >&2
+        tail -80 "$WORKER_LOG" >&2
+    else
+        echo "(worker log not created)" >&2
+    fi
+    echo "--- worker process state ---" >&2
+    ps -p "$WORKER_PID2" -o pid,state,command 2>/dev/null >&2 || echo "PID $WORKER_PID2 gone" >&2
+    fail "second start did not reach Nest bootstrap" 18
+fi
+if ! kill -0 "$WORKER_PID2" 2>/dev/null; then
+    echo "--- worker log tail (PID $WORKER_PID2 gone after bootstrap) ---" >&2
+    tail -60 "$WORKER_LOG" 2>/dev/null >&2 || true
+    fail "second start PID $WORKER_PID2 exited after bootstrap" 18
+fi
 log "  restart cycle clean (new PID $WORKER_PID2)"
 
 # Final stop to leave the VM in a clean state.
