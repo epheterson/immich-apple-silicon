@@ -2167,6 +2167,10 @@ def _find_ml_dir() -> Path | None:
     return ml_dir
 
 
+_STALE_WORKER_RE = re.compile(r"(?:^|/)node\b.*/dist/main\.js(?:\s|$)")
+_STALE_ML_RE = re.compile(r"(?:^|/)python[\d.]*\b.*\s-m\s+src\.main(?:\s|$)")
+
+
 def _kill_stale_processes():
     """Kill any lingering immich worker or ML processes not tracked by PID files.
 
@@ -2174,13 +2178,17 @@ def _kill_stale_processes():
     processes from previous runs, manual starts, or crashed accelerator
     instances that left orphans.
 
-    The pattern is EXTREMELY specific on purpose: an earlier version
-    used ``pgrep -f "immich|src.main"`` which happily matched ANY
-    command line containing the substring "immich" — including the
-    VM E2E harness's ``tart run immich-test-run-*`` and
-    ``docker compose ... immich-e2e-stack`` subprocesses, which the
-    watchdog then helpfully SIGTERM'd mid-test. The fix: match only
-    on canonical accelerator-launched command tails.
+    History: an earlier version used ``pgrep -f "immich|src.main"``
+    which matched ANY command line containing the substring "immich"
+    — including the VM E2E harness's ``tart run immich-test-run-*``
+    and ``docker compose ... immich-e2e-stack`` subprocesses, which
+    the watchdog then SIGTERM'd mid-test. We couldn't reproduce the
+    E2E failures until we realized it was our own code killing them.
+
+    The fix walks `ps -axo pid,command` and filters in Python with
+    proper regex (word boundaries, alternation, anchors) rather than
+    trying to coax BSD pgrep's basic-regex flavor into matching
+    `python -m src.main` without also matching `src.maintenance`.
     """
     stale = 0
     tracked_pids = set()
@@ -2189,39 +2197,37 @@ def _kill_stale_processes():
         if pid:
             tracked_pids.add(pid)
 
-    # Canonical launch shapes for the native worker and ML service.
-    # - worker: `node <server_dir>/dist/main.js`  (see cmd_start)
-    # - ml:     `python -m src.main` run from the ml venv
-    # We match the last path component of dist/main.js plus the
-    # explicit -m flag for src.main, which neither tart run nor
-    # docker compose will ever produce.
-    patterns = [
-        # node ... dist/main.js — spawned by start_service for worker
-        r"node .*/dist/main\.js",
-        # python -m src.main — ml venv entrypoint
-        r"python.* -m src\.main(\s|$)",
-    ]
     try:
-        for pattern in patterns:
-            result = subprocess.run(
-                ["pgrep", "-f", pattern],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            for line in result.stdout.strip().split("\n"):
-                if not line.strip():
-                    continue
-                pid = int(line.strip())
-                if pid in tracked_pids or pid == os.getpid():
-                    continue
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                    stale += 1
-                except OSError:
-                    pass
-    except (subprocess.SubprocessError, ValueError):
-        pass
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return
+
+    my_pid = os.getpid()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # `pid=,command=` prints the pid in the first whitespace-
+        # separated field and the full command (possibly with spaces)
+        # in the rest of the line.
+        try:
+            pid_str, cmdline = line.split(None, 1)
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid == my_pid or pid in tracked_pids:
+            continue
+        if _STALE_WORKER_RE.search(cmdline) or _STALE_ML_RE.search(cmdline):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                stale += 1
+            except OSError:
+                pass
 
     # Also kill old ffmpeg-proxy/server.py if still running from v0.x
     try:
