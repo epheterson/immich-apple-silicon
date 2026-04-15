@@ -780,6 +780,138 @@ class TestBrewInstallDetection:
         )
 
 
+class TestKillStaleProcessesPattern:
+    """Static regression guards for _kill_stale_processes's pgrep
+    patterns.
+
+    History: before v1.4.5, the watchdog called
+    ``pgrep -f "immich|src.main"`` which matched ANY command line
+    containing the substring "immich" — including the VM E2E
+    harness's `tart run immich-test-run-*` and `docker compose ...
+    immich-e2e-stack` subprocesses. Every watchdog tick SIGTERM'd
+    our test children mid-run. We couldn't reproduce the E2E
+    failures until we realized it was our own code killing them.
+
+    The fix is two precise patterns that only match the canonical
+    shapes `start_service` launches. These tests assert the
+    patterns (a) don't fall back to the old "immich" bare word,
+    (b) DO match real worker/ml command lines, and (c) DON'T match
+    the harness-style command lines that caused the incident.
+    """
+
+    def _load_kill_stale_source(self):
+        src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()
+        start = src.index("def _kill_stale_processes")
+        end = src.index("\ndef ", start + 1)
+        return src[start:end]
+
+    def test_kill_stale_does_not_pgrep_bare_immich(self):
+        body = self._load_kill_stale_source()
+        # Strip out docstring + comments (they legitimately mention
+        # the old broken pattern as history/warning) so we only
+        # inspect EXECUTABLE python. The simplest way: drop every
+        # line that starts with whitespace + '#' or lives inside
+        # a triple-quoted block.
+        import re as _re
+
+        code_only = _re.sub(r'"""[\s\S]*?"""', "", body)
+        code_only = _re.sub(r"^\s*#.*$", "", code_only, flags=_re.M)
+        # Now the old pgrep pattern must not appear anywhere in
+        # executable code. The specific footgun: any pgrep -f call
+        # whose pattern is the bare word "immich" or "immich|…".
+        assert '"immich|src.main"' not in code_only, (
+            "The bare-substring pattern is exactly the bug that "
+            "killed the E2E harness. Do not reintroduce it."
+        )
+        assert '"immich"' not in code_only, (
+            "Matching command lines on the bare word 'immich' will "
+            "catch unrelated processes (tart run immich-test-*, "
+            "docker compose immich-e2e-stack, etc)."
+        )
+
+    def test_kill_stale_patterns_match_real_worker(self):
+        """The real worker command line (as spawned by start_service
+        in cmd_start) must match one of the configured pgrep
+        patterns. If it doesn't, the watchdog stops catching
+        zombies — which is the ORIGINAL bug this function exists
+        to prevent."""
+        import re as _re
+
+        body = self._load_kill_stale_source()
+        # Canonical worker launch — matches what start_service does:
+        # [node, dist/main.js] with cwd=server_dir
+        cmdline = "/opt/homebrew/opt/node@22/bin/node /Users/elp/.immich-accelerator/server/2.7.4/dist/main.js"
+        assert _re.search(r"node \.\*/dist/main\\.js", body) or _re.search(
+            r"dist/main\\.js", body
+        ), "worker pgrep pattern missing from _kill_stale_processes"
+        # And the pattern we find must actually match a realistic
+        # worker command line:
+        worker_pat = r"node .*/dist/main\.js"
+        assert _re.search(worker_pat, cmdline), (
+            "canonical worker command line does not match the "
+            "pgrep pattern — watchdog would miss real zombies"
+        )
+
+    def test_kill_stale_patterns_match_real_ml(self):
+        import re as _re
+
+        # Canonical ML launch: `python3 -m src.main` from the ml venv.
+        cmdline = "/Users/elp/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main"
+        ml_pat = r"python.* -m src\.main(\s|$)"
+        assert _re.search(ml_pat, cmdline), (
+            "canonical ml command line does not match the ml " "pgrep pattern"
+        )
+
+    def test_kill_stale_patterns_do_not_match_e2e_harness(self):
+        """Hard assertion: the patterns must NOT match any of the
+        command-line shapes the VM E2E harness produces. This is the
+        exact pollution path we fixed."""
+        import re as _re
+
+        harness_cmdlines = [
+            "tart run --no-graphics immich-test-run-20260415-011735",
+            "/Users/elp/.orbstack/bin/docker compose -f /Users/elp/Repos/immich-apple-silicon/scripts/e2e-stack.yml up -d",
+            "socat TCP-LISTEN:12283,bind=192.168.64.1,fork,reuseaddr TCP:127.0.0.1:22283",
+            "ssh -i /tmp/iac-e2e-key admin@192.168.64.38",
+            "rsync -az /Users/elp/Repos/immich-apple-silicon/immich_accelerator admin@192.168.64.38:/tmp/iac-src/",
+            "/opt/homebrew/bin/python3 /tmp/drift_check.py",
+            "bash scripts/e2e-run.sh",
+        ]
+        patterns = [
+            r"node .*/dist/main\.js",
+            r"python.* -m src\.main(\s|$)",
+        ]
+        for cmd in harness_cmdlines:
+            for pat in patterns:
+                assert not _re.search(pat, cmd), (
+                    f"pattern {pat!r} matches harness cmdline {cmd!r} "
+                    "— this is the incident that prompted the fix"
+                )
+
+    def test_kill_stale_patterns_do_not_match_random_python_apps(self):
+        """Broader safety net: nothing that merely HAS 'src.main' in
+        it (e.g., someone working on a completely different project
+        with a ``src.main`` module) should be caught. The `-m`
+        requirement makes this specific to python module invocation.
+        """
+        import re as _re
+
+        benign_cmdlines = [
+            "python3 /Users/someone/project/src/main.py",
+            "vim immich/server/src/main.ts",
+            "cat src.main.cache",
+        ]
+        patterns = [
+            r"node .*/dist/main\.js",
+            r"python.* -m src\.main(\s|$)",
+        ]
+        for cmd in benign_cmdlines:
+            for pat in patterns:
+                assert not _re.search(
+                    pat, cmd
+                ), f"pattern {pat!r} matches benign cmdline {cmd!r}"
+
+
 class TestNodeVersionPreflight:
     """Regression guards for the Sharp-on-node-25 bug class.
 

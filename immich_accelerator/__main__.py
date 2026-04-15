@@ -2173,6 +2173,14 @@ def _kill_stale_processes():
     Prevents zombie workers from competing for BullMQ jobs. This catches
     processes from previous runs, manual starts, or crashed accelerator
     instances that left orphans.
+
+    The pattern is EXTREMELY specific on purpose: an earlier version
+    used ``pgrep -f "immich|src.main"`` which happily matched ANY
+    command line containing the substring "immich" — including the
+    VM E2E harness's ``tart run immich-test-run-*`` and
+    ``docker compose ... immich-e2e-stack`` subprocesses, which the
+    watchdog then helpfully SIGTERM'd mid-test. The fix: match only
+    on canonical accelerator-launched command tails.
     """
     stale = 0
     tracked_pids = set()
@@ -2181,19 +2189,32 @@ def _kill_stale_processes():
         if pid:
             tracked_pids.add(pid)
 
-    # Find all immich-related processes
+    # Canonical launch shapes for the native worker and ML service.
+    # - worker: `node <server_dir>/dist/main.js`  (see cmd_start)
+    # - ml:     `python -m src.main` run from the ml venv
+    # We match the last path component of dist/main.js plus the
+    # explicit -m flag for src.main, which neither tart run nor
+    # docker compose will ever produce.
+    patterns = [
+        # node ... dist/main.js — spawned by start_service for worker
+        r"node .*/dist/main\.js",
+        # python -m src.main — ml venv entrypoint
+        r"python.* -m src\.main(\s|$)",
+    ]
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "immich|src.main"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        for line in result.stdout.strip().split("\n"):
-            if not line.strip():
-                continue
-            pid = int(line.strip())
-            if pid not in tracked_pids and pid != os.getpid():
+        for pattern in patterns:
+            result = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            for line in result.stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+                pid = int(line.strip())
+                if pid in tracked_pids or pid == os.getpid():
+                    continue
                 try:
                     os.kill(pid, signal.SIGTERM)
                     stale += 1
