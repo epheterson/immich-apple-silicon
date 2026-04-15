@@ -1,12 +1,25 @@
 #!/bin/bash
 # scripts/e2e-host-portforward.sh
 #
-# Ephemeral socat forwarders that expose the host's 127.0.0.1-bound
-# Immich services on 192.168.64.1 so the tart VM can reach them.
+# Ephemeral socat forwarders that expose host-loopback TCP services
+# on the host bridge IP so the tart VM can reach them.
 #
-# Starts three forwarders, writes their PIDs to a pidfile, and
-# tears them down on signal or on `--stop`. Does NOT modify the
-# underlying docker-compose or port bindings.
+# Source ports (VM-side) are fixed — they're what e2e-fresh-install
+# hard-codes into its test config. Destination ports (host-side)
+# are parameterized via env so callers can point the harness at
+# either the developer's prod Immich (the old, dangerous default)
+# OR the isolated e2e stack from scripts/e2e-stack.yml (now the
+# only sanctioned mode).
+#
+# Env overrides:
+#   E2E_DST_IMMICH_PORT  host port for Immich API (default 2283)
+#   E2E_DST_DB_PORT      host port for Postgres  (default 5432)
+#   E2E_DST_REDIS_PORT   host port for Redis     (default 6379)
+#
+# The defaults still point at the prod ports for backwards-compat
+# invocations, but e2e-run.sh sets all three to the isolated stack
+# ports (22283/25432/26379) before calling into this script. If
+# you're running the harness by hand, set them explicitly.
 
 set -euo pipefail
 
@@ -16,6 +29,12 @@ PIDFILE="/tmp/immich-e2e-portforward.pid"
 # Caller passes it in so we don't have to guess — VM IP is only
 # known after `tart run` starts.
 HOST_BIND="${HOST_BIND_IP:-192.168.64.1}"
+
+# Destination ports on the host loopback. Defaults match the old
+# prod layout; e2e-run.sh overrides these for isolated stack mode.
+DST_IMMICH="${E2E_DST_IMMICH_PORT:-2283}"
+DST_DB="${E2E_DST_DB_PORT:-5432}"
+DST_REDIS="${E2E_DST_REDIS_PORT:-6379}"
 
 export PATH="/opt/homebrew/bin:$PATH"
 
@@ -34,7 +53,10 @@ start_forwarders() {
         stop_forwarders
     fi
     : > "$PIDFILE"
-    for pair in "12283:2283" "15432:5432" "16379:6379"; do
+    # src:dst pairs. VM-side source ports are fixed; host-side dst
+    # ports come from env so the caller decides whether we talk to
+    # isolated e2e stack or (deprecated) prod Immich.
+    for pair in "12283:$DST_IMMICH" "15432:$DST_DB" "16379:$DST_REDIS"; do
         src="${pair%:*}"; dst="${pair#*:}"
         socat TCP-LISTEN:"$src",bind="$HOST_BIND",fork,reuseaddr TCP:127.0.0.1:"$dst" &
         echo $! >> "$PIDFILE"

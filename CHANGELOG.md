@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.5 — 2026-04-15
+
+### Fixes
+- **Watchdog pattern was too broad, killing unrelated processes**: `_kill_stale_processes()` used `pgrep -f "immich|src.main"`, which matched the literal substring "immich" anywhere in a command line. That caught legitimate accelerator workers AND any unrelated process whose command line happened to contain the word — including `tart run immich-test-run-*`, `docker compose ... immich-e2e-stack`, and similar tooling. On a Mac with `immich-accelerator watch` running under launchd, every watchdog tick quietly SIGTERM'd those processes. Fix: two precise patterns (`node .*/dist/main\.js` and `python.* -m src\.main`) that only match the canonical worker/ML launch shapes from `start_service` and nothing else.
+
+### Test infrastructure
+- **Isolated E2E Immich stack (`scripts/e2e-stack.yml`, `scripts/e2e-stack.sh`)**: The VM test harness used to port-forward traffic straight at the developer's prod Immich (postgres/redis/server in OrbStack on default ports). A test worker booting with `IMMICH_MEDIA_LOCATION=/tmp/e2e-upload` caused Immich's StorageService to persist that path into the prod DB and run a blanket `UPDATE asset_file SET path = REPLACE(...)` across every thumbnail row. Recovery happened (v1.4.4 auto-migration rewrote paths back), but no more. The harness now requires a dedicated compose stack — `immich_postgres_e2e` + `immich_redis_e2e` + `immich_server_e2e` (api-only) on port-shifted loopback addresses 25432/26379/22283 with throwaway state under `/tmp/immich-e2e-stack/`. `e2e-run.sh` refuses to run unless the isolated stack is up; it will NOT fall back to prod. Stack lifecycle is manual (`scripts/e2e-stack.sh up` / `down`) so long-running Immich-server boot (~4 min on first run, migration-heavy) doesn't live inside a flaky shell subprocess.
+- **`scripts/e2e-host-portforward.sh` destination ports parameterized** via `E2E_DST_IMMICH_PORT` / `E2E_DST_DB_PORT` / `E2E_DST_REDIS_PORT`. Defaults still point at prod (for backwards compat in one-off manual invocations) but `e2e-run.sh` unconditionally overrides them to the isolated stack's ports.
+
+### Test coverage
+- `tests/test_fresh_install.py::TestKillStaleProcessesPattern` — 5 new tests locking in the watchdog fix. They (a) assert the old `"immich|src.main"` pattern isn't anywhere in executable code (docstrings are exempt so we can document the bug as history), (b) assert the new patterns DO match a real worker/ml command line as produced by `start_service`, (c) assert the new patterns do NOT match any shape the E2E harness produces (tart run, docker compose, socat, ssh, rsync, ad-hoc python scripts). Plus a benign-cmdline guard so someone else's `python3 src/main.py` doesn't trip it.
+
 ## 1.4.4 — 2026-04-14
 
 ### Fixes

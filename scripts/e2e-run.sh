@@ -69,38 +69,66 @@ if ! command -v socat >/dev/null; then
     exit 1
 fi
 
-# Check immich_server is running
-if ! "$HOME/.orbstack/bin/docker" ps --format '{{.Names}}' 2>/dev/null | grep -qx immich_server; then
-    log "immich_server is not running in OrbStack. Aborting."
+# ------------------- Isolated Immich stack (precondition) ---------
+# The VM harness used to forward traffic straight at the developer's
+# prod Immich. A test worker booting with IMMICH_MEDIA_LOCATION=
+# /tmp/e2e-upload then wrote that path into prod's system_metadata
+# and ran a blanket path rewrite across every asset_file row. The
+# harness now refuses to target anything but the dedicated e2e
+# stack defined in scripts/e2e-stack.yml — postgres + redis + api-
+# only Immich server on port-shifted loopback addresses with
+# throwaway state.
+#
+# The stack is a PRECONDITION, not something this script brings up
+# itself. That's intentional: the stack takes ~4 minutes to become
+# healthy (Immich's schema migrations run on first boot), and
+# launching a 4-minute fixture inside a shell subprocess turned out
+# to be unreliable. Instead, run it once manually, let multiple
+# E2E iterations reuse it, then tear it down yourself:
+#
+#   scripts/e2e-stack.sh up       # one-time, ~4 min
+#   scripts/e2e-run.sh             # fast, ~90s, can repeat
+#   scripts/e2e-stack.sh down     # when you're done
+#
+# If the stack isn't up, refuse to run. We will NOT fall back to
+# prod Immich — that's the whole point of this refactor.
+if ! curl -sf http://127.0.0.1:22283/api/server/ping >/dev/null 2>&1; then
+    log "Isolated e2e stack not reachable at 127.0.0.1:22283."
+    log "Bring it up first with: scripts/e2e-stack.sh up"
+    log "(Refusing to fall back to prod Immich — that caused the "
+    log " /tmp/e2e-upload DB pollution incident on 2026-04-15.)"
     exit 1
 fi
+if [ ! -s /tmp/immich-e2e-stack/api-key ]; then
+    log "Isolated stack is running but has no API key cached."
+    log "Re-run: scripts/e2e-stack.sh up"
+    exit 1
+fi
+DB_PASSWORD="e2epass"
+IMMICH_API_KEY=$("$REPO_DIR/scripts/e2e-stack.sh" api-key)
+log "using isolated stack: API key ${IMMICH_API_KEY:0:8}... (len ${#IMMICH_API_KEY})"
 
-# Resolve DB password from env Immich
-DB_PASSWORD=$("$HOME/.orbstack/bin/docker" inspect immich_server \
-    --format '{{range .Config.Env}}{{println .}}{{end}}' \
-    | awk -F= '/^DB_PASSWORD=/{print $2}')
-if [ -z "$DB_PASSWORD" ]; then
-    log "could not resolve DB_PASSWORD from immich_server env"
-    exit 1
-fi
-
-# Immich API key from vault
-if [ -f "$HOME/vault/secrets/services.yml" ] && command -v yq >/dev/null; then
-    IMMICH_API_KEY=$(yq '.services.immich.api_key' "$HOME/vault/secrets/services.yml" 2>/dev/null)
-fi
-if [ -z "${IMMICH_API_KEY:-}" ] || [ "$IMMICH_API_KEY" = "null" ]; then
-    log "IMMICH_API_KEY not found in vault and not set in env"
-    exit 1
-fi
+# Tell the port forwarder where to send VM traffic. The VM-side
+# ports (12283/15432/16379) stay the same because that's what the
+# in-VM E2E script hardcodes; only the host-side destination shifts
+# from prod defaults to the isolated stack's port-shifted layout.
+export E2E_DST_IMMICH_PORT=22283
+export E2E_DST_DB_PORT=25432
+export E2E_DST_REDIS_PORT=26379
 
 # ------------------- Cleanup trap ----------------------
+# Installed after the stack precondition check so we don't paper
+# over a missing stack with a trap. The trap only tears down the
+# VM + port forwarders — the isolated stack persists across runs
+# and is managed manually via scripts/e2e-stack.sh.
 cleanup() {
     log "tearing down..."
     "$REPO_DIR/scripts/e2e-host-portforward.sh" stop 2>/dev/null || true
     tart stop --timeout 5 "$TEST_VM" 2>/dev/null || true
     tart delete "$TEST_VM" 2>/dev/null || true
     rm -f "$KEY_FILE" "$KEY_FILE.pub" 2>/dev/null || true
-    log "cleanup done. (base VM and OCI image retained — run scripts/tart-cleanup.sh --all to free them)"
+    log "cleanup done. Isolated stack left running — tear it down"
+    log "when finished with: scripts/e2e-stack.sh down"
 }
 trap cleanup EXIT
 
