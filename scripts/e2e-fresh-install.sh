@@ -59,11 +59,23 @@ if [ ! -x "$PY" ]; then
     PY="/opt/homebrew/opt/python@3.11/bin/python3.11"
 fi
 
-log "step 1: python + fastapi + uvicorn importable (pre-installed at bootstrap)"
+log "step 1: python + fastapi + uvicorn + stub-ML deps importable"
 "$PY" -c "
-import sys, fastapi, uvicorn
-print(f'python {sys.version_info.major}.{sys.version_info.minor}, fastapi {fastapi.__version__}, uvicorn {uvicorn.__version__}')
-" || fail "dashboard deps not importable — bootstrap VM may be stale, re-run e2e-bootstrap-vm.sh" 2
+import sys, fastapi, uvicorn, numpy, PIL
+print(f'python {sys.version_info.major}.{sys.version_info.minor}'
+      f', fastapi {fastapi.__version__}'
+      f', uvicorn {uvicorn.__version__}'
+      f', numpy {numpy.__version__}'
+      f', Pillow {PIL.__version__}')
+" || fail "dependency import failed — bootstrap VM may be stale, re-run e2e-bootstrap-vm.sh" 2
+
+# Also verify the CLI --version flag works and matches VERSION file
+EXPECTED_VER=$(cat "$SRC_DIR/VERSION" | tr -d '[:space:]')
+ACTUAL_VER=$(PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator --version 2>&1 | awk '{print $2}')
+if [ "$EXPECTED_VER" != "$ACTUAL_VER" ]; then
+    fail "immich-accelerator --version reports '$ACTUAL_VER' but VERSION file has '$EXPECTED_VER'" 2
+fi
+log "  CLI --version reports $ACTUAL_VER (matches VERSION file)"
 
 # -------------------------------------------------------------------
 # 2. Dashboard create_app smoke — direct regression for issue #17.
@@ -527,9 +539,42 @@ fi
 log "  worker PID $WORKER_PID alive after bootstrap"
 
 # -------------------------------------------------------------------
-# 13. Verify the status command reports the running worker + ML.
+# 13a. Dashboard against a LIVE worker. Step 5 tested the dashboard
+#      with no worker running (every service reports alive=false).
+#      This variant runs the dashboard while the worker is actually
+#      up from step 12, verifying /api/status reports worker.alive=
+#      true. This is the canonical "everything wired together" test
+#      — if anything in the status pipeline regresses (config read,
+#      pidfile scan, DB/Redis ping, JSON serialization), it fires
+#      here.
 # -------------------------------------------------------------------
-log "step 13: immich-accelerator status shows worker + ml running"
+log "step 13a: dashboard shows worker.alive=true while worker is running"
+PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator dashboard --port 28421 \
+    > /tmp/dashboard-live.log 2>&1 &
+DASH_PID=$!
+for _ in $(seq 1 15); do
+    if curl -sf http://localhost:28421/ >/dev/null 2>&1; then break; fi
+    sleep 1
+done
+if ! curl -sf http://localhost:28421/ >/dev/null; then
+    cat /tmp/dashboard-live.log >&2
+    kill "$DASH_PID" 2>/dev/null || true
+    fail "live dashboard did not serve / within 15s" 15
+fi
+STATUS_LIVE=$(curl -sf http://localhost:28421/api/status)
+if ! echo "$STATUS_LIVE" | grep -q '"worker":{"alive":true'; then
+    echo "live status body: $STATUS_LIVE" >&2
+    kill "$DASH_PID" 2>/dev/null || true
+    fail "live dashboard status does not show worker.alive=true" 15
+fi
+log "  live dashboard reports worker.alive=true"
+kill "$DASH_PID" 2>/dev/null || true
+wait "$DASH_PID" 2>/dev/null || true
+
+# -------------------------------------------------------------------
+# 13b. Verify the status command reports the running worker + ML.
+# -------------------------------------------------------------------
+log "step 13b: immich-accelerator status shows worker + ml running"
 STATUS_OUT=$(PYTHONPATH="$SRC_DIR" "$PY" -m immich_accelerator status 2>&1)
 if ! echo "$STATUS_OUT" | grep -qiE "worker.*running|worker.*PID"; then
     echo "$STATUS_OUT" >&2
