@@ -2167,12 +2167,28 @@ def _find_ml_dir() -> Path | None:
     return ml_dir
 
 
+_STALE_WORKER_RE = re.compile(r"(?:^|/)node\b.*/dist/main\.js(?:\s|$)")
+_STALE_ML_RE = re.compile(r"(?:^|/)python[\d.]*\b.*\s-m\s+src\.main(?:\s|$)")
+
+
 def _kill_stale_processes():
     """Kill any lingering immich worker or ML processes not tracked by PID files.
 
     Prevents zombie workers from competing for BullMQ jobs. This catches
     processes from previous runs, manual starts, or crashed accelerator
     instances that left orphans.
+
+    History: an earlier version used ``pgrep -f "immich|src.main"``
+    which matched ANY command line containing the substring "immich"
+    — including the VM E2E harness's ``tart run immich-test-run-*``
+    and ``docker compose ... immich-e2e-stack`` subprocesses, which
+    the watchdog then SIGTERM'd mid-test. We couldn't reproduce the
+    E2E failures until we realized it was our own code killing them.
+
+    The fix walks `ps -axo pid,command` and filters in Python with
+    proper regex (word boundaries, alternation, anchors) rather than
+    trying to coax BSD pgrep's basic-regex flavor into matching
+    `python -m src.main` without also matching `src.maintenance`.
     """
     stale = 0
     tracked_pids = set()
@@ -2181,26 +2197,37 @@ def _kill_stale_processes():
         if pid:
             tracked_pids.add(pid)
 
-    # Find all immich-related processes
     try:
         result = subprocess.run(
-            ["pgrep", "-f", "immich|src.main"],
+            ["ps", "-axo", "pid=,command="],
             capture_output=True,
             text=True,
             timeout=5,
         )
-        for line in result.stdout.strip().split("\n"):
-            if not line.strip():
-                continue
-            pid = int(line.strip())
-            if pid not in tracked_pids and pid != os.getpid():
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                    stale += 1
-                except OSError:
-                    pass
-    except (subprocess.SubprocessError, ValueError):
-        pass
+    except (subprocess.SubprocessError, OSError):
+        return
+
+    my_pid = os.getpid()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # `pid=,command=` prints the pid in the first whitespace-
+        # separated field and the full command (possibly with spaces)
+        # in the rest of the line.
+        try:
+            pid_str, cmdline = line.split(None, 1)
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid == my_pid or pid in tracked_pids:
+            continue
+        if _STALE_WORKER_RE.search(cmdline) or _STALE_ML_RE.search(cmdline):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                stale += 1
+            except OSError:
+                pass
 
     # Also kill old ffmpeg-proxy/server.py if still running from v0.x
     try:

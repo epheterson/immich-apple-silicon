@@ -1,0 +1,92 @@
+name: immich-e2e-stack
+# Isolated Immich stack the VM E2E harness talks to.
+#
+# This exists because scripts/e2e-run.sh used to forward VM traffic
+# directly at the developer's PROD Immich (postgres + redis + server
+# all running under `immich_*` in OrbStack on the default ports).
+# When the VM worker booted with IMMICH_MEDIA_LOCATION=/tmp/e2e-upload,
+# Immich's StorageService persisted that path to the real DB, running
+# a blanket path-rewrite over every asset_file row and leaving the
+# prod DB in a state only a second media_location change could
+# recover from. Never again.
+#
+# Everything here is namespaced `immich_*_e2e`, binds to loopback
+# ports 2XXXX (shifted +20000), uses throwaway volumes under
+# /tmp/immich-e2e-stack/, and matches the exact images your prod
+# stack runs. The version tag is pinned to the same tag the E2E
+# downloads via download_immich_server — mismatches between the
+# running Immich API version and the extracted server workers have
+# bitten us before.
+
+services:
+  immich_postgres_e2e:
+    container_name: immich_postgres_e2e
+    image: tensorchord/pgvecto-rs:pg14-v0.2.0
+    environment:
+      POSTGRES_PASSWORD: e2epass
+      POSTGRES_USER: postgres
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - /tmp/immich-e2e-stack/pg:/var/lib/postgresql/data
+    ports:
+      - "25432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "immich"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  immich_redis_e2e:
+    container_name: immich_redis_e2e
+    image: redis:6.2-alpine
+    ports:
+      - "26379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Immich server in api-only mode — microservices run on the host
+  # (the whole point of the E2E harness). Version pinned to match
+  # whatever the E2E downloads via download_immich_server so the
+  # API shape and DB schema line up.
+  immich_server_e2e:
+    container_name: immich_server_e2e
+    image: ghcr.io/immich-app/immich-server:v2.7.4
+    environment:
+      DB_HOSTNAME: immich_postgres_e2e
+      DB_PORT: 5432
+      DB_USERNAME: postgres
+      DB_PASSWORD: e2epass
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: immich_redis_e2e
+      REDIS_PORT: 6379
+      IMMICH_WORKERS_INCLUDE: api
+      # We don't need real ML for the harness — point at a dead
+      # address so the server logs warnings but keeps serving API.
+      IMMICH_MACHINE_LEARNING_URL: http://127.0.0.1:1
+      # IMMICH_MEDIA_LOCATION is the path the server container sees;
+      # Immich writes this to system_metadata on first boot. The VM
+      # test worker will rewrite it to /tmp/e2e-upload — in this
+      # DB, which is throwaway, so the rewrite is a harmless no-op.
+      IMMICH_MEDIA_LOCATION: /immich-upload
+    volumes:
+      - /tmp/immich-e2e-stack/upload:/immich-upload
+    ports:
+      - "22283:2283"
+    depends_on:
+      immich_postgres_e2e:
+        condition: service_healthy
+      immich_redis_e2e:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - /bin/sh
+        - -c
+        - "wget -q -O - http://127.0.0.1:2283/api/server/ping >/dev/null 2>&1"
+      interval: 3s
+      timeout: 4s
+      retries: 40

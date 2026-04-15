@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.5 — 2026-04-15
+
+### Fixes
+- **Database backups were silently 0 bytes (#24)**. Immich pipes `pg_dump` through `gzip --rsyncable`, which Apple's BSD gzip doesn't support. `pg_dump_shim.js` now reroutes those calls to Homebrew's GNU gzip (or strips the flag as fallback). The formula now `depends_on "gzip"` so fresh installs get GNU gzip automatically.
+- **Watchdog could kill unrelated processes**. `_kill_stale_processes` matched any command line containing the substring `immich`. Replaced with precise patterns for the canonical worker (`node … dist/main.js`) and ML service (`python -m src.main`) launch shapes.
+
+### Test infrastructure
+- **Isolated E2E Immich stack** (`scripts/e2e-stack.yml` + `e2e-stack.sh`). Dedicated postgres / redis / api-only Immich server on port-shifted loopback addresses with throwaway state. The VM harness now requires this stack and refuses to run against prod Immich.
+- **Real-data backup integration test** that runs `pg_dump | gzip --rsyncable` through the shim against the isolated Postgres and asserts the output is a valid non-empty pg_dump.
+
 ## 1.4.4 — 2026-04-14
 
 ### Fixes

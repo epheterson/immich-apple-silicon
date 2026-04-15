@@ -22,8 +22,11 @@ from unittest.mock import patch, MagicMock
 
 from immich_accelerator.__main__ import (
     SUPPORTED_NODE_MAJORS,
+    _STALE_ML_RE,
+    _STALE_WORKER_RE,
     _check_node_engines_compat,
     _has_everything,
+    _kill_stale_processes,
     _needs_core_plugin,
     _node_major_version,
     _rebuild_sharp,
@@ -654,6 +657,171 @@ class TestPgDumpShim:
         # The shim writes its rewrite notice to stderr.
         assert "postgres client interpose" in result.stderr
 
+    # --- gzip --rsyncable regression (issue #24 tail) ---
+
+    @pytest.mark.slow
+    def test_shim_rewrites_gzip_rsyncable_to_gnu_gzip(self, tmp_path):
+        """Issue #24 final tail: Immich's DatabaseBackupService pipes
+        pg_dump output through `gzip --rsyncable`. Apple's BSD gzip
+        does NOT support --rsyncable, so the `gzip` child errors out
+        immediately and emits zero bytes. Upstream's spawnDuplexStream
+        doesn't check gzip's exit code — the pipeline resolves
+        "cleanly" and Immich logs 'Database Backup Success' on top
+        of a 0-byte file.
+
+        The shim reroutes `gzip --rsyncable` calls to Homebrew's
+        GNU gzip (which supports --rsyncable) if installed, and
+        falls back to stripping the flag otherwise. This test runs
+        the "preferred" path against a real /opt/homebrew/bin/gzip.
+        """
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        gnu_gzip = Path("/opt/homebrew/bin/gzip")
+        if not gnu_gzip.exists():
+            pytest.skip("brew gzip not installed — brew install gzip")
+
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { spawnSync } = require('node:child_process');\n"
+            "const res = spawnSync('gzip', ['--rsyncable'], {\n"
+            "  input: 'hello rsyncable world',\n"
+            "});\n"
+            "console.log('exit=' + res.status);\n"
+            "console.log('bytes=' + res.stdout.length);\n"
+            "if (res.status !== 0) { process.exit(1); }\n"
+            "if (res.stdout.length === 0) { process.exit(2); }\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, (
+            f"shim gzip rewrite failed:\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "exit=0" in result.stdout
+        # Non-zero byte count proves the pipeline actually wrote data,
+        # which is the bug-that-was: exit=0 alone can coexist with a
+        # zero-byte output file (which is exactly how the silent
+        # failure shipped to users).
+        assert "bytes=0" not in result.stdout, (
+            "shim-rewritten gzip produced 0 bytes — this is the "
+            "exact regression that shipped to users in v1.4.2-1.4.5"
+        )
+        assert "gzip interpose" in result.stderr
+
+    @pytest.mark.slow
+    def test_shim_gzip_without_rsyncable_is_untouched(self, tmp_path):
+        """Regression guard: if someone calls `gzip` without
+        --rsyncable, the shim must not touch the call. We don't want
+        to silently reroute every gzip in the worker process — only
+        the specific failure case that triggers Immich's backup bug.
+        """
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { spawnSync } = require('node:child_process');\n"
+            "const res = spawnSync('gzip', ['-c'], {\n"
+            "  input: 'plain gzip call',\n"
+            "});\n"
+            "console.log('exit=' + res.status);\n"
+            "console.log('bytes=' + res.stdout.length);\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0
+        # No interpose message — bare `gzip -c` should pass through.
+        assert "gzip interpose" not in result.stderr
+        assert "exit=0" in result.stdout
+
+    @pytest.mark.slow
+    def test_full_pipeline_produces_valid_gzipped_sql_against_db(self, tmp_path):
+        """The integration test Eric asked for: `pg_dump | gzip
+        --rsyncable > file`, exactly the shape upstream
+        DatabaseBackupService uses, executed through the shim against
+        a REAL postgres and verified that the output is (a) non-empty
+        and (b) valid gzipped SQL.
+
+        Requires an isolated e2e stack to be up (scripts/e2e-stack.sh
+        up). Skips otherwise — we're not going anywhere near prod.
+        """
+        import gzip as _gzip
+        import shutil
+        import socket
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        libpq_bin = Path("/opt/homebrew/opt/libpq/bin/pg_dump")
+        if not libpq_bin.exists():
+            pytest.skip("libpq not installed — brew install libpq")
+        # Isolated stack defaults from scripts/e2e-stack.yml
+        try:
+            with socket.create_connection(("127.0.0.1", 25432), timeout=1):
+                pass
+        except OSError:
+            pytest.skip(
+                "isolated e2e stack not running on 127.0.0.1:25432 — "
+                "bring it up with scripts/e2e-stack.sh up"
+            )
+
+        out = tmp_path / "backup.sql.gz"
+        # Reproduce Immich's exact spawn shape inside node + shim.
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { spawn } = require('node:child_process');\n"
+            "const fs = require('fs');\n"
+            "const pgdump = spawn('/usr/lib/postgresql/14/bin/pg_dump', [\n"
+            "  '--username', 'postgres', '--host', '127.0.0.1',\n"
+            "  '--port', '25432', 'immich', '--clean', '--if-exists'\n"
+            "], { env: { PATH: process.env.PATH, PGPASSWORD: 'e2epass' } });\n"
+            "pgdump.stderr.on('data', c => process.stderr.write('pg: '+c));\n"
+            "const gz = spawn('gzip', ['--rsyncable']);\n"
+            "gz.stderr.on('data', c => process.stderr.write('gz: '+c));\n"
+            f"const out = fs.createWriteStream({str(out)!r});\n"
+            "pgdump.stdout.pipe(gz.stdin);\n"
+            "gz.stdout.pipe(out);\n"
+            "out.on('close', () => { console.log('done'); });\n"
+            "out.on('error', e => { console.error('out err', e); "
+            "process.exit(1); });\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"backup pipeline failed:\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert out.exists(), "backup file was not created"
+        assert out.stat().st_size > 0, (
+            "backup file is 0 bytes — the exact regression that "
+            "shipped in v1.4.2-1.4.5. Shim routing of `gzip "
+            "--rsyncable` is broken."
+        )
+        # Validate the file is real gzipped SQL.
+        with _gzip.open(out, "rt") as fh:
+            head = fh.read(4096)
+        assert (
+            "PostgreSQL database dump" in head
+        ), f"backup content doesn't look like a pg_dump:\n{head[:500]}"
+
 
 class TestExternalLibraryValidation:
     """External-library importPaths must resolve on the Mac filesystem
@@ -778,6 +946,201 @@ class TestBrewInstallDetection:
             "Both _finalize_config and cmd_uninstall must detect brew "
             "installs and avoid touching Cellar-owned files."
         )
+
+
+class TestKillStaleProcessesPattern:
+    """Functional tests for _kill_stale_processes.
+
+    History + post-mortem of the first failed fix:
+
+    v1.0-v1.4.4 used ``pgrep -f "immich|src.main"`` which matched ANY
+    command line containing the substring "immich" — including the VM
+    E2E harness's `tart run immich-test-run-*` and `docker compose
+    ... immich-e2e-stack` subprocesses. Every watchdog tick SIGTERM'd
+    them mid-run. We couldn't reproduce the E2E failures until we
+    realized it was our own code killing them.
+
+    The FIRST fix attempt used narrower pgrep patterns and validated
+    them with Python's ``re.search``. Tests were green. Production
+    was still broken because the production call path went through
+    ``pgrep -f`` (BSD pgrep on macOS), whose basic-regex flavor
+    doesn't understand ``\\s`` or unescaped ``(|)``. The test and
+    prod regex engines disagreed — textbook mocking-vs-reality gap.
+
+    Resolution: stop relying on BSD pgrep. Shell out to ``ps`` and
+    filter in Python with ``re.compile``. Production and tests now
+    share one regex engine. AND these tests now actually EXECUTE
+    ``_kill_stale_processes`` with a mocked ``subprocess.run`` that
+    returns canned ps output, rather than re-parsing regex strings
+    out of the source — the gap that let us ship a broken fix.
+    """
+
+    def _ps_output(self, rows):
+        """Build a fake `ps -axo pid=,command=` output block.
+
+        `rows` is a list of (pid, cmdline) tuples. Uses BSD ps's
+        pid-right-padded layout; production parser is ``split(None,
+        1)`` so exact spacing doesn't matter.
+        """
+        return "\n".join(f"{pid:6d} {cmd}" for pid, cmd in rows) + "\n"
+
+    def _run(self, rows, tracked=None):
+        """Invoke _kill_stale_processes against canned ps output.
+
+        Returns the list of (pid, signal) tuples os.kill was called
+        on — i.e., the exact set of PIDs production would have
+        SIGTERM'd in this world state.
+        """
+        killed = []
+        fake_result = MagicMock()
+        fake_result.stdout = self._ps_output(rows)
+        with (
+            patch(
+                "immich_accelerator.__main__.subprocess.run",
+                return_value=fake_result,
+            ),
+            patch(
+                "immich_accelerator.__main__.read_pid",
+                side_effect=lambda name: (tracked or {}).get(name),
+            ),
+            patch(
+                "immich_accelerator.__main__.os.kill",
+                side_effect=lambda pid, sig: killed.append((pid, sig)),
+            ),
+        ):
+            _kill_stale_processes()
+        return killed
+
+    # ---- static guard against ever re-adopting the broad pattern ----
+
+    def test_source_does_not_match_bare_immich(self):
+        import re as _re
+
+        src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()
+        start = src.index("def _kill_stale_processes")
+        end = src.index("\ndef ", start + 1)
+        body = src[start:end]
+        code_only = _re.sub(r'"""[\s\S]*?"""', "", body)
+        code_only = _re.sub(r"^\s*#.*$", "", code_only, flags=_re.M)
+        assert (
+            '"immich|src.main"' not in code_only
+        ), "bare-substring pattern killed the E2E harness; do not revive"
+        assert (
+            '"immich"' not in code_only
+        ), "bare 'immich' substring catches unrelated processes"
+
+    # ---- regex-only sanity checks on the compiled patterns ----
+
+    def test_stale_worker_regex_matches_canonical_worker(self):
+        cmd = (
+            "/opt/homebrew/opt/node@22/bin/node "
+            "/Users/elp/.immich-accelerator/server/2.7.4/dist/main.js"
+        )
+        assert _STALE_WORKER_RE.search(cmd)
+
+    def test_stale_ml_regex_matches_canonical_ml(self):
+        cmd = "/Users/elp/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main"
+        assert _STALE_ML_RE.search(cmd)
+
+    def test_stale_ml_regex_rejects_prefix_collision(self):
+        # src.maintenance must NOT match. Prefix collision is the
+        # whole reason we need an anchor on the pattern.
+        cmd = "/opt/homebrew/bin/python3 -m src.maintenance --arg foo"
+        assert not _STALE_ML_RE.search(cmd)
+
+    # ---- full _kill_stale_processes functional tests ----
+
+    def test_kills_canonical_worker_and_ml(self):
+        rows = [
+            (
+                1001,
+                "/opt/homebrew/opt/node@22/bin/node "
+                "/Users/elp/.immich-accelerator/server/2.7.4/dist/main.js",
+            ),
+            (
+                1002,
+                "/Users/elp/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main",
+            ),
+        ]
+        killed = self._run(rows)
+        killed_pids = {pid for pid, _sig in killed}
+        assert 1001 in killed_pids
+        assert 1002 in killed_pids
+        # Everything should be SIGTERM (15), not SIGKILL
+        for _pid, sig in killed:
+            assert int(sig) == 15
+
+    def test_skips_tracked_pids(self):
+        """Live managed worker PID (tracked in the pidfile) must
+        not be SIGTERM'd — that's the job of cmd_stop, not the
+        stale-process sweeper."""
+        rows = [
+            (
+                2001,
+                "/opt/homebrew/opt/node@22/bin/node "
+                "/Users/elp/.immich-accelerator/server/2.7.4/dist/main.js",
+            ),
+        ]
+        killed = self._run(rows, tracked={"worker": 2001})
+        assert killed == [], (
+            "tracked worker PID 2001 was killed — watchdog is supposed "
+            "to leave the live managed process alone"
+        )
+
+    def test_does_not_kill_e2e_harness_processes(self):
+        """The exact cmdline shapes the old broad pattern was
+        killing. All must survive the new sweep."""
+        rows = [
+            (3001, "tart run --no-graphics immich-test-run-20260415-011735"),
+            (
+                3002,
+                "/Users/elp/.orbstack/bin/docker compose -f "
+                "/Users/elp/Repos/immich-apple-silicon/scripts/e2e-stack.yml up -d",
+            ),
+            (
+                3003,
+                "socat TCP-LISTEN:12283,bind=192.168.64.1,fork,reuseaddr "
+                "TCP:127.0.0.1:22283",
+            ),
+            (3004, "ssh -i /tmp/iac-e2e-key admin@192.168.64.38"),
+            (
+                3005,
+                "rsync -az /Users/elp/Repos/immich-apple-silicon/"
+                "immich_accelerator admin@192.168.64.38:/tmp/iac-src/",
+            ),
+            (3006, "/opt/homebrew/bin/python3 /tmp/drift_check.py"),
+            (3007, "bash scripts/e2e-run.sh"),
+            (3008, "vim immich/server/src/main.ts"),
+            (3009, "python3 /Users/someone/project/src/main.py"),
+        ]
+        killed = self._run(rows)
+        assert killed == [], f"watchdog killed harness/benign processes: {killed}"
+
+    def test_mixed_kills_only_real_zombies(self):
+        """Realistic ps output with both canonical stale processes
+        and harness/benign cmdlines. Only the real zombies die."""
+        rows = [
+            # Real zombies
+            (
+                4001,
+                "/opt/homebrew/opt/node@22/bin/node "
+                "/Users/elp/.immich-accelerator/server/2.7.4/dist/main.js",
+            ),
+            (
+                4002,
+                "/Users/elp/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main",
+            ),
+            # Harness + noise — all must survive
+            (4101, "tart run --no-graphics immich-test-run-20260415-011735"),
+            (4102, "docker compose up immich-e2e-stack"),
+            (4103, "/opt/homebrew/bin/python3 -m src.maintenance --flush"),
+            (4104, "vim immich/server/src/main.ts"),
+        ]
+        killed_pids = {pid for pid, _sig in self._run(rows)}
+        assert killed_pids == {
+            4001,
+            4002,
+        }, f"expected to kill only {{4001, 4002}}, got {killed_pids}"
 
 
 class TestNodeVersionPreflight:
