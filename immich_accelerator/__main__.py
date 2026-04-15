@@ -40,6 +40,15 @@ CONFIG_FILE = DATA_DIR / "config.json"
 PID_DIR = DATA_DIR / "pids"
 LOG_DIR = DATA_DIR / "logs"
 
+# Node.js majors Immich 2.7.x + sharp@0.34.5 are known to work with.
+# Immich pins engines.node=24.x; sharp's native addons break with
+# NODE_MODULE_VERSION mismatches on node 25+. Homebrew's default
+# `node` formula tracks mainline (currently 25.x), so we pin to the
+# closest LTS available as a keg-only bottle (node@22). Raise this
+# range when Immich bumps engines in a new major release AND sharp
+# ships a prebuilt for the new node major.
+SUPPORTED_NODE_MAJORS = (22, 24)
+
 
 # --- Utility ---
 
@@ -328,23 +337,82 @@ def find_docker() -> str:
     )
 
 
+def _node_major_version(node_path: str) -> int | None:
+    """Return the major version integer of a node binary, or None.
+
+    Used by find_node() to filter brew-installed nodes to only those
+    Immich + sharp will accept. We never trust the path name — only
+    what `--version` actually reports.
+    """
+    try:
+        result = subprocess.run(
+            [node_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.match(r"v(\d+)\.", result.stdout.strip())
+    return int(match.group(1)) if match else None
+
+
 def find_node() -> str:
-    paths = ["/opt/homebrew/bin/node", "/usr/local/bin/node"]
-    for p in paths:
+    """Return a node binary whose major version is in SUPPORTED_NODE_MAJORS.
+
+    Homebrew's default `node` formula tracks the current mainline
+    (25.x as of 2026-04), which breaks sharp's native addons with
+    NODE_MODULE_VERSION mismatches. We prefer the keg-only LTS
+    node@22 (closest available bottle) first, fall through to any
+    other keg-only formula we might add later, and only accept
+    /opt/homebrew/bin/node if its actual reported version is in the
+    supported range.
+
+    If nothing compatible is present, install node@22 via Homebrew.
+    """
+    keg_candidates = [
+        f"/opt/homebrew/opt/node@{major}/bin/node" for major in SUPPORTED_NODE_MAJORS
+    ]
+    fallback_candidates = ["/opt/homebrew/bin/node", "/usr/local/bin/node"]
+    for p in keg_candidates:
         if os.path.isfile(p):
             return p
-    if _brew_install("node"):
-        for p in paths:
-            if os.path.isfile(p):
+    for p in fallback_candidates:
+        if os.path.isfile(p):
+            major = _node_major_version(p)
+            if major is not None and major in SUPPORTED_NODE_MAJORS:
                 return p
-    raise RuntimeError("Node.js not found. Install with: brew install node")
+    # Nothing compatible — install the closest LTS we support.
+    if _brew_install("node@22"):
+        p = "/opt/homebrew/opt/node@22/bin/node"
+        if os.path.isfile(p):
+            return p
+    raise RuntimeError(
+        "Node.js (version 22 or 24) not found. " "Install with: brew install node@22"
+    )
 
 
 def find_npm() -> str:
+    """Return the npm binary colocated with the node we picked.
+
+    If find_node() returned a keg-only node@XX build, npm lives in
+    the same opt dir and won't be on PATH under /opt/homebrew/bin.
+    Prefer the colocated one so `npm rebuild` picks up the matching
+    node.
+    """
+    try:
+        node_path = find_node()
+        npm_colocated = str(Path(node_path).parent / "npm")
+        if os.path.isfile(npm_colocated):
+            return npm_colocated
+    except RuntimeError:
+        pass
     return find_binary(
         "npm",
         ["/opt/homebrew/bin/npm", "/usr/local/bin/npm"],
-        "Install with: brew install node",
+        "Install with: brew install node@22",
     )
 
 
@@ -497,29 +565,109 @@ def _rebuild_sharp(server_dir: Path) -> None:
 
     The container has linux-arm64 Sharp. System libvips matches Docker's
     error handling for corrupt HEIF files.
+
+    Raises RuntimeError if the rebuild fails — silently logging a
+    warning was the v1.4.x behavior and it turned every sharp
+    breakage into an opaque worker crash at ``require('sharp')``
+    during Nest bootstrap with no obvious remediation for the user.
+    The rebuild failure IS the problem, so we make it the error.
     """
     log.info("Rebuilding Sharp for macOS (requires: brew install vips)...")
+    # Use the npm colocated with our chosen node so the native
+    # binding ABI matches the node the worker will actually spawn.
     npm = find_npm()
     sharp_dirs = list(server_dir.glob("node_modules/.pnpm/sharp@*/node_modules/sharp"))
-    if sharp_dirs:
+    if not sharp_dirs:
+        raise RuntimeError(
+            "Sharp not found under server_dir/node_modules/.pnpm/sharp@* — "
+            "extraction may be incomplete. Re-run setup."
+        )
+    # Put our node's bin dir first on PATH so npm spawns the right
+    # node for the gyp build. Without this, a keg-only node@22
+    # doesn't get found and npm falls back to the system node.
+    node_bin = str(Path(find_node()).parent)
+    result = subprocess.run(
+        [npm, "rebuild"],
+        cwd=str(sharp_dirs[0]),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env={
+            **os.environ,
+            "PATH": f"{node_bin}:/opt/homebrew/bin:{os.environ.get('PATH', '')}",
+        },
+    )
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout or "")[-600:]
+        node_major = _node_major_version(find_node()) or "?"
+        raise RuntimeError(
+            "Sharp rebuild failed against system libvips "
+            f"(node {node_major}.x).\n"
+            f"  Last output:\n    {tail}\n"
+            "  Check that libvips is installed: brew install vips\n"
+            f"  If node is newer than {SUPPORTED_NODE_MAJORS[-1]}, install "
+            "a supported LTS: brew install node@22"
+        )
+    log.info("  Sharp rebuilt against system libvips")
+
+
+def _verify_sharp_loads(server_dir: str, node: str) -> tuple[bool, str]:
+    """Run ``require('sharp')`` via node and return (ok, stderr_tail).
+
+    This is the cheapest possible preflight for the class of bug
+    where Sharp's native addon fails to load because of a node
+    version bump. It catches it in <1s instead of letting the
+    worker crash mid-Nest-bootstrap 10+ seconds in with a stack
+    trace that looks like an Immich bug.
+    """
+    try:
         result = subprocess.run(
-            [npm, "rebuild"],
-            cwd=str(sharp_dirs[0]),
+            [node, "-e", "require('sharp'); console.log('sharp-ok')"],
+            cwd=server_dir,
             capture_output=True,
             text=True,
-            timeout=180,
-            env={
-                **os.environ,
-                "PATH": f"/opt/homebrew/bin:{os.environ.get('PATH', '')}",
-            },
+            timeout=15,
         )
-        if result.returncode != 0:
-            log.error("Sharp rebuild failed: %s", result.stderr[-500:])
-            log.error("Make sure libvips is installed: brew install vips")
-        else:
-            log.info("  Sharp rebuilt against system libvips")
-    else:
-        log.warning("Sharp not found in node_modules — thumbnail generation may fail")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"spawn failed: {e}"
+    if result.returncode == 0 and "sharp-ok" in result.stdout:
+        return True, ""
+    return False, (result.stderr or result.stdout or "")[-600:]
+
+
+def _check_node_engines_compat(server_dir: Path | str, node: str) -> tuple[bool, str]:
+    """Parse Immich's package.json engines.node and compare to `node`.
+
+    Returns (ok, message). We don't enforce the exact pin Immich
+    sets (``24.14.1``) — any supported LTS major in
+    SUPPORTED_NODE_MAJORS is acceptable. The check exists to catch
+    "user ran `brew upgrade`, node silently jumped to 25, sharp
+    broke" — the most common drift pattern on existing installs.
+    """
+    server_dir = Path(server_dir)
+    pkg_path = server_dir / "package.json"
+    if not pkg_path.exists():
+        return True, ""
+    try:
+        pkg = json.loads(pkg_path.read_text())
+        engines = str(pkg.get("engines", {}).get("node", ""))
+    except (OSError, json.JSONDecodeError):
+        return True, ""
+    actual_major = _node_major_version(node)
+    if actual_major is None:
+        return False, f"could not read `{node} --version`"
+    if actual_major in SUPPORTED_NODE_MAJORS:
+        return True, ""
+    if engines:
+        return False, (
+            f"node {actual_major}.x is incompatible with Immich's "
+            f"engines.node={engines} (accelerator supports "
+            f"{SUPPORTED_NODE_MAJORS}). Install: brew install node@22"
+        )
+    return False, (
+        f"node {actual_major}.x is outside the accelerator-supported "
+        f"range {SUPPORTED_NODE_MAJORS}. Install: brew install node@22"
+    )
 
 
 def _ghcr_urlopen_with_retry(req, timeout: int = 300, max_attempts: int = 4):
@@ -2156,8 +2304,59 @@ def cmd_start(args):
             return
         cmd_stop(None)
 
-    node = config["node"]
+    # Re-resolve node every start. config["node"] is a cache, not the
+    # source of truth — a user `brew upgrade` can silently swap node
+    # underneath us, or delete the path entirely. find_node() enforces
+    # SUPPORTED_NODE_MAJORS, so if the cached path points at something
+    # that's been upgraded out of range, it'll be replaced here.
+    try:
+        node = find_node()
+    except RuntimeError as e:
+        log.error("%s", e)
+        return
+    if config.get("node") != node:
+        log.info(
+            "Node path changed (%s -> %s) — updating config.",
+            config.get("node") or "(unset)",
+            node,
+        )
+        config["node"] = node
+        save_config(config)
     server_dir = config["server_dir"]
+
+    # Node-version compatibility check against Immich's engines.node.
+    # Catches the "brew upgrade bumped node past the supported LTS"
+    # drift pattern with a clear message, before the worker crashes
+    # mid-Nest-bootstrap with an opaque require('sharp') stack trace.
+    ok, msg = _check_node_engines_compat(Path(server_dir), node)
+    if not ok:
+        log.error("Node version check failed: %s", msg)
+        return
+
+    # Sharp load preflight. Spawn `node -e "require('sharp')"` in the
+    # server_dir — if it fails, try a rebuild and retry. If the retry
+    # still fails, hard error with remediation. This turns a class of
+    # opaque worker-crash bugs into a 1-second, clearly-labeled check.
+    ok, err = _verify_sharp_loads(server_dir, node)
+    if not ok:
+        log.warning("Sharp failed to load — rebuilding against system libvips...")
+        log.warning("  reason: %s", err.splitlines()[-1] if err else "(unknown)")
+        try:
+            _rebuild_sharp(Path(server_dir))
+        except RuntimeError as e:
+            log.error("%s", e)
+            return
+        ok, err = _verify_sharp_loads(server_dir, node)
+        if not ok:
+            log.error("Sharp still fails to load after rebuild:")
+            for line in err.splitlines()[-10:]:
+                log.error("  %s", line)
+            log.error(
+                "The worker cannot start without a working Sharp binding. "
+                "If you just ran `brew upgrade`, revert to a supported node "
+                "LTS: brew install node@22"
+            )
+            return
 
     # Worker environment
     worker_env = os.environ.copy()

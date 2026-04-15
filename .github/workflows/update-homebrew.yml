@@ -63,7 +63,13 @@ jobs:
 
             depends_on :macos
             depends_on arch: :arm64
-            depends_on "node"
+            # Immich 2.7.x pins engines.node = 24.x and sharp@0.34.5
+            # native addons break on node 25 (brew's default `node`
+            # formula). node@22 is the closest LTS with an arm64
+            # bottle that satisfies Immich's range. Pin explicitly —
+            # the accelerator's find_node() looks under
+            # /opt/homebrew/opt/node@22/bin/node.
+            depends_on "node@22"
             depends_on "vips"
             depends_on "libpq"
             depends_on "python@3.11"
