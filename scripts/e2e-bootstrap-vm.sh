@@ -156,16 +156,70 @@ if ! command -v brew >/dev/null 2>&1; then
     echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
 fi
 eval "$(/opt/homebrew/bin/brew shellenv)"
-brew install --quiet python@3.11 git vips node libpq
-# Dashboard deps pre-installed so per-run E2E doesn't hit PyPI.
-# Same composition as ml/requirements.txt — faithful proxy for the
-# Homebrew formula's ml venv.
-/opt/homebrew/opt/python@3.11/bin/python3.11 -m pip install \
-    --break-system-packages --quiet \
-    fastapi 'uvicorn[standard]'
+# node@22 specifically — Immich 2.7.4 pins engines.node=24.14.1 and
+# sharp@0.34.5 native addons won't load on the brew-default node 25.
+# node@22 is keg-only so it must be linked explicitly via PATH order.
+brew install --quiet python@3.11 git vips node@22 libpq
+export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
+# Dashboard + stub ML service deps pre-installed so per-run E2E
+# doesn't hit PyPI and doesn't need to build heavy ML wheels at
+# test time. This set covers:
+#   fastapi, uvicorn[standard] — dashboard (issue #17 coverage)
+#   numpy, Pillow              — top-level imports of ml/src/main.py
+#   python-multipart           — FastAPI multipart form handling
+# Running `ml/src/main.py` in STUB_MODE is how we exercise the real
+# /predict render path in the VM E2E without pulling ~2GB of mlx /
+# onnxruntime / coreml. The stub mode is a first-class feature of
+# the ml service, not a test hack.
+#
+# Retry the pip install up to 3 times — VM DNS is flaky and
+# transient "nodename nor servname" errors are common. pip's own
+# retries don't help because they fire BELOW DNS resolution.
+for attempt in 1 2 3; do
+    if /opt/homebrew/opt/python@3.11/bin/python3.11 -m pip install \
+        --break-system-packages --quiet \
+        fastapi 'uvicorn[standard]' numpy Pillow python-multipart; then
+        break
+    fi
+    echo "pip install attempt $attempt failed, retrying in 5s..."
+    sleep 5
+    if [ "$attempt" = 3 ]; then
+        echo "pip install failed after 3 attempts"
+        exit 1
+    fi
+done
 # Verify install before writing the marker — fail loud if anything
 # didn't land where it should.
-/opt/homebrew/bin/python3.11 -c "import fastapi, uvicorn; print('bootstrap deps OK', fastapi.__version__, uvicorn.__version__)"
+/opt/homebrew/bin/python3.11 -c "
+import fastapi, uvicorn, numpy, PIL
+print('bootstrap deps OK:',
+      'fastapi', fastapi.__version__,
+      'uvicorn', uvicorn.__version__,
+      'numpy', numpy.__version__,
+      'Pillow', PIL.__version__)
+"
+
+# Create the /build synthetic firmlink so Immich 2.7+ plugin paths
+# resolve at runtime. This is EXACTLY what `immich-accelerator setup`
+# does for real users — we do it during bootstrap so the base VM has
+# /build active from first boot, letting the E2E exercise the real
+# worker-start path (which verifies corePlugin/manifest.json at
+# /build/corePlugin/manifest.json). Requires a reboot to take effect;
+# the VM is stopped immediately after this and saved as the base,
+# so when clones boot for E2E runs, /build is already live.
+# Some macOS VM images only honor the legacy /etc/synthetic.conf
+# (singular) even though /etc/synthetic.d/ is the supported location
+# on macOS 11+. Write both to be safe. Both files must be owned by
+# root and have tab-separated <name>\t<relative-path> entries.
+sudo mkdir -p /etc/synthetic.d
+ENTRY=$(printf 'build\tUsers/admin/.immich-accelerator/build-data')
+echo "$ENTRY" | sudo tee /etc/synthetic.d/immich-accelerator >/dev/null
+echo "$ENTRY" | sudo tee /etc/synthetic.conf >/dev/null
+echo "wrote synthetic firmlink entry to both /etc/synthetic.d and /etc/synthetic.conf"
+# Pre-create the build-data target dir so /build resolves cleanly.
+# The E2E's step 3 populates this with corePlugin and geodata.
+mkdir -p /Users/admin/.immich-accelerator/build-data
+
 touch ~/.bootstrapped
 echo "bootstrap inner script complete"
 INNER
@@ -178,6 +232,32 @@ scp -i "$KEY_FILE" \
     "$INNER_SCRIPT" "$VM_USER@$VM_IP:/tmp/bootstrap-inner.sh"
 ssh "${SSH_KEY_OPTS[@]}" "$VM_USER@$VM_IP" "bash /tmp/bootstrap-inner.sh"
 rm -f "$INNER_SCRIPT"
+
+# Reboot the VM so macOS reads /etc/synthetic.d/immich-accelerator
+# and creates the /build firmlink. `apfs.util -t` at runtime fails
+# with "failed to stitch firmlinks" on the root volume — a reboot
+# is required. Then verify /build exists before saving the base.
+log "Rebooting VM so /etc/synthetic.d/ takes effect..."
+ssh "${SSH_KEY_OPTS[@]}" "$VM_USER@$VM_IP" "sudo shutdown -r now" 2>/dev/null || true
+# Wait for the VM to go down (old PID disappears) then come back up.
+sleep 15
+for _ in $(seq 1 60); do
+    if ssh "${SSH_KEY_OPTS[@]}" -o ConnectTimeout=3 \
+        "$VM_USER@$VM_IP" "echo ok" 2>/dev/null | grep -q ok; then
+        break
+    fi
+    sleep 2
+done
+
+log "Verifying /build firmlink after reboot..."
+if ! ssh "${SSH_KEY_OPTS[@]}" "$VM_USER@$VM_IP" \
+    "test -e /build && readlink /build" 2>&1; then
+    log "/build is not active after reboot — synthetic.d did not take effect"
+    ssh "${SSH_KEY_OPTS[@]}" "$VM_USER@$VM_IP" \
+        "ls -la /; cat /etc/synthetic.d/immich-accelerator; od -c /etc/synthetic.d/immich-accelerator" 2>&1 || true
+    exit 1
+fi
+log "/build synthetic firmlink verified post-reboot"
 
 log "Stopping VM and saving snapshot..."
 ssh "${SSH_KEY_OPTS[@]}" "$VM_USER@$VM_IP" "sudo shutdown -h now" 2>/dev/null || true
