@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.8 — 2026-04-18
+
+### Improvements
+- **Dashboard shows worker memory usage.** "Microservices Worker (450 MB)" next to the service status so memory growth during long thumbnail runs is visible (#33).
+- **Human-readable API error messages.** Dashboard now shows specific messages for common failures (auth rejected, connection refused, timeout, empty response) instead of raw Python exceptions.
+
 ## 1.4.7 — 2026-04-17
 
 ### Fixes

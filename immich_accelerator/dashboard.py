@@ -157,13 +157,25 @@ def get_status(config: dict) -> dict:
 
     # Check worker PID file (more reliable than pgrep — process name is 'node', not 'immich')
     worker_alive = False
+    worker_rss_mb = 0
     pid_file = Path.home() / ".immich-accelerator" / "pids" / "worker.pid"
     try:
         if pid_file.exists():
             pid = int(pid_file.read_text().strip().split("\n")[0])
             os.kill(pid, 0)  # check if process exists
             worker_alive = True
-    except (ValueError, OSError):
+            # Grab RSS for memory-growth detection. On macOS `ps -o rss=`
+            # returns kilobytes. Rising RSS over hours suggests a libvips
+            # or Sharp memory leak causing the thumbnail slowdown (#33).
+            rss_out = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "rss="],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if rss_out.returncode == 0 and rss_out.stdout.strip():
+                worker_rss_mb = round(int(rss_out.stdout.strip()) / 1024)
+    except (ValueError, OSError, subprocess.SubprocessError):
         pass
 
     # Processing counts
@@ -226,7 +238,10 @@ def get_status(config: dict) -> dict:
                 f"{immich_url}/api/jobs", headers={"x-api-key": api_key}
             )
             with _urlreq2.urlopen(req, timeout=5) as r:
-                jobs = json.loads(r.read())
+                body = r.read()
+                if not body or not body.strip():
+                    raise ValueError(f"empty response from {immich_url}/api/jobs")
+                jobs = json.loads(body)
                 queue_map = {
                     "thumbnailGeneration": "thumbnails",
                     "smartSearch": "clip",
@@ -241,7 +256,20 @@ def get_status(config: dict) -> dict:
                     queue_status[our_name] = (active + waiting) > 0
                     queue_counts[our_name] = active + waiting
         except Exception as e:
-            jobs_api_error = str(e)[:200]
+            err = str(e)
+            # Make common errors human-readable
+            if "Expecting value" in err or "empty response" in err:
+                jobs_api_error = (
+                    f"Immich API returned empty response (check immich_url in config)"
+                )
+            elif "401" in err or "403" in err:
+                jobs_api_error = "API key rejected (check api_key in config)"
+            elif "Connection refused" in err or "ECONNREFUSED" in err:
+                jobs_api_error = f"cannot reach {immich_url} (is Immich running?)"
+            elif "timed out" in err.lower():
+                jobs_api_error = "Immich API timed out (server under heavy load?)"
+            else:
+                jobs_api_error = err[:200]
             log.warning("jobs API unreachable: %s", jobs_api_error)
     else:
         jobs_api_error = "no api_key configured"
@@ -276,7 +304,11 @@ def get_status(config: dict) -> dict:
 
     status = {
         "services": {
-            "worker": {"alive": worker_alive, "name": "Microservices Worker"},
+            "worker": {
+                "alive": worker_alive,
+                "name": "Microservices Worker",
+                "rss_mb": worker_rss_mb,
+            },
             "ml": {"alive": ml_alive, "name": "ML Service"},
             "docker": {"alive": total > 0, "name": "Docker (API)"},
         },

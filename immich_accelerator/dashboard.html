@@ -378,7 +378,9 @@ function render(d) {
     dot.className = 'dot ' + (svc.alive ? 'on' : 'off');
     const lbl = document.createElement('div');
     lbl.className = 'service-label';
-    lbl.textContent = svc.name;
+    let label = svc.name;
+    if (svc.rss_mb > 0) label += ' (' + svc.rss_mb + ' MB)';
+    lbl.textContent = label;
     div.appendChild(dot);
     div.appendChild(lbl);
     svcEl.appendChild(div);
