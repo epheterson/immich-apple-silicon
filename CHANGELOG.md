@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.9 — 2026-04-23
+
+### Fixes
+- **iPhone 15+ Ultra HDR images failed thumbnail generation (#36)**. Sharp was using a pre-packaged binary without libultrahdr support. Now builds from source against Homebrew's libvips which includes it. Existing installs: run `immich-accelerator setup` to trigger a rebuild.
+
 ## 1.4.8 — 2026-04-18
 
 ### Improvements
