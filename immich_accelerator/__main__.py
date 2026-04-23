@@ -595,6 +595,12 @@ def _rebuild_sharp(server_dir: Path) -> None:
         env={
             **os.environ,
             "PATH": f"{node_bin}:/opt/homebrew/bin:{os.environ.get('PATH', '')}",
+            # Force build from source against system libvips instead of
+            # using Sharp's pre-packaged darwin-arm64 binary. The pre-built
+            # binary is compiled without libultrahdr, so iPhone 15+ Ultra
+            # HDR images fail with "unsupported image format" (#36).
+            # Homebrew's vips includes libultrahdr.
+            "npm_config_build_from_source": "true",
         },
     )
     if result.returncode != 0:
