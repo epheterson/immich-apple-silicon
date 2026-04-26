@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.10 — 2026-04-25
+
+### Fixes
+- **CLIP/smart search crashes on MLX 0.31.2 (#38)**. MLX 0.31.2 introduced a threading regression that crashes with "no Stream(gpu, 0)" during CLIP inference. Pinned `mlx<0.31.2` until upstream fixes it. Existing installs: `brew reinstall immich-accelerator`.
+- **ML submodule updated** with face embedding batch-dim fallback, CLIP model-swap retry, and gpu_lock clarification from upstream code review.
+
 ## 1.4.9 — 2026-04-23
 
 ### Fixes
