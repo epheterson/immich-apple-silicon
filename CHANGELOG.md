@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.11 — 2026-04-27
+
+### Improvements
+- **Environment preflight checks on start.** Auto-detects and fixes common issues before launching the worker: ImageMagick HEIC codec (auto-reinstalls), NFS mount accessibility, DB/Redis connectivity for split setups. Runs silently when everything is healthy.
+
 ## 1.4.10 — 2026-04-25
 
 ### Fixes

@@ -557,6 +557,113 @@ def _find_exposed_port(docker: str, container_names: list[str], default: str) ->
     return default
 
 
+# --- Environment health checks ---
+
+
+def _preflight_env_health(config: dict) -> None:
+    """Auto-detect and fix common environment issues before starting.
+
+    Each check is non-fatal — we log a warning and attempt to fix.
+    If the fix fails, we warn but don't block startup. The worker
+    will hit the issue at runtime and the user will see the error
+    in context, which is better than a cryptic preflight failure.
+
+    Checks added here should be things we've seen break in the
+    wild and can fix without user intervention.
+    """
+    brew = shutil.which("brew") or "/opt/homebrew/bin/brew"
+
+    # ImageMagick HEIC codec — Immich uses ImageMagick for person
+    # face thumbnails (not Sharp). If the HEIC codec module is
+    # missing, PersonGenerateThumbnail fails on HEIC-originating
+    # faces. brew reinstall fixes it.
+    identify = shutil.which("identify")
+    if identify:
+        try:
+            result = subprocess.run(
+                [identify, "-list", "format"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if "HEIC" not in result.stdout:
+                log.warning("ImageMagick HEIC codec missing — reinstalling...")
+                fix = subprocess.run(
+                    [brew, "reinstall", "imagemagick"],
+                    capture_output=True,
+                    timeout=300,
+                )
+                if fix.returncode == 0:
+                    log.info("  ImageMagick reinstalled")
+                else:
+                    log.warning("  brew reinstall failed (exit %d)", fix.returncode)
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    # NFS mount reachable — for split setups where upload_mount
+    # is on a network share (e.g., /nas/...). If the mount went
+    # stale (NAS rebooted, network blip), the worker will hang
+    # on first file access. Use a short timeout via a subprocess
+    # stat call instead of Path.exists() which can hang indefinitely
+    # on a stale NFS mount.
+    upload_mount = config.get("upload_mount", "")
+    if upload_mount and not upload_mount.startswith(("/Users", "/tmp")):
+        try:
+            probe = subprocess.run(
+                ["stat", upload_mount],
+                capture_output=True,
+                timeout=5,
+            )
+            if probe.returncode != 0:
+                log.warning(
+                    "upload_mount %s is not accessible — check NFS/SMB mount.",
+                    upload_mount,
+                )
+            elif not os.access(upload_mount, os.W_OK):
+                log.warning(
+                    "upload_mount %s is not writable — thumbnails will fail.",
+                    upload_mount,
+                )
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "upload_mount %s timed out — NFS/SMB mount may be stale.",
+                upload_mount,
+            )
+        except OSError as e:
+            log.warning("upload_mount %s: %s", upload_mount, e)
+
+    # DB/Redis connectivity — for split setups, catch unreachable
+    # DB before the worker spends 30s trying to connect.
+    def _check_port(host: str, port_str: str, label: str) -> None:
+        if host in ("localhost", "127.0.0.1"):
+            return
+        try:
+            port = int(port_str)
+        except (ValueError, TypeError):
+            return
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                pass
+        except OSError:
+            log.warning(
+                "%s at %s:%d is unreachable — worker will fail to start.",
+                label,
+                host,
+                port,
+            )
+
+    _check_port(
+        config.get("db_hostname", "localhost"),
+        config.get("db_port", "5432"),
+        "Postgres",
+    )
+    _check_port(
+        config.get("redis_hostname", "localhost"),
+        config.get("redis_port", "6379"),
+        "Redis",
+    )
+
+
 # --- Server management ---
 
 
@@ -2506,6 +2613,10 @@ def cmd_start(args):
         worker_env["PATH"] = (
             str(Path(config["ffmpeg_path"]).parent) + ":" + worker_env["PATH"]
         )
+
+    # Environment health checks — auto-detect and fix common issues
+    # (ImageMagick HEIC codec, NFS mount, DB/Redis reachability).
+    _preflight_env_health(config)
 
     # Re-resolve ml_dir every start. Same pattern as the node path
     # resolution above: config["ml_dir"] is a cache that goes stale
