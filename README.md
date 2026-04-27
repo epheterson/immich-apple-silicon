@@ -203,17 +203,7 @@ Reboot. Now `/data` on the Mac resolves to the SMB/NFS mount, matching what Dock
 
 ### Changing IMMICH_MEDIA_LOCATION on an existing install
 
-Immich automatically rewrites all file paths in the database on restart when `IMMICH_MEDIA_LOCATION` changes. It's safe — **but back up your database first**. The API will be unresponsive for a few minutes while paths rewrite (~3 min for 300k assets).
-
-### Migration notes
-
-**Adding a Mac to an existing NAS Immich** (most common): Set `IMMICH_WORKERS_INCLUDE=api` on the NAS, expose Postgres and Redis on the LAN, then `immich-accelerator setup --url http://nas:2283 --api-key KEY` on the Mac. Thumbnails and transcodes will generate on the Mac going forward. See [Topology](#topology) above.
-
-**Moving Docker from Mac to NAS**: Back up the database first. Deploy Immich on the NAS, import the backup BEFORE starting the Immich server (otherwise empty tables conflict with the restore). Rsync thumbnails/encoded-video or let the worker regenerate them. `docker rm` the Mac containers (not just `stop` — restart policies bring them back).
-
-**Synology tips**: DSM uses ports 5432 (Postgres) and 6379 (Redis) internally — use alternate ports like 15432/16379. `docker-compose` isn't on the default SSH PATH — run `export PATH=/usr/local/bin:$PATH` first.
-
-**NFS path tip**: If the Mac already mounts the NAS (e.g., `/nas/`), put Immich's upload dir under that mount and set `IMMICH_MEDIA_LOCATION` to the Mac's mount path in Docker. Both sides use the same path — no synthetic links needed.
+Immich automatically rewrites all file paths in the database on restart when `IMMICH_MEDIA_LOCATION` changes. It's safe — **but back up your database first**.
 
 ## ML service
 
