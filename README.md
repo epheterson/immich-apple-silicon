@@ -203,7 +203,25 @@ Reboot. Now `/data` on the Mac resolves to the SMB/NFS mount, matching what Dock
 
 ### Changing IMMICH_MEDIA_LOCATION on an existing install
 
-Immich automatically rewrites all file paths in the database on restart when `IMMICH_MEDIA_LOCATION` changes. It's safe — **but back up your database first**.
+Immich automatically rewrites all file paths in the database on restart when `IMMICH_MEDIA_LOCATION` changes. It's safe — **but back up your database first**. The API will be unresponsive for a few minutes while paths rewrite (~3 min for 300k assets).
+
+### Migrating from local Docker to split (NAS + Mac)
+
+If you're currently running everything on the Mac and want to move Docker to a NAS:
+
+1. **Back up your database** — `docker exec immich_postgres pg_dump -U postgres -d immich | gzip > immich-backup.sql.gz`
+2. **Deploy Immich on the NAS** — server (API-only), Postgres, and Redis. Use non-default ports if the NAS already has Postgres/Redis (Synology DSM uses 5432 and 6379 internally — use 15432/16379 instead).
+3. **Import the backup BEFORE starting the Immich server** — if the server runs migrations first, the restore will conflict with the empty tables. Stop the server, drop + recreate the database, then import.
+4. **Rsync thumbnails + encoded-video** to the NAS (or let the worker regenerate them — faster to rsync, but regeneration works if you'd rather not transfer ~300 GB).
+5. **Remove the Mac's Docker containers** — `docker rm` (not just `docker stop`) to prevent auto-restart policies from bringing them back.
+6. **Reconfigure** — `immich-accelerator setup --url http://nas-ip:2283 --api-key KEY`
+
+**Path tip for NFS users:** If your Mac already mounts the NAS at `/nas/`, put Immich's upload directory under that mount (e.g., `/nas/immich/upload/`). Set `IMMICH_MEDIA_LOCATION=/nas/immich/upload` in the NAS Docker compose with a matching bind mount (`/volume1/share/immich/upload:/nas/immich/upload`). Both sides use `/nas/...` paths — no synthetic links needed.
+
+**Synology notes:**
+- `docker` and `docker-compose` are at `/usr/local/bin/` but not on the default SSH PATH — prefix commands with `export PATH=/usr/local/bin:$PATH`
+- DSM's built-in Postgres and Redis occupy ports 5432 and 6379 — use alternate ports for Immich
+- NFS permission errors (`fchmodat: Operation not permitted`) during rsync are harmless — Synology controls permissions on its shares
 
 ## ML service
 
