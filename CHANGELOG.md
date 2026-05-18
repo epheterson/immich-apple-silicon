@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.12 — 2026-05-16
+
+### Fixes
+- **Startup validates database and Redis connections with real queries (#42)**. Instead of just checking TCP connectivity, the preflight now runs `psql SELECT 1` and `redis-cli PING`. Surfaces the actual error (auth failure, port conflict, connection reset) with actionable guidance instead of letting the worker crash with a raw ECONNRESET.
+- **Auto-creates missing media subdirectories on startup (#43)**. If `upload/`, `thumbs/`, `encoded-video/`, etc. are missing under `IMMICH_MEDIA_LOCATION`, the preflight creates them with `.immich` markers so Immich's StorageService doesn't crash.
+
 ## 1.4.11 — 2026-04-27
 
 ### Improvements

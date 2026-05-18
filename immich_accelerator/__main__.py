@@ -560,7 +560,7 @@ def _find_exposed_port(docker: str, container_names: list[str], default: str) ->
 # --- Environment health checks ---
 
 
-def _preflight_env_health(config: dict) -> None:
+def _preflight_env_health(config: dict) -> bool:
     """Auto-detect and fix common environment issues before starting.
 
     Each check is non-fatal — we log a warning and attempt to fix.
@@ -632,36 +632,163 @@ def _preflight_env_health(config: dict) -> None:
         except OSError as e:
             log.warning("upload_mount %s: %s", upload_mount, e)
 
-    # DB/Redis connectivity — for split setups, catch unreachable
-    # DB before the worker spends 30s trying to connect.
-    def _check_port(host: str, port_str: str, label: str) -> None:
-        if host in ("localhost", "127.0.0.1"):
-            return
+    # DB connectivity — try a real psql query, not just TCP connect.
+    # ECONNRESET from Postgres looks identical to "unreachable" from
+    # the worker's perspective. A real query surfaces auth failures,
+    # SSL issues, pg_hba rejections, and port conflicts clearly (#42).
+    db_host = config.get("db_hostname", "localhost")
+    db_port = config.get("db_port", "5432")
+    db_user = config.get("db_username", "postgres")
+    db_name = config.get("db_name", "immich")
+    db_pass = config.get("db_password", "")
+    psql = shutil.which("psql") or "/opt/homebrew/opt/libpq/bin/psql"
+    if Path(psql).exists():
         try:
-            port = int(port_str)
-        except (ValueError, TypeError):
-            return
-        try:
-            with socket.create_connection((host, port), timeout=3):
-                pass
-        except OSError:
-            log.warning(
-                "%s at %s:%d is unreachable — worker will fail to start.",
-                label,
-                host,
-                port,
+            result = subprocess.run(
+                [
+                    psql,
+                    "-h",
+                    db_host,
+                    "-p",
+                    str(db_port),
+                    "-U",
+                    db_user,
+                    "-d",
+                    db_name,
+                    "-c",
+                    "SELECT 1",
+                    "-t",
+                    "-A",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env={**os.environ, "PGPASSWORD": db_pass},
             )
+            if result.returncode != 0:
+                err = (result.stderr or "").strip()
+                log.error("Postgres connection failed:")
+                log.error(
+                    "  host=%s port=%s user=%s db=%s",
+                    db_host,
+                    db_port,
+                    db_user,
+                    db_name,
+                )
+                if "Connection reset" in err or "ECONNRESET" in err:
+                    log.error(
+                        "  Connection was reset — port conflict or auth rejection."
+                    )
+                    log.error("  Is another service using port %s?", db_port)
+                    log.error(
+                        "  Does docker-compose expose the port without 127.0.0.1 prefix?"
+                    )
+                elif "password authentication failed" in err:
+                    log.error(
+                        "  Password rejected. Check DB_PASSWORD matches config.json."
+                    )
+                elif "Connection refused" in err:
+                    log.error(
+                        "  Nothing listening on %s:%s. Is the database running?",
+                        db_host,
+                        db_port,
+                    )
+                else:
+                    log.error("  %s", err.split("\n")[0] if err else "unknown error")
+                log.error("")
+                log.error(
+                    "  Worker cannot start without a working database connection."
+                )
+                return False  # Block startup — worker will crash anyway
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "Postgres connection timed out (host=%s port=%s)", db_host, db_port
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        # No psql available — fall back to TCP connect check
+        try:
+            with socket.create_connection((db_host, int(db_port)), timeout=3):
+                pass
+        except (OSError, ValueError):
+            log.error("Postgres at %s:%s is unreachable.", db_host, db_port)
+            log.error("  Is the database container running? Are ports exposed?")
+            return False  # Block startup
 
-    _check_port(
-        config.get("db_hostname", "localhost"),
-        config.get("db_port", "5432"),
-        "Postgres",
-    )
-    _check_port(
-        config.get("redis_hostname", "localhost"),
-        config.get("redis_port", "6379"),
-        "Redis",
-    )
+    # Redis connectivity — try a real PING if redis-cli is available.
+    redis_host = config.get("redis_hostname", "localhost")
+    redis_port = config.get("redis_port", "6379")
+    redis_cli = shutil.which("redis-cli")
+    if redis_cli:
+        try:
+            result = subprocess.run(
+                [redis_cli, "-h", redis_host, "-p", str(redis_port), "PING"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if "PONG" not in (result.stdout or ""):
+                err = (result.stderr or result.stdout or "").strip()
+                log.error(
+                    "Redis connection failed (host=%s port=%s):", redis_host, redis_port
+                )
+                log.error("  %s", err[:200] if err else "no response")
+                log.error("  Worker needs Redis for the job queue.")
+                return False
+        except (subprocess.TimeoutExpired, OSError, subprocess.SubprocessError):
+            try:
+                with socket.create_connection((redis_host, int(redis_port)), timeout=3):
+                    pass
+            except (OSError, ValueError):
+                log.error("Redis at %s:%s is unreachable.", redis_host, redis_port)
+                return False
+    else:
+        try:
+            with socket.create_connection((redis_host, int(redis_port)), timeout=3):
+                pass
+        except (OSError, ValueError):
+            log.error("Redis at %s:%s is unreachable.", redis_host, redis_port)
+            return False  # Block startup
+
+    # Media location subdirectory check — Immich expects these under
+    # IMMICH_MEDIA_LOCATION. If they're missing, the path is wrong or
+    # the Docker volume mount is incomplete. Don't auto-create — that
+    # would hide the real problem (#43).
+    if upload_mount and Path(upload_mount).exists():
+        expected = [
+            "upload",
+            "thumbs",
+            "encoded-video",
+            "library",
+            "profile",
+            "backups",
+        ]
+        missing = [d for d in expected if not Path(upload_mount, d).exists()]
+        if missing:
+            log.error(
+                "IMMICH_MEDIA_LOCATION (%s) is missing: %s",
+                upload_mount,
+                ", ".join(missing),
+            )
+            log.error("")
+            log.error(
+                "  This directory should contain: upload/, thumbs/, encoded-video/,"
+            )
+            log.error("  library/, profile/, backups/")
+            log.error("")
+            log.error("  Common causes:")
+            log.error("    - IMMICH_MEDIA_LOCATION points to the wrong directory")
+            log.error(
+                "    - Docker volume mount only maps a subdirectory (e.g., upload/)"
+            )
+            log.error("      instead of the whole media location")
+            log.error("")
+            log.error("  Check your docker-compose volumes: the mount should cover")
+            log.error("  the entire IMMICH_MEDIA_LOCATION, not just upload/ inside it.")
+            return False
+
+    return True
 
 
 # --- Server management ---
@@ -2616,7 +2743,8 @@ def cmd_start(args):
 
     # Environment health checks — auto-detect and fix common issues
     # (ImageMagick HEIC codec, NFS mount, DB/Redis reachability).
-    _preflight_env_health(config)
+    if not _preflight_env_health(config):
+        return
 
     # Re-resolve ml_dir every start. Same pattern as the node path
     # resolution above: config["ml_dir"] is a cache that goes stale
