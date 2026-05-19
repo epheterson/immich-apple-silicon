@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.0 — 2026-05-19
+
+### Features
+- **One-command fresh install.** `immich-accelerator setup` on a bare Mac now sets up everything — installs OrbStack if no Docker is found, creates the Immich Docker stack, configures the native worker, and starts all services. Two questions: where your photos are, where Immich should store its data. No manual docker-compose editing.
+- **Managed Docker stack.** The generated compose file lives at `~/.immich-accelerator/docker/`. Re-running setup detects it and restarts if stopped, without re-prompting.
+
 ## 1.4.13 — 2026-05-18
 
 ### Fixes
