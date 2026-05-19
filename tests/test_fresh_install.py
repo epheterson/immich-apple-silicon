@@ -22,6 +22,7 @@ from unittest.mock import patch, MagicMock
 
 from immich_accelerator.__main__ import (
     SUPPORTED_NODE_MAJORS,
+    _COMPOSE_TEMPLATE,
     _STALE_ML_RE,
     _STALE_WORKER_RE,
     _check_node_engines_compat,
