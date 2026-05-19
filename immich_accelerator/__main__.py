@@ -795,20 +795,22 @@ def _preflight_env_health(config: dict) -> bool:
 
 
 def _rebuild_sharp(server_dir: Path) -> None:
-    """Rebuild Sharp native bindings against system libvips (Homebrew).
+    """Install Sharp's pre-built darwin-arm64 binary.
 
-    The container has linux-arm64 Sharp. System libvips matches Docker's
-    error handling for corrupt HEIF files.
+    The Docker image has linux Sharp binaries that can't run on macOS.
+    We install the official pre-built darwin-arm64 package from npm,
+    which bundles its own libvips (8.17.x). This matches what stock
+    Immich Docker ships and avoids the UHDR auto-detect bug in system
+    vips 8.18+ (#44): Homebrew's libvips has a UHDR loader that claims
+    JPEG files but fails through Sharp's auto-detect chain. The
+    pre-built vips doesn't include libultrahdr, so jpegload handles
+    all JPEGs cleanly.
 
-    Raises RuntimeError if the rebuild fails — silently logging a
-    warning was the v1.4.x behavior and it turned every sharp
-    breakage into an opaque worker crash at ``require('sharp')``
-    during Nest bootstrap with no obvious remediation for the user.
-    The rebuild failure IS the problem, so we make it the error.
+    Previous approach (npm rebuild / build_from_source) always compiled
+    from source against system vips because the Docker extraction never
+    included the darwin prebuilt. That was never intentional — we just
+    didn't realize npm rebuild had nothing to fall back to.
     """
-    log.info("Rebuilding Sharp for macOS (requires: brew install vips)...")
-    # Use the npm colocated with our chosen node so the native
-    # binding ABI matches the node the worker will actually spawn.
     npm = find_npm()
     sharp_dirs = list(server_dir.glob("node_modules/.pnpm/sharp@*/node_modules/sharp"))
     if not sharp_dirs:
@@ -816,39 +818,48 @@ def _rebuild_sharp(server_dir: Path) -> None:
             "Sharp not found under server_dir/node_modules/.pnpm/sharp@* — "
             "extraction may be incomplete. Re-run setup."
         )
-    # Put our node's bin dir first on PATH so npm spawns the right
-    # node for the gyp build. Without this, a keg-only node@22
-    # doesn't get found and npm falls back to the system node.
+    sharp_dir = sharp_dirs[0]
+
+    # Extract the Sharp version from the pnpm path (sharp@0.34.5)
+    sharp_version = sharp_dir.parent.parent.name.split("@")[-1]
+    if not sharp_version or not sharp_version[0].isdigit():
+        sharp_version = "0.34.5"  # fallback
+
+    log.info("Installing Sharp pre-built binary for macOS (v%s)...", sharp_version)
+
     node_bin = str(Path(find_node()).parent)
+    env = {
+        **os.environ,
+        "PATH": f"{node_bin}:/opt/homebrew/bin:{os.environ.get('PATH', '')}",
+    }
+
+    # Install the official pre-built darwin-arm64 package.
     result = subprocess.run(
-        [npm, "rebuild"],
-        cwd=str(sharp_dirs[0]),
+        [npm, "install", f"@img/sharp-darwin-arm64@{sharp_version}", "--no-save"],
+        cwd=str(sharp_dir),
         capture_output=True,
         text=True,
         timeout=180,
-        env={
-            **os.environ,
-            "PATH": f"{node_bin}:/opt/homebrew/bin:{os.environ.get('PATH', '')}",
-            # Force build from source against system libvips instead of
-            # using Sharp's pre-packaged darwin-arm64 binary. The pre-built
-            # binary is compiled without libultrahdr, so iPhone 15+ Ultra
-            # HDR images fail with "unsupported image format" (#36).
-            # Homebrew's vips includes libultrahdr.
-            "npm_config_build_from_source": "true",
-        },
+        env=env,
     )
     if result.returncode != 0:
         tail = (result.stderr or result.stdout or "")[-600:]
-        node_major = _node_major_version(find_node()) or "?"
         raise RuntimeError(
-            "Sharp rebuild failed against system libvips "
-            f"(node {node_major}.x).\n"
+            f"Failed to install @img/sharp-darwin-arm64@{sharp_version}.\n"
             f"  Last output:\n    {tail}\n"
-            "  Check that libvips is installed: brew install vips\n"
-            f"  If node is newer than {SUPPORTED_NODE_MAJORS[-1]}, install "
-            "a supported LTS: brew install node@22"
         )
-    log.info("  Sharp rebuilt against system libvips")
+
+    # Remove source-built binary if it exists, so Sharp picks up the
+    # pre-built one. The source-built binary links against system vips
+    # which has the UHDR loader bug.
+    source_build = sharp_dir / "src" / "build"
+    if source_build.exists():
+        try:
+            shutil.rmtree(source_build)
+        except OSError as e:
+            log.warning("Could not remove source-built Sharp: %s", e)
+
+    log.info("  Sharp pre-built binary installed")
 
 
 def _verify_sharp_loads(server_dir: str, node: str) -> tuple[bool, str]:

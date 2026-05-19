@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.13 — 2026-05-18
+
+### Fixes
+- **UHDR JPEG thumbnails failing (#44)**. Sharp was building from source against system libvips which has a UHDR loader that breaks JPEG auto-detect. Now installs the official pre-built darwin-arm64 binary from npm, which bundles vips 8.17.3 without the UHDR loader. Matches stock Immich Docker behavior. Existing installs: `immich-accelerator setup` to trigger a rebuild.
+
 ## 1.4.12 — 2026-05-16
 
 ### Fixes
