@@ -2044,6 +2044,7 @@ services:
   immich-server:
     container_name: immich_server
     image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+    env_file: .env
     environment:
       - IMMICH_WORKERS_INCLUDE=api
       - IMMICH_MACHINE_LEARNING_URL=http://host.docker.internal:3003
@@ -2067,7 +2068,7 @@ services:
       - POSTGRES_DB=immich
       - POSTGRES_INITDB_ARGS=--data-checksums
     volumes:
-      - ${DB_DATA_LOCATION}:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     ports:
       - '127.0.0.1:5432:5432'
     restart: unless-stopped
@@ -2078,6 +2079,9 @@ services:
     ports:
       - '127.0.0.1:6379:6379'
     restart: unless-stopped
+
+volumes:
+  pgdata:
 """
 
 
@@ -2210,11 +2214,15 @@ def _fresh_install(docker: str) -> bool:
     import secrets
 
     db_password = secrets.token_urlsafe(24)
-    db_data = str(compose_dir / "pgdata")
+    # All vars the Immich server reads from .env (via env_file).
+    # Must match what stock Immich docker-compose expects.
     env_content = (
         f"UPLOAD_LOCATION={data_path}\n"
         f"DB_PASSWORD={db_password}\n"
-        f"DB_DATA_LOCATION={db_data}\n"
+        f"DB_HOSTNAME=immich_postgres\n"
+        f"DB_USERNAME=postgres\n"
+        f"DB_DATABASE_NAME=immich\n"
+        f"REDIS_HOSTNAME=immich_redis\n"
     )
     (compose_dir / ".env").write_text(env_content)
     os.chmod(compose_dir / ".env", 0o600)
@@ -2314,7 +2322,10 @@ def _setup_local(args):
     log.info("  Upload: %s", immich["upload_mount"] or "not detected")
 
     # Install dependencies and extract server first (doesn't need Docker config)
-    upload = immich["upload_mount"]
+    # Prefer upload_mount (from Docker volume inspection), fall back to
+    # media_location (from IMMICH_MEDIA_LOCATION env). Both point to the
+    # same directory when the compose uses same-path mounts.
+    upload = immich["upload_mount"] or immich.get("media_location")
 
     node, ffmpeg_path, ml_dir = _check_local_tools()
     server_dir = extract_immich_server(docker, immich["container"], immich["version"])
