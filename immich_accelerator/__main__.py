@@ -860,7 +860,6 @@ def _rebuild_sharp(server_dir: Path) -> None:
             log.warning("Could not remove source-built Sharp: %s", e)
 
     log.info("  Sharp pre-built binary installed")
-    log.info("  Sharp rebuilt against system libvips")
 
 
 def _verify_sharp_loads(server_dir: str, node: str) -> tuple[bool, str]:
