@@ -52,10 +52,11 @@ jobs:
         # "slow step failed" rather than masking the fast ones.
         run: pytest -v tests/test_fresh_install.py -m slow
 
-  fresh-install-e2e:
-    # Full E2E on macOS: install Docker, generate compose, start
-    # Immich stack, run setup, start native worker + ML, validate.
-    runs-on: macos-14
+  fresh-install-docker:
+    # Docker E2E: generates compose from template, starts the full
+    # Immich stack, validates API + detection. Runs on Ubuntu where
+    # Docker is pre-installed (macOS runners can't run Docker VMs).
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,18 +64,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
-      - name: Install Docker via colima
-        run: |
-          brew install colima docker docker-compose
-          colima start --cpu 2 --memory 4
-          docker info
-      - name: Install test dependencies
-        run: pip install pytest
-      - name: Install node@22 + vips + libpq
-        run: |
-          brew install node@22 vips libpq
-          echo "/opt/homebrew/opt/node@22/bin" >> $GITHUB_PATH
       - name: Generate compose from template
         run: |
           python3 -c "
@@ -95,7 +84,9 @@ jobs:
           (test_dir / '.env').write_text(env)
           print('Compose generated')
           "
-      - name: Start Immich Docker stack
+      - name: Validate compose syntax
+        run: docker compose -f /tmp/fresh-install-ci/docker-compose.yml config > /dev/null
+      - name: Start Immich stack
         run: |
           cd /tmp/fresh-install-ci
           docker compose up -d
@@ -108,7 +99,11 @@ jobs:
             sleep 3
           done
           curl -sf http://localhost:2283/api/server/ping | grep -q pong || { echo "API never came up"; docker logs immich_server; exit 1; }
-      - name: Verify detection
+      - name: Verify all containers running
+        run: |
+          docker ps --format "{{.Names}}\t{{.Status}}" | grep immich
+          [ $(docker ps --format "{{.Names}}" | grep -c immich) -eq 3 ] || { echo "Not all containers running"; exit 1; }
+      - name: Verify setup detection
         run: |
           python3 -c "
           import sys
@@ -116,47 +111,19 @@ jobs:
           from immich_accelerator.__main__ import detect_immich
           immich = detect_immich('docker')
           assert immich['version'], 'no version'
-          assert immich['workers_include'] == 'api'
+          assert immich['workers_include'] == 'api', f'wrong workers: {immich[\"workers_include\"]}'
           assert immich.get('media_location'), 'no media_location'
-          print(f'Detected: v{immich[\"version\"]}')
+          print(f'Detected: v{immich[\"version\"]}, workers={immich[\"workers_include\"]}')
+          print(f'Media: {immich[\"media_location\"]}')
+          print('Detection: OK')
           "
-      - name: Extract server + install Sharp
-        run: |
-          python3 -c "
-          import sys
-          sys.path.insert(0, '.')
-          from immich_accelerator.__main__ import detect_immich, extract_immich_server
-          immich = detect_immich('docker')
-          server_dir = extract_immich_server('docker', immich['container'], immich['version'])
-          print(f'Server extracted: {server_dir}')
-          "
-      - name: Verify Sharp loads
-        run: |
-          node -e "const s = require('sharp'); console.log('Sharp OK:', s.versions.vips, s.versions.sharp)" \
-            --require ~/.immich-accelerator/server/*/node_modules/.pnpm/sharp@*/node_modules/sharp 2>/dev/null || \
-          python3 -c "
-          import sys, subprocess
-          sys.path.insert(0, '.')
-          from immich_accelerator.__main__ import find_node, _verify_sharp_loads
-          from pathlib import Path
-          import glob
-          server_dirs = glob.glob(str(Path.home() / '.immich-accelerator/server/*'))
-          if server_dirs:
-              node = find_node()
-              ok, err = _verify_sharp_loads(server_dirs[0], node)
-              print(f'Sharp loads: {ok}')
-              if not ok: print(f'Error: {err[:200]}')
-              assert ok, 'Sharp failed to load'
-          "
-      - name: Run unit tests
-        run: pytest -v tests/test_fresh_install.py -m "not slow"
       - name: Tear down
         if: always()
         run: cd /tmp/fresh-install-ci && docker compose down -v 2>/dev/null || true
 
   auto-tag:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [lint, fresh-install-macos, fresh-install-e2e]
+    needs: [lint, fresh-install-macos, fresh-install-docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
