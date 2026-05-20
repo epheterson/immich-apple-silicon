@@ -43,15 +43,11 @@ The microservices worker is extracted directly from your running Immich Docker i
 ## Requirements
 
 - macOS on Apple Silicon (M1/M2/M3/M4)
-- Immich already running in Docker (on this Mac or a remote host like a NAS)
-- [Homebrew](https://brew.sh) (setup will offer to install Node.js and libvips if missing)
-- Python 3.11+ for the ML service
+- [Homebrew](https://brew.sh)
 
-> **FFmpeg:** Downloaded automatically during setup ([jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) — the same ffmpeg Immich uses in Docker).
+That's it. Setup installs everything else (Docker, Node.js, ffmpeg, ML dependencies).
 
 ## Quick start
-
-### 1. Install and run setup
 
 ```bash
 brew tap epheterson/immich-accelerator
@@ -59,51 +55,20 @@ brew install immich-accelerator
 immich-accelerator setup
 ```
 
-Or from source:
+If no Docker is found, setup offers to install [OrbStack](https://orbstack.dev). If no Immich is running, setup creates the entire Docker stack for you — just answer two questions:
 
-```bash
-git clone --recursive https://github.com/epheterson/immich-apple-silicon.git
-cd immich-apple-silicon
-python3 -m immich_accelerator setup
-```
+1. **Where are your photos?** (e.g., `~/Pictures`) — mounted read-only for Immich to import
+2. **Where should Immich store its data?** (e.g., `~/.immich-accelerator/data`) — thumbnails, transcoded video, backups
 
-Setup handles everything: installs dependencies, downloads jellyfin-ffmpeg, creates the ML service venv, extracts the server from Docker, and guides you through the docker-compose changes.
+Setup generates the docker-compose, starts Immich, extracts the native worker, and starts everything. Open `http://localhost:2283` to create your admin account.
 
-For NAS + Mac or manual setups, see [Split deployment](#split-deployment-nas--mac) below.
+For existing Immich installs, setup detects the running containers and configures the accelerator to work alongside them.
 
-### 2. Configure Docker
+For NAS + Mac setups, see [Split deployment](#split-deployment-nas--mac) below.
 
-The setup command prints the required changes. The key settings:
+### Understanding `IMMICH_MEDIA_LOCATION`
 
-```yaml
-services:
-  immich-server:
-    environment:
-      - IMMICH_WORKERS_INCLUDE=api
-      - IMMICH_MACHINE_LEARNING_URL=http://host.internal:3003  # OrbStack
-      # Docker Desktop: use http://host.docker.internal:3003 instead
-      - IMMICH_MEDIA_LOCATION=/your/upload/path
-    volumes:
-      # IMPORTANT: use the same absolute path on both sides (not the Docker default)
-      - /your/upload/path:/your/upload/path
-      - /your/photos:/your/photos:ro
-```
-
-Then: `docker compose up -d`
-
-### Understanding path mapping
-
-Immich stores absolute file paths in Postgres. Docker and the native worker must resolve those paths to the same files. `IMMICH_MEDIA_LOCATION` is the lever: set it to the real host path (like `/Users/you/immich/upload`) and mount that same path inside Docker with `-v /Users/you/immich/upload:/Users/you/immich/upload`. Both sides now see the same bytes at the same path.
-
-Setup detects your upload directory and tells you exactly what to use. For cross-machine setups see [Split deployment](#split-deployment-nas--mac-or-any-two-hosts) — the requirements are stricter.
-
-### 3. Start the accelerator
-
-```bash
-immich-accelerator start
-```
-
-Starts the native microservices worker and ML service. Immich's web UI works as usual. Uploads go through Docker's API, compute happens natively.
+This is the directory Immich uses as its media root. It contains these subdirectories: `upload/`, `thumbs/`, `encoded-video/`, `library/`, `profile/`, `backups/`. Both Docker and the native worker must see this directory at the same absolute path. Setup handles this automatically for same-machine installs.
 
 ## Commands
 
