@@ -95,7 +95,18 @@ Real-time monitoring at `http://your-mac:8420`:
 immich-accelerator dashboard
 ```
 
-Shows service health, processing progress with live rates and ETAs, Apple Silicon hardware utilization, and system metrics. Mobile-friendly — check from your phone.
+Shows service health, processing progress with live rates and ETAs, Apple Silicon hardware utilization, and system metrics. Mobile-friendly -- check from your phone.
+
+The dashboard and setup use the Immich API for job status and queue control. Create an API key from an **admin** account in Administration > API Keys with these permissions:
+
+| Permission | Used by | Why |
+|-----------|---------|-----|
+| `job.read` | Dashboard | Show queue activity (active/waiting counts) |
+| `job.create` | Dashboard | Re-queue button |
+| `asset.read` | Setup | Detect upload library path |
+| `library.read` | Setup | Detect external library paths |
+
+All `job.*` and `library.*` endpoints require admin access. If the dashboard shows "API key invalid," make sure the key was created by an admin user.
 
 ![Dashboard](docs/dashboard.png)
 
