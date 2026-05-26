@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.1 — 2026-05-25
+
+### Fixes
+- **HEVC VideoToolbox output now always uses Apple-compatible hvc1 tag (#48)**. ffmpeg defaults to hev1 for HEVC, which Apple's decoder rejects. The wrapper now injects `-tag:v hvc1` when encoding HEVC via VideoToolbox if the caller doesn't specify it.
+
 ## 1.5.0 — 2026-05-19
 
 ### Features

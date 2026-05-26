@@ -11,6 +11,8 @@ REAL_FFMPEG="/opt/homebrew/bin/ffmpeg"
 
 ARGS=("$@")
 USE_HW=false
+USE_HEVC=false
+HAS_HEVC_TAG=false
 NEW_ARGS=()
 
 for ((i=0; i<${#ARGS[@]}; i++)); do
@@ -30,6 +32,7 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
                 NEW_ARGS+=("$arg" "hevc_videotoolbox")
                 ((i++))
                 USE_HW=true
+                USE_HEVC=true
                 continue
                 ;;
         esac
@@ -41,10 +44,22 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
         continue
     fi
 
+    # Track if -tag:v is already specified (including stream-specific -tag:v:0 etc.)
+    [[ "$arg" == -tag:v* ]] && HAS_HEVC_TAG=true
+
     NEW_ARGS+=("$arg")
 done
 
 if [[ "$USE_HW" == true ]]; then
+    # Ensure HEVC output uses hvc1 tag (Apple-compatible).
+    # hev1 (ffmpeg default) stores parameter sets in-band — Apple's
+    # decoder rejects it. Immich usually passes -tag:v hvc1 itself,
+    # but if it's absent we inject it before the output filename.
+    if [[ "$USE_HEVC" == true && "$HAS_HEVC_TAG" == false ]]; then
+        len=${#NEW_ARGS[@]}
+        LAST="${NEW_ARGS[$((len-1))]}"
+        NEW_ARGS=("${NEW_ARGS[@]:0:$((len-1))}" "-tag:v" "hvc1" "$LAST")
+    fi
     exec "$REAL_FFMPEG" -hwaccel videotoolbox "${NEW_ARGS[@]}"
 else
     exec "$REAL_FFMPEG" "${NEW_ARGS[@]}"
