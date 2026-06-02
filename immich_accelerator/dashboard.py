@@ -5,7 +5,7 @@ both API endpoints and a beautiful single-page dashboard. Polls the
 Immich database, checks service health, and reads system metrics.
 
 Usage:
-    python -m immich_accelerator dashboard          # http://localhost:8420
+    python -m immich_accelerator dashboard          # http://localhost:8422
     python -m immich_accelerator dashboard --port 9000
 
 Security note: The dashboard renders data from the local Immich database

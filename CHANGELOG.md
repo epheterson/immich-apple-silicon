@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.2 — 2026-06-02
+
+### Fixes
+- **Fix watchdog spawning duplicate workers (#51)**. Immich 2.7+ sets `process.title='immich'`, so the parent node PID exits while child processes keep running. PID tracking now falls back to scanning for live `immich` processes, preventing the watchdog from spawning duplicates. Stop also kills all orphaned immich processes.
+
 ## 1.5.1 — 2026-05-25
 
 ### Fixes
