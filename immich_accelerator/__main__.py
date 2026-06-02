@@ -95,7 +95,8 @@ def _ensure_build_link():
                 try:
                     # Write new synthetic.d file first — only remove legacy if this succeeds
                     r1 = subprocess.run(
-                        ["sudo", "mkdir", "-p", "/etc/synthetic.d"],
+                        # install -d pins mode 755 (see note in main create path)
+                        ["sudo", "install", "-d", "-m", "755", "/etc/synthetic.d"],
                         capture_output=True,
                         timeout=30,
                     )
@@ -166,7 +167,12 @@ def _ensure_build_link():
     entry = f"build\t{relative_target}\n"
     try:
         result = subprocess.run(
-            ["sudo", "mkdir", "-p", "/etc/synthetic.d"],
+            # install -d, not mkdir -p: pin mode 755 so a tight root umask
+            # (e.g. 027 → 750) can't leave /etc/synthetic.d unsearchable by
+            # the non-root user. A 750 dir makes a later non-root exists()
+            # check on its contents raise PermissionError. install -d also
+            # normalises an existing dir's mode, self-healing prior installs.
+            ["sudo", "install", "-d", "-m", "755", "/etc/synthetic.d"],
             capture_output=True,
             timeout=30,
         )
