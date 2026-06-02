@@ -2045,7 +2045,7 @@ name: immich
 services:
   immich-server:
     container_name: immich_server
-    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+{user_line}    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
     env_file: .env
     environment:
       - IMMICH_WORKERS_INCLUDE=api
@@ -2192,6 +2192,29 @@ def _fresh_install(docker: str) -> bool:
     data_path = data_path or default_data
     Path(data_path).mkdir(parents=True, exist_ok=True)
 
+    # Run the server container as the invoking user instead of root.
+    # The immich-server container only needs to read your photos (mounted
+    # read-only) and read/write the media/data directory. Running it as
+    # your own UID means everything it writes to those bind mounts is
+    # owned by you, not root — so the data dir stays removable without
+    # sudo and there are no permission surprises later. Postgres and Redis
+    # are left as their default (root) users: they only touch a named
+    # volume and the network, never your host files, so there's nothing to
+    # gain by changing them. No GID is needed — Docker defaults the
+    # supplementary group to 0, which is fine for owner-writable mounts.
+    run_as_user = True
+    log.info("")
+    try:
+        answer = input(
+            "  Run the Immich server container as the current user "
+            f"(uid {os.getuid()})? [Y/n] "
+        ).strip().lower()
+    except EOFError:
+        answer = ""
+    if answer and answer != "y":
+        run_as_user = False
+    user_line = f'    user: "{os.getuid()}"\n' if run_as_user else ""
+
     # Check ports
     for port, label in [(2283, "Immich"), (5432, "Postgres"), (6379, "Redis")]:
         try:
@@ -2209,7 +2232,9 @@ def _fresh_install(docker: str) -> bool:
     # Use str.replace instead of str.format to avoid issues with
     # curly braces in paths or the Docker ${{}} env var syntax.
     photos_mount = f"{photos_path}:{photos_path}:ro"
-    compose_content = _COMPOSE_TEMPLATE.replace("{photos_mount}", photos_mount)
+    compose_content = _COMPOSE_TEMPLATE.replace(
+        "{photos_mount}", photos_mount
+    ).replace("{user_line}", user_line)
 
     (compose_dir / "docker-compose.yml").write_text(compose_content)
 
