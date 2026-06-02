@@ -83,13 +83,13 @@ This is the directory Immich uses as its media root. It contains these subdirect
 | `immich-accelerator logs [worker\|ml]` | Tail service logs |
 | `immich-accelerator update` | Update to match new Immich version |
 | `immich-accelerator watch` | Monitor + auto-restart on crash (for launchd) |
-| `immich-accelerator dashboard` | Web UI at http://localhost:8422 |
+| `immich-accelerator dashboard` | Web UI at http://localhost:8420 |
 | `immich-accelerator ml-test` | Diagnose the ML service (health + CLIP + OCR round-trip) |
 | `immich-accelerator uninstall` | Remove services, data, and launchd config |
 
 ## Dashboard
 
-Real-time monitoring at `http://your-mac:8422`:
+Real-time monitoring at `http://your-mac:8420`:
 
 ```bash
 immich-accelerator dashboard
@@ -275,7 +275,7 @@ Fixed in v1.4.1. The OCI image extractor used to skip small layers that containe
 - Config file (`~/.immich-accelerator/config.json`) is chmod 600
 - Postgres exposed on `127.0.0.1:5432` (localhost only) by default
 - Redis exposed on `127.0.0.1:6379` (localhost only) by default
-- Dashboard binds on `0.0.0.0:8422` (LAN-accessible) — the Re-queue button triggers job processing via the Immich API. If you're on an untrusted network, don't run the dashboard or bind to localhost only
+- Dashboard binds on `0.0.0.0:8420` (LAN-accessible) — the Re-queue button triggers job processing via the Immich API. If you're on an untrusted network, don't run the dashboard or bind to localhost only
 
 ## On agentic engineering
 
