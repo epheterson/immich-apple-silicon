@@ -2083,8 +2083,8 @@ name: immich
 services:
   immich-server:
     container_name: immich_server
-{user_line}    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
-    env_file: .env
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+{user_line}    env_file: .env
     environment:
       - IMMICH_WORKERS_INCLUDE=api
       - IMMICH_MACHINE_LEARNING_URL=http://host.docker.internal:3003
