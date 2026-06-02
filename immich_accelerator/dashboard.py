@@ -404,7 +404,7 @@ def create_app(config: dict):
     return app
 
 
-def run_dashboard(config: dict, port: int = 8422):
+def run_dashboard(config: dict, port: int = 8420):
     """Start the dashboard server."""
     import uvicorn
 

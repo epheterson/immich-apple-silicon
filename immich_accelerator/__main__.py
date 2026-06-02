@@ -3284,7 +3284,7 @@ def cmd_watch(_args):
         config = load_config()
         import urllib.request as _urlreq
 
-        _urlreq.urlopen("http://localhost:8422/", timeout=2)
+        _urlreq.urlopen("http://localhost:8420/", timeout=2)
     except Exception:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         dash_log = open(LOG_DIR / "dashboard.log", "a")
@@ -3297,7 +3297,7 @@ def cmd_watch(_args):
         )
         dash_log.close()
         write_pid("dashboard", proc.pid)
-        log.info("Dashboard started: http://localhost:8422")
+        log.info("Dashboard started: http://localhost:8420")
 
     # Warn if auto-update won't work for remote setups
     _watch_config = load_config()
@@ -3739,8 +3739,8 @@ def main():
     )
     sub.add_parser("update", help="Update to match Immich version")
     sub.add_parser("watch", help="Monitor services, restart on crash (for launchd)")
-    dash_p = sub.add_parser("dashboard", help="Web dashboard (http://localhost:8422)")
-    dash_p.add_argument("--port", type=int, default=8422, help="Dashboard port")
+    dash_p = sub.add_parser("dashboard", help="Web dashboard (http://localhost:8420)")
+    dash_p.add_argument("--port", type=int, default=8420, help="Dashboard port")
     sub.add_parser(
         "ml-test",
         help="Diagnose the ML service (health + CLIP + OCR round-trip)",
