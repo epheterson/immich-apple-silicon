@@ -1274,12 +1274,20 @@ def write_pid(name: str, pid: int) -> None:
     (PID_DIR / f"{name}.pid").write_text(f"{pid}\n{start_time}")
 
 
-def _find_live_worker_pid() -> int | None:
-    """Scan ps for a live Immich worker process.
+_WORKER_CMD_RE = re.compile(
+    r"^immich\s*$"  # 2.7+: process.title = 'immich'
+    r"|(?:^|/)node\b.*/dist/main\.js(?:\s|$)"  # pre-2.7: node .../dist/main.js
+)
 
-    Immich 2.7+ sets process.title='immich', so the recorded PID's
+
+def _scan_worker_pids(exclude: set[int] | None = None) -> list[int]:
+    """Return PIDs of live Immich worker processes found via ``ps``.
+
+    Immich 2.7+ sets ``process.title='immich'``, so the recorded PID's
     parent may exit while child 'immich' processes keep running.
-    This finds one so the watchdog doesn't spawn duplicates.
+
+    *exclude* is an optional set of PIDs to skip (e.g. tracked PIDs).
+    The current process is always excluded.
     """
     try:
         result = subprocess.run(
@@ -1289,9 +1297,13 @@ def _find_live_worker_pid() -> int | None:
             timeout=5,
         )
     except (subprocess.SubprocessError, OSError):
-        return None
+        return []
 
-    my_pid = os.getpid()
+    skip = {os.getpid()}
+    if exclude:
+        skip |= exclude
+
+    pids: list[int] = []
     for line in result.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -1301,20 +1313,32 @@ def _find_live_worker_pid() -> int | None:
             pid = int(pid_str)
         except ValueError:
             continue
-        if pid == my_pid:
+        if pid in skip:
             continue
-        if re.match(r"^immich\s*$", cmdline) or re.search(
-            r"(?:^|/)node\b.*/dist/main\.js(?:\s|$)", cmdline
-        ):
-            return pid
-    return None
+        if _WORKER_CMD_RE.search(cmdline):
+            pids.append(pid)
+    return pids
+
+
+def _find_live_worker_pid() -> int | None:
+    """Return any one live Immich worker PID, or None."""
+    pids = _scan_worker_pids()
+    return pids[0] if pids else None
+
+
+def _adopt_live_worker() -> int | None:
+    """Find a live worker via ps scan and adopt it into the PID file."""
+    pid = _find_live_worker_pid()
+    if pid is not None:
+        write_pid("worker", pid)
+    return pid
 
 
 def read_pid(name: str) -> int | None:
     pid_file = PID_DIR / f"{name}.pid"
     if not pid_file.exists():
         if name == "worker":
-            return _find_live_worker_pid()
+            return _adopt_live_worker()
         return None
     try:
         lines = pid_file.read_text().strip().split("\n")
@@ -1327,46 +1351,40 @@ def read_pid(name: str) -> int | None:
                 log.debug("PID %d reused (start time mismatch), cleaning up", pid)
                 pid_file.unlink(missing_ok=True)
                 if name == "worker":
-                    return _find_live_worker_pid()
+                    return _adopt_live_worker()
                 return None
         return pid
     except (ValueError, OSError):
         pid_file.unlink(missing_ok=True)
         if name == "worker":
-            return _find_live_worker_pid()
+            return _adopt_live_worker()
         return None
 
 
 def _kill_all_worker_processes():
-    """Kill all 'immich' processes (Immich 2.7+ sets process.title)."""
-    try:
-        result = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (subprocess.SubprocessError, OSError):
+    """Kill all 'immich' processes (Immich 2.7+ sets process.title).
+
+    Sends SIGTERM first, waits briefly, then escalates to SIGKILL for
+    any survivors.
+    """
+    pids = _scan_worker_pids()
+    if not pids:
         return
-    my_pid = os.getpid()
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+
+    for pid in pids:
         try:
-            pid_str, cmdline = line.split(None, 1)
-            pid = int(pid_str)
-        except ValueError:
-            continue
-        if pid == my_pid:
-            continue
-        if re.match(r"^immich\s*$", cmdline) or re.search(
-            r"(?:^|/)node\b.*/dist/main\.js(?:\s|$)", cmdline
-        ):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    # Give orphans a moment to exit gracefully before escalating
+    time.sleep(1)
+    for pid in pids:
+        try:
+            os.kill(pid, 0)  # still alive?
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def kill_pid(name: str) -> bool:
@@ -2778,10 +2796,7 @@ def _find_ml_dir() -> Path | None:
     return ml_dir
 
 
-_STALE_WORKER_RE = re.compile(
-    r"(?:(?:^|/)node\b.*/dist/main\.js(?:\s|$))"  # pre-2.7: node .../dist/main.js
-    r"|(?:^immich\s*$)"  # 2.7+: process.title = 'immich'
-)
+_STALE_WORKER_RE = _WORKER_CMD_RE  # same pattern, used by _kill_stale_processes + tests
 _STALE_ML_RE = re.compile(r"(?:^|/)python[\d.]*\b.*\s-m\s+src\.main(?:\s|$)")
 
 
