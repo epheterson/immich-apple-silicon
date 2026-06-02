@@ -1274,9 +1274,47 @@ def write_pid(name: str, pid: int) -> None:
     (PID_DIR / f"{name}.pid").write_text(f"{pid}\n{start_time}")
 
 
+def _find_live_worker_pid() -> int | None:
+    """Scan ps for a live Immich worker process.
+
+    Immich 2.7+ sets process.title='immich', so the recorded PID's
+    parent may exit while child 'immich' processes keep running.
+    This finds one so the watchdog doesn't spawn duplicates.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+    my_pid = os.getpid()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid_str, cmdline = line.split(None, 1)
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid == my_pid:
+            continue
+        if re.match(r"^immich\s*$", cmdline) or re.search(
+            r"(?:^|/)node\b.*/dist/main\.js(?:\s|$)", cmdline
+        ):
+            return pid
+    return None
+
+
 def read_pid(name: str) -> int | None:
     pid_file = PID_DIR / f"{name}.pid"
     if not pid_file.exists():
+        if name == "worker":
+            return _find_live_worker_pid()
         return None
     try:
         lines = pid_file.read_text().strip().split("\n")
@@ -1288,11 +1326,47 @@ def read_pid(name: str) -> int | None:
             if current_start and current_start != lines[1]:
                 log.debug("PID %d reused (start time mismatch), cleaning up", pid)
                 pid_file.unlink(missing_ok=True)
+                if name == "worker":
+                    return _find_live_worker_pid()
                 return None
         return pid
     except (ValueError, OSError):
         pid_file.unlink(missing_ok=True)
+        if name == "worker":
+            return _find_live_worker_pid()
         return None
+
+
+def _kill_all_worker_processes():
+    """Kill all 'immich' processes (Immich 2.7+ sets process.title)."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return
+    my_pid = os.getpid()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid_str, cmdline = line.split(None, 1)
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid == my_pid:
+            continue
+        if re.match(r"^immich\s*$", cmdline) or re.search(
+            r"(?:^|/)node\b.*/dist/main\.js(?:\s|$)", cmdline
+        ):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
 
 
 def kill_pid(name: str) -> bool:
@@ -1300,7 +1374,6 @@ def kill_pid(name: str) -> bool:
     if pid is None:
         return False
     try:
-        # Kill the entire process group (catches Node.js child processes)
         pgid = os.getpgid(pid)
         os.killpg(pgid, signal.SIGTERM)
     except OSError:
@@ -1308,6 +1381,10 @@ def kill_pid(name: str) -> bool:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+
+    # Also kill any orphaned immich processes not in the same group
+    if name == "worker":
+        _kill_all_worker_processes()
 
     # Wait for exit
     for _ in range(50):
@@ -1317,7 +1394,6 @@ def kill_pid(name: str) -> bool:
         except OSError:
             break
     else:
-        # Still alive after 5s — escalate to SIGKILL
         try:
             pgid = os.getpgid(pid)
             os.killpg(pgid, signal.SIGKILL)
@@ -2702,7 +2778,10 @@ def _find_ml_dir() -> Path | None:
     return ml_dir
 
 
-_STALE_WORKER_RE = re.compile(r"(?:^|/)node\b.*/dist/main\.js(?:\s|$)")
+_STALE_WORKER_RE = re.compile(
+    r"(?:(?:^|/)node\b.*/dist/main\.js(?:\s|$))"  # pre-2.7: node .../dist/main.js
+    r"|(?:^immich\s*$)"  # 2.7+: process.title = 'immich'
+)
 _STALE_ML_RE = re.compile(r"(?:^|/)python[\d.]*\b.*\s-m\s+src\.main(?:\s|$)")
 
 
@@ -3190,7 +3269,7 @@ def cmd_watch(_args):
         config = load_config()
         import urllib.request as _urlreq
 
-        _urlreq.urlopen("http://localhost:8420/", timeout=2)
+        _urlreq.urlopen("http://localhost:8422/", timeout=2)
     except Exception:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         dash_log = open(LOG_DIR / "dashboard.log", "a")
@@ -3203,7 +3282,7 @@ def cmd_watch(_args):
         )
         dash_log.close()
         write_pid("dashboard", proc.pid)
-        log.info("Dashboard started: http://localhost:8420")
+        log.info("Dashboard started: http://localhost:8422")
 
     # Warn if auto-update won't work for remote setups
     _watch_config = load_config()
@@ -3645,8 +3724,8 @@ def main():
     )
     sub.add_parser("update", help="Update to match Immich version")
     sub.add_parser("watch", help="Monitor services, restart on crash (for launchd)")
-    dash_p = sub.add_parser("dashboard", help="Web dashboard (http://localhost:8420)")
-    dash_p.add_argument("--port", type=int, default=8420, help="Dashboard port")
+    dash_p = sub.add_parser("dashboard", help="Web dashboard (http://localhost:8422)")
+    dash_p.add_argument("--port", type=int, default=8422, help="Dashboard port")
     sub.add_parser(
         "ml-test",
         help="Diagnose the ML service (health + CLIP + OCR round-trip)",
