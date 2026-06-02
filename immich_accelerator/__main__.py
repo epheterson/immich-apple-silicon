@@ -265,6 +265,36 @@ def _remove_build_link():
         log.info("  /build link removed. Reboot to fully deactivate.")
 
 
+def _rmtree_or_explain(path: Path, *, what: str) -> bool:
+    """Remove a directory tree, or stop and explain — never force-delete.
+
+    A container that previously ran as root can leave root-owned files in
+    a bind-mounted directory, which makes shutil.rmtree fail partway with
+    a PermissionError. We deliberately do NOT chmod or `sudo rm -rf` our
+    way through it: if a path was ever mis-set (say a library someone
+    created directly in their home dir), a force-delete could wipe real
+    data. We err on the side of caution — report exactly what could not be
+    removed, suggest the manual command, and let the user decide.
+
+    Returns True only if the tree is now gone.
+    """
+    if not path.exists():
+        return True
+    try:
+        shutil.rmtree(path)
+        return True
+    except OSError as e:
+        log.error("")
+        log.error("Could not fully remove %s (%s).", path, what)
+        log.error("  %s: %s", type(e).__name__, e)
+        log.error("  This usually means it holds files owned by root, left")
+        log.error("  behind by a container that ran as root. Nothing was")
+        log.error("  force-deleted — some files may remain.")
+        log.error("  Review the contents, and if you're certain it's safe:")
+        log.error("      sudo rm -rf %s", path)
+        return False
+
+
 def find_binary(name: str, paths: list[str], install_hint: str) -> str:
     for p in paths:
         if os.path.isfile(p):
@@ -1064,8 +1094,8 @@ def download_immich_server(version: str) -> Path:
     staging.mkdir(parents=True, exist_ok=True)
 
     build_data = DATA_DIR / "build-data"
-    if build_data.exists():
-        shutil.rmtree(build_data)
+    if not _rmtree_or_explain(build_data, what="stale build-data"):
+        raise RuntimeError(f"Could not clear {build_data} — see message above.")
     build_data.mkdir(parents=True, exist_ok=True)
 
     # Download and extract layers containing server and build data.
@@ -1207,9 +1237,11 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
         shutil.rmtree(staging)
         raise RuntimeError("Extracted server is missing dist/main.js")
 
-    # Extract build data (geodata, plugins, web assets)
-    if build_data.exists():
-        shutil.rmtree(build_data)
+    # Extract build data (geodata, plugins, web assets). On a re-run this
+    # dir already exists; if we can't clear it cleanly, stop with a clear
+    # message rather than a raw traceback (and without force-deleting).
+    if not _rmtree_or_explain(build_data, what="stale build-data"):
+        raise RuntimeError(f"Could not clear {build_data} — see message above.")
     log.info("Extracting build data...")
     result = subprocess.run(
         [docker, "cp", f"{container}:/build", str(build_data)],
@@ -3613,17 +3645,19 @@ def cmd_uninstall(_args):
     # Remove /build firmlink from synthetic.conf
     _remove_build_link()
 
-    # Remove data directory
+    # Remove data directory. A server container that previously ran as root
+    # may have left root-owned files here; if so we stop and explain rather
+    # than force-deleting (see _rmtree_or_explain).
     if DATA_DIR.exists():
-        shutil.rmtree(DATA_DIR)
-        log.info("Removed %s", DATA_DIR)
+        if _rmtree_or_explain(DATA_DIR, what="accelerator data"):
+            log.info("Removed %s", DATA_DIR)
 
     # Remove ML venv — but only for direct clones. Deleting brew's
     # Cellar-owned venv would break the currently-running python and
     # leave a broken formula until `brew reinstall`.
     if ml_venv.exists() and not is_brew_install:
-        shutil.rmtree(ml_venv)
-        log.info("Removed ML venv")
+        if _rmtree_or_explain(ml_venv, what="ML venv"):
+            log.info("Removed ML venv")
 
     log.info("")
     log.info("Uninstalled. To restore Immich to stock:")
