@@ -1039,6 +1039,12 @@ class TestKillStaleProcessesPattern:
         )
         assert _STALE_WORKER_RE.search(cmd)
 
+    def test_stale_worker_regex_matches_immich_process_title(self):
+        assert _STALE_WORKER_RE.search("immich")
+        assert _STALE_WORKER_RE.search("immich ")
+        assert not _STALE_WORKER_RE.search("immich-accelerator watch")
+        assert not _STALE_WORKER_RE.search("docker compose ... immich-e2e-stack")
+
     def test_stale_ml_regex_matches_canonical_ml(self):
         cmd = "/Users/elp/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main"
         assert _STALE_ML_RE.search(cmd)
