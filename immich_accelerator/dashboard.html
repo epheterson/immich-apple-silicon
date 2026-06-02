@@ -274,7 +274,11 @@
     </div>
   </header>
 
-  <div class="services" id="svc"></div>
+  <div class="services" id="svc">
+    <div class="service"><div class="dot"></div><div class="service-label" style="color:var(--text-muted)">Microservices Worker</div></div>
+    <div class="service"><div class="dot"></div><div class="service-label" style="color:var(--text-muted)">ML Service</div></div>
+    <div class="service"><div class="dot"></div><div class="service-label" style="color:var(--text-muted)">Docker (API)</div></div>
+  </div>
 
   <div class="section" style="display:flex; justify-content:space-between; align-items:center;">
     <span>Apple Silicon</span>
@@ -287,9 +291,19 @@
        onmouseout="this.style.borderColor='var(--card-border)'; this.style.color='var(--text-dim)'"
     >Re-queue Missing ↻</button>
   </div>
-  <div class="chip-grid" id="chips"></div>
+  <div class="chip-grid" id="chips">
+    <div class="chip-card"><div class="chip-header cpu">CPU (NEON)</div><div class="task-row"><div class="task-top"><div class="task-label">Thumbnails</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill cpu" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
+    <div class="chip-card"><div class="chip-header gpu">Metal GPU</div><div class="task-row"><div class="task-top"><div class="task-label">CLIP Embeddings</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill gpu" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
+    <div class="chip-card"><div class="chip-header ane">Neural Engine</div><div class="task-row"><div class="task-top"><div class="task-label">Face Detection · OCR</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill ane" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
+    <div class="chip-card"><div class="chip-header vtb">VideoToolbox</div><div class="task-row"><div class="task-top"><div class="task-label">Video Transcode</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill vtb" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
+  </div>
 
-  <div class="sys" id="sys"></div>
+  <div class="sys" id="sys">
+    <span>Load <span class="v">—</span></span>
+    <span>CPUs <span class="v">—</span></span>
+    <span>Memory <span class="v">—</span></span>
+    <span>Updated <span class="v">—</span></span>
+  </div>
 
   <footer>
     <a href="https://github.com/epheterson/immich-apple-silicon">immich-accelerator</a> <span id="footer-ver">v1.0.0</span>
@@ -307,8 +321,7 @@ const CHIPS = [
     { key: 'clip', rk: 'clip', label: 'CLIP Embeddings' },
   ]},
   { chip: 'ane', chipLabel: 'Neural Engine', tasks: [
-    { key: 'faces', rk: 'faces', label: 'Face Detection' },
-    { key: 'ocr', rk: 'ocr', label: 'OCR' },
+    { key: 'faces', rk: 'faces', label: 'Face Detection · OCR', altKey: 'ocr', altRk: 'ocr' },
   ]},
   { chip: 'vtb', chipLabel: 'VideoToolbox', tasks: [
     { key: 'video', rk: 'video', label: 'Video Transcode' },
@@ -403,9 +416,15 @@ function render(d) {
     const isMulti = chip.tasks.length > 1;
 
     chip.tasks.forEach((t, idx) => {
-      const p = d.progress[t.key];
-      const rate = rates[t.rk] || 0;
-      const qc = (d.queue_counts && d.queue_counts[t.key]) || 0;
+      let p = d.progress[t.key];
+      let rate = rates[t.rk] || 0;
+      let qc = (d.queue_counts && d.queue_counts[t.key]) || 0;
+      if (t.altKey) {
+        const alt = d.progress[t.altKey];
+        if (alt.pct < p.pct) p = alt;
+        rate = Math.max(rate, rates[t.altRk] || 0);
+        qc += (d.queue_counts && d.queue_counts[t.altKey]) || 0;
+      }
       const rem = qc > 0 ? qc : (p.total - p.done);
       const eta = etaStr(rem, rate);
       const qActive = d.queue_active && d.queue_active[t.key];
