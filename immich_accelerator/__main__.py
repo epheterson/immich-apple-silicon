@@ -2092,6 +2092,10 @@ services:
     volumes:
       - ${UPLOAD_LOCATION}:${UPLOAD_LOCATION}
       - {photos_mount}
+      # The image declares VOLUME /data (default media location). We point
+      # media elsewhere via IMMICH_MEDIA_LOCATION, but name this so it
+      # isn't an anonymous volume orphaned on every down/up.
+      - server_data:/data
     ports:
       - '2283:2283'
     depends_on:
@@ -2122,6 +2126,7 @@ services:
 
 volumes:
   pgdata:
+  server_data:
 """
 
 
