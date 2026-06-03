@@ -77,7 +77,7 @@ jobs:
           os.makedirs(photos, exist_ok=True)
           data = str(test_dir / 'data')
           os.makedirs(data, exist_ok=True)
-          compose = _COMPOSE_TEMPLATE.replace('{photos_mount}', f'{photos}:{photos}:ro')
+          compose = _COMPOSE_TEMPLATE.replace('{photos_mount}', f'{photos}:{photos}:ro').replace('{user_line}', '')
           (test_dir / 'docker-compose.yml').write_text(compose)
           pw = secrets.token_urlsafe(24)
           env = f'UPLOAD_LOCATION={data}\nDB_PASSWORD={pw}\nDB_HOSTNAME=immich_postgres\nDB_USERNAME=postgres\nDB_DATABASE_NAME=immich\nREDIS_HOSTNAME=immich_redis\n'
