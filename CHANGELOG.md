@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.3 — 2026-06-03
+
+### Fixes
+- **Fix root-owned files from Docker containers (#52)**. Fresh installs now offer to run the Immich server container as the current user, preventing root-owned files in bind-mounted directories. Contributed by [@hiisukun](https://github.com/hiisukun).
+- **Graceful uninstall when root-owned files exist**. `uninstall` now explains the problem and suggests `sudo rm -rf` instead of crashing with a raw PermissionError.
+- **Fix `/etc/synthetic.d` permissions**. A tight root umask could leave the directory unsearchable by non-root users, breaking the `/build` firmlink check.
+- **Compose project named "immich"**. Was defaulting to "docker" (the parent directory name).
+
 ## 1.5.2 — 2026-06-02
 
 ### Fixes
