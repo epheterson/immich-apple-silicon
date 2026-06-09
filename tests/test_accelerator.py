@@ -224,7 +224,13 @@ class TestConfigManagement:
 
 
 class TestRedisAuth:
-    def test_manual_template_includes_redis_credentials(self, tmp_data_dir):
+    def test_manual_template_includes_redis_credentials(self, tmp_data_dir, monkeypatch):
+        # _setup_manual probes local tools after writing the template; stub
+        # that out so the test doesn't depend on brew/node being installed.
+        monkeypatch.setattr(
+            "immich_accelerator.__main__._check_local_tools",
+            lambda: ("/usr/bin/node", None, None),
+        )
         _setup_manual(None)
         config = json.loads(tmp_data_dir["config_file"].read_text())
         assert "redis_username" in config
