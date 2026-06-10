@@ -34,6 +34,7 @@ from immich_accelerator.__main__ import (
     cmd_status,
     cmd_logs,
     start_service,
+    _setup_manual,
     DATA_DIR,
     CONFIG_FILE,
     PID_DIR,
@@ -215,6 +216,73 @@ class TestConfigManagement:
         config_file.write_text("not json at all")
         with pytest.raises(json.JSONDecodeError):
             load_config()
+
+
+# ---------------------------------------------------------------------------
+# Authenticated Redis (issue #56)
+# ---------------------------------------------------------------------------
+
+
+class TestRedisAuth:
+    def test_manual_template_includes_redis_credentials(self, tmp_data_dir, monkeypatch):
+        # _setup_manual probes local tools after writing the template; stub
+        # that out so the test doesn't depend on brew/node being installed.
+        monkeypatch.setattr(
+            "immich_accelerator.__main__._check_local_tools",
+            lambda: ("/usr/bin/node", None, None),
+        )
+        _setup_manual(None)
+        config = json.loads(tmp_data_dir["config_file"].read_text())
+        assert "redis_username" in config
+        assert "redis_password" in config
+
+    def _run_preflight(self, monkeypatch, config):
+        """Run _preflight_env_health, capturing the redis-cli PING.
+
+        Only redis-cli is on PATH; every other probe is neutralized so
+        the test exercises the Redis auth path regardless of host state.
+        Returns (cmd, env) of the captured redis-cli invocation.
+        """
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            if cmd and "redis-cli" in cmd[0]:
+                captured["cmd"] = cmd
+                captured["env"] = kwargs.get("env", {})
+            return MagicMock(stdout="PONG", stderr="", returncode=0)
+
+        monkeypatch.setattr(
+            "immich_accelerator.__main__.shutil.which",
+            lambda name: "/bin/redis-cli" if name == "redis-cli" else None,
+        )
+        monkeypatch.setattr("immich_accelerator.__main__.subprocess.run", fake_run)
+        monkeypatch.setattr(
+            "immich_accelerator.__main__.socket.create_connection",
+            lambda *a, **k: MagicMock(),
+        )
+        from immich_accelerator.__main__ import _preflight_env_health
+
+        _preflight_env_health(config)
+        return captured.get("cmd", []), captured.get("env", {})
+
+    def test_preflight_uses_auth_when_password_set(self, monkeypatch, sample_config):
+        _cmd, env = self._run_preflight(
+            monkeypatch, {**sample_config, "redis_password": "s3cret"}
+        )
+        assert env.get("REDISCLI_AUTH") == "s3cret"
+
+    def test_preflight_omits_auth_when_no_password(self, monkeypatch, sample_config):
+        cmd, env = self._run_preflight(monkeypatch, sample_config)
+        assert "REDISCLI_AUTH" not in env
+        assert "--user" not in cmd
+
+    def test_preflight_passes_username_for_acl(self, monkeypatch, sample_config):
+        cmd, env = self._run_preflight(
+            monkeypatch,
+            {**sample_config, "redis_username": "immich", "redis_password": "s3cret"},
+        )
+        assert cmd[cmd.index("--user") + 1] == "immich"
+        assert env.get("REDISCLI_AUTH") == "s3cret"
 
 
 # ---------------------------------------------------------------------------

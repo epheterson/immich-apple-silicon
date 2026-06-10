@@ -756,14 +756,25 @@ def _preflight_env_health(config: dict) -> bool:
     # Redis connectivity — try a real PING if redis-cli is available.
     redis_host = config.get("redis_hostname", "localhost")
     redis_port = config.get("redis_port", "6379")
+    redis_username = config.get("redis_username", "")
+    redis_password = config.get("redis_password", "")
     redis_cli = shutil.which("redis-cli")
     if redis_cli:
         try:
+            # REDISCLI_AUTH keeps the password off the process list.
+            redis_env = os.environ.copy()
+            if redis_password:
+                redis_env["REDISCLI_AUTH"] = redis_password
+            redis_cmd = [redis_cli, "-h", redis_host, "-p", str(redis_port)]
+            if redis_username:
+                redis_cmd += ["--user", redis_username]
+            redis_cmd.append("PING")
             result = subprocess.run(
-                [redis_cli, "-h", redis_host, "-p", str(redis_port), "PING"],
+                redis_cmd,
                 capture_output=True,
                 text=True,
                 timeout=5,
+                env=redis_env,
             )
             if "PONG" not in (result.stdout or ""):
                 err = (result.stderr or result.stdout or "").strip()
@@ -2559,6 +2570,8 @@ def _setup_remote(args):
     db_name = prompt("Database name", "immich")
     redis_hostname = prompt("Redis host", db_hostname)
     redis_port = prompt("Redis port", "6379")
+    redis_username = prompt("Redis username [blank if none]", "")
+    redis_password = getpass.getpass("  Redis password [blank if none]: ").strip()
 
     # Probe Docker's view of the media root so we can surface mismatch
     # up-front rather than when thumbnails 404 (issue #19). Requires
@@ -2666,6 +2679,8 @@ def _setup_remote(args):
         "db_name": db_name,
         "redis_hostname": redis_hostname,
         "redis_port": redis_port,
+        "redis_username": redis_username,
+        "redis_password": redis_password,
         "upload_mount": upload_mount,
         "ffmpeg_path": ffmpeg_path,
         "ml_dir": str(ml_dir) if ml_dir else None,
@@ -2703,6 +2718,8 @@ def _setup_manual(_args):
         "db_name": "immich",
         "redis_hostname": "YOUR_REDIS_HOST",
         "redis_port": "6379",
+        "redis_username": "",
+        "redis_password": "",
         "upload_mount": "/path/to/immich/upload",
         "ffmpeg_path": "/opt/homebrew/bin/ffmpeg",
         "ml_dir": str(Path(__file__).parent.parent / "ml"),
@@ -3103,6 +3120,14 @@ def cmd_start(args):
             "PATH": str(Path(node).parent) + ":" + os.environ.get("PATH", ""),
         }
     )
+
+    # Forward Redis credentials only when set — an empty password makes
+    # ioredis send AUTH to a password-less Redis, which errors (issue #56).
+    # REDIS_USERNAME enables ACL (user + password) auth on Redis 6+.
+    if config.get("redis_username"):
+        worker_env["REDIS_USERNAME"] = config["redis_username"]
+    if config.get("redis_password"):
+        worker_env["REDIS_PASSWORD"] = config["redis_password"]
 
     if config.get("upload_mount"):
         worker_env["IMMICH_MEDIA_LOCATION"] = config["upload_mount"]
