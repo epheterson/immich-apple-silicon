@@ -1,9 +1,9 @@
 # Changelog
 
-## Unreleased
+## 1.5.4 — 2026-06-09
 
 ### Features
-- **Support authenticated Redis (#56)**. The native worker now forwards `REDIS_PASSWORD` and `REDIS_USERNAME` to Immich, so deployments that require a Redis password (e.g. the TrueNAS Immich app) or ACL user+password auth work. Remote setup prompts for the username and password, the manual config template includes `redis_username` / `redis_password` fields, and the preflight Redis check authenticates via `REDISCLI_AUTH` (and `--user` for ACL).
+- **Support authenticated Redis (#56)**. The native worker now forwards `REDIS_PASSWORD` and `REDIS_USERNAME` to Immich, so deployments that require a Redis password (e.g. TrueNAS) or ACL auth work. Contributed by [@exkuretrol](https://github.com/exkuretrol).
 
 ## 1.5.3 — 2026-06-03
 
