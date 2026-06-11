@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.5 — 2026-06-10
+
+### Fixes
+- **Fix install and upgrade flow for Homebrew 5.1.15+ tap trust enforcement.** Homebrew now refuses to load formulas from untrusted third-party taps: `brew install immich-accelerator` after a bare `brew tap` hard-fails for new users, and existing taps are silently skipped by `brew outdated`/`brew upgrade` — installs go stale with no warning. Quick start now uses the fully-qualified `brew install epheterson/immich-accelerator/immich-accelerator` (which Homebrew accepts without prior trust) plus `brew trust` so upgrades keep working. The formula caveats now mention the trust step, and the README documents both failure modes and how to update the accelerator itself.
+
 ## 1.5.4 — 2026-06-09
 
 ### Features

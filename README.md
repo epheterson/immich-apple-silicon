@@ -50,8 +50,8 @@ That's it. Setup installs everything else (Docker, Node.js, ffmpeg, ML dependenc
 ## Quick start
 
 ```bash
-brew tap epheterson/immich-accelerator
-brew install immich-accelerator
+brew install epheterson/immich-accelerator/immich-accelerator
+brew trust epheterson/immich-accelerator  # Homebrew 5.1.15+: lets brew upgrade see future releases
 immich-accelerator setup
 ```
 
@@ -117,6 +117,15 @@ The accelerator handles Immich updates automatically:
 - **On every `start`:** checks the Docker container version, re-extracts if it changed
 - **In `watch` mode:** checks every 5 minutes. If Watchtower or a manual `docker compose pull` updates Immich, the watchdog stops the worker, re-extracts the new server, and restarts. No manual intervention needed.
 - **Manual:** `immich-accelerator update` if you prefer to control the timing
+
+To update the accelerator itself:
+
+```bash
+brew upgrade immich-accelerator
+immich-accelerator stop && immich-accelerator start
+```
+
+If `brew upgrade` says there's nothing to do but you know a newer release exists, see [Troubleshooting](#brew-upgrade-never-finds-a-new-version).
 
 ## Performance tuning
 
@@ -234,7 +243,7 @@ The native worker runs Immich's unmodified code. The ffmpeg and image processing
 
 ## Troubleshooting
 
-The accelerator will tell you what's wrong, but here are the four most common split-setup friction points and the one-command fixes.
+The accelerator will tell you what's wrong, but here are the most common friction points and the one-command fixes.
 
 ### Thumbnails 404 in the Immich web UI
 
@@ -269,6 +278,30 @@ Fixed in v1.4.1. If you're on an older release, `brew upgrade immich-accelerator
 ### `immich-accelerator setup` fails with `ENOENT: /build/corePlugin/manifest.json`
 
 Fixed in v1.4.1. The OCI image extractor used to skip small layers that contained the Immich 2.7+ `corePlugin` WASM files. Upgrade and re-run setup.
+
+### `brew install` fails with "Refusing to load formula ... from untrusted tap"
+
+Homebrew 5.1.15 (June 2026) requires third-party taps to be explicitly trusted before it will load their formulas. The fix is one command:
+
+```bash
+brew trust epheterson/immich-accelerator
+```
+
+Using the fully-qualified name (`brew install epheterson/immich-accelerator/immich-accelerator`, as in the quick start) bypasses the check for that one command — Homebrew treats naming the tap explicitly as consent — but `brew upgrade` still skips the tap until it's trusted.
+
+### `brew upgrade` never finds a new version
+
+Symptom — `brew upgrade immich-accelerator` reports nothing to do (and `brew outdated` shows nothing), but GitHub has a newer release. `brew info immich-accelerator` shows the real error: `Refusing to load formula ... from untrusted tap`.
+
+Cause — the same trust requirement as above, but for taps added *before* Homebrew 5.1.15 there's no error: Homebrew *silently skips* untrusted formulas during `outdated`/`upgrade`, so your install goes stale with no warning.
+
+Fix:
+
+```bash
+brew trust epheterson/immich-accelerator
+brew update && brew upgrade immich-accelerator
+immich-accelerator stop && immich-accelerator start
+```
 
 ## Security
 

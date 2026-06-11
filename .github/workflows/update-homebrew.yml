@@ -115,6 +115,10 @@ jobs:
               <<~EOS
                 To get started:
                   immich-accelerator setup
+
+                Homebrew 5.1.15+ silently skips untrusted taps during upgrades.
+                So future releases reach you, run once:
+                  brew trust ${OWNER}/immich-accelerator
               EOS
             end
 
