@@ -2523,12 +2523,16 @@ def _setup_local(args):
         "version": immich["version"],
         "server_dir": str(server_dir),
         "node": node,
-        "db_hostname": "localhost",
+        # Use 127.0.0.1, not "localhost": on macOS localhost resolves to
+        # ::1 (IPv6) first, but the Docker/OrbStack stack publishes these
+        # ports on 127.0.0.1 (IPv4) only, so "localhost" can hit ::1 and
+        # fail or stall. 127.0.0.1 connects directly to the published port.
+        "db_hostname": "127.0.0.1",
         "db_port": immich["db_port"],
         "db_username": immich["db_username"],
         "db_password": immich["db_password"],
         "db_name": immich["db_name"],
-        "redis_hostname": "localhost",
+        "redis_hostname": "127.0.0.1",
         "redis_port": immich["redis_port"],
         "upload_mount": upload,
         "ffmpeg_path": ffmpeg_path,
