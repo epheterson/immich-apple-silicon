@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.6 — 2026-06-11
+
+### Fixes
+- **Default local DB/Redis host to 127.0.0.1 instead of localhost (#59)**. On macOS, `localhost` can resolve to `::1` (IPv6) first while the generated Docker stack publishes Postgres/Redis on `127.0.0.1` only, so connections could fail or stall. Auto-detected local setups now use `127.0.0.1`; remote and manual configs are unchanged. Contributed by [@hiisukun](https://github.com/hiisukun).
+
+### CI
+- **Bump GitHub Actions to Node 24 runtimes (#60)**. `checkout` v4 → v6, `setup-python` v5 → v6, ahead of GitHub's June 16 forced Node 24 migration.
+
 ## 1.5.5 — 2026-06-10
 
 ### Fixes
