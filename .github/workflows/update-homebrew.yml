@@ -33,7 +33,7 @@ jobs:
           echo "sha256=$ML_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Checkout tap repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ github.repository_owner }}/homebrew-immich-accelerator
           token: ${{ secrets.TAP_TOKEN }}
