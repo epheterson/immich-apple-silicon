@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.8 — 2026-06-14
+
+### Fixes
+- **Detect the upload mount when uploads live at `/data` (#62)**. Detection only matched a Docker mount whose destination contained `/upload`, so the modern Immich default — `${UPLOAD_LOCATION}:/data` with no `IMMICH_MEDIA_LOCATION` set — reported "Upload: not detected". Detection now resolves the media location the way Immich itself does (`storage.service.js`: explicit `IMMICH_MEDIA_LOCATION`, else whichever of `/data` or `/usr/src/app/upload` is mounted) and reports the matching mount. Reported by [@goldhandconsultancy](https://github.com/goldhandconsultancy).
+
 ## 1.5.7 — 2026-06-13
 
 ### Fixes

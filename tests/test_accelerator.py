@@ -396,6 +396,74 @@ class TestDetectImmich:
             assert info["db_password"] == "secret"
             assert info["upload_mount"] == "/photos/upload"
 
+    def _detect_with(self, env_output, mounts_json):
+        """Run detect_immich with a stubbed docker, given env + mounts."""
+        docker_ps_output = "immich_server\tghcr.io/immich-app/immich-server:v2.7.5\n"
+        package_json = json.dumps({"version": "2.7.5"})
+
+        def run_side_effect(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            if cmd[1] == "ps":
+                result.stdout = docker_ps_output
+            elif cmd[1] == "exec" and "package.json" in " ".join(cmd):
+                result.stdout = package_json
+            elif cmd[1] == "exec" and "env" in cmd:
+                result.stdout = env_output
+            elif cmd[1] == "inspect" and "Mounts" in " ".join(cmd):
+                result.stdout = mounts_json
+            elif cmd[1] == "port":
+                result.stdout = "0.0.0.0:5432\n"
+            else:
+                result.stdout = ""
+            return result
+
+        with patch("subprocess.run", side_effect=run_side_effect):
+            return detect_immich("/usr/local/bin/docker")
+
+    def test_detects_data_mount_modern_default(self):
+        """Modern compose mounts uploads at /data with no IMMICH_MEDIA_LOCATION
+        env — the /upload substring match missed this (issue #62)."""
+        mounts = json.dumps(
+            [
+                {"Destination": "/data", "Source": "/Volumes/4TB/Immich/Uploads"},
+                {"Destination": "/etc/localtime", "Source": "/etc/localtime"},
+                {"Destination": "/Importmap", "Source": "/Volumes/4TB/photos"},
+            ]
+        )
+        info = self._detect_with("DB_PASSWORD=x\n", mounts)
+        assert info["upload_mount"] == "/Volumes/4TB/Immich/Uploads"
+        assert info["media_location"] == "/data"
+
+    def test_explicit_media_location_env_wins(self):
+        """An explicit IMMICH_MEDIA_LOCATION picks the matching mount."""
+        mounts = json.dumps(
+            [
+                {"Destination": "/data", "Source": "/srv/data"},
+                {"Destination": "/mnt/immich", "Source": "/Volumes/X/immich"},
+            ]
+        )
+        info = self._detect_with("IMMICH_MEDIA_LOCATION=/mnt/immich\n", mounts)
+        assert info["upload_mount"] == "/Volumes/X/immich"
+        assert info["media_location"] == "/mnt/immich"
+
+    def test_legacy_upload_dest_still_detected(self):
+        """Legacy /usr/src/app/upload destination is still found."""
+        mounts = json.dumps(
+            [{"Destination": "/usr/src/app/upload", "Source": "/photos/upload"}]
+        )
+        info = self._detect_with("", mounts)
+        assert info["upload_mount"] == "/photos/upload"
+        assert info["media_location"] == "/usr/src/app/upload"
+
+    def test_no_media_mount_not_detected(self):
+        """No /data or /upload mount → upload_mount stays None (not detected)."""
+        mounts = json.dumps(
+            [{"Destination": "/etc/localtime", "Source": "/etc/localtime"}]
+        )
+        info = self._detect_with("", mounts)
+        assert info["upload_mount"] is None
+
     def test_detects_server_by_container_name(self):
         docker_ps_output = "immich_server\tsome-custom-image:latest\n"
         package_json = json.dumps({"version": "2.5.0"})
