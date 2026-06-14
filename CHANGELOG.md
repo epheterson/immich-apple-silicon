@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.9 — 2026-06-14
+
+### Fixes
+- **Fix a regression in 1.5.8's upload detection (#62, #64)**. 1.5.8 returned the resolved media location as the detected value, which combined with the start-time path check to block `start` with a false "path mismatch" even after a correct setup. Detection now keeps the raw `IMMICH_MEDIA_LOCATION` value (the effective path is still used internally to pick the mount), and only bind mounts are considered. Upgrading from 1.5.8 is recommended.
+
 ## 1.5.8 — 2026-06-14
 
 ### Fixes
