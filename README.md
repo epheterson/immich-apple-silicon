@@ -247,6 +247,14 @@ The native worker runs Immich's unmodified code. The ffmpeg and image processing
 
 The accelerator will tell you what's wrong, but here are the most common friction points and the one-command fixes.
 
+### Setup says "Upload: not detected"
+
+Symptom — `immich-accelerator setup` finds your Immich container but reports `Upload: not detected`.
+
+Cause — fixed in v1.5.8. Older versions only recognized uploads mounted under a `/upload` path; the modern Immich compose mounts `${UPLOAD_LOCATION}:/data` and leaves `IMMICH_MEDIA_LOCATION` unset, so detection missed it.
+
+Fix — `brew upgrade immich-accelerator` and re-run setup. If you're on a same-machine Docker Desktop setup where the container path (`/data`) differs from the host mount, the absolute paths still have to match for the native worker to read them — see [Split deployment](#split-deployment-nas--mac); the simplest fix is to set `IMMICH_MEDIA_LOCATION` (and the bind mount) to the host path so both sides agree.
+
 ### Thumbnails 404 in the Immich web UI
 
 Symptom — the native worker runs happily, but Immich's API server logs `ENOENT: /data/thumbs/.../xxx_thumbnail.webp` and thumbnails never show up.
