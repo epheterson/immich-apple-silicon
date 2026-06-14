@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.7 — 2026-06-13
+
+### Fixes
+- **Detect the media root correctly when a storage label is set (#61)**. The split-deployment path check assumed Immich's `upload/<uuid>/` layout and mis-detected a date-nested folder (e.g. `…/library/Anthony/2026/06`) for anyone using a storage label or custom storage template — the suggested `upload_mount` would have gone stale next month. Detection now follows Immich's own path builder (`<MEDIA>/library/<label|uuid>/…`) and resolves the true media root.
+- **Don't suggest an impossible synthetic link (#61)**. macOS synthetic links can only create a single top-level name, so the previous guidance to mirror Docker's container-default `/usr/src/app/upload` could never work. The mismatch warning now offers achievable routes: a synthetic link when the media root is top-level, or re-pointing `IMMICH_MEDIA_LOCATION` first when it isn't. Suggested commands use `printf` so the tab separator is portable across bash and zsh.
+- **Validate the `/build` synthetic entry by content, not file existence (#61)**. A hand-edited `/etc/synthetic.d/immich-accelerator` (e.g. a manual upload-path entry) was treated as "build link configured," so the required `/build` entry was silently skipped and Microservices came up red after reboot. Setup now checks for the actual `build` entry and appends it if missing, preserving any foreign lines. Reported by [@Rustymage](https://github.com/Rustymage).
+
 ## 1.5.6 — 2026-06-11
 
 ### Fixes

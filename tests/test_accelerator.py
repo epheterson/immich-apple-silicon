@@ -224,7 +224,9 @@ class TestConfigManagement:
 
 
 class TestRedisAuth:
-    def test_manual_template_includes_redis_credentials(self, tmp_data_dir, monkeypatch):
+    def test_manual_template_includes_redis_credentials(
+        self, tmp_data_dir, monkeypatch
+    ):
         # _setup_manual probes local tools after writing the template; stub
         # that out so the test doesn't depend on brew/node being installed.
         monkeypatch.setattr(
@@ -837,6 +839,69 @@ class TestEnsureBuildLink:
             MockPath.side_effect = lambda p: mock_build if p == "/build" else Path(p)
             assert _ensure_build_link() is False
 
+    def test_appends_build_entry_when_conf_has_foreign_lines(self, tmp_data_dir):
+        """File exists with a foreign line but no build entry → append, don't skip.
+
+        Regression for issue #61: a hand-edited synthetic.d file (e.g. a manual
+        upload-path entry) must not be mistaken for a configured build link. We
+        write the missing build entry while preserving the user's foreign line.
+        """
+        (tmp_data_dir["data_dir"] / "build-data").mkdir(exist_ok=True)
+        synth_file = tmp_data_dir["data_dir"] / "synthetic-conf"
+        synth_file.write_text("usr/src/app/upload\tVolumes/upload\n")
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        with patch(
+            "immich_accelerator.__main__._build_link_ok", return_value=False
+        ), patch(
+            "immich_accelerator.__main__.DATA_DIR", tmp_data_dir["data_dir"]
+        ), patch(
+            "immich_accelerator.__main__.SYNTHETIC_CONF", synth_file
+        ), patch(
+            "immich_accelerator.__main__.Path"
+        ) as MockPath, patch(
+            "builtins.input", return_value="y"
+        ), patch(
+            "immich_accelerator.__main__.subprocess.run", return_value=mock_result
+        ) as mock_run:
+            mock_build = MagicMock()
+            mock_build.exists.return_value = False
+            MockPath.side_effect = lambda p: mock_build if p == "/build" else Path(p)
+            _ensure_build_link()
+
+        tee_calls = [
+            c
+            for c in mock_run.call_args_list
+            if c.args and "tee" in c.args[0] and str(synth_file) in c.args[0]
+        ]
+        assert tee_calls, "expected a sudo tee write to the synthetic.d file"
+        written = tee_calls[0].kwargs["input"]
+        assert "build\t" in written  # our entry was added
+        assert "usr/src/app/upload\tVolumes/upload" in written  # foreign line kept
+
+    def test_has_build_entry_ignores_substring_and_comments(self):
+        """_has_build_entry matches the entry name, not a substring or comment."""
+        from immich_accelerator.__main__ import _has_build_entry
+
+        assert _has_build_entry("build\tUsers/me/build-data\n") is True
+        assert _has_build_entry("# build\tUsers/me/build-data\n") is False
+        assert _has_build_entry("data\tVolumes/build/upload\n") is False
+        assert _has_build_entry("") is False
+        assert _has_build_entry("  build\tUsers/me/build-data\n") is True  # leading ws
+
+    def test_strip_build_entry_keeps_foreign_and_comments(self):
+        """_strip_build_entry removes only the build line, keeping the rest."""
+        from immich_accelerator.__main__ import _strip_build_entry
+
+        content = "# a comment\ndata\tVolumes/upload\nbuild\tUsers/me/build-data\n"
+        out = _strip_build_entry(content)
+        assert "build\tUsers/me/build-data" not in out
+        assert "data\tVolumes/upload" in out
+        assert "# a comment" in out
+        # Only build line removed → exactly one line gone
+        assert out == "# a comment\ndata\tVolumes/upload\n"
+
 
 class TestRemoveBuildLink:
     def test_noop_when_conf_missing(self, tmp_data_dir):
@@ -860,6 +925,168 @@ class TestRemoveBuildLink:
             assert args[0] == "sudo"
             assert args[1] == "rm"
             assert str(synth_file) in str(args[2])
+
+    def test_preserves_foreign_lines_on_remove(self, tmp_data_dir):
+        """Uninstall must keep the user's foreign lines (issue #61): strip only
+        the build entry and write back the remainder, never blanket-rm."""
+        synth_file = tmp_data_dir["data_dir"] / "synthetic-conf"
+        synth_file.write_text("data\tVolumes/upload\nbuild\tUsers/test/build-data\n")
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        with patch("immich_accelerator.__main__.SYNTHETIC_CONF", synth_file), patch(
+            "immich_accelerator.__main__.subprocess.run", return_value=mock_result
+        ) as mock_run:
+            _remove_build_link()
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            assert args[1] == "tee"  # rewrite, not rm
+            written = mock_run.call_args.kwargs["input"]
+            assert "data\tVolumes/upload" in written
+            assert "build\t" not in written
+
+
+# ---------------------------------------------------------------------------
+# Docker media-root detection (_detect_docker_media_prefix)
+# ---------------------------------------------------------------------------
+
+
+class TestDetectDockerMediaPrefix:
+    """Regression coverage for issue #61: detection must follow Immich's actual
+    layout (<MEDIA>/library/<storageLabel|uuid>/…), not assume upload/<uuid>/."""
+
+    def _detect(self, items):
+        from immich_accelerator.__main__ import _detect_docker_media_prefix
+
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({"assets": {"items": items}}).encode()
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        with patch("urllib.request.urlopen", return_value=resp):
+            return _detect_docker_media_prefix("http://nas:2283", "key")
+
+    def test_storage_label_no_uuid(self):
+        """User set a storage label ('Anthony') → no UUID in path. The bug case."""
+        got = self._detect(
+            [
+                {
+                    "libraryId": None,
+                    "originalPath": "/usr/src/app/upload/library/Anthony/2026/06/IMG_1.jpg",
+                }
+            ]
+        )
+        assert got == "/usr/src/app/upload"
+
+    def test_default_uuid_layout(self):
+        """No storage label → ownerId UUID under library/. Media root before library."""
+        got = self._detect(
+            [
+                {
+                    "libraryId": None,
+                    "originalPath": "/data/library/3fa85f64-5717-4562-b3fc-2c963f66afa6/2024/2024-01-01/IMG.jpg",
+                }
+            ]
+        )
+        assert got == "/data"
+
+    def test_skips_external_then_reads_upload_asset(self):
+        """External-library assets (libraryId set) are skipped; first upload wins."""
+        got = self._detect(
+            [
+                {"libraryId": "ext-1", "originalPath": "/nas/Pictures/2026/x.jpg"},
+                {
+                    "libraryId": None,
+                    "originalPath": "/mnt/photos/library/admin/2026/06/y.jpg",
+                },
+            ]
+        )
+        assert got == "/mnt/photos"
+
+    def test_only_external_returns_none(self):
+        """All external → don't know, don't block."""
+        got = self._detect(
+            [{"libraryId": "ext-1", "originalPath": "/nas/Pictures/2026/x.jpg"}]
+        )
+        assert got is None
+
+    def test_legacy_uuid_fallback_without_library_segment(self):
+        """Old layout with a UUID but no `library` segment → legacy fallback."""
+        got = self._detect(
+            [
+                {
+                    "libraryId": None,
+                    "originalPath": "/data/upload/3fa85f64-5717-4562-b3fc-2c963f66afa6/2024/IMG.jpg",
+                }
+            ]
+        )
+        assert got == "/data"
+
+    def test_empty_items_returns_none(self):
+        assert self._detect([]) is None
+
+
+# ---------------------------------------------------------------------------
+# Path-mismatch warning (_warn_on_path_mismatch, _is_top_level_path)
+# ---------------------------------------------------------------------------
+
+
+class TestIsTopLevelPath:
+    def test_top_level_true(self):
+        from immich_accelerator.__main__ import _is_top_level_path
+
+        assert _is_top_level_path("/data") is True
+        assert _is_top_level_path("data") is True
+        assert _is_top_level_path("/immich") is True
+
+    def test_nested_or_empty_false(self):
+        from immich_accelerator.__main__ import _is_top_level_path
+
+        assert _is_top_level_path("/usr/src/app/upload") is False
+        assert _is_top_level_path("/") is False
+        assert _is_top_level_path("") is False
+
+
+class TestWarnOnPathMismatch:
+    """Issue #61: guidance must be achievable. Synthetic link is only offered
+    when Docker's media root is top-level; nested roots steer to Route 1/2."""
+
+    def _warn(self, detected, mount, caplog):
+        import logging
+
+        from immich_accelerator.__main__ import _warn_on_path_mismatch
+
+        with patch(
+            "immich_accelerator.__main__._detect_docker_media_prefix",
+            return_value=detected,
+        ), patch(
+            "immich_accelerator.__main__._fetch_external_libraries", return_value=[]
+        ), caplog.at_level(
+            logging.ERROR, logger="accelerator"
+        ):
+            fatal = _warn_on_path_mismatch("http://nas:2283", "key", mount)
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        return fatal, text
+
+    def test_top_level_offers_synthetic(self, caplog):
+        fatal, text = self._warn("/photos", "/data", caplog)
+        assert fatal is True
+        # Valid synthetic command: single top-level name, no-leading-slash target,
+        # printf (portable tab); the printed instruction shows a literal \t.
+        assert "printf 'photos\\tdata\\n'" in text
+        assert "Route 1" not in text
+
+    def test_nested_steers_to_routes_not_impossible_synthetic(self, caplog):
+        fatal, text = self._warn("/usr/src/app/upload", "/data", caplog)
+        assert fatal is True
+        assert "Route 1" in text and "Route 2" in text
+        assert "nested" in text
+        # Must NOT emit the impossible nested synthetic name as a command
+        assert "usr/src/app/upload\\t" not in text
+
+    def test_compatible_paths_not_fatal(self, caplog):
+        # upload_mount is a parent of detected → compatible, no error
+        fatal, text = self._warn("/data/library", "/data", caplog)
+        assert fatal is False
+        assert "Upload path mismatch" not in text
 
 
 # ---------------------------------------------------------------------------

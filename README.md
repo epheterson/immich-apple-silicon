@@ -186,6 +186,8 @@ data	Volumes/photos/immich/library
 
 Reboot. Now `/data` on the Mac resolves to the SMB/NFS mount, matching what Docker already stores in the database. No `IMMICH_MEDIA_LOCATION` change needed.
 
+> **Synthetic links can only create a single top-level name** (e.g. `/data`, `/immich`) — that's a macOS limitation, not ours. If Docker is using the container default `IMMICH_MEDIA_LOCATION=/usr/src/app/upload`, you **cannot** mirror that path on the Mac (you can't synthesize `/usr/src/app/...`, and `/usr` already exists). Use Option A, or first set `IMMICH_MEDIA_LOCATION` to a top-level path like `/data` and then synthesize that.
+
 ### Changing IMMICH_MEDIA_LOCATION on an existing install
 
 Immich automatically rewrites all file paths in the database on restart when `IMMICH_MEDIA_LOCATION` changes. It's safe — **but back up your database first**.
@@ -252,6 +254,19 @@ Symptom — the native worker runs happily, but Immich's API server logs `ENOENT
 Cause — split-setup path mismatch. Docker Immich stores absolute paths like `/data/library/<uuid>/...` in Postgres; the native worker writes to your `upload_mount` which is something else. Docker API then 404s the stored path.
 
 Fix — run `immich-accelerator setup --url http://your-nas:2283 --api-key YOUR_KEY` again. v1.4.1+ detects Docker's media root via the API and refuses to save a broken config. You'll see the mismatch explicitly with both walkthroughs (match Docker, or synthetic link on Mac). See [Split deployment](#split-deployment-nas--mac) above for the two options.
+
+### Microservices red after editing `/etc/synthetic.d/immich-accelerator` by hand
+
+Symptom — you added your own line to `/etc/synthetic.d/immich-accelerator` (e.g. a split-deployment upload path), rebooted, and Microservices is red. The native worker won't start because `/build` doesn't resolve.
+
+Cause — that file also holds the required `/build` synthetic link (for Immich 2.7+ plugin paths). Before v1.5.7, setup treated the file *existing* as "build link configured" and skipped writing the entry, so a hand-edited file silently lost `/build`.
+
+Fix — upgrade to v1.5.7+ and re-run setup; it now checks for the actual `build` entry and appends it without touching your other lines. Or add it yourself and reboot:
+
+```bash
+# /etc/synthetic.d/immich-accelerator — needs a build entry (tab-separated)
+printf 'build\t%s\n' "${HOME#/}/.immich-accelerator/build-data" | sudo tee -a /etc/synthetic.d/immich-accelerator
+```
 
 ### ML jobs fail with "Machine learning request failed for all URLs"
 

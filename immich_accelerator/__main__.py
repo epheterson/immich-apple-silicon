@@ -66,6 +66,74 @@ def _build_link_ok() -> bool:
         return False
 
 
+def _synthetic_build_entry(build_data: Path) -> str:
+    """The synthetic.d line that maps /build to our build-data directory.
+
+    The target column has NO leading slash: synthetic.conf(5) resolves it
+    relative to /, and that's the form Apple's own examples use.
+    """
+    return f"build\t{str(build_data).lstrip('/')}\n"
+
+
+def _has_build_entry(content: str) -> bool:
+    """True if synthetic.d content already declares the /build link.
+
+    Matches on the entry NAME (first tab-separated column), not a substring —
+    a foreign line whose target merely contains 'build' must not count as the
+    /build link being configured. Existence of the file is not enough: a user
+    can hand-edit /etc/synthetic.d/immich-accelerator (e.g. to add an upload
+    path) and clobber or omit our build entry (issue #61).
+    """
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.split("\t", 1)[0].strip() == "build":
+            return True
+    return False
+
+
+def _strip_build_entry(content: str) -> str:
+    """Return `content` with our build entries removed, foreign lines kept.
+
+    Matches the entry NAME column (consistent with _has_build_entry), so
+    comments and unrelated entries the user added survive (issue #61).
+    """
+    return "".join(
+        line
+        for line in content.splitlines(keepends=True)
+        if line.strip().split("\t", 1)[0].strip() != "build"
+    )
+
+
+def _read_synthetic_conf() -> str:
+    """Read SYNTHETIC_CONF, falling back to sudo for a root-only-readable file.
+
+    A tight root umask can leave /etc/synthetic.d unsearchable (750) or the
+    file unreadable by the non-root user — a case this module's own create
+    path acknowledges. A plain read would then return "", and rewriting from
+    "" would clobber the user's foreign lines. The sudo fallback reads the
+    real content so append/strip operations preserve those lines (issue #61).
+    Callers should only invoke this once they're already prepared to sudo.
+    """
+    try:
+        if SYNTHETIC_CONF.exists():
+            return SYNTHETIC_CONF.read_text()
+        return ""
+    except OSError:
+        pass
+    try:
+        r = subprocess.run(
+            ["sudo", "cat", str(SYNTHETIC_CONF)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return r.stdout if r.returncode == 0 else ""
+    except subprocess.SubprocessError:
+        return ""
+
+
 def _ensure_build_link():
     """Ensure /build exists on macOS, pointing to our build-data directory.
 
@@ -86,12 +154,8 @@ def _ensure_build_link():
                 content = legacy.read_text() if legacy.exists() else ""
             except OSError:
                 content = ""
-            has_legacy = any(
-                line.startswith("build\t") for line in content.splitlines()
-            )
-            if has_legacy:
-                relative_target = str(build_data).lstrip("/")
-                entry = f"build\t{relative_target}\n"
+            if _has_build_entry(content):
+                entry = _synthetic_build_entry(build_data)
                 try:
                     # Write new synthetic.d file first — only remove legacy if this succeeds
                     r1 = subprocess.run(
@@ -112,12 +176,7 @@ def _ensure_build_link():
                     if r2.returncode != 0:
                         raise OSError("tee failed")
                     # New file written — now safe to clean legacy
-                    lines = [
-                        line
-                        for line in content.splitlines(keepends=True)
-                        if not line.startswith("build\t")
-                    ]
-                    new_content = "".join(lines)
+                    new_content = _strip_build_entry(content)
                     if new_content.strip():
                         subprocess.run(
                             ["sudo", "tee", str(legacy)],
@@ -142,8 +201,22 @@ def _ensure_build_link():
         log.warning("  Plugin paths may not resolve correctly.")
         return False
 
-    # Check if already configured but not yet active (needs reboot)
-    if SYNTHETIC_CONF.exists():
+    # Read any existing synthetic.d file. Existence alone is NOT proof the
+    # build link is configured — a user may have hand-edited this file (e.g.
+    # to add a split-deployment upload path) and left out our build entry
+    # (issue #61). Gate on the actual entry, and preserve foreign lines so
+    # we never silently delete a user's manual additions. This first read is
+    # best-effort and non-sudo (so we don't prompt for a password just to
+    # check); a tight-umask file is re-read with sudo after the user opts in.
+    existing = ""
+    try:
+        if SYNTHETIC_CONF.exists():
+            existing = SYNTHETIC_CONF.read_text()
+    except OSError:
+        existing = ""
+
+    if _has_build_entry(existing):
+        # build entry present but /build not yet active → just needs a reboot.
         log.info("/build link configured but not yet active.")
         log.info("  Reboot to activate it.")
         return False
@@ -162,9 +235,32 @@ def _ensure_build_link():
     if answer and answer != "y":
         return False
 
-    # Write our own file in /etc/synthetic.d/ (avoids touching shared synthetic.conf)
-    relative_target = str(build_data).lstrip("/")
-    entry = f"build\t{relative_target}\n"
+    # Write our file in /etc/synthetic.d/ (avoids touching shared synthetic.conf).
+    # Append-if-missing: keep any foreign lines the user added so we don't clobber
+    # a manual split-deployment entry, but make sure our build line is present.
+    # Re-read now (with a sudo fallback) so a root-only-readable file isn't seen
+    # as empty — that would drop the user's foreign lines on the rewrite below.
+    existing = _read_synthetic_conf()
+    if _has_build_entry(existing):
+        # Became readable and already has our entry — nothing to write.
+        log.info("/build link already configured. Reboot to activate it.")
+        return False
+    foreign = [
+        line
+        for line in existing.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if foreign:
+        log.warning(
+            "%s already has %d entr%s we didn't write — preserving them:",
+            SYNTHETIC_CONF,
+            len(foreign),
+            "y" if len(foreign) == 1 else "ies",
+        )
+        for line in foreign:
+            log.warning("     %s", line)
+    base = existing.rstrip("\n") + "\n" if existing.strip() else ""
+    entry = base + _synthetic_build_entry(build_data)
     try:
         result = subprocess.run(
             # install -d, not mkdir -p: pin mode 755 so a tight root umask
@@ -214,21 +310,34 @@ def _remove_build_link():
     """Remove /build synthetic link during uninstall."""
     removed = False
 
-    # Remove synthetic.d file (v1.3.3+)
-    if SYNTHETIC_CONF.exists():
+    # Remove our build entry from synthetic.d (v1.3.3+). Strip only the build
+    # line and keep any foreign lines the user added (e.g. a split-deployment
+    # upload path, issue #61) — rm the file only when nothing else remains.
+    conf_content = _read_synthetic_conf()
+    if conf_content:
         log.info("Removing /build link (requires sudo)...")
+        remainder = _strip_build_entry(conf_content)
         try:
-            result = subprocess.run(
-                ["sudo", "rm", str(SYNTHETIC_CONF)],
-                capture_output=True,
-                timeout=10,
-            )
+            if remainder.strip():
+                result = subprocess.run(
+                    ["sudo", "tee", str(SYNTHETIC_CONF)],
+                    input=remainder,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            else:
+                result = subprocess.run(
+                    ["sudo", "rm", str(SYNTHETIC_CONF)],
+                    capture_output=True,
+                    timeout=10,
+                )
             if result.returncode == 0:
                 removed = True
             else:
-                log.warning("  Could not remove %s", SYNTHETIC_CONF)
+                log.warning("  Could not update %s", SYNTHETIC_CONF)
         except subprocess.SubprocessError as e:
-            log.warning("  Could not remove %s: %s", SYNTHETIC_CONF, e)
+            log.warning("  Could not update %s: %s", SYNTHETIC_CONF, e)
 
     # Also clean legacy entry from /etc/synthetic.conf (pre-v1.3.3)
     legacy_conf = Path("/etc/synthetic.conf")
@@ -1829,18 +1938,29 @@ def _detect_docker_media_prefix(base_url: str, api_key: str) -> str | None:
         if not original:
             continue
         parts = Path(original).parts
-        # Immich's upload path layout: <MEDIA_LOCATION>/upload/<userUUID>/<year>/<filename>
-        # The user UUID is a 36-char 4-dash string. Everything above
-        # that UUID is IMMICH_MEDIA_LOCATION/upload — strip the
-        # `upload` segment to get the media root.
+        # Immich's own path builder (cores/storage.core.js):
+        #   getLibraryFolder = join(mediaLocation, "library", storageLabel || ownerId)
+        # so every uploaded original lives at:
+        #   <IMMICH_MEDIA_LOCATION>/library/<storageLabel|ownerUUID>/<storage-template…>/<file>
+        # The media root is therefore everything *before* the `library`
+        # segment. This holds whether or not the user set a storage label —
+        # the old UUID heuristic assumed `upload/<uuid>/` and silently
+        # mis-detected a date-nested path for anyone with a storage label
+        # (issue #61). Use the first `library` segment: a storage template
+        # could itself contain a folder named "library", but the media root
+        # would not normally.
+        if "library" in parts:
+            before = parts[: parts.index("library")]
+            return str(Path(*before)) if before else None
+        # Fallbacks for layouts without a `library` segment (very old installs
+        # or non-standard configs). Try the legacy upload/<UUID> layout, then
+        # a last-resort trim of the trailing <year>/<filename>.
         for i, p in enumerate(parts):
             if len(p) == 36 and p.count("-") == 4:
                 before = parts[:i]
-                # Strip trailing "upload" if present
                 if before and before[-1] == "upload":
                     before = before[:-1]
                 return str(Path(*before)) if before else None
-        # Fallback for non-standard layouts.
         if len(parts) >= 3:
             return str(Path(*parts[:-2]))
     return None
@@ -1870,6 +1990,19 @@ def _fetch_external_libraries(base_url: str, api_key: str) -> list[dict]:
     except (urllib.error.URLError, urllib.error.HTTPError, ValueError, TimeoutError):
         pass
     return []
+
+
+def _is_top_level_path(path: str) -> bool:
+    """True if `path` is a single top-level component under / (e.g. /data).
+
+    synthetic.conf(5) can only create an entity whose name is a single
+    component at the root mount point. A nested path like /usr/src/app/upload
+    cannot be turned into a synthetic link (and /usr already exists), so the
+    "mirror Docker's path on the Mac" route is only viable when Docker's media
+    root is top-level (issue #61).
+    """
+    stripped = path.strip("/")
+    return bool(stripped) and "/" not in stripped
 
 
 def _warn_on_path_mismatch(immich_url: str, api_key: str, upload_mount: str) -> bool:
@@ -1908,20 +2041,61 @@ def _warn_on_path_mismatch(immich_url: str, api_key: str, upload_mount: str) -> 
             log.error("   Docker Immich stores uploads under: %s", detected_norm)
             log.error("   Your upload_mount is set to:        %s", mount_norm)
             log.error("")
-            log.error("   Two ways to fix this (see README 'Split deployment'):")
-            log.error("")
-            log.error("     A. Reconfigure Docker's IMMICH_MEDIA_LOCATION to:")
-            log.error("          %s", mount_norm)
-            log.error("")
-            log.error("     B. Create a synthetic link so the Mac sees Docker's path:")
-            log.error(
-                "          echo '%s\\t%s' | sudo tee -a /etc/synthetic.d/immich-accelerator",
-                detected_norm.lstrip("/"),
-                mount_norm.lstrip("/"),
-            )
-            log.error(
-                "        Reboot, then re-run setup with upload_mount=%s", detected_norm
-            )
+            if _is_top_level_path(detected_norm):
+                # Docker's media root is a single top-level component, so the
+                # Mac can reproduce it with a synthetic link. Offer both routes.
+                log.error("   Two ways to fix this (see README 'Split deployment'):")
+                log.error("")
+                log.error("     A. Point Docker's IMMICH_MEDIA_LOCATION at your mount:")
+                log.error("          %s", mount_norm)
+                log.error("")
+                log.error(
+                    "     B. Make the Mac resolve Docker's path with a synthetic link:"
+                )
+                # printf, not echo: only zsh's echo expands \t — printf gives a
+                # real tab in bash and zsh alike, so the synthetic entry is valid.
+                log.error(
+                    "          printf '%s\\t%s\\n' | sudo tee -a /etc/synthetic.d/immich-accelerator",
+                    detected_norm.lstrip("/"),
+                    mount_norm.lstrip("/"),
+                )
+                log.error(
+                    "        Reboot, then re-run setup with upload_mount=%s",
+                    detected_norm,
+                )
+            else:
+                # Nested/system media root (e.g. the container default
+                # /usr/src/app/upload). It can't be a synthetic link, so the
+                # synthetic route needs a top-level media root first.
+                log.error(
+                    "   %s is nested — macOS synthetic links only create a single",
+                    detected_norm,
+                )
+                log.error(
+                    "   top-level name (e.g. /data), so it can't be mirrored as-is."
+                )
+                log.error(
+                    "   Two ways forward (back up your DB first — paths migrate):"
+                )
+                log.error("")
+                log.error("     Route 1 — point Docker at the path the Mac mounts:")
+                log.error(
+                    "          set IMMICH_MEDIA_LOCATION=%s, bind the volume there.",
+                    mount_norm,
+                )
+                log.error("          No synthetic link needed; re-run setup as-is.")
+                log.error("")
+                log.error(
+                    "     Route 2 — switch Docker to a top-level path, then synthesize:"
+                )
+                log.error(
+                    "          set IMMICH_MEDIA_LOCATION=/data (bind the volume to /data),"
+                )
+                log.error(
+                    "          printf 'data\\t%s\\n' | sudo tee -a /etc/synthetic.d/immich-accelerator",
+                    mount_norm.lstrip("/"),
+                )
+                log.error("          Reboot, then re-run setup with upload_mount=/data")
             log.error("")
 
     # --- (b) external library paths ---
@@ -2352,10 +2526,14 @@ def _fresh_install(docker: str) -> bool:
     run_as_user = True
     log.info("")
     try:
-        answer = input(
-            "  Run the Immich server container as the current user "
-            f"(uid {os.getuid()})? [Y/n] "
-        ).strip().lower()
+        answer = (
+            input(
+                "  Run the Immich server container as the current user "
+                f"(uid {os.getuid()})? [Y/n] "
+            )
+            .strip()
+            .lower()
+        )
     except EOFError:
         answer = ""
     if answer and answer != "y":
@@ -2379,9 +2557,9 @@ def _fresh_install(docker: str) -> bool:
     # Use str.replace instead of str.format to avoid issues with
     # curly braces in paths or the Docker ${{}} env var syntax.
     photos_mount = f"{photos_path}:{photos_path}:ro"
-    compose_content = _COMPOSE_TEMPLATE.replace(
-        "{photos_mount}", photos_mount
-    ).replace("{user_line}", user_line)
+    compose_content = _COMPOSE_TEMPLATE.replace("{photos_mount}", photos_mount).replace(
+        "{user_line}", user_line
+    )
 
     (compose_dir / "docker-compose.yml").write_text(compose_content)
 
