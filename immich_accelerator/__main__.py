@@ -664,30 +664,36 @@ def detect_immich(docker: str) -> dict:
     except (json.JSONDecodeError, subprocess.SubprocessError):
         mounts = []
 
-    # Resolve the container's media location the way Immich itself does
+    # Find which mount holds the upload library the way Immich itself does
     # (services/storage.service.js detectMediaLocation): an explicit
     # IMMICH_MEDIA_LOCATION wins; otherwise Immich uses whichever of /data or
-    # /usr/src/app/upload exists in the container — for a bind mount that means
-    # it's a mount destination. The old detector hardcoded a "/upload"
-    # substring match, so it missed the modern default where uploads are
-    # mounted at /data (issue #62).
-    dests = {}
+    # /usr/src/app/upload exists in the container. The old detector hardcoded a
+    # "/upload" substring match, so it missed the modern default where uploads
+    # are bind-mounted at /data (issue #62).
+    #
+    # Only bind mounts qualify: the native worker reads files directly off disk,
+    # so a named/anonymous volume (Source lives inside Docker's VM) is no use.
+    bind_dests = {}
     for m in mounts:
+        if m.get("Type") and m.get("Type") != "bind":
+            continue
         d = m.get("Destination", "").rstrip("/")
-        if d:
-            dests.setdefault(d, m.get("Source", ""))
+        src = m.get("Source", "")
+        if d and src:
+            bind_dests.setdefault(d, src)
 
-    media_location = env.get("IMMICH_MEDIA_LOCATION", "").rstrip("/")
-    if not media_location or media_location not in dests:
+    media_env = env.get("IMMICH_MEDIA_LOCATION", "").rstrip("/")
+    media_dest = media_env if media_env in bind_dests else ""
+    if not media_dest:
         for candidate in ("/data", "/usr/src/app/upload"):
-            if candidate in dests:
-                media_location = media_location or candidate
+            if candidate in bind_dests:
+                media_dest = candidate
                 break
 
-    upload_mount = dests.get(media_location)
+    upload_mount = bind_dests.get(media_dest)
     if not upload_mount:
         # Last resort: legacy substring match for non-standard destinations.
-        for d, src in dests.items():
+        for d, src in bind_dests.items():
             if "/upload" in d:
                 upload_mount = src
                 break
@@ -707,7 +713,7 @@ def detect_immich(docker: str) -> dict:
         "upload_mount": upload_mount,
         "ml_url": env.get("IMMICH_MACHINE_LEARNING_URL", ""),
         "workers_include": env.get("IMMICH_WORKERS_INCLUDE", ""),
-        "media_location": media_location,
+        "media_location": env.get("IMMICH_MEDIA_LOCATION", ""),
     }
 
 

@@ -433,7 +433,9 @@ class TestDetectImmich:
         )
         info = self._detect_with("DB_PASSWORD=x\n", mounts)
         assert info["upload_mount"] == "/Volumes/4TB/Immich/Uploads"
-        assert info["media_location"] == "/data"
+        # media_location stays the raw env value (unset here) — see comment in
+        # detect_immich; the effective /data is used only to pick the mount.
+        assert info["media_location"] == ""
 
     def test_explicit_media_location_env_wins(self):
         """An explicit IMMICH_MEDIA_LOCATION picks the matching mount."""
@@ -454,7 +456,21 @@ class TestDetectImmich:
         )
         info = self._detect_with("", mounts)
         assert info["upload_mount"] == "/photos/upload"
-        assert info["media_location"] == "/usr/src/app/upload"
+
+    def test_named_volume_at_data_is_ignored(self):
+        """A non-bind mount at /data (Source inside Docker's VM) is not a usable
+        host path for the native worker, so it must not be chosen."""
+        mounts = json.dumps(
+            [
+                {
+                    "Type": "volume",
+                    "Destination": "/data",
+                    "Source": "/var/lib/docker/volumes/immich_data/_data",
+                }
+            ]
+        )
+        info = self._detect_with("", mounts)
+        assert info["upload_mount"] is None
 
     def test_no_media_mount_not_detected(self):
         """No /data or /upload mount → upload_mount stays None (not detected)."""
