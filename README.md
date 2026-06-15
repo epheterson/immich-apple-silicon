@@ -235,10 +235,12 @@ The native worker runs Immich's unmodified code. The ffmpeg and image processing
 | **ML: Face detection** | ONNX Runtime | Apple Vision framework (Neural Engine) | Different model entirely. Detection accuracy is comparable; bounding boxes may differ slightly. |
 | **ML: Face recognition** | ONNX Runtime | ONNX Runtime with CoreML | Same model, CoreML acceleration. Numerically close embeddings. |
 | **ML: OCR** | PaddleOCR via ONNX | Apple Vision framework (Neural Engine) | Different engine. Vision framework OCR is generally more accurate for Latin text, may differ for CJK. |
+| **HEIC decode** | libvips built with libde265 | Apple ImageIO (`sips`), then Sharp | Sharp's prebuilt libvips on macOS has no HEVC decoder, so iPhone HEICs are decoded by Apple's native ImageIO before Sharp processes them. Pixels are effectively identical for thumbnails. |
 
 ### What this means in practice
 
 - **Thumbnails, previews, and video**: Identical to Docker. Same jellyfin-ffmpeg binary, same `tonemapx` HDR tone mapping, same output. VideoToolbox hardware encoding is faster but visually equivalent.
+- **HEIC photos**: Thumbnails generate correctly. The default iPhone format (HEVC-coded HEIC, often tiled) is decoded by Apple's ImageIO since Sharp's bundled libheif is AVIF-only; output is visually identical.
 - **CLIP search**: Search results are equivalent but not identical. A search that returns 20 results in Docker will return ~18-20 of the same results natively, possibly in slightly different order.
 - **Face grouping**: Faces are detected and grouped correctly. The grouping boundaries may differ slightly (e.g., a borderline face might be grouped differently).
 - **OCR**: Text extraction is at least as good as Docker for English/Latin text.

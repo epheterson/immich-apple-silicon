@@ -1376,3 +1376,111 @@ class TestDashboardStartsInFreshVenv:
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
         assert "ok FastAPI" in result.stdout
+
+
+class TestHeicDecodeShim:
+    """The HEIC decode shim (issue #62 follow-up) interposes on require('sharp')
+    to route HEVC-HEIC paths through Apple's ImageIO. These guard the JS logic
+    without needing real Sharp/sips (the real decode is verified on-device)."""
+
+    SHIM = REPO_ROOT / "immich_accelerator" / "hooks" / "heic_decode_shim.js"
+
+    def test_shim_file_exists(self):
+        assert self.SHIM.exists(), "heic_decode_shim.js must ship in hooks/"
+
+    def test_shim_is_wired_into_worker_node_options(self):
+        """cmd_start must add the shim to the worker's NODE_OPTIONS."""
+        src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()
+        assert "heic_decode_shim.js" in src
+        assert 'require "{heic_shim}"' in src or "--require" in src
+
+    def test_shim_syntax_valid(self):
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        result = subprocess.run(
+            [node, "--check", str(self.SHIM)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, f"shim syntax error: {result.stderr}"
+
+    def test_intercepts_sharp_routes_heic_passes_through_others(self, tmp_path):
+        """Functional: with a fake `sharp` module and a stub `sips`, the shim
+        must (a) wrap require('sharp'), (b) hand a Buffer to Sharp for a HEIC
+        path, and (c) pass a non-HEIC path through unchanged."""
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+
+        # Fake sharp module: reports whether it received a Buffer or a string.
+        sharp_dir = tmp_path / "node_modules" / "sharp"
+        sharp_dir.mkdir(parents=True)
+        (sharp_dir / "index.js").write_text(
+            "function fakeSharp(input){"
+            "process.stdout.write('INPUT_TYPE:'+"
+            "(Buffer.isBuffer(input)?'buffer':typeof input)+'\\n');"
+            "return {};}"
+            "fakeSharp.cache=function(){};"
+            "module.exports=fakeSharp;\n"
+        )
+
+        # Stub sips: writes a dummy file to the --out path and exits 0.
+        sips = tmp_path / "sips_stub.sh"
+        sips.write_text(
+            "#!/bin/bash\n"
+            'while [ "$1" != "--out" ] && [ $# -gt 0 ]; do shift; done\n'
+            "shift\n"
+            'printf DUMMY > "$1"\n'
+        )
+        sips.chmod(0o755)
+
+        # A real HEVC-HEIC file (ftyp box, major brand 'heic').
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(
+            bytes([0, 0, 0, 0x18]) + b"ftypheic" + b"\x00\x00\x00\x00mif1heic"
+        )
+        # A non-HEIC file that must pass through untouched.
+        notheic = tmp_path / "plain.jpg"
+        notheic.write_bytes(b"\xff\xd8\xff\xe0not-really-but-not-ftyp")
+
+        driver = tmp_path / "driver.js"
+        driver.write_text(
+            "const sharp=require('sharp');"
+            "process.stdout.write('WRAPPED:'+(sharp.__heicShimWrapped===true)+'\\n');"
+            "sharp(process.argv[2]);"
+            "sharp(process.argv[3]);\n"
+        )
+
+        result = subprocess.run(
+            [
+                node,
+                "--require",
+                str(self.SHIM),
+                str(driver),
+                str(heic),
+                str(notheic),
+            ],
+            cwd=str(tmp_path),
+            env={
+                "PATH": "/usr/bin:/bin",
+                "IMMICH_ACCELERATOR_SIPS": str(sips),
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, f"driver failed: {result.stderr}"
+        lines = result.stdout.strip().splitlines()
+        assert "WRAPPED:true" in lines, f"shim did not wrap sharp: {lines}"
+        # HEIC first → Buffer (decoded via stub sips); non-HEIC → string passthrough.
+        types = [ln for ln in lines if ln.startswith("INPUT_TYPE:")]
+        assert types == [
+            "INPUT_TYPE:buffer",
+            "INPUT_TYPE:string",
+        ], f"expected heic→buffer, other→string; got {types}\n{result.stdout}"
