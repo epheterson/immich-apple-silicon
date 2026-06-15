@@ -3176,6 +3176,75 @@ def _kill_stale_processes():
         time.sleep(1)
 
 
+def _canon_path(p: str) -> str:
+    """Collapse the macOS data-volume firmlink so `/nas` and
+    `/System/Volumes/Data/nas` compare equal.
+
+    Pure string normalization — it never touches the filesystem, so (unlike
+    os.path.realpath / os.stat) it can't hang on a stale/hung NFS mount, which
+    is the exact failure this gate exists to avoid.
+    """
+    p = "/" + p.strip("/")
+    prefix = "/System/Volumes/Data"
+    if p == prefix:
+        return "/"
+    if p.startswith(prefix + "/"):
+        return p[len(prefix) :]
+    return p
+
+
+def _media_mount_ready(media_path: str) -> bool:
+    """True if media_path currently resides on a network (nfs/smbfs) mount.
+
+    Guards the NAS case: the media root (e.g. /nas/...) is an NFS mount, but
+    before it's up the path resolves to a local placeholder directory and
+    writing there is silently lost once the real mount masks it. We find the
+    longest mount point that is a prefix of the media path and require its
+    filesystem to be nfs or smbfs.
+
+    Deliberately avoids realpath/stat on the path and on mount points — those
+    block forever on a stale NFS mount (see _preflight_env_health). Firmlink
+    equivalence is handled by _canon_path string normalization instead, and the
+    only filesystem call is `mount`, which has a timeout.
+    """
+    if not media_path:
+        return False
+    target = _canon_path(media_path)
+    try:
+        out = subprocess.run(
+            ["/sbin/mount"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return False
+    best_mp, best_fs = "", ""
+    for line in out.splitlines():
+        # macOS: "<src> on <mountpoint> (<fstype>, <opts>)". Split on the first
+        # " on " (NFS/SMB sources have none) and the LAST " (" (the fstype
+        # paren) so a mountpoint containing spaces/parens still parses.
+        if " on " not in line or " (" not in line:
+            continue
+        mp_part, _, paren = line.split(" on ", 1)[1].rpartition(" (")
+        mp = _canon_path(mp_part)
+        fstype = paren.split(",", 1)[0].rstrip(") ").strip()
+        if (target == mp or target.startswith(mp.rstrip("/") + "/")) and len(mp) > len(
+            best_mp
+        ):
+            best_mp, best_fs = mp, fstype
+    return best_fs in ("nfs", "smbfs")
+
+
+def _wait_for_media_mount(media_path: str, timeout: int = 60) -> bool:
+    """Poll until media_path is on a network mount, up to `timeout` seconds."""
+    if _media_mount_ready(media_path):
+        return True
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(3)
+        if _media_mount_ready(media_path):
+            return True
+    return False
+
+
 def cmd_start(args):
     config = load_config()
 
@@ -3484,6 +3553,26 @@ def cmd_start(args):
     elif not config.get("ml_dir"):
         log.warning("No ml_dir configured — ML service will not start.")
         log.warning("  Re-run: immich-accelerator setup")
+
+    # Media-mount gate. When the media root must live on a network mount
+    # (e.g. NAS over NFS), refuse to start the worker until that mount is
+    # actually present. Otherwise Immich's StorageService bootstrap writes
+    # marker/thumbnail files into the *local placeholder* directory that
+    # exists before the mount comes up — and those writes are silently masked
+    # once the real mount lands (data loss). Opt-in via config so local /
+    # same-host setups are unaffected; the watch loop retries, so the worker
+    # starts as soon as the mount appears.
+    if config.get("require_media_mount"):
+        # Match exactly what the worker uses for IMMICH_MEDIA_LOCATION above.
+        media_root = config.get("upload_mount") or ""
+        if not _wait_for_media_mount(media_root):
+            log.error(
+                "Media mount not ready: %s is not on a network (nfs/smbfs) mount.",
+                media_root or "(upload_mount unset)",
+            )
+            log.error("  Refusing to start the worker — it would write to a local")
+            log.error("  placeholder the NAS mount would later mask. Check the mount.")
+            return
 
     # Start native Immich microservices worker
     log.info("Starting Immich worker (version %s)...", config["version"])

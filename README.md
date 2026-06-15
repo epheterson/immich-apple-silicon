@@ -192,6 +192,10 @@ Reboot. Now `/data` on the Mac resolves to the SMB/NFS mount, matching what Dock
 
 Immich automatically rewrites all file paths in the database on restart when `IMMICH_MEDIA_LOCATION` changes. It's safe — **but back up your database first**.
 
+### NAS media on a network mount: gate the worker on the mount
+
+If your media root lives on a network mount (NFS/SMB), set `"require_media_mount": true` in `~/.immich-accelerator/config.json`. The worker then refuses to start until that path is on a real `nfs`/`smbfs` mount, and the watch loop retries until it is. This prevents a boot-order race where the worker starts before the mount is up and writes thumbnails into a local placeholder directory that the mount later masks (silent data loss). Off by default; only affects setups that opt in.
+
 ## ML service
 
 The ML service is a managed fork of [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) by [@sebastianfredette](https://github.com/sebastianfredette), included as a git submodule. It replaces Immich's Docker ML container with native macOS inference. Upstream changes are reviewed before merging.

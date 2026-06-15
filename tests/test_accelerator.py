@@ -1178,6 +1178,61 @@ class TestWarnOnPathMismatch:
 # ---------------------------------------------------------------------------
 
 
+class TestMediaMountReady:
+    """The media-mount gate: refuse to start the worker until the NAS media
+    root is on a real network mount (avoids writing thumbnails to a local
+    placeholder that the NFS mount later masks)."""
+
+    NFS = "10.0.0.14:/volume1/ELP NAS on /System/Volumes/Data/nas (nfs, nodev, nosuid)"
+    APFS = (
+        "/dev/disk3s1 on / (apfs, local, read-only)\n"
+        "/dev/disk3s5 on /System/Volumes/Data (apfs, local)"
+    )
+
+    def _check(self, media, mount_output):
+        from immich_accelerator.__main__ import _media_mount_ready
+
+        result = MagicMock()
+        result.stdout = mount_output
+        with patch(
+            "immich_accelerator.__main__.subprocess.run", return_value=result
+        ), patch("os.path.realpath", side_effect=lambda p: p):
+            return _media_mount_ready(media)
+
+    def test_media_on_nfs_is_ready(self):
+        assert (
+            self._check(
+                "/System/Volumes/Data/nas/immich/upload", self.APFS + "\n" + self.NFS
+            )
+            is True
+        )
+
+    def test_media_local_only_not_ready(self):
+        # longest prefix is the apfs data volume → not a network mount
+        assert self._check("/System/Volumes/Data/immich", self.APFS) is False
+
+    def test_unmounted_nas_placeholder_not_ready(self):
+        # /nas exists as a local dir (no nfs line) → must be rejected
+        assert self._check("/System/Volumes/Data/nas/immich/upload", self.APFS) is False
+
+    def test_empty_path_not_ready(self):
+        assert self._check("", self.APFS) is False
+
+    def test_wait_returns_true_when_ready(self):
+        from immich_accelerator.__main__ import _wait_for_media_mount
+
+        with patch("immich_accelerator.__main__._media_mount_ready", return_value=True):
+            assert _wait_for_media_mount("/x", timeout=1) is True
+
+    def test_wait_times_out_when_never_ready(self):
+        from immich_accelerator.__main__ import _wait_for_media_mount
+
+        with patch(
+            "immich_accelerator.__main__._media_mount_ready", return_value=False
+        ):
+            assert _wait_for_media_mount("/x", timeout=0) is False
+
+
 class TestPathConstants:
     def test_data_dir_is_in_home(self):
         assert str(DATA_DIR).endswith(".immich-accelerator")
