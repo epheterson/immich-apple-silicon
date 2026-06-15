@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.10 — 2026-06-14
+
+### Fixes
+- **Generate thumbnails for HEIC photos (#62)**. Sharp's prebuilt libvips on macOS bundles libheif without an HEVC decoder (AVIF only), so iPhone HEICs failed to decode (`bad seek` / "compression format has not been built in") and never got thumbnails. The native worker now routes HEVC-HEIC files through Apple's ImageIO (`sips`) before Sharp, via a preloaded module that wraps `sharp` — Immich's source is untouched. Handles tiled iPhone HEICs that even system libheif rejects (its iref security limit). AVIF, JPEG, and everything else are unaffected. Reported by [@goldhandconsultancy](https://github.com/goldhandconsultancy).
+
 ## 1.5.9 — 2026-06-14
 
 ### Fixes

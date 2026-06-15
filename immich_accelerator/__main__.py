@@ -3368,6 +3368,19 @@ def cmd_start(args):
             f"{existing} {require_arg}".strip() if existing else require_arg
         )
 
+    # HEIC decode shim (issue #62 follow-up): Sharp's prebuilt libvips ships
+    # without an HEVC decoder (AVIF-only), so iPhone HEICs fail to decode and
+    # never get thumbnails. This preload wraps the `sharp` module to route
+    # HEVC-HEIC file paths through Apple's ImageIO (`sips`) before Sharp.
+    # Same --require interposition; Immich's source on disk is untouched.
+    heic_shim = Path(__file__).parent / "hooks" / "heic_decode_shim.js"
+    if heic_shim.exists():
+        existing = worker_env.get("NODE_OPTIONS", "").strip()
+        require_arg = f'--require "{heic_shim}"'
+        worker_env["NODE_OPTIONS"] = (
+            f"{existing} {require_arg}".strip() if existing else require_arg
+        )
+
     # /build link points to our build-data dir (set up during setup).
     # Required for Immich 2.7+ plugin WASM paths stored in the shared DB.
     build_data = DATA_DIR / "build-data"
