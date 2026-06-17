@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.11 — 2026-06-16
+
+### Fixes
+- **Dashboard progress now matches Immich's own counts (#68)**. Per-stage completion could read over 100% (e.g. "Neural Engine — 102.1%") and was generally inaccurate: the done-counts were taken from side tables (`smart_search`, `asset_job_status`) unfiltered — including rows left behind by deleted/hidden assets — and divided by a single asset total. Each bar now counts over the **same population Immich itself uses** (per `asset-job.repository.js`): thumbnails/OCR over live non-hidden assets, CLIP/faces over assets-that-have-a-preview, video over live non-hidden videos. Done can no longer exceed total, and the percentages line up with Immich's Jobs page. (A 100% clamp remains as a safety net.) Reported by [@Rustymage](https://github.com/Rustymage).
+
 ## 1.5.10 — 2026-06-14
 
 ### Fixes
