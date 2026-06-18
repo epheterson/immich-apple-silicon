@@ -178,27 +178,53 @@ def get_status(config: dict) -> dict:
     except (ValueError, OSError, subprocess.SubprocessError):
         pass
 
-    # Processing counts
-    # Exclude hidden assets (Live Photo motion files) — Immich skips them too
+    # Processing counts — each queue counted over the SAME population Immich
+    # itself uses (see asset-job.repository.js), so our numbers match Immich's
+    # Jobs page. Two denominators: live non-hidden assets (thumbnails, OCR,
+    # video) and "assets with previews" (CLIP + faces — Immich won't queue
+    # those until a preview exists). Counting side tables (smart_search,
+    # asset_job_status) unfiltered overcounts, since rows persist for
+    # deleted/hidden assets — that's how completion read >100% (#68).
+    #   live = asset, deletedAt IS NULL, visibility != hidden
+    #   awp  = live + has an asset_job_status row + has a Preview file
     counts_raw = _query_db(
-        "SELECT COUNT(*) FILTER (WHERE thumbhash IS NOT NULL), COUNT(*), "
-        "(SELECT COUNT(*) FROM smart_search), "
-        '(SELECT COUNT(*) FROM asset_job_status WHERE "facesRecognizedAt" IS NOT NULL), '
-        '(SELECT COUNT(*) FROM asset_job_status WHERE "ocrAt" IS NOT NULL), '
-        "COUNT(*) FILTER (WHERE type = 'VIDEO' AND visibility != 'hidden'), "
-        "(SELECT COUNT(*) FROM asset_file af JOIN asset a ON a.id = af.\"assetId\" WHERE af.type = 'encoded_video' AND a.visibility != 'hidden') "
-        "FROM asset WHERE \"deletedAt\" IS NULL AND visibility != 'hidden'",
+        "WITH live AS ("
+        "  SELECT id, type, thumbhash FROM asset"
+        "  WHERE \"deletedAt\" IS NULL AND visibility != 'hidden'), "
+        "awp AS ("
+        '  SELECT a.id, js."facesRecognizedAt" FROM asset a'
+        '  JOIN asset_job_status js ON js."assetId" = a.id'
+        "  WHERE a.\"deletedAt\" IS NULL AND a.visibility != 'hidden'"
+        "    AND EXISTS (SELECT 1 FROM asset_file f"
+        "               WHERE f.\"assetId\" = a.id AND f.type = 'preview')) "
+        "SELECT (SELECT COUNT(*) FROM live), "
+        "(SELECT COUNT(*) FROM awp), "
+        "(SELECT COUNT(*) FROM live WHERE type = 'VIDEO'), "
+        "(SELECT COUNT(*) FROM live WHERE thumbhash IS NOT NULL), "
+        '(SELECT COUNT(*) FROM awp WHERE EXISTS (SELECT 1 FROM smart_search s WHERE s."assetId" = awp.id)), '
+        '(SELECT COUNT(*) FROM awp WHERE "facesRecognizedAt" IS NOT NULL), '
+        '(SELECT COUNT(*) FROM live l WHERE EXISTS (SELECT 1 FROM asset_job_status js WHERE js."assetId" = l.id AND js."ocrAt" IS NOT NULL)), '
+        "(SELECT COUNT(*) FROM live l WHERE l.type = 'VIDEO' AND EXISTS (SELECT 1 FROM asset_file f WHERE f.\"assetId\" = l.id AND f.type = 'encoded_video'))",
         config,
     )
 
-    thumbs, total, clip, faces, ocr, total_videos, encoded_videos = 0, 0, 0, 0, 0, 0, 0
+    # total_assets: thumbnails/OCR denominator; total_previews: CLIP/faces.
+    total_assets = total_previews = total_videos = 0
+    thumbs = clip = faces = ocr = encoded_videos = 0
     if counts_raw and "|" in counts_raw:
         parts = counts_raw.split("|")
-        if len(parts) == 7:
+        if len(parts) == 8:
             try:
-                thumbs, total, clip, faces, ocr, total_videos, encoded_videos = [
-                    int(p) for p in parts
-                ]
+                (
+                    total_assets,
+                    total_previews,
+                    total_videos,
+                    thumbs,
+                    clip,
+                    faces,
+                    ocr,
+                    encoded_videos,
+                ) = [int(p) for p in parts]
             except ValueError:
                 pass
 
@@ -286,17 +312,20 @@ def get_status(config: dict) -> dict:
     def prog(done, tot):
         if queues_known and not any_active and done < tot:
             return {"done": done, "total": tot, "pct": 100.0, "skipped": tot - done}
+        # Clamp to 100: done can briefly exceed tot from count skew between the
+        # asset-total and per-stage-done queries (assets added/removed mid-scan),
+        # and a completion percentage can't exceed 100% (#68).
         return {
             "done": done,
             "total": tot,
-            "pct": round(done / max(tot, 1) * 100, 1),
+            "pct": min(round(done / max(tot, 1) * 100, 1), 100.0),
             "skipped": 0,
         }
 
     # Video transcode: use queue state for pct when active, 100% when idle + transcoded
     vid_active = queue_status.get("video", False)
     if vid_active and total_videos > 0:
-        vid_pct = round(encoded_videos / total_videos * 100, 1)
+        vid_pct = min(round(encoded_videos / total_videos * 100, 1), 100.0)
     elif encoded_videos > 0:
         vid_pct = 100.0
     else:
@@ -310,13 +339,15 @@ def get_status(config: dict) -> dict:
                 "rss_mb": worker_rss_mb,
             },
             "ml": {"alive": ml_alive, "name": "ML Service"},
-            "docker": {"alive": total > 0, "name": "Docker (API)"},
+            "docker": {"alive": total_assets > 0, "name": "Docker (API)"},
         },
         "progress": {
-            "thumbnails": prog(thumbs, total),
-            "clip": prog(clip, total),
-            "faces": prog(faces, total),
-            "ocr": prog(ocr, total),
+            # Each bar uses Immich's own denominator: thumbnails/OCR over all
+            # live assets, CLIP/faces over assets-with-previews.
+            "thumbnails": prog(thumbs, total_assets),
+            "clip": prog(clip, total_previews),
+            "faces": prog(faces, total_previews),
+            "ocr": prog(ocr, total_assets),
             "video": {
                 "done": encoded_videos,
                 "total": total_videos,

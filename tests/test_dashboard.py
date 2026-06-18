@@ -1,4 +1,5 @@
 """Tests for immich_accelerator.dashboard — status API, caching, FastAPI app."""
+
 from __future__ import annotations
 
 import json
@@ -22,17 +23,19 @@ from immich_accelerator.dashboard import (
     _CACHE_TTL,
 )
 
-
 # ---------------------------------------------------------------------------
 # _get_accelerator_version
 # ---------------------------------------------------------------------------
+
 
 class TestGetAcceleratorVersion:
     def test_reads_version_file(self, tmp_path):
         version_file = tmp_path / "VERSION"
         version_file.write_text("1.3.1\n")
         with patch("immich_accelerator.dashboard.Path") as mock_path_cls:
-            mock_path_cls.return_value.parent.parent.__truediv__ = lambda self, x: version_file
+            mock_path_cls.return_value.parent.parent.__truediv__ = (
+                lambda self, x: version_file
+            )
             # Directly test: the function reads from Path(__file__).parent.parent / "VERSION"
             # We'll just verify the fallback behavior since patching __file__ is awkward
             pass
@@ -41,7 +44,9 @@ class TestGetAcceleratorVersion:
         with patch("immich_accelerator.dashboard.Path") as mock_path_cls:
             mock_version = MagicMock()
             mock_version.exists.return_value = False
-            mock_path_cls.return_value.parent.parent.__truediv__.return_value = mock_version
+            mock_path_cls.return_value.parent.parent.__truediv__.return_value = (
+                mock_version
+            )
             result = _get_accelerator_version()
             assert result == "1.0.0"
 
@@ -55,6 +60,7 @@ class TestGetAcceleratorVersion:
 # ---------------------------------------------------------------------------
 # _run
 # ---------------------------------------------------------------------------
+
 
 class TestRun:
     def test_successful_command(self):
@@ -73,7 +79,11 @@ class TestRun:
 
     def test_timeout_returns_empty(self):
         import subprocess
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="cmd", timeout=5)):
+
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="cmd", timeout=5),
+        ):
             assert _run(["slow-cmd"]) == ""
 
     def test_os_error_returns_empty(self):
@@ -104,6 +114,7 @@ class TestRun:
 # _query_db
 # ---------------------------------------------------------------------------
 
+
 class TestQueryDb:
     def test_uses_psql_when_password_set(self):
         config = {
@@ -113,8 +124,9 @@ class TestQueryDb:
             "db_password": "secret",
             "db_name": "immich",
         }
-        with patch("os.path.exists", return_value=True), \
-             patch("immich_accelerator.dashboard._run", return_value="42") as mock_run:
+        with patch("os.path.exists", return_value=True), patch(
+            "immich_accelerator.dashboard._run", return_value="42"
+        ) as mock_run:
             result = _query_db("SELECT 1", config)
             assert result == "42"
             cmd = mock_run.call_args[0][0]
@@ -130,6 +142,7 @@ class TestQueryDb:
             "db_password": "",
             "db_name": "immich",
         }
+
         # psql not found, docker found
         def exists_side_effect(path):
             if "psql" in str(path):
@@ -138,8 +151,9 @@ class TestQueryDb:
                 return True
             return False
 
-        with patch("os.path.exists", side_effect=exists_side_effect), \
-             patch("immich_accelerator.dashboard._run", return_value="1") as mock_run:
+        with patch("os.path.exists", side_effect=exists_side_effect), patch(
+            "immich_accelerator.dashboard._run", return_value="1"
+        ) as mock_run:
             result = _query_db("SELECT 1", config)
             assert result == "1"
             cmd = mock_run.call_args[0][0]
@@ -155,6 +169,7 @@ class TestQueryDb:
             "db_name": "immich",
             "db_container": "my_custom_postgres",
         }
+
         def exists_side_effect(path):
             if "psql" in str(path):
                 return False
@@ -162,8 +177,9 @@ class TestQueryDb:
                 return True
             return False
 
-        with patch("os.path.exists", side_effect=exists_side_effect), \
-             patch("immich_accelerator.dashboard._run", return_value="1") as mock_run:
+        with patch("os.path.exists", side_effect=exists_side_effect), patch(
+            "immich_accelerator.dashboard._run", return_value="1"
+        ) as mock_run:
             _query_db("SELECT 1", config)
             cmd = mock_run.call_args[0][0]
             assert "my_custom_postgres" in cmd
@@ -173,11 +189,13 @@ class TestQueryDb:
 # get_status
 # ---------------------------------------------------------------------------
 
+
 class TestGetStatus:
     @pytest.fixture(autouse=True)
     def reset_cache(self):
         """Reset the module-level cache before each test."""
         import immich_accelerator.dashboard as d
+
         d._cache = {}
         d._cache_ts = 0
         d._static_hw = None
@@ -188,11 +206,15 @@ class TestGetStatus:
 
     def test_returns_structure(self, sample_config):
         import immich_accelerator.dashboard as d
+
         d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
 
-        with patch("urllib.request.urlopen", side_effect=OSError), \
-             patch("immich_accelerator.dashboard._query_db", return_value="100|200|100|100|50|10|5"), \
-             patch("immich_accelerator.dashboard._run", return_value="{ 1.50 2.00 3.00 }"):
+        with patch("urllib.request.urlopen", side_effect=OSError), patch(
+            "immich_accelerator.dashboard._query_db",
+            return_value="200|100|10|150|80|70|120|5",
+        ), patch(
+            "immich_accelerator.dashboard._run", return_value="{ 1.50 2.00 3.00 }"
+        ):
             status = get_status(sample_config)
 
         assert "services" in status
@@ -204,11 +226,15 @@ class TestGetStatus:
 
     def test_services_section(self, sample_config):
         import immich_accelerator.dashboard as d
+
         d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
 
-        with patch("urllib.request.urlopen", side_effect=OSError), \
-             patch("immich_accelerator.dashboard._query_db", return_value="50|100|50|50|25|5|3"), \
-             patch("immich_accelerator.dashboard._run", return_value="{ 0.50 1.00 1.50 }"):
+        with patch("urllib.request.urlopen", side_effect=OSError), patch(
+            "immich_accelerator.dashboard._query_db",
+            return_value="100|50|10|40|30|25|60|3",
+        ), patch(
+            "immich_accelerator.dashboard._run", return_value="{ 0.50 1.00 1.50 }"
+        ):
             status = get_status(sample_config)
 
         assert "worker" in status["services"]
@@ -220,11 +246,15 @@ class TestGetStatus:
 
     def test_progress_section(self, sample_config):
         import immich_accelerator.dashboard as d
+
         d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
 
-        with patch("urllib.request.urlopen", side_effect=OSError), \
-             patch("immich_accelerator.dashboard._query_db", return_value="80|100|60|70|50|10|5"), \
-             patch("immich_accelerator.dashboard._run", return_value="{ 0.50 1.00 1.50 }"):
+        with patch("urllib.request.urlopen", side_effect=OSError), patch(
+            "immich_accelerator.dashboard._query_db",
+            return_value="100|80|10|70|60|50|40|5",
+        ), patch(
+            "immich_accelerator.dashboard._run", return_value="{ 0.50 1.00 1.50 }"
+        ):
             status = get_status(sample_config)
 
         progress = status["progress"]
@@ -242,22 +272,45 @@ class TestGetStatus:
 
     def test_progress_calculations(self, sample_config):
         import immich_accelerator.dashboard as d
+
         d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
 
-        with patch("urllib.request.urlopen", side_effect=OSError), \
-             patch("immich_accelerator.dashboard._query_db", return_value="100|100|100|100|100|10|10"), \
-             patch("immich_accelerator.dashboard._run", return_value=""):
+        with patch("urllib.request.urlopen", side_effect=OSError), patch(
+            "immich_accelerator.dashboard._query_db",
+            return_value="100|80|10|100|80|70|90|5",
+        ), patch("immich_accelerator.dashboard._run", return_value=""):
             status = get_status(sample_config)
 
+        # thumbs (100) over total_assets (100) → 100%
         assert status["progress"]["thumbnails"]["pct"] == 100.0
+
+    def test_pct_clamped_to_100_when_done_exceeds_total(self, sample_config):
+        """Regression for #68: count skew (done > total) must not show >100%."""
+        import immich_accelerator.dashboard as d
+
+        d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
+
+        # fields: total_assets|total_previews|total_videos|thumbs|clip|faces|ocr|video
+        # faces (110) > its denominator total_previews (100) -> 110% without clamp.
+        with patch("urllib.request.urlopen", side_effect=OSError), patch(
+            "immich_accelerator.dashboard._query_db",
+            return_value="200|100|10|150|90|110|150|5",
+        ), patch("immich_accelerator.dashboard._run", return_value=""):
+            status = get_status(sample_config)
+
+        assert status["progress"]["faces"]["pct"] == 100.0
+        for key in ("thumbnails", "clip", "faces", "ocr"):
+            assert status["progress"][key]["pct"] <= 100.0
 
     def test_caching(self, sample_config):
         import immich_accelerator.dashboard as d
+
         d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
 
-        with patch("urllib.request.urlopen", side_effect=OSError), \
-             patch("immich_accelerator.dashboard._query_db", return_value="50|100|50|50|50|5|3") as mock_db, \
-             patch("immich_accelerator.dashboard._run", return_value=""):
+        with patch("urllib.request.urlopen", side_effect=OSError), patch(
+            "immich_accelerator.dashboard._query_db",
+            return_value="100|50|10|40|30|25|60|3",
+        ) as mock_db, patch("immich_accelerator.dashboard._run", return_value=""):
             status1 = get_status(sample_config)
             status2 = get_status(sample_config)
 
@@ -267,22 +320,25 @@ class TestGetStatus:
 
     def test_empty_db_response(self, sample_config):
         import immich_accelerator.dashboard as d
+
         d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
 
-        with patch("urllib.request.urlopen", side_effect=OSError), \
-             patch("immich_accelerator.dashboard._query_db", return_value=""), \
-             patch("immich_accelerator.dashboard._run", return_value=""):
+        with patch("urllib.request.urlopen", side_effect=OSError), patch(
+            "immich_accelerator.dashboard._query_db", return_value=""
+        ), patch("immich_accelerator.dashboard._run", return_value=""):
             status = get_status(sample_config)
 
         assert status["progress"]["thumbnails"]["total"] == 0
 
     def test_malformed_db_response(self, sample_config):
         import immich_accelerator.dashboard as d
+
         d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
 
-        with patch("urllib.request.urlopen", side_effect=OSError), \
-             patch("immich_accelerator.dashboard._query_db", return_value="not|a|valid|response"), \
-             patch("immich_accelerator.dashboard._run", return_value=""):
+        with patch("urllib.request.urlopen", side_effect=OSError), patch(
+            "immich_accelerator.dashboard._query_db",
+            return_value="not|a|valid|response",
+        ), patch("immich_accelerator.dashboard._run", return_value=""):
             status = get_status(sample_config)
 
         # Should gracefully handle parse errors
@@ -290,22 +346,26 @@ class TestGetStatus:
 
     def test_load_parsing(self, sample_config):
         import immich_accelerator.dashboard as d
+
         d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
 
-        with patch("urllib.request.urlopen", side_effect=OSError), \
-             patch("immich_accelerator.dashboard._query_db", return_value="0|0|0|0|0|0|0"), \
-             patch("immich_accelerator.dashboard._run", return_value="{ 2.50 3.00 4.00 }"):
+        with patch("urllib.request.urlopen", side_effect=OSError), patch(
+            "immich_accelerator.dashboard._query_db", return_value="0|0|0|0|0|0|0"
+        ), patch(
+            "immich_accelerator.dashboard._run", return_value="{ 2.50 3.00 4.00 }"
+        ):
             status = get_status(sample_config)
 
         assert status["system"]["load_1m"] == 2.5
 
     def test_version_from_config(self, sample_config):
         import immich_accelerator.dashboard as d
+
         d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
 
-        with patch("urllib.request.urlopen", side_effect=OSError), \
-             patch("immich_accelerator.dashboard._query_db", return_value="0|0|0|0|0|0|0"), \
-             patch("immich_accelerator.dashboard._run", return_value=""):
+        with patch("urllib.request.urlopen", side_effect=OSError), patch(
+            "immich_accelerator.dashboard._query_db", return_value="0|0|0|0|0|0|0"
+        ), patch("immich_accelerator.dashboard._run", return_value=""):
             status = get_status(sample_config)
 
         assert status["version"] == "2.6.3"
@@ -315,6 +375,7 @@ class TestGetStatus:
 # FastAPI app
 # ---------------------------------------------------------------------------
 
+
 class TestFastAPIApp:
     @pytest.fixture
     def app(self, sample_config):
@@ -323,17 +384,21 @@ class TestFastAPIApp:
     @pytest.fixture
     def client(self, app):
         from starlette.testclient import TestClient
+
         return TestClient(app)
 
     def test_index_returns_html(self, client):
         # Mock the HTML file read
-        with patch("immich_accelerator.dashboard._load_html", return_value="<html>test</html>"):
+        with patch(
+            "immich_accelerator.dashboard._load_html", return_value="<html>test</html>"
+        ):
             resp = client.get("/")
             assert resp.status_code == 200
             assert "text/html" in resp.headers["content-type"]
 
     def test_api_status_endpoint(self, client, sample_config):
         import immich_accelerator.dashboard as d
+
         d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
         d._cache = {}
         d._cache_ts = 0
@@ -358,6 +423,7 @@ class TestFastAPIApp:
         config_no_key["api_key"] = ""
         app = create_app(config_no_key)
         from starlette.testclient import TestClient
+
         client = TestClient(app)
         resp = client.post("/api/requeue")
         assert resp.status_code == 400
@@ -366,11 +432,12 @@ class TestFastAPIApp:
     def test_api_requeue_with_api_key(self, sample_config):
         app = create_app(sample_config)
         from starlette.testclient import TestClient
+
         client = TestClient(app)
 
         with patch("urllib.request.urlopen") as mock_urlopen:
             mock_resp = MagicMock()
-            mock_resp.read.return_value = b'{}'
+            mock_resp.read.return_value = b"{}"
             mock_resp.__enter__ = lambda s: mock_resp
             mock_resp.__exit__ = MagicMock(return_value=False)
             mock_urlopen.return_value = mock_resp
@@ -388,6 +455,7 @@ class TestFastAPIApp:
     def test_api_requeue_handles_failures(self, sample_config):
         app = create_app(sample_config)
         from starlette.testclient import TestClient
+
         client = TestClient(app)
 
         with patch("urllib.request.urlopen", side_effect=OSError("connection refused")):
@@ -400,13 +468,18 @@ class TestFastAPIApp:
     def test_api_requeue_handles_400_as_ok(self, sample_config):
         """400 from Immich means 'already running' which is fine."""
         import urllib.error
+
         app = create_app(sample_config)
         from starlette.testclient import TestClient
+
         client = TestClient(app)
 
         error = urllib.error.HTTPError(
             url="http://localhost:2283/api/jobs/thumbnailGeneration",
-            code=400, msg="Bad Request", hdrs={}, fp=None,
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=None,
         )
         with patch("urllib.request.urlopen", side_effect=error):
             resp = client.post("/api/requeue")
