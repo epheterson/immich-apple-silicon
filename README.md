@@ -194,7 +194,7 @@ Immich automatically rewrites all file paths in the database on restart when `IM
 
 ### NAS media on a network mount: gate the worker on the mount
 
-If your media root lives on a network mount (NFS/SMB), set `"require_media_mount": true` in `~/.immich-accelerator/config.json`. The worker then refuses to start until that path is on a real `nfs`/`smbfs` mount, and the watch loop retries until it is. This prevents a boot-order race where the worker starts before the mount is up and writes thumbnails into a local placeholder directory that the mount later masks (silent data loss). Off by default; only affects setups that opt in.
+If your media root lives on a network mount (NFS/SMB), set `"require_media_mount": true` in `~/.immich-accelerator/config.json`. The worker then refuses to start until that path is on a real `nfs`/`smbfs` mount. Under `watch`/launchd mode (the normal install) the start is retried every 30s, so the worker comes up automatically as soon as the mount appears. This prevents a boot-order race where the worker starts before the mount is up and writes thumbnails into a local placeholder directory that the mount later masks (silent data loss). Off by default; only affects setups that opt in.
 
 ## ML service
 

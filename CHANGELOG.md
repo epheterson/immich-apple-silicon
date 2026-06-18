@@ -1,9 +1,9 @@
 # Changelog
 
-## 1.5.11 — 2026-06-15
+## 1.5.12 — 2026-06-17
 
 ### Fixes
-- **Don't start the worker before the media mount is ready (opt-in)**. On NAS setups where the media root is a network mount (e.g. NFS), the worker could bootstrap before the mount came up — Immich's `StorageService` then writes marker/thumbnail files into the *local placeholder* directory, which is silently masked once the real mount lands (data loss), or hangs forever on a `hard` NFS cold-trigger. Set `"require_media_mount": true` in `~/.immich-accelerator/config.json` and the worker refuses to start until the media root is on a real `nfs`/`smbfs` mount; the watch loop retries, so it starts as soon as the mount appears. Off by default — local/same-host installs are unaffected.
+- **Don't start the worker before the media mount is ready (opt-in)**. On NAS setups where the media root is a network mount (e.g. NFS), the worker could bootstrap before the mount came up — Immich's `StorageService` then writes marker/thumbnail files into the *local placeholder* directory, which is silently masked once the real mount lands (data loss), or hangs forever on a `hard` NFS cold-trigger. Set `"require_media_mount": true` in `~/.immich-accelerator/config.json` and the worker refuses to start until the media root is on a real `nfs`/`smbfs` mount. Under `watch`/launchd mode the start is retried every 30s, so it comes up as soon as the mount appears. The gate runs before the ML service starts (so a not-ready mount never leaves an orphaned ML process) and fast-fails if `upload_mount` is unset. Off by default — local/same-host installs are unaffected.
 
 ## 1.5.10 — 2026-06-14
 

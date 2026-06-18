@@ -3506,6 +3506,32 @@ def cmd_start(args):
     if not _preflight_env_health(config):
         return
 
+    # Media-mount gate. When the media root must live on a network mount
+    # (e.g. NAS over NFS/SMB), refuse to start until that mount is actually
+    # present. Otherwise Immich's StorageService bootstrap writes marker/
+    # thumbnail files into the *local placeholder* directory that exists before
+    # the mount comes up — and those writes are silently masked once the real
+    # mount lands (data loss). Opt-in via config so local / same-host setups are
+    # unaffected. Gated BEFORE the ML service starts so a not-ready mount never
+    # leaves an orphaned ML process. Under `watch`/launchd the loop re-invokes
+    # start every 30s, so the worker comes up as soon as the mount does.
+    if config.get("require_media_mount"):
+        # Same key the worker uses for IMMICH_MEDIA_LOCATION (set above).
+        media_root = config.get("upload_mount") or ""
+        if not media_root:
+            log.error("require_media_mount is set but upload_mount is unset.")
+            log.error("  Re-run: immich-accelerator setup")
+            return
+        if not _wait_for_media_mount(media_root):
+            log.error(
+                "Media mount not ready: %s is not on a network (nfs/smbfs) mount.",
+                media_root,
+            )
+            log.error("  Refusing to start — the worker would write to a local")
+            log.error("  placeholder the mount would later mask (data loss).")
+            log.error("  Under `watch`/launchd this retries automatically.")
+            return
+
     # Re-resolve ml_dir every start. Same pattern as the node path
     # resolution above: config["ml_dir"] is a cache that goes stale
     # when brew upgrade deletes the old Cellar directory (#29).
@@ -3553,26 +3579,6 @@ def cmd_start(args):
     elif not config.get("ml_dir"):
         log.warning("No ml_dir configured — ML service will not start.")
         log.warning("  Re-run: immich-accelerator setup")
-
-    # Media-mount gate. When the media root must live on a network mount
-    # (e.g. NAS over NFS), refuse to start the worker until that mount is
-    # actually present. Otherwise Immich's StorageService bootstrap writes
-    # marker/thumbnail files into the *local placeholder* directory that
-    # exists before the mount comes up — and those writes are silently masked
-    # once the real mount lands (data loss). Opt-in via config so local /
-    # same-host setups are unaffected; the watch loop retries, so the worker
-    # starts as soon as the mount appears.
-    if config.get("require_media_mount"):
-        # Match exactly what the worker uses for IMMICH_MEDIA_LOCATION above.
-        media_root = config.get("upload_mount") or ""
-        if not _wait_for_media_mount(media_root):
-            log.error(
-                "Media mount not ready: %s is not on a network (nfs/smbfs) mount.",
-                media_root or "(upload_mount unset)",
-            )
-            log.error("  Refusing to start the worker — it would write to a local")
-            log.error("  placeholder the NAS mount would later mask. Check the mount.")
-            return
 
     # Start native Immich microservices worker
     log.info("Starting Immich worker (version %s)...", config["version"])
