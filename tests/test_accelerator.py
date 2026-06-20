@@ -35,6 +35,7 @@ from immich_accelerator.__main__ import (
     cmd_logs,
     start_service,
     _setup_manual,
+    cap_log,
     DATA_DIR,
     CONFIG_FILE,
     PID_DIR,
@@ -1225,3 +1226,42 @@ class TestMainDispatch:
             "immich_accelerator.__main__.cmd_stop", side_effect=KeyboardInterrupt
         ):
             main()  # Should not raise
+
+
+class TestCapLog:
+    """Service-log rotation: cap in place (the worker holds the file open in
+    append mode, so we truncate the inode, never rename it)."""
+
+    def test_under_cap_untouched(self, tmp_path):
+        p = tmp_path / "worker.log"
+        p.write_bytes(b"line\n" * 100)
+        before = p.read_bytes()
+        assert cap_log(p, max_bytes=10_000) is False
+        assert p.read_bytes() == before
+
+    def test_missing_file_is_noop(self, tmp_path):
+        assert cap_log(tmp_path / "nope.log", max_bytes=10) is False
+
+    def test_over_cap_truncates_and_keeps_tail(self, tmp_path):
+        p = tmp_path / "worker.log"
+        p.write_bytes(b"".join(b"line-%d\n" % i for i in range(50_000)))
+        assert p.stat().st_size > 1000
+        assert cap_log(p, max_bytes=1000) is True
+        out = p.read_bytes()
+        # shrunk below the original, keeps the most recent lines, drops the oldest
+        assert p.stat().st_size < 50_000 * 7
+        assert b"log rotated" in out
+        assert b"line-49999\n" in out
+        assert b"line-0\n" not in out
+
+    def test_truncate_preserves_inode(self, tmp_path):
+        # The open append fd must keep working after a rotate (same inode).
+        p = tmp_path / "worker.log"
+        p.write_bytes(b"x\n" * 200_000)
+        ino_before = p.stat().st_ino
+        with open(p, "a") as fh:  # simulate the worker's open append handle
+            assert cap_log(p, max_bytes=1000) is True
+            fh.write("after-rotate\n")
+            fh.flush()
+        assert p.stat().st_ino == ino_before
+        assert b"after-rotate\n" in p.read_bytes()
