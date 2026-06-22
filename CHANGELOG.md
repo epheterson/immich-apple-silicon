@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.13 — 2026-06-21
+
+### Fixes
+- **Fix misplaced OCR bounding boxes; sync the ML service to upstream.** OCR boxes were emitted in pixel coordinates, but Immich expects normalized 0–1 coordinates, so recognized-text boxes rendered in the wrong place. The bundled `immich-ml-metal` is updated to upstream `main` (carrying our `mlx<0.31.2` pin), which fixes the bbox calculation and brings ~2 months of upstream improvements: ViT-L-14 auto-conversion to MLX with an open_clip fallback, face-recognition CoreML provider tuning (MLProgram/ANE), CLIP model load moved off the event loop, and new model mappings. Reported by [@shtefko](https://github.com/shtefko) (immich-ml-metal#2).
+
 ## 1.5.12 — 2026-06-19
 
 ### Fixes
