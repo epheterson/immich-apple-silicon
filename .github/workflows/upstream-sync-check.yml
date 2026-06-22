@@ -1,0 +1,118 @@
+name: Upstream sync check
+
+# Notify (never auto-merge) when the bundled immich-ml-metal fork has drifted
+# behind upstream. ML changes alter inference behavior (CLIP backend, CoreML
+# providers) and must be validated live on Apple Silicon before shipping, so this
+# only opens/updates a tracking issue — the pull + validation stays a human step.
+#
+# Process when this fires (see the issue body):
+#   1. Branch `sync-upstream` off upstream main, cherry-pick our standing patches.
+#   2. Validate on a Mac (ml-test + a real OCR/face/CLIP round-trip).
+#   3. Merge to fork main, bump the `ml` submodule, release.
+#
+# Standing patches we always carry forward (must survive every sync):
+#   - mlx>=0.22.0,<0.31.2  (issue #38: CLIP threading crash on mlx 0.31.2)
+
+on:
+  schedule:
+    - cron: "0 14 * * 1" # Mondays 14:00 UTC
+  workflow_dispatch: {} # allow manual runs
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  UPSTREAM: sebastianfredette/immich-ml-metal
+  TRACKING_TITLE: "ML upstream sync: immich-ml-metal has new commits"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Compare our ml pin against upstream main
+        id: cmp
+        run: |
+          set -euo pipefail
+          cd ml
+          OUR_SHA="$(git rev-parse HEAD)"
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --quiet upstream main
+          UP_SHA="$(git rev-parse upstream/main)"
+
+          # Authoritative check: is upstream/main already contained in our pin?
+          # (Do NOT use the GitHub compare API across forks with a merge-commit
+          # base — it reports phantom "behind_by" counts. git is the source of
+          # truth here.)
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "behind=0" >> "$GITHUB_OUTPUT"
+            echo "✅ In sync. our=$OUR_SHA upstream=$UP_SHA"
+            exit 0
+          fi
+
+          COUNT="$(git rev-list --count HEAD..upstream/main)"
+          echo "behind=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "our_sha=$OUR_SHA" >> "$GITHUB_OUTPUT"
+          echo "up_sha=$UP_SHA" >> "$GITHUB_OUTPUT"
+
+          # Write the (untrusted) upstream commit messages to a FILE rather than
+          # GITHUB_OUTPUT: a crafted commit message containing the heredoc
+          # delimiter could otherwise break out and inject step outputs.
+          git log --oneline --no-decorate HEAD..upstream/main | head -50 \
+            > "$GITHUB_WORKSPACE/ml_behind.txt"
+
+          echo "⚠️  Behind by $COUNT commit(s)."
+
+      - name: Open or update tracking issue
+        if: steps.cmp.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.cmp.outputs.behind }}
+          OUR_SHA: ${{ steps.cmp.outputs.our_sha }}
+          UP_SHA: ${{ steps.cmp.outputs.up_sha }}
+        run: |
+          set -euo pipefail
+          # Read untrusted upstream commit log from the file into a shell var.
+          # Bash does not re-evaluate the *value* of an expanded variable, so
+          # embedding "$LOG" in the heredoc below is not a command-injection
+          # vector (single-pass expansion).
+          LOG="$(cat "$GITHUB_WORKSPACE/ml_behind.txt")"
+
+          BODY="$(cat <<EOF
+          The bundled \`immich-ml-metal\` submodule is **$BEHIND commit(s) behind** upstream \`${UPSTREAM}\` main.
+
+          - our pin: \`$OUR_SHA\`
+          - upstream main: \`$UP_SHA\`
+
+          ### New upstream commits
+          \`\`\`
+          $LOG
+          \`\`\`
+
+          ### How to sync (human-validated; do not auto-merge)
+          1. In the \`ml\` fork: branch \`sync-upstream\` off upstream \`main\`, cherry-pick our standing patches.
+          2. **Validate on a Mac** — \`immich-accelerator ml-test\` plus a real OCR / face / CLIP round-trip.
+          3. Merge to fork \`main\`, bump the \`ml\` submodule here, cut a release.
+
+          Standing patches to carry forward every sync:
+          - \`mlx>=0.22.0,<0.31.2\` (#38 — CLIP threading crash)
+
+          _Opened automatically by the weekly upstream-sync check; updates in place until synced._
+          EOF
+          )"
+
+          EXISTING="$(gh issue list --state open --search "in:title \"$TRACKING_TITLE\"" --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --body "$BODY"
+            gh issue comment "$EXISTING" --body "Still behind by $BEHIND as of this run (upstream \`$UP_SHA\`)."
+            echo "Updated issue #$EXISTING"
+          else
+            gh issue create --title "$TRACKING_TITLE" --body "$BODY"
+            echo "Created tracking issue"
+          fi

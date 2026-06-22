@@ -77,12 +77,12 @@ This is the directory Immich uses as its media root. It contains these subdirect
 | `immich-accelerator setup` | Auto-detect local Docker, extract server, configure |
 | `immich-accelerator setup --url URL` | Setup from remote Immich instance |
 | `immich-accelerator setup --manual` | Create config template for manual editing |
-| `immich-accelerator start` | Start native worker + ML |
+| `immich-accelerator start` | Start worker + ML once, foreground (testing; no auto-restart/update/log-rotation — see [Running as a service](#running-as-a-service-recommended)) |
 | `immich-accelerator stop` | Stop native services |
 | `immich-accelerator status` | Show what's running |
 | `immich-accelerator logs [worker\|ml]` | Tail service logs |
 | `immich-accelerator update` | Update to match new Immich version |
-| `immich-accelerator watch` | Monitor + auto-restart on crash (for launchd) |
+| `immich-accelerator watch` | Monitor + auto-restart/update + log rotation (what the service runs) |
 | `immich-accelerator dashboard` | Web UI at http://localhost:8420 |
 | `immich-accelerator ml-test` | Diagnose the ML service (health + CLIP + OCR round-trip) |
 | `immich-accelerator uninstall` | Remove services, data, and launchd config |
@@ -205,15 +205,29 @@ The ML service is a managed fork of [immich-ml-metal](https://github.com/sebasti
 
 Contributions to the ML service are made via [upstream PRs](https://github.com/sebastianfredette/immich-ml-metal/pulls).
 
-## Running as a service
+## Running as a service (recommended)
 
-Setup offers to install a launchd service automatically. If you skipped that prompt:
+Run the accelerator as a background service, not with a bare `immich-accelerator start`. The service runs `watch` mode, and **only `watch` mode gives you**:
+
+- **Auto-restart** — launchd (`KeepAlive`) restarts the monitor if it dies; the monitor restarts the worker, ML, and dashboard if they crash.
+- **Auto-update** — picks up new Immich versions (re-extracts the worker) and notifies on accelerator updates.
+- **Log rotation** — caps `worker.log`/`ml.log` so they can't grow without bound.
+
+A plain `immich-accelerator start` runs once in the foreground with none of the above — use it only for quick testing.
+
+**Homebrew install (recommended):**
 
 ```bash
-immich-accelerator setup  # re-run, it will offer again
+brew services start epheterson/immich-accelerator/immich-accelerator
 ```
 
-The service uses `watch` mode with `KeepAlive` — launchd restarts the monitor if it dies, and the monitor restarts worker, ML, and dashboard if they crash.
+This uses the formula's own service definition, survives `brew upgrade`, and restarts at login. Check it with `brew services list`. Stop with `brew services stop epheterson/immich-accelerator/immich-accelerator`.
+
+> Don't also install the launchd plist below if you're using `brew services` — running both double-starts the watcher.
+
+**Git / non-Homebrew install:** `immich-accelerator setup` offers to install a launchd LaunchAgent (`~/Library/LaunchAgents/com.immich.accelerator.plist`). If you skipped that prompt, re-run `setup` and it will offer again.
+
+Either way the service uses `watch` mode with `KeepAlive`. Confirm everything is healthy with `immich-accelerator status` and `immich-accelerator ml-test`.
 
 ## Safety
 
