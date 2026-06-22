@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.12 — 2026-06-19
+
+### Fixes
+- **Cap service logs so they can't grow unbounded.** `worker.log`/`ml.log` were opened in append mode and never rotated — a worker spewing stack traces for unsupported files (e.g. videos mislabeled `.heic`) had grown one log to 10GB. Each log is now capped at 200MB: the `watch` loop rotates in place every cycle, and `start` rotates before (re)opening. Rotation truncates the existing file rather than renaming it, so it works while the worker holds the file open (append mode), and the last 2000 lines of context are preserved.
+
 ## 1.5.11 — 2026-06-16
 
 ### Fixes

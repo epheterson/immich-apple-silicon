@@ -40,6 +40,12 @@ CONFIG_FILE = DATA_DIR / "config.json"
 PID_DIR = DATA_DIR / "pids"
 LOG_DIR = DATA_DIR / "logs"
 
+# Service logs are opened in append mode and the worker can spew stack traces
+# for unsupported files (e.g. videos mislabeled .heic) — left unmanaged a log
+# grew to 10GB. Cap each log; the watch loop and start enforce it.
+LOG_MAX_BYTES = 200 * 1024 * 1024  # rotate a service log once it exceeds 200 MB
+LOG_KEEP_TAIL_LINES = 2000  # lines of recent context preserved across a rotate
+
 # Node.js majors Immich 2.7.x + sharp@0.34.5 are known to work with.
 # Immich pins engines.node=24.x; sharp's native addons break with
 # NODE_MODULE_VERSION mismatches on node 25+. Homebrew's default
@@ -1610,10 +1616,59 @@ def kill_pid(name: str) -> bool:
     return True
 
 
+def cap_log(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> bool:
+    """Cap a service log in place once it exceeds max_bytes, preserving the last
+    LOG_KEEP_TAIL_LINES lines of context. Returns True if it rotated.
+
+    Must truncate the existing inode rather than rename it: the worker/ML hold
+    these files open in append (O_APPEND) mode, so a rename would leave the open
+    fd writing to the moved file while the new one stayed empty until restart.
+    With O_APPEND the process's next write resumes at end-of-file, so truncating
+    to a small tail is safe while it keeps logging. (A write landing between the
+    truncate and the tail rewrite could garble one line — acceptable at the rare
+    200MB-rotation boundary.)
+    """
+    try:
+        if not log_path.exists() or log_path.stat().st_size <= max_bytes:
+            return False
+        tail = b""
+        try:
+            with open(log_path, "rb") as f:
+                size = f.seek(0, os.SEEK_END)
+                f.seek(max(0, size - 4 * 1024 * 1024))  # last ~4MB covers the tail
+                tail = b"\n".join(f.read().split(b"\n")[-LOG_KEEP_TAIL_LINES:])
+        except OSError:
+            tail = b""
+        with open(log_path, "r+b") as f:
+            f.truncate(0)
+            f.write(
+                b"[immich-accelerator] log rotated (exceeded "
+                + str(max_bytes // (1024 * 1024)).encode()
+                + b" MB)\n"
+            )
+            if tail:
+                f.write(tail)
+                if not tail.endswith(b"\n"):
+                    f.write(b"\n")
+        return True
+    except OSError:
+        return False
+
+
+def cap_service_logs() -> None:
+    """Cap all known service logs. Cheap (a stat each) unless one is oversized."""
+    for name in ("worker", "ml", "dashboard"):
+        if cap_log(LOG_DIR / f"{name}.log"):
+            log.info(
+                "Rotated %s.log (exceeded %d MB)", name, LOG_MAX_BYTES // (1024 * 1024)
+            )
+
+
 def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
     """Start a background service and track its PID. Returns PID."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"{name}.log"
+    cap_log(log_file)  # don't inherit a giant log across a (re)start
     fh = open(log_file, "a")
     try:
         proc = subprocess.Popen(
@@ -3627,6 +3682,10 @@ def cmd_watch(_args):
         try:
             time.sleep(30)
             config = load_config()  # reload each cycle (setup may have changed it)
+
+            # Keep service logs bounded — the worker can spew stack traces for
+            # unsupported files; left unmanaged a log grew to 10GB.
+            cap_service_logs()
 
             # Check ML — re-resolve ml_dir each cycle (same stale-
             # path fix as cmd_start; brew upgrade can invalidate it).
