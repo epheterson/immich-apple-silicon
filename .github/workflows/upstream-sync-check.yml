@@ -116,3 +116,79 @@ jobs:
             gh issue create --title "$TRACKING_TITLE" --body "$BODY"
             echo "Created tracking issue"
           fi
+
+  mlx-pin:
+    # Notify when a newer mlx than our `<0.31.2` pin (#38) ships, so we can
+    # re-test and potentially lift the pin. 0.31.2 hard-crashes CLIP inference
+    # in pool threads ("There is no Stream(gpu, 0)"); verified live that even
+    # the per-thread stream initializer doesn't save it, so the pin is the only
+    # protection. As of the last check 0.31.2 was still the latest.
+    runs-on: ubuntu-latest
+    env:
+      PIN: "0.31.2" # the excluded version: our pin is mlx < PIN
+      MLX_TITLE: "mlx > 0.31.2 is available — re-test the #38 CLIP pin"
+    steps:
+      - name: Check PyPI for mlx newer than the pin
+        id: mlx
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check packaging
+          # Python fetches PyPI itself (urllib) — don't pipe curl into `python3 -`
+          # with a heredoc; the pipe and the heredoc both claim stdin.
+          NEWER="$(PIN="$PIN" python3 <<'PY'
+          import json, os, urllib.request
+          from packaging.version import Version
+          pin = Version(os.environ["PIN"])
+          with urllib.request.urlopen("https://pypi.org/pypi/mlx/json", timeout=30) as r:
+              data = json.load(r)
+          newer = []
+          for ver, files in data["releases"].items():
+              if not files or all(f.get("yanked") for f in files):
+                  continue  # skip versions with no/only-yanked artifacts
+              try:
+                  v = Version(ver)
+              except Exception:
+                  continue
+              if v > pin and not v.is_prerelease:
+                  newer.append(v)
+          newer.sort()
+          print(newer[-1] if newer else "")
+          PY
+          )"
+          echo "newer=$NEWER" >> "$GITHUB_OUTPUT"
+          if [ -n "$NEWER" ]; then
+            echo "⚠️  mlx $NEWER is available (> $PIN) — pin re-test warranted."
+          else
+            echo "✅ No mlx > $PIN yet. Pin stands."
+          fi
+
+      - name: Open or update pin re-test issue
+        if: steps.mlx.outputs.newer != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEWER: ${{ steps.mlx.outputs.newer }}
+        run: |
+          set -euo pipefail
+          BODY="$(cat <<EOF
+          A newer mlx than our pin is on PyPI: **$NEWER** (we pin \`mlx>=0.22.0,<$PIN\`, #38).
+
+          \`mlx==$PIN\` hard-crashes CLIP inference in the worker's thread pool
+          (\`std::runtime_error: There is no Stream(gpu, 0) in current thread\`). Don't lift
+          the pin on faith — **re-test $NEWER first**:
+
+          1. python@3.11 venv; \`pip install "mlx==$NEWER" "mlx-clip @ git+https://github.com/harperreed/mlx_clip.git@f56e3ecc72c74c68b6b50eb6f50c3f22fc23fe2c" pillow numpy huggingface-hub\`
+          2. Load \`mlx-community/clip-vit-base-patch32\`, run \`model.model(pixel_values=...)\` + \`np.array(out.image_embeds[0])\` from a \`ThreadPoolExecutor(max_workers=4)\` ~24 times concurrently.
+          3. **Pass = no \`Stream(gpu, 0)\` abort.** If it passes, bump the pin to \`<next-bad\` (or drop it) in the ml fork and re-sync.
+
+          _Opened automatically by the weekly mlx-pin check; updates in place until resolved._
+          EOF
+          )"
+
+          EXISTING="$(gh issue list --state open --search "in:title \"$MLX_TITLE\"" --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --body "$BODY"
+            echo "Updated issue #$EXISTING"
+          else
+            gh issue create --title "$MLX_TITLE" --body "$BODY"
+            echo "Created pin re-test issue"
+          fi
