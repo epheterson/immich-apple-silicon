@@ -36,6 +36,7 @@ from immich_accelerator.__main__ import (
     start_service,
     _setup_manual,
     cap_log,
+    diagnose_worker_log,
     DATA_DIR,
     CONFIG_FILE,
     PID_DIR,
@@ -1265,3 +1266,39 @@ class TestCapLog:
             fh.flush()
         assert p.stat().st_ino == ino_before
         assert b"after-rotate\n" in p.read_bytes()
+
+
+class TestDiagnoseWorkerLog:
+    """Turn a known unrecoverable worker-bootstrap failure into actionable
+    guidance instead of a raw stack trace + silent crash loop (issue #73)."""
+
+    GEODATA_LOG = (
+        "[Nest] MapRepository] Starting geodata import\n"
+        "Query failed : { error: Error: write EPIPE ... }\n"
+        "[Nest] ERROR [MetadataService] Unable to initialize reverse geocoding: "
+        "Error: write EPIPE\n"
+        "Error: Metadata service init failed\n"
+    )
+
+    def test_geodata_failure_returns_guidance(self, tmp_path):
+        p = tmp_path / "worker.log"
+        p.write_text(self.GEODATA_LOG)
+        hint = diagnose_worker_log(p)
+        assert hint is not None
+        assert "geodata" in hint.lower()
+        assert "IMMICH_WORKERS_INCLUDE=api" in hint
+
+    def test_unrelated_failure_returns_none(self, tmp_path):
+        p = tmp_path / "worker.log"
+        p.write_text("[Nest] ERROR something totally unrelated exploded\n")
+        assert diagnose_worker_log(p) is None
+
+    def test_missing_log_returns_none(self, tmp_path):
+        assert diagnose_worker_log(tmp_path / "nope.log") is None
+
+    def test_signature_found_in_large_log_tail(self, tmp_path):
+        # The signature must be matched even when buried under a big log;
+        # it's near the end (the worker dies right after), within the tail.
+        p = tmp_path / "worker.log"
+        p.write_text(("noise line\n" * 5000) + self.GEODATA_LOG)
+        assert diagnose_worker_log(p) is not None

@@ -188,6 +188,19 @@ Reboot. Now `/data` on the Mac resolves to the SMB/NFS mount, matching what Dock
 
 > **Synthetic links can only create a single top-level name** (e.g. `/data`, `/immich`) — that's a macOS limitation, not ours. If Docker is using the container default `IMMICH_MEDIA_LOCATION=/usr/src/app/upload`, you **cannot** mirror that path on the Mac (you can't synthesize `/usr/src/app/...`, and `/usr` already exists). Use Option A, or first set `IMMICH_MEDIA_LOCATION` to a top-level path like `/data` and then synthesize that.
 
+### Fresh split deployment: let the frontend initialize geodata first
+
+If your Immich frontend has run **api-only from the very start** (`IMMICH_WORKERS_INCLUDE=api` set before it ever ran its own microservices worker), the reverse-geocoding tables were never initialized. The accelerator then becomes the first microservices worker to touch the database and tries to run Immich's one-time **geodata import** — a large bulk insert that can break over a network database connection (`write EPIPE`), so the worker fails to start.
+
+Fix: initialize geodata once on the frontend, then hand off to the accelerator.
+
+1. On the frontend, temporarily **remove** `IMMICH_WORKERS_INCLUDE=api` (or set it to include the microservices worker) and restart it.
+2. Wait for it to finish the geodata import (watch its logs for "geodata import" completing).
+3. **Re-add** `IMMICH_WORKERS_INCLUDE=api` and restart the frontend.
+4. Start the accelerator — the tables already exist, so it skips the import.
+
+This only affects brand-new split installs. Once geodata is initialized it stays initialized, and normal upgrades are unaffected.
+
 ### Changing IMMICH_MEDIA_LOCATION on an existing install
 
 Immich automatically rewrites all file paths in the database on restart when `IMMICH_MEDIA_LOCATION` changes. It's safe — **but back up your database first**.

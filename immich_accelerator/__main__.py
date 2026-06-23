@@ -1664,6 +1664,38 @@ def cap_service_logs() -> None:
             )
 
 
+# Worker bootstrap failures a plain restart won't fix. Each entry pairs log
+# substrings (all must be present) with actionable guidance, so when the worker
+# dies we can point the user at the cause instead of leaving a raw stack trace
+# and a silent 30s crash-restart loop.
+_WORKER_FATAL_HINTS: list[tuple[tuple[str, ...], str]] = [
+    (
+        ("Unable to initialize reverse geocoding",),
+        "Reverse-geocoding (geodata) import failed. On a fresh split deployment the "
+        "accelerator is the first microservices worker to run, so it performs "
+        "Immich's one-time geodata import — and that bulk insert can break over a "
+        "network database connection (write EPIPE).\n"
+        "  Fix: initialize geodata once on your Immich frontend — temporarily remove "
+        "IMMICH_WORKERS_INCLUDE=api so its own worker runs, let it finish, then "
+        "re-add the variable — and start the accelerator again.\n"
+        "  Details: https://github.com/epheterson/immich-apple-silicon#split-deployment-nas--mac",
+    ),
+]
+
+
+def diagnose_worker_log(log_path: Path) -> str | None:
+    """Scan the tail of the worker log for a known unrecoverable-bootstrap
+    signature and return actionable guidance, or None if nothing is recognized."""
+    try:
+        tail = log_path.read_text(errors="replace")[-20000:]
+    except OSError:
+        return None
+    for needles, guidance in _WORKER_FATAL_HINTS:
+        if all(n in tail for n in needles):
+            return guidance
+    return None
+
+
 def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
     """Start a background service and track its PID. Returns PID."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1695,6 +1727,11 @@ def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
         lines = log_file.read_text().strip().split("\n")
         for line in lines[-10:]:
             log.error("  %s", line)
+        if name == "worker":
+            hint = diagnose_worker_log(log_file)
+            if hint:
+                for line in hint.split("\n"):
+                    log.error("  %s", line)
         (PID_DIR / f"{name}.pid").unlink(missing_ok=True)
         raise RuntimeError(f"{name} failed to start")
 
@@ -3678,6 +3715,7 @@ def cmd_watch(_args):
 
     check_count = 0
     self_update_notified = False
+    shown_worker_hints: set[str] = set()
     while True:
         try:
             time.sleep(30)
@@ -3711,6 +3749,15 @@ def cmd_watch(_args):
 
             # Check worker
             if not read_pid("worker"):
+                # Surface a known unrecoverable cause once (e.g. a fresh
+                # split-deploy geodata import failing) instead of looping
+                # silently — restarting won't fix it until the user acts.
+                hint = diagnose_worker_log(LOG_DIR / "worker.log")
+                if hint and hint not in shown_worker_hints:
+                    shown_worker_hints.add(hint)
+                    log.error("Worker is failing to start:")
+                    for line in hint.split("\n"):
+                        log.error("  %s", line)
                 log.warning("Worker crashed — restarting...")
                 try:
                     cmd_start(argparse.Namespace(force=True))
