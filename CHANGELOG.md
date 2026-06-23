@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.15 — 2026-06-23
+
+### Fixes
+- **Keep remote Postgres connections alive in split deployments (#74).** When the worker and the database sit on different network segments, a stateful firewall or NAT can silently reap an idle connection; the worker then hangs on the next read until `read ETIMEDOUT` and doesn't recover (intermittent, since only idle connections get reaped). Immich doesn't expose a keepalive setting, so the worker now preloads a small shim that enables TCP keepAlive on every `pg` connection, keeping the socket warm so it isn't dropped. No-op for same-host setups; Immich's source is untouched. Tunable/disable via `IMMICH_ACCEL_PG_KEEPALIVE` / `IMMICH_ACCEL_PG_KEEPALIVE_MS`. Reported by [@shtefko](https://github.com/shtefko).
+
 ## 1.5.14 — 2026-06-23
 
 ### Fixes
