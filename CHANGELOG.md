@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.14 — 2026-06-23
+
+### Fixes
+- **Actionable error when a fresh split deployment can't import geodata (#73).** On a split setup whose frontend ran api-only from the start, the accelerator is the first microservices worker to run, so it attempts Immich's one-time reverse-geocoding (geodata) import — a large bulk insert that can break over a network DB connection (`write EPIPE`), leaving the worker in a silent crash-restart loop. The worker log is now scanned on failure: when this signature is detected, the accelerator prints the cause and the fix (initialize geodata once on the frontend, then switch back to `IMMICH_WORKERS_INCLUDE=api`) instead of a raw stack trace. Documented in the split-deployment guide. Reported by [@shtefko](https://github.com/shtefko).
+
 ## 1.5.13 — 2026-06-21
 
 ### Fixes
