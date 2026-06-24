@@ -5,6 +5,11 @@
 ### Features
 - **Media-readiness gate: don't start until the real media root is mounted (default on).** On a network-mounted media root, the worker could start before the mount came up and write thumbnails into a local placeholder directory that the mount later masks (silent data loss). The worker now drops a small marker file in the media root on first start and verifies it on every subsequent start; if the marker is missing — a placeholder, or the mount isn't up yet — it refuses to start (the watch loop retries, so it comes up as soon as the mount appears). Mount-agnostic (works for local, NFS, and SMB), runs before the ML service so a not-ready mount never orphans it, and probes in a timeout-bounded subprocess so a hung mount can't wedge startup. Opt out with `"require_media_ready": false`.
 
+## 1.5.15 — 2026-06-23
+
+### Fixes
+- **Keep remote Postgres connections alive in split deployments (#74).** When the worker and the database sit on different network segments, a stateful firewall or NAT can silently reap an idle connection; the worker then hangs on the next read until `read ETIMEDOUT` and doesn't recover (intermittent, since only idle connections get reaped). Immich doesn't expose a keepalive setting, so the worker now preloads a small shim that enables TCP keepAlive on every `pg` connection, keeping the socket warm so it isn't dropped. No-op for same-host setups; Immich's source is untouched. Tunable/disable via `IMMICH_ACCEL_PG_KEEPALIVE` / `IMMICH_ACCEL_PG_KEEPALIVE_MS`. Reported by [@shtefko](https://github.com/shtefko).
+
 ## 1.5.14 — 2026-06-23
 
 ### Fixes

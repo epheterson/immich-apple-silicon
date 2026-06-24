@@ -1484,3 +1484,93 @@ class TestHeicDecodeShim:
             "INPUT_TYPE:buffer",
             "INPUT_TYPE:string",
         ], f"expected heic→buffer, other→string; got {types}\n{result.stdout}"
+
+
+class TestPgKeepaliveShim:
+    """The pg keepalive shim sets keepAlive on Immich's Postgres connections so
+    a stateful firewall between worker and a remote DB can't reap idle
+    connections (issue #74). Immich's source is never touched — the shim wraps
+    the `pg` module via NODE_OPTIONS=--require."""
+
+    SHIM_PATH = REPO_ROOT / "immich_accelerator" / "hooks" / "pg_keepalive_shim.js"
+
+    def test_shim_file_exists(self):
+        assert self.SHIM_PATH.exists(), f"hook shim missing: {self.SHIM_PATH}"
+
+    def test_shim_is_referenced_by_cmd_start(self):
+        src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()
+        assert "pg_keepalive_shim.js" in src
+        assert "NODE_OPTIONS" in src
+
+    @pytest.mark.slow
+    def test_shim_injects_keepalive_into_pg(self, tmp_path):
+        """Run node with the shim preloaded against a fake `pg` module (no real
+        DB), construct a Pool, and confirm keepAlive is injected while
+        instanceof and an explicit caller value are both preserved."""
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+
+        # Minimal stand-in for node-postgres: Pool/Client that stash their config.
+        pgdir = tmp_path / "node_modules" / "pg"
+        pgdir.mkdir(parents=True)
+        (pgdir / "index.js").write_text(
+            "class Pool { constructor(c){ this.options = c || {}; } }\n"
+            "class Client { constructor(c){ this.options = c || {}; } }\n"
+            "module.exports = { Pool, Client };\n"
+        )
+
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { Pool } = require('pg');\n"
+            "const p = new Pool({ host: 'db' });\n"
+            "console.log('KEEPALIVE:' + p.options.keepAlive);\n"
+            "console.log('DELAY:' + p.options.keepAliveInitialDelayMillis);\n"
+            "console.log('INSTANCE:' + (p instanceof Pool));\n"
+            "const q = new Pool({ keepAlive: false });\n"
+            "console.log('EXPLICIT:' + q.options.keepAlive);\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+        out = result.stdout
+        assert "KEEPALIVE:true" in out, out
+        assert "DELAY:10000" in out, out
+        assert "INSTANCE:true" in out, out  # Proxy preserves instanceof
+        assert "EXPLICIT:false" in out, out  # never override an explicit choice
+
+    @pytest.mark.slow
+    def test_shim_disabled_via_env(self, tmp_path):
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        pgdir = tmp_path / "node_modules" / "pg"
+        pgdir.mkdir(parents=True)
+        (pgdir / "index.js").write_text(
+            "class Pool { constructor(c){ this.options = c || {}; } }\n"
+            "module.exports = { Pool };\n"
+        )
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { Pool } = require('pg');\n"
+            "console.log('KEEPALIVE:' + new Pool({}).options.keepAlive);\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            cwd=str(tmp_path),
+            env={"IMMICH_ACCEL_PG_KEEPALIVE": "0", "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "KEEPALIVE:undefined" in result.stdout, result.stdout
