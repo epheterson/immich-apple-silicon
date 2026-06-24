@@ -3473,6 +3473,20 @@ def cmd_start(args):
             f"{existing} {require_arg}".strip() if existing else require_arg
         )
 
+    # pg keepalive shim (issue #74): in a split deployment a stateful firewall
+    # between the worker and a remote Postgres can silently reap an idle
+    # connection, after which the next read hangs to ETIMEDOUT and the worker
+    # never recovers. Immich doesn't expose a keepalive env var, so we wrap the
+    # `pg` module to set keepAlive on every connection. Same --require
+    # interposition; Immich's source is untouched. No-op for same-host setups.
+    pg_keepalive_shim = Path(__file__).parent / "hooks" / "pg_keepalive_shim.js"
+    if pg_keepalive_shim.exists():
+        existing = worker_env.get("NODE_OPTIONS", "").strip()
+        require_arg = f'--require "{pg_keepalive_shim}"'
+        worker_env["NODE_OPTIONS"] = (
+            f"{existing} {require_arg}".strip() if existing else require_arg
+        )
+
     # /build link points to our build-data dir (set up during setup).
     # Required for Immich 2.7+ plugin WASM paths stored in the shared DB.
     build_data = DATA_DIR / "build-data"
