@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.18 — 2026-06-24
+
+### Fixes
+- **Media-readiness gate no longer refuses a writable split setup (#80).** The gate checked writability at the media *root*, but Immich only writes to the subdirs (`upload`, `thumbs`, …) — a split deployment can have a root-owned, non-writable media root (e.g. a `/data` synthetic link) while the subdirs are fully writable. The gate now places/verifies its marker across the media root *and* Immich's standard subdirs (root first, for back-compat), testing writability where Immich actually writes. A genuinely missing/unmounted root still correctly refuses. Reported by [@shtefko](https://github.com/shtefko).
+- **`brew services stop`/`restart` now actually stop the worker (#81).** The worker, ML, and dashboard run detached, so they survived when launchd signalled only the watcher — a stop or restart left them running. The watcher now traps SIGTERM/SIGINT and stops its services before exiting, so the service lifecycle behaves as expected. Reported by [@shtefko](https://github.com/shtefko).
+- **`immich-accelerator start` now also starts the dashboard.** Previously only `watch`/brew-services brought it up. Reported by [@shtefko](https://github.com/shtefko).
+
 ## 1.5.17 — 2026-06-23
 
 ### Fixes

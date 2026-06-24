@@ -1353,14 +1353,59 @@ class TestEnsureMediaReady:
             is False
         )
 
-    def test_first_run_refuses_when_root_not_writable(self, tmp_path):
-        # upload_mount points "through" a regular file — makedirs/open must fail,
-        # so first-run init can't establish a marker and we refuse.
+    def test_first_run_refuses_when_root_absent(self, tmp_path):
+        # upload_mount points "through" a regular file — the dir doesn't exist,
+        # so first-run init has no candidate and we refuse.
         afile = tmp_path / "not_a_dir"
         afile.write_text("x")
         config = {"upload_mount": str(afile / "media")}
         assert ensure_media_ready(config) is False
         assert "media_id" not in config
+
+    def test_first_run_uses_writable_subdir_when_root_readonly(
+        self, tmp_path, tmp_data_dir
+    ):
+        # #80: media root not writable (e.g. a root-owned /data symlink) but the
+        # Immich subdirs are — the gate must mark a subdir, not refuse.
+        if os.geteuid() == 0:
+            pytest.skip("chmod read-only is ineffective as root")
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / "upload").mkdir()
+        os.chmod(media, 0o555)  # root not writable
+        try:
+            config = {"upload_mount": str(media)}
+            assert ensure_media_ready(config) is True
+            assert config.get("media_id")
+            assert (media / "upload" / MEDIA_MARKER_NAME).exists()
+            assert not (media / MEDIA_MARKER_NAME).exists()  # not at the root
+        finally:
+            os.chmod(media, 0o755)  # let tmp_path clean up
+
+    def test_verify_finds_marker_in_subdir(self, tmp_path):
+        # A marker written into a subdir (root-readonly case) verifies on restart.
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / "thumbs").mkdir()
+        (media / "thumbs" / MEDIA_MARKER_NAME).write_text("xyz")
+        assert (
+            ensure_media_ready({"upload_mount": str(media), "media_id": "xyz"}) is True
+        )
+
+    def test_refuses_when_root_readonly_and_no_writable_subdir(self, tmp_path):
+        # Root not writable AND no subdirs at all → genuinely can't establish a
+        # marker → refuse (first run).
+        if os.geteuid() == 0:
+            pytest.skip("chmod read-only is ineffective as root")
+        media = tmp_path / "media"
+        media.mkdir()
+        os.chmod(media, 0o555)
+        try:
+            config = {"upload_mount": str(media)}
+            assert ensure_media_ready(config) is False
+            assert "media_id" not in config
+        finally:
+            os.chmod(media, 0o755)
 
 
 class TestInstalledVersion:
@@ -1379,3 +1424,27 @@ class TestInstalledVersion:
 
         with patch("immich_accelerator.__main__._OPT_VERSION_FILE", tmp_path / "nope"):
             assert _installed_version() == running
+
+
+class TestStartDashboard:
+    """start_dashboard() is called from both `start` and `watch`; it must not
+    spawn a second dashboard when one is already running (the double-start race
+    that crashes on EADDRINUSE and orphans the real one)."""
+
+    def test_skips_when_pid_alive(self):
+        from immich_accelerator.__main__ import start_dashboard
+
+        with patch("immich_accelerator.__main__.read_pid", return_value=1234), patch(
+            "immich_accelerator.__main__.subprocess.Popen"
+        ) as popen:
+            start_dashboard()
+            popen.assert_not_called()
+
+    def test_skips_when_already_serving(self):
+        from immich_accelerator.__main__ import start_dashboard
+
+        with patch("immich_accelerator.__main__.read_pid", return_value=None), patch(
+            "urllib.request.urlopen"
+        ), patch("immich_accelerator.__main__.subprocess.Popen") as popen:
+            start_dashboard()  # urlopen succeeds → already serving
+            popen.assert_not_called()

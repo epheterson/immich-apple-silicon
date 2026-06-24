@@ -1729,24 +1729,50 @@ MEDIA_MARKER_NAME = ".immich-accelerator-media-id"
 # The probe runs in a child process with a hard timeout: a blocked filesystem
 # syscall on a stale/hung network mount can't be interrupted in-process, so we
 # must be able to kill it. Modes:
-#   verify <root> <id> -> exit 0 iff the marker exists and equals <id>
-#   init   <root> <id> -> create the marker with <id> (root must be writable),
+#   verify <root> <id> -> exit 0 iff a matching marker is found in any candidate
+#   init   <root> <id> -> write the marker into the first WRITABLE candidate,
 #                         exit 0 iff it reads back correctly
+#
+# Candidates are the media root PLUS Immich's standard subdirs (upload, thumbs,
+# …). Why not just the root: Immich only ever writes to the subdirs, not the
+# root — a split setup can have a root-owned, non-writable media root (e.g. a
+# `/data` synthetic link) while the subdirs are perfectly writable (#80). So we
+# test writability where Immich actually writes. The root stays first in the
+# list for back-compat with markers written by 1.5.16 (which used the root).
+# Only EXISTING dirs are used (no spurious subdir creation), so a missing root
+# (mount not up) still correctly fails.
 _MEDIA_PROBE = r"""
 import os, sys
 mode, root, want = sys.argv[1], sys.argv[2], sys.argv[3]
-marker = os.path.join(root, ".immich-accelerator-media-id")
+MARKER = ".immich-accelerator-media-id"
+SUBDIRS = ("upload", "library", "thumbs", "encoded-video", "profile", "backups")
+cands = [root] + [os.path.join(root, s) for s in SUBDIRS]
+cands = [d for d in cands if os.path.isdir(d)]
 try:
-    if mode == "init":
-        os.makedirs(root, exist_ok=True)
-        with open(marker, "w") as f:
-            f.write(want)
-    with open(marker) as f:
-        got = f.read().strip()
-    sys.exit(0 if got == want else 3)
+    if mode == "verify":
+        for d in cands:
+            try:
+                with open(os.path.join(d, MARKER)) as f:
+                    if f.read().strip() == want:
+                        sys.exit(0)
+            except OSError:
+                continue
+        sys.exit(3)  # no matching marker anywhere -> placeholder / not mounted
+    else:  # init: write the marker into the first writable candidate
+        for d in cands:
+            p = os.path.join(d, MARKER)
+            try:
+                with open(p, "w") as f:
+                    f.write(want)
+                with open(p) as f:
+                    if f.read().strip() == want:
+                        sys.exit(0)
+            except OSError:
+                continue
+        sys.exit(2)  # no writable candidate (perm problem / not mounted)
 except Exception as e:
     sys.stderr.write(str(e))
-    sys.exit(2)
+    sys.exit(4)
 """
 
 
@@ -1846,6 +1872,35 @@ def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
         raise RuntimeError(f"{name} failed to start")
 
     return proc.pid
+
+
+def start_dashboard() -> None:
+    """Start the dashboard in the background if it isn't already running.
+    Idempotent — used by both `start` and `watch` so either brings the
+    dashboard up (#81)."""
+    if read_pid("dashboard"):
+        return  # already tracked + alive (also guards a just-spawned one)
+    try:
+        import urllib.request as _u
+
+        _u.urlopen("http://localhost:8420/", timeout=2)
+        return  # serving (untracked — e.g. stale pid file)
+    except Exception:
+        pass
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    dash_log = open(LOG_DIR / "dashboard.log", "a")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", __package__ or "immich_accelerator", "dashboard"],
+            cwd=str(Path(__file__).parent.parent),
+            stdout=dash_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        dash_log.close()
+    write_pid("dashboard", proc.pid)
+    log.info("Dashboard started: http://localhost:8420")
 
 
 # --- Commands ---
@@ -3723,6 +3778,11 @@ def cmd_start(args):
         raise
 
     log.info("  Worker running (PID %d)", worker_pid)
+
+    # Bring up the dashboard too, so `start` is a complete bring-up (#81 — users
+    # shouldn't need `watch`/brew-services just to get the dashboard).
+    start_dashboard()
+
     log.info("")
     log.info("Immich Accelerator running")
     log.info("  Worker log: %s/worker.log", LOG_DIR)
@@ -3815,6 +3875,20 @@ def cmd_watch(_args):
     """
     log.info("Watching services (Ctrl+C to stop)...")
 
+    # `brew services stop`/`restart` send SIGTERM to this watcher, but the
+    # worker/ML/dashboard run detached (own session) and would survive — so a
+    # plain stop/restart left them running (#81). Trap the signal and stop the
+    # children before exiting, so the service lifecycle works as expected.
+    def _graceful_stop(signum, _frame):
+        log.info("Received signal %d — stopping services...", signum)
+        try:
+            cmd_stop(argparse.Namespace())
+        finally:
+            sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _graceful_stop)
+    signal.signal(signal.SIGINT, _graceful_stop)
+
     # A detached worker survives `brew services restart`, so a freshly-launched
     # watch (new code) would otherwise adopt a worker still running the OLD code
     # after a `brew upgrade`. If the running worker's stamped version doesn't
@@ -3834,30 +3908,14 @@ def cmd_watch(_args):
             )
             cmd_stop(argparse.Namespace())
 
-    # First ensure everything is running
+    # First ensure everything is running. cmd_start brings up worker, ML, AND
+    # the dashboard, so only start the dashboard separately when the worker/ML
+    # were already up (avoids a double-start race on the dashboard).
     if not read_pid("worker") or not read_pid("ml"):
         log.info("Services not running, starting...")
         cmd_start(argparse.Namespace(force=True))
-
-    # Start dashboard in background if not already running
-    try:
-        config = load_config()
-        import urllib.request as _urlreq
-
-        _urlreq.urlopen("http://localhost:8420/", timeout=2)
-    except Exception:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        dash_log = open(LOG_DIR / "dashboard.log", "a")
-        proc = subprocess.Popen(
-            [sys.executable, "-m", __package__ or "immich_accelerator", "dashboard"],
-            cwd=str(Path(__file__).parent.parent),
-            stdout=dash_log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        dash_log.close()
-        write_pid("dashboard", proc.pid)
-        log.info("Dashboard started: http://localhost:8420")
+    else:
+        start_dashboard()
 
     # Warn if auto-update won't work for remote setups
     _watch_config = load_config()
