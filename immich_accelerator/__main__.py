@@ -3880,11 +3880,12 @@ def cmd_watch(_args):
             # take effect on its own; no manual restart needed. No-op on
             # non-Homebrew installs (opt symlink absent → _installed_version
             # falls back to __version__).
-            if _installed_version() != __version__:
+            installed = _installed_version()  # read once (symlink can change)
+            if installed != __version__:
                 log.info(
                     "Accelerator upgraded on disk (%s -> %s) — relaunching.",
                     __version__,
-                    _installed_version(),
+                    installed,
                 )
                 cmd_stop(argparse.Namespace())
                 return  # launchd KeepAlive relaunches with the new code
