@@ -1874,19 +1874,34 @@ def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
     return proc.pid
 
 
+def _pid_on_port(port: int) -> int | None:
+    """PID listening on a TCP port (via lsof), or None."""
+    try:
+        out = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        return int(out.split()[0]) if out else None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
 def start_dashboard() -> None:
     """Start the dashboard in the background if it isn't already running.
     Idempotent — used by both `start` and `watch` so either brings the
     dashboard up (#81)."""
     if read_pid("dashboard"):
         return  # already tracked + alive (also guards a just-spawned one)
-    try:
-        import urllib.request as _u
-
-        _u.urlopen("http://localhost:8420/", timeout=2)
-        return  # serving (untracked — e.g. stale pid file)
-    except Exception:
-        pass
+    # Untracked but already serving (an orphan from a prior run whose pid file
+    # was lost) — adopt its pid so a later stop can actually reach it, instead
+    # of leaving an unkillable orphan AND refusing to start a tracked one.
+    orphan = _pid_on_port(8420)
+    if orphan:
+        write_pid("dashboard", orphan)
+        log.info("Adopted running dashboard (PID %d)", orphan)
+        return
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     dash_log = open(LOG_DIR / "dashboard.log", "a")
     try:
