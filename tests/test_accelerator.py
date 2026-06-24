@@ -1440,11 +1440,59 @@ class TestStartDashboard:
             start_dashboard()
             popen.assert_not_called()
 
-    def test_skips_when_already_serving(self):
+    def test_adopts_untracked_orphan_on_port(self):
+        # Serving on 8420 but no pid file → adopt the listener's pid (so a later
+        # stop can reach it) instead of spawning a second one.
         from immich_accelerator.__main__ import start_dashboard
 
         with patch("immich_accelerator.__main__.read_pid", return_value=None), patch(
-            "urllib.request.urlopen"
-        ), patch("immich_accelerator.__main__.subprocess.Popen") as popen:
-            start_dashboard()  # urlopen succeeds → already serving
+            "immich_accelerator.__main__._pid_on_port", return_value=729
+        ), patch("immich_accelerator.__main__.write_pid") as wpid, patch(
+            "immich_accelerator.__main__.subprocess.Popen"
+        ) as popen:
+            start_dashboard()
             popen.assert_not_called()
+            wpid.assert_called_once_with("dashboard", 729)
+
+    def test_starts_fresh_when_nothing_running(self):
+        from immich_accelerator.__main__ import start_dashboard
+
+        with patch("immich_accelerator.__main__.read_pid", return_value=None), patch(
+            "immich_accelerator.__main__._pid_on_port", return_value=None
+        ), patch("immich_accelerator.__main__.write_pid"), patch(
+            "immich_accelerator.__main__.subprocess.Popen"
+        ) as popen:
+            popen.return_value.pid = 555
+            start_dashboard()
+            popen.assert_called_once()
+
+
+class TestStopAllFast:
+    """The watcher's SIGTERM handler must signal ALL services up front (launchd
+    SIGKILLs the watcher within seconds, less than cmd_stop's 5s-per-service
+    waits), so worker+ML+dashboard all get SIGTERM even if the handler is cut
+    short (#81 follow-up: ML/dashboard survived a stop)."""
+
+    def test_signals_all_three_services(self):
+        from immich_accelerator.__main__ import stop_all_fast
+
+        pids = {"worker": 111, "ml": 222, "dashboard": 333}
+        sent = []
+
+        def fake_kill(pid, sig):
+            if sig == 0:
+                raise OSError()  # report dead so the wait loop exits immediately
+
+        with patch(
+            "immich_accelerator.__main__.read_pid", side_effect=lambda n: pids.get(n)
+        ), patch("os.getpgid", side_effect=lambda pid: pid), patch(
+            "os.killpg", side_effect=lambda pgid, sig: sent.append((pgid, sig))
+        ), patch(
+            "os.kill", side_effect=fake_kill
+        ), patch(
+            "immich_accelerator.__main__._kill_all_worker_processes"
+        ):
+            stop_all_fast()
+
+        termed = {pgid for pgid, sig in sent if sig == signal.SIGTERM}
+        assert termed == {111, 222, 333}  # all signalled before any wait

@@ -1874,19 +1874,34 @@ def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
     return proc.pid
 
 
+def _pid_on_port(port: int) -> int | None:
+    """PID listening on a TCP port (via lsof), or None."""
+    try:
+        out = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        return int(out.split()[0]) if out else None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
 def start_dashboard() -> None:
     """Start the dashboard in the background if it isn't already running.
     Idempotent — used by both `start` and `watch` so either brings the
     dashboard up (#81)."""
     if read_pid("dashboard"):
         return  # already tracked + alive (also guards a just-spawned one)
-    try:
-        import urllib.request as _u
-
-        _u.urlopen("http://localhost:8420/", timeout=2)
-        return  # serving (untracked — e.g. stale pid file)
-    except Exception:
-        pass
+    # Untracked but already serving (an orphan from a prior run whose pid file
+    # was lost) — adopt its pid so a later stop can actually reach it, instead
+    # of leaving an unkillable orphan AND refusing to start a tracked one.
+    orphan = _pid_on_port(8420)
+    if orphan:
+        write_pid("dashboard", orphan)
+        log.info("Adopted running dashboard (PID %d)", orphan)
+        return
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     dash_log = open(LOG_DIR / "dashboard.log", "a")
     try:
@@ -3789,6 +3804,61 @@ def cmd_start(args):
     log.info("  ML log:     %s/ml.log", LOG_DIR)
 
 
+def stop_all_fast() -> None:
+    """Stop worker+ML+dashboard quickly, signalling ALL of them up front.
+
+    For the watcher's SIGTERM handler: `brew services stop`/`restart` SIGKILLs
+    the watcher only a few seconds after SIGTERM, which is less than cmd_stop's
+    sequential per-service waits (up to 5s EACH) — so cmd_stop only ever killed
+    the first service before being cut off (#81 follow-up: ML+dashboard survived
+    a stop). Here every service gets SIGTERM in the first few milliseconds, so
+    they all terminate even if the watcher is killed immediately after; the
+    bounded wait + SIGKILL of stragglers is best-effort cleanup.
+    """
+
+    def alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    pids: dict[str, int] = {}
+    for name in ("worker", "ml", "dashboard"):
+        pid = read_pid(name)
+        if not pid:
+            continue
+        pids[name] = pid
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+    _kill_all_worker_processes()  # sweep orphaned immich procs too
+
+    # Short, PARALLEL wait (not 5s-per-service) so we stay well under launchd's
+    # stop grace; SIGKILL anything still alive.
+    for _ in range(30):  # up to ~3s total
+        if all(not alive(p) for p in pids.values()):
+            break
+        time.sleep(0.1)
+    for name, pid in pids.items():
+        if alive(pid):
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except OSError:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+    for name in pids:
+        (PID_DIR / f"{name}.pid").unlink(missing_ok=True)
+    if pids:
+        log.info("Stopped: %s", ", ".join(pids))
+
+
 def cmd_stop(_args):
     stopped = False
     for name in ("worker", "ml", "dashboard"):
@@ -3880,9 +3950,9 @@ def cmd_watch(_args):
     # plain stop/restart left them running (#81). Trap the signal and stop the
     # children before exiting, so the service lifecycle works as expected.
     def _graceful_stop(signum, _frame):
-        log.info("Received signal %d — stopping services...", signum)
+        log.info("Received signal %d, stopping services...", signum)
         try:
-            cmd_stop(argparse.Namespace())
+            stop_all_fast()  # signal all up front — launchd SIGKILLs us in ~secs
         finally:
             sys.exit(0)
 

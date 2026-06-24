@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.19 — 2026-06-24
+
+### Fixes
+- **`brew services stop`/`restart` now stop ML and the dashboard too, not just the worker (#81 follow-up).** v1.5.18's stop handler used the normal sequential shutdown, which waits up to 5s per service; launchd SIGKILLs the watcher only a few seconds after signalling it, so the handler was cut off after the worker and left ML + dashboard running. The handler now signals all services up front, so they all stop even under launchd's short grace.
+
 ## 1.5.18 — 2026-06-24
 
 ### Fixes
