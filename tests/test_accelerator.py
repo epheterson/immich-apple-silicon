@@ -1448,3 +1448,34 @@ class TestStartDashboard:
         ), patch("immich_accelerator.__main__.subprocess.Popen") as popen:
             start_dashboard()  # urlopen succeeds → already serving
             popen.assert_not_called()
+
+
+class TestStopAllFast:
+    """The watcher's SIGTERM handler must signal ALL services up front (launchd
+    SIGKILLs the watcher within seconds, less than cmd_stop's 5s-per-service
+    waits), so worker+ML+dashboard all get SIGTERM even if the handler is cut
+    short (#81 follow-up: ML/dashboard survived a stop)."""
+
+    def test_signals_all_three_services(self):
+        from immich_accelerator.__main__ import stop_all_fast
+
+        pids = {"worker": 111, "ml": 222, "dashboard": 333}
+        sent = []
+
+        def fake_kill(pid, sig):
+            if sig == 0:
+                raise OSError()  # report dead so the wait loop exits immediately
+
+        with patch(
+            "immich_accelerator.__main__.read_pid", side_effect=lambda n: pids.get(n)
+        ), patch("os.getpgid", side_effect=lambda pid: pid), patch(
+            "os.killpg", side_effect=lambda pgid, sig: sent.append((pgid, sig))
+        ), patch(
+            "os.kill", side_effect=fake_kill
+        ), patch(
+            "immich_accelerator.__main__._kill_all_worker_processes"
+        ):
+            stop_all_fast()
+
+        termed = {pgid for pgid, sig in sent if sig == signal.SIGTERM}
+        assert termed == {111, 222, 333}  # all signalled before any wait
