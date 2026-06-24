@@ -122,6 +122,13 @@ To update the accelerator itself:
 
 ```bash
 brew upgrade immich-accelerator
+```
+
+If you run it as a service (`watch` mode — the recommended setup), that's all you need: within ~30s the watcher notices the new version on disk, relaunches itself, and restarts the worker and ML service on the new code. (A detached worker survives a plain restart, so this version-aware reload is what guarantees the new code actually takes effect — `brew services restart` alone wouldn't reload the worker.)
+
+If you run the worker manually instead of as a service, restart it yourself after upgrading:
+
+```bash
 immich-accelerator stop && immich-accelerator start
 ```
 
