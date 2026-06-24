@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.16 — 2026-06-23
+
+### Features
+- **Media-readiness gate: don't start until the real media root is mounted (default on).** On a network-mounted media root, the worker could start before the mount came up and write thumbnails into a local placeholder directory that the mount later masks (silent data loss). The worker now drops a small marker file in the media root on first start and verifies it on every subsequent start; if the marker is missing — a placeholder, or the mount isn't up yet — it refuses to start (the watch loop retries, so it comes up as soon as the mount appears). Mount-agnostic (works for local, NFS, and SMB), runs before the ML service so a not-ready mount never orphans it, and probes in a timeout-bounded subprocess so a hung mount can't wedge startup. Opt out with `"require_media_ready": false`.
+
 ## 1.5.15 — 2026-06-23
 
 ### Fixes

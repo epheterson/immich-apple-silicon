@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 
@@ -1694,6 +1695,88 @@ def diagnose_worker_log(log_path: Path) -> str | None:
         if all(n in tail for n in needles):
             return guidance
     return None
+
+
+# Media-readiness gate. Confirms IMMICH_MEDIA_LOCATION is the real, mounted
+# media root before the worker starts, so it can't write thumbnails into a local
+# placeholder directory that a network mount later masks (silent data loss).
+# Mount-agnostic by design: instead of inspecting the mount type, we drop a
+# marker file holding a unique id in the media root on first successful start and
+# verify it on every later start. Present + matching = the real root is here;
+# missing = a placeholder, or the mount isn't up yet.
+MEDIA_MARKER_NAME = ".immich-accelerator-media-id"
+
+# The probe runs in a child process with a hard timeout: a blocked filesystem
+# syscall on a stale/hung network mount can't be interrupted in-process, so we
+# must be able to kill it. Modes:
+#   verify <root> <id> -> exit 0 iff the marker exists and equals <id>
+#   init   <root> <id> -> create the marker with <id> (root must be writable),
+#                         exit 0 iff it reads back correctly
+_MEDIA_PROBE = r"""
+import os, sys
+mode, root, want = sys.argv[1], sys.argv[2], sys.argv[3]
+marker = os.path.join(root, ".immich-accelerator-media-id")
+try:
+    if mode == "init":
+        os.makedirs(root, exist_ok=True)
+        with open(marker, "w") as f:
+            f.write(want)
+    with open(marker) as f:
+        got = f.read().strip()
+    sys.exit(0 if got == want else 3)
+except Exception as e:
+    sys.stderr.write(str(e))
+    sys.exit(2)
+"""
+
+
+def _media_probe(mode: str, root: str, media_id: str, timeout: int = 15) -> bool:
+    """Run the marker probe in a child process with a hard timeout. Returns True
+    only on a clean exit 0; any nonzero exit or timeout (e.g. a hung network
+    mount) is treated as not-ready."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _MEDIA_PROBE, mode, root, media_id],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def ensure_media_ready(config: dict) -> bool:
+    """Confirm the media root is really present and writable before starting,
+    establishing an id marker on first run. Returns True to proceed, False to
+    refuse. Mount-agnostic; safe to leave on for local installs (the marker is
+    created once and always present thereafter)."""
+    media_root = config.get("upload_mount") or ""
+    if not media_root:
+        return True  # nothing configured to guard (same-host default path)
+
+    media_id = config.get("media_id")
+    if media_id:
+        if _media_probe("verify", media_root, media_id):
+            return True
+        log.error("Media location not ready: %s", media_root)
+        log.error("  The marker identifying your media root is missing or")
+        log.error("  unreadable. Usually a network mount isn't up yet, or the")
+        log.error("  media path changed. Refusing to start so the worker can't")
+        log.error("  write into a placeholder the mount would later mask.")
+        log.error("  If you intentionally moved the media root, re-run setup.")
+        return False
+
+    # First run: establish the marker. Requires a present, writable root.
+    new_id = uuid.uuid4().hex
+    if _media_probe("init", media_root, new_id):
+        config["media_id"] = new_id
+        save_config(config)
+        log.info("Media root verified and marked: %s", media_root)
+        return True
+    log.error("Media location not writable: %s", media_root)
+    log.error("  Refusing to start — check the mount is up and writable.")
+    return False
 
 
 def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
@@ -3541,6 +3624,15 @@ def cmd_start(args):
     # Environment health checks — auto-detect and fix common issues
     # (ImageMagick HEIC codec, NFS mount, DB/Redis reachability).
     if not _preflight_env_health(config):
+        return
+
+    # Media-readiness gate (opt-out via "require_media_ready": false). Confirm
+    # the media root is the real, mounted location before starting — otherwise
+    # the worker can write thumbnails into a local placeholder that a network
+    # mount later masks (silent data loss). Runs before the ML service starts so
+    # a not-ready mount never leaves an orphaned ML process; the watch loop
+    # retries, so the worker comes up as soon as the mount appears.
+    if config.get("require_media_ready", True) and not ensure_media_ready(config):
         return
 
     # Re-resolve ml_dir every start. Same pattern as the node path

@@ -37,6 +37,8 @@ from immich_accelerator.__main__ import (
     _setup_manual,
     cap_log,
     diagnose_worker_log,
+    ensure_media_ready,
+    MEDIA_MARKER_NAME,
     DATA_DIR,
     CONFIG_FILE,
     PID_DIR,
@@ -1302,3 +1304,59 @@ class TestDiagnoseWorkerLog:
         p = tmp_path / "worker.log"
         p.write_text(("noise line\n" * 5000) + self.GEODATA_LOG)
         assert diagnose_worker_log(p) is not None
+
+
+class TestEnsureMediaReady:
+    """Mount-agnostic readiness gate (#11): refuse to start unless the media
+    root is the real, marked location — so the worker can't write into a
+    placeholder a network mount later masks. The marker identifies the root
+    regardless of how it's mounted (local/NFS/SMB)."""
+
+    def test_no_upload_mount_is_allowed(self):
+        # Nothing configured to guard (same-host default) → don't block.
+        assert ensure_media_ready({}) is True
+
+    def test_first_run_marks_writable_root(self, tmp_path, tmp_data_dir):
+        media = tmp_path / "media"
+        media.mkdir()
+        config = {"upload_mount": str(media)}
+        assert ensure_media_ready(config) is True
+        # marker created, id recorded in config
+        assert config.get("media_id")
+        assert (media / MEDIA_MARKER_NAME).read_text().strip() == config["media_id"]
+
+    def test_verify_passes_when_marker_matches(self, tmp_path):
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / MEDIA_MARKER_NAME).write_text("abc123")
+        assert (
+            ensure_media_ready({"upload_mount": str(media), "media_id": "abc123"})
+            is True
+        )
+
+    def test_refuses_when_marker_missing(self, tmp_path):
+        # media_id known but the marker isn't there → placeholder / mount down.
+        media = tmp_path / "media"
+        media.mkdir()  # empty dir, no marker (simulates unmounted placeholder)
+        assert (
+            ensure_media_ready({"upload_mount": str(media), "media_id": "abc123"})
+            is False
+        )
+
+    def test_refuses_when_marker_mismatch(self, tmp_path):
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / MEDIA_MARKER_NAME).write_text("different")
+        assert (
+            ensure_media_ready({"upload_mount": str(media), "media_id": "abc123"})
+            is False
+        )
+
+    def test_first_run_refuses_when_root_not_writable(self, tmp_path):
+        # upload_mount points "through" a regular file — makedirs/open must fail,
+        # so first-run init can't establish a marker and we refuse.
+        afile = tmp_path / "not_a_dir"
+        afile.write_text("x")
+        config = {"upload_mount": str(afile / "media")}
+        assert ensure_media_ready(config) is False
+        assert "media_id" not in config
