@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.17 — 2026-06-23
+
+### Fixes
+- **`brew upgrade` now actually takes effect.** The worker and ML service run detached, so they survived a `brew services restart` — a fresh watcher would adopt the still-running *old-code* worker, and an upgrade silently didn't apply until a full manual stop/start. The watcher now stamps the version each worker starts with, restarts a worker found running stale code, and (in service mode) notices when the installed version on disk changes and relaunches itself so the new code — shims and fixes — comes up on a fresh worker within ~30s. No manual restart needed when running as a service. README updated.
+
 ## 1.5.16 — 2026-06-23
 
 ### Features

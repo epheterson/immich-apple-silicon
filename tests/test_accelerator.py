@@ -39,6 +39,7 @@ from immich_accelerator.__main__ import (
     diagnose_worker_log,
     ensure_media_ready,
     MEDIA_MARKER_NAME,
+    _installed_version,
     DATA_DIR,
     CONFIG_FILE,
     PID_DIR,
@@ -1360,3 +1361,21 @@ class TestEnsureMediaReady:
         config = {"upload_mount": str(afile / "media")}
         assert ensure_media_ready(config) is False
         assert "media_id" not in config
+
+
+class TestInstalledVersion:
+    """Detect a `brew upgrade` while watch runs old code, so it can relaunch
+    into the new code and reload the worker (otherwise a detached worker keeps
+    running stale code after an upgrade)."""
+
+    def test_reads_opt_symlink_version(self, tmp_path):
+        vf = tmp_path / "VERSION"
+        vf.write_text("9.9.9\n")
+        with patch("immich_accelerator.__main__._OPT_VERSION_FILE", vf):
+            assert _installed_version() == "9.9.9"
+
+    def test_falls_back_to_running_version_when_absent(self, tmp_path):
+        from immich_accelerator.__main__ import __version__ as running
+
+        with patch("immich_accelerator.__main__._OPT_VERSION_FILE", tmp_path / "nope"):
+            assert _installed_version() == running

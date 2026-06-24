@@ -41,6 +41,26 @@ CONFIG_FILE = DATA_DIR / "config.json"
 PID_DIR = DATA_DIR / "pids"
 LOG_DIR = DATA_DIR / "logs"
 
+# Records the package version the running worker was started with, so the watch
+# loop can tell when a `brew upgrade` left the worker on stale code.
+WORKER_VERSION_FILE = PID_DIR / "worker.version"
+
+# A running `watch` keeps executing the OLD code in memory after `brew upgrade`
+# swaps the Cellar. Reading VERSION through Homebrew's version-independent opt
+# symlink lets it notice it's now stale and relaunch into the new code. Absent
+# on non-Homebrew (git) installs, where __version__ is authoritative.
+_OPT_VERSION_FILE = Path("/opt/homebrew/opt/immich-accelerator/libexec/VERSION")
+
+
+def _installed_version() -> str:
+    """The version currently installed on disk (via the stable opt symlink),
+    which can differ from __version__ when watch is running post-upgrade."""
+    try:
+        return _OPT_VERSION_FILE.read_text().strip()
+    except OSError:
+        return __version__
+
+
 # Service logs are opened in append mode and the worker can spew stack traces
 # for unsupported files (e.g. videos mislabeled .heic) — left unmanaged a log
 # grew to 10GB. Cap each log; the watch loop and start enforce it.
@@ -1802,6 +1822,13 @@ def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
     fh.close()
 
     write_pid(name, proc.pid)
+    if name == "worker":
+        # Stamp the version this worker is running so watch can detect when a
+        # later `brew upgrade` has left it on stale code.
+        try:
+            WORKER_VERSION_FILE.write_text(__version__)
+        except OSError:
+            pass
 
     # Check it's still alive after a moment
     time.sleep(2)
@@ -3788,6 +3815,25 @@ def cmd_watch(_args):
     """
     log.info("Watching services (Ctrl+C to stop)...")
 
+    # A detached worker survives `brew services restart`, so a freshly-launched
+    # watch (new code) would otherwise adopt a worker still running the OLD code
+    # after a `brew upgrade`. If the running worker's stamped version doesn't
+    # match ours, stop it so it gets restarted below with the new code (shims,
+    # fixes). Version-gated so a plain crash relaunch doesn't churn a healthy
+    # worker.
+    if read_pid("worker"):
+        try:
+            worker_ver = WORKER_VERSION_FILE.read_text().strip()
+        except OSError:
+            worker_ver = None
+        if worker_ver and worker_ver != __version__:
+            log.info(
+                "Worker is running stale code (%s, now %s) — restarting it.",
+                worker_ver,
+                __version__,
+            )
+            cmd_stop(argparse.Namespace())
+
     # First ensure everything is running
     if not read_pid("worker") or not read_pid("ml"):
         log.info("Services not running, starting...")
@@ -3826,6 +3872,23 @@ def cmd_watch(_args):
         try:
             time.sleep(30)
             config = load_config()  # reload each cycle (setup may have changed it)
+
+            # Auto-apply a `brew upgrade`: if the version installed on disk no
+            # longer matches the code we're running, stop the (now-stale)
+            # services and exit so launchd KeepAlive relaunches watch with the
+            # new code, which then starts a fresh worker. Makes `brew upgrade`
+            # take effect on its own; no manual restart needed. No-op on
+            # non-Homebrew installs (opt symlink absent → _installed_version
+            # falls back to __version__).
+            installed = _installed_version()  # read once (symlink can change)
+            if installed != __version__:
+                log.info(
+                    "Accelerator upgraded on disk (%s -> %s) — relaunching.",
+                    __version__,
+                    installed,
+                )
+                cmd_stop(argparse.Namespace())
+                return  # launchd KeepAlive relaunches with the new code
 
             # Keep service logs bounded — the worker can spew stack traces for
             # unsupported files; left unmanaged a log grew to 10GB.
