@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.20 — 2026-06-26
+
+### Docs
+- **README house style**: added badges, a Star History chart, and License/Credits sections, and aligned the footer to the canonical form. Documented that Immich's `Transcoding video ... without hardware acceleration` log is expected and benign on macOS (the ffmpeg wrapper does the VideoToolbox encode; Immich has no VideoToolbox option to report). Reported by [@shtefko](https://github.com/shtefko) (#84).
+
 ## 1.5.19 — 2026-06-24
 
 ### Fixes

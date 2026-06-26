@@ -1,6 +1,12 @@
 # Immich Accelerator
 
-> **Alpha — use at your own risk.** Tested on Mac Mini M4 (24GB) with Immich v2.7.2 and OrbStack. Back up your Immich database before trying this.
+[![Release](https://img.shields.io/github/v/release/epheterson/immich-apple-silicon.svg?label=release)](https://github.com/epheterson/immich-apple-silicon/releases)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-blue.svg)]()
+[![Homebrew](https://img.shields.io/badge/install-Homebrew-orange.svg)](https://github.com/epheterson/homebrew-immich-accelerator)
+[![Immich](https://img.shields.io/badge/Immich-2.7%2B-5b21b6.svg)](https://immich.app/)
+
+> **Alpha: use at your own risk.** Tested on Mac Mini M4 (24GB) with Immich v2.7.2 and OrbStack. Back up your Immich database before trying this.
 
 Run Immich's compute natively on Apple Silicon. Thumbnails use the fast M-series CPU, video transcoding uses VideoToolbox hardware encoding, and ML runs on Metal GPU, Neural Engine, and CoreML.
 
@@ -263,7 +269,7 @@ The native worker runs Immich's unmodified code. The ffmpeg and image processing
 | Area | Docker | Native (Accelerator) | Impact |
 |------|--------|---------------------|--------|
 | **ffmpeg** | Jellyfin-ffmpeg | Jellyfin-ffmpeg (same binary, macOS arm64 build) | **Identical.** Same `tonemapx` filter, same encoders, same behavior. Downloaded automatically during setup. |
-| **ffmpeg encoders** | Software H.264/HEVC | VideoToolbox hardware H.264/HEVC via wrapper | Hardware-encoded output has slightly different bitstream characteristics. Visually equivalent. A lightweight wrapper remaps Immich's software encoder requests to VideoToolbox hardware equivalents. |
+| **ffmpeg encoders** | Software H.264/HEVC | VideoToolbox hardware H.264/HEVC via wrapper | Hardware-encoded output has slightly different bitstream characteristics. Visually equivalent. A lightweight wrapper remaps Immich's software encoder requests to VideoToolbox hardware equivalents. Immich has no VideoToolbox option, so it logs `Transcoding video ... without hardware acceleration` even though the encode runs on the GPU via the wrapper. That log is expected and benign. |
 | **Sharp / libvips** | Prebuilt linux-arm64 Sharp | Rebuilt against Homebrew system libvips | Identical image output. System libvips handles corrupt HEIF files more gracefully (matches Docker's error handling). |
 | **ML: CLIP** | ONNX Runtime | MLX on Metal GPU | Same model, different runtime. Embeddings are numerically close but not identical (floating-point differences). Search results are equivalent. |
 | **ML: Face detection** | ONNX Runtime | Apple Vision framework (Neural Engine) | Different model entirely. Detection accuracy is comparable; bounding boxes may differ slightly. |
@@ -371,8 +377,24 @@ immich-accelerator stop && immich-accelerator start
 
 ## On agentic engineering
 
-This project was built iteratively across several sessions with [Claude Code](https://claude.ai/code) (Opus 4.6). From zero knowledge of the Immich codebase to a working native accelerator, including upstream contributions to the ML service and a feature discussion with the Immich maintainers. Inspect the code yourself, use it and share it, or don't.
+This project was built iteratively across several sessions with [Claude Code](https://claude.com/claude-code) (Opus 4.6). From zero knowledge of the Immich codebase to a working native accelerator, including upstream contributions to the ML service and a feature discussion with the Immich maintainers. Inspect the code yourself, use it and share it, or don't.
 
 ---
 
-Built with ❤️ in California by [@epheterson](https://github.com/epheterson) and [Claude Code](https://claude.ai/code).
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=epheterson/immich-apple-silicon&type=Date)](https://star-history.com/#epheterson/immich-apple-silicon&Date)
+
+---
+
+## License
+
+MIT
+
+## Credits
+
+[Immich](https://immich.app/) · [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) · [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) · [Sharp](https://sharp.pixelplumbing.com/)
+
+---
+
+Built with ❤️ in California by [@epheterson](https://github.com/epheterson) and [Claude Code](https://claude.com/claude-code).
