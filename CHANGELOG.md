@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.21 — 2026-06-27
+
+### Fixed
+- **`brew cleanup` failing on root-owned `.pyc`** (#86): the CLI wrapper now sets `PYTHONDONTWRITEBYTECODE=1`, so Python no longer writes `__pycache__` into the Homebrew Cellar. Previously, running the CLI as root (e.g. `sudo immich-accelerator ...`) left root-owned bytecode in the keg that `brew cleanup` couldn't remove. Reported by [@shtefko](https://github.com/shtefko). After upgrading, clear any existing root-owned files once: `sudo chown -R $(whoami):admin /opt/homebrew/Cellar/immich-accelerator`.
+
 ## 1.5.20 — 2026-06-26
 
 ### Docs

@@ -95,6 +95,11 @@ jobs:
                   echo "Fix with: brew reinstall immich-accelerator" >&2
                   exit 1
                 fi
+                # Don't write .pyc into the Cellar. Python would otherwise
+                # create __pycache__ next to the installed modules; if the CLI
+                # is ever run as root (sudo, or a root service) those files are
+                # root-owned and break "brew cleanup". (Issue #86.)
+                export PYTHONDONTWRITEBYTECODE=1
                 export PYTHONPATH="#{libexec}:\\\$PYTHONPATH"
                 cd "#{libexec}"
                 exec "\\\$VENV_PY" -m immich_accelerator "\\\$@"
