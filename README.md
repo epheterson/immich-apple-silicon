@@ -6,7 +6,7 @@
 [![Homebrew](https://img.shields.io/badge/install-Homebrew-orange.svg)](https://github.com/epheterson/homebrew-immich-accelerator)
 [![Immich](https://img.shields.io/badge/Immich-2.7%2B-5b21b6.svg)](https://immich.app/)
 
-> **Alpha: use at your own risk.** Tested on Mac Mini M4 (24GB) with Immich v2.7.2 and OrbStack. Back up your Immich database before trying this.
+> **Beta.** In daily use on a Mac Mini M4 (24GB) against an Immich 2.7.x library. Stable, but back up your Immich database before your first run.
 
 Run Immich's compute natively on Apple Silicon. Thumbnails use the fast M-series CPU, video transcoding uses VideoToolbox hardware encoding, and ML runs on Metal GPU, Neural Engine, and CoreML.
 
@@ -40,7 +40,7 @@ The microservices worker is extracted directly from your running Immich Docker i
 | Expose Postgres/Redis ports | `5432:5432`, `6379:6379` in docker-compose | Remove the port lines | None |
 | Native microservices worker | Extracted from Docker image, runs via `node` | Stop the accelerator | None |
 | Native ML service | Separate Python service | Stop the accelerator | None |
-| `/build` symlink (Immich 2.7+) | `/etc/synthetic.d/immich-accelerator` — requires sudo once during setup | `immich-accelerator uninstall` removes it; reboot to deactivate | Low |
+| `/build` symlink (Immich 2.7+) | `/etc/synthetic.d/immich-accelerator` (requires sudo once during setup) | `immich-accelerator uninstall` removes it; reboot to deactivate | Low |
 
 **Why `/build`?** Immich 2.7+ stores absolute plugin paths like `/build/corePlugin/dist/plugin.wasm` in its database. Both Docker and native workers need `/build` to resolve. macOS SIP prevents creating root-level directories, so we use Apple's [synthetic link](https://man.cx/synthetic.conf(5)) mechanism to map `/build` → `~/.immich-accelerator/build-data`. Setup prompts for sudo once; a reboot may be required to activate.
 
@@ -61,10 +61,10 @@ brew trust epheterson/immich-accelerator  # Homebrew 5.1.15+: lets brew upgrade 
 immich-accelerator setup
 ```
 
-If no Docker is found, setup offers to install [OrbStack](https://orbstack.dev). If no Immich is running, setup creates the entire Docker stack for you — just answer two questions:
+If no Docker is found, setup offers to install [OrbStack](https://orbstack.dev). If no Immich is running, setup creates the entire Docker stack for you. Just answer two questions:
 
-1. **Where are your photos?** (e.g., `~/Pictures`) — mounted read-only for Immich to import
-2. **Where should Immich store its data?** (e.g., `~/.immich-accelerator/data`) — thumbnails, transcoded video, backups
+1. **Where are your photos?** (e.g., `~/Pictures`), mounted read-only for Immich to import
+2. **Where should Immich store its data?** (e.g., `~/.immich-accelerator/data`) for thumbnails, transcoded video, and backups
 
 Setup generates the docker-compose, starts Immich, extracts the native worker, and starts everything. Open `http://localhost:2283` to create your admin account.
 
@@ -78,20 +78,22 @@ This is the directory Immich uses as its media root. It contains these subdirect
 
 ## Commands
 
+Every command is prefixed with `immich-accelerator` (e.g. `immich-accelerator setup`).
+
 | Command | What it does |
 |---------|-------------|
-| `immich-accelerator setup` | Auto-detect local Docker, extract server, configure |
-| `immich-accelerator setup --url URL` | Setup from remote Immich instance |
-| `immich-accelerator setup --manual` | Create config template for manual editing |
-| `immich-accelerator start` | Start worker + ML once, foreground (testing; no auto-restart/update/log-rotation — see [Running as a service](#running-as-a-service-recommended)) |
-| `immich-accelerator stop` | Stop native services |
-| `immich-accelerator status` | Show what's running |
-| `immich-accelerator logs [worker\|ml]` | Tail service logs |
-| `immich-accelerator update` | Update to match new Immich version |
-| `immich-accelerator watch` | Monitor + auto-restart/update + log rotation (what the service runs) |
-| `immich-accelerator dashboard` | Web UI at http://localhost:8420 |
-| `immich-accelerator ml-test` | Diagnose the ML service (health + CLIP + OCR round-trip) |
-| `immich-accelerator uninstall` | Remove services, data, and launchd config |
+| `setup` | Auto-detect local Docker, extract server, configure |
+| `setup --url URL` | Set up from a remote Immich instance |
+| `setup --manual` | Create a config template for manual editing |
+| `start` | Run worker + ML once in the foreground (testing only; use the [service](#running-as-a-service-recommended) for auto-restart/update/log-rotation) |
+| `stop` | Stop native services |
+| `status` | Show what's running |
+| `logs [worker\|ml]` | Tail service logs |
+| `update` | Update to match a new Immich version |
+| `watch` | Monitor + auto-restart/update + log rotation (what the service runs) |
+| `dashboard` | Web UI at http://localhost:8420 |
+| `ml-test` | Diagnose the ML service (health + CLIP + OCR round-trip) |
+| `uninstall` | Remove services, data, and launchd config |
 
 ## Dashboard
 
@@ -101,7 +103,7 @@ Real-time monitoring at `http://your-mac:8420`:
 immich-accelerator dashboard
 ```
 
-Shows service health, processing progress with live rates and ETAs, Apple Silicon hardware utilization, and system metrics. Mobile-friendly -- check from your phone.
+Shows service health, processing progress with live rates and ETAs, Apple Silicon hardware utilization, and system metrics. Mobile-friendly, check from your phone.
 
 The dashboard and setup use the Immich API for job status and queue control. Create an API key from an **admin** account in Administration > API Keys with these permissions:
 
@@ -130,7 +132,7 @@ To update the accelerator itself:
 brew upgrade immich-accelerator
 ```
 
-If you run it as a service (`watch` mode — the recommended setup), that's all you need: within ~30s the watcher notices the new version on disk, relaunches itself, and restarts the worker and ML service on the new code. (A detached worker survives a plain restart, so this version-aware reload is what guarantees the new code actually takes effect — `brew services restart` alone wouldn't reload the worker.)
+If you run it as a service (`watch` mode, the recommended setup), that's all you need: within ~30s the watcher notices the new version on disk, relaunches itself, and restarts the worker and ML service on the new code. (A detached worker survives a plain restart, so this version-aware reload is what guarantees the new code actually takes effect; `brew services restart` alone wouldn't reload the worker.)
 
 If you run the worker manually instead of as a service, restart it yourself after upgrading:
 
@@ -153,7 +155,7 @@ In the Immich admin UI (Administration → Jobs), tune the per-queue concurrency
 | Metadata Extraction | 4 | I/O-bound (exiftool) |
 | Video Conversion | 1 | Hardware-accelerated via VideoToolbox |
 
-Higher isn't always better — oversubscribing the CPU causes thrashing and actually reduces throughput.
+Higher isn't always better. Oversubscribing the CPU causes thrashing and actually reduces throughput.
 
 ## Split deployment (NAS + Mac, or any two hosts)
 
@@ -178,11 +180,11 @@ Contributions to the ML service are made via [upstream PRs](https://github.com/s
 
 Run the accelerator as a background service, not with a bare `immich-accelerator start`. The service runs `watch` mode, and **only `watch` mode gives you**:
 
-- **Auto-restart** — launchd (`KeepAlive`) restarts the monitor if it dies; the monitor restarts the worker, ML, and dashboard if they crash.
-- **Auto-update** — picks up new Immich versions (re-extracts the worker) and notifies on accelerator updates.
-- **Log rotation** — caps `worker.log`/`ml.log` so they can't grow without bound.
+- **Auto-restart**: launchd (`KeepAlive`) restarts the monitor if it dies; the monitor restarts the worker, ML, and dashboard if they crash.
+- **Auto-update**: picks up new Immich versions (re-extracts the worker) and notifies on accelerator updates.
+- **Log rotation**: caps `worker.log`/`ml.log` so they can't grow without bound.
 
-A plain `immich-accelerator start` runs once in the foreground with none of the above — use it only for quick testing.
+A plain `immich-accelerator start` runs once in the foreground with none of the above. Use it only for quick testing.
 
 **Homebrew install (recommended):**
 
@@ -192,7 +194,7 @@ brew services start epheterson/immich-accelerator/immich-accelerator
 
 This uses the formula's own service definition, survives `brew upgrade`, and restarts at login. Check it with `brew services list`. Stop with `brew services stop epheterson/immich-accelerator/immich-accelerator`.
 
-> Don't also install the launchd plist below if you're using `brew services` — running both double-starts the watcher.
+> Don't also install the launchd plist below if you're using `brew services`. Running both double-starts the watcher.
 
 **Git / non-Homebrew install:** `immich-accelerator setup` offers to install a launchd LaunchAgent (`~/Library/LaunchAgents/com.immich.accelerator.plist`). If you skipped that prompt, re-run `setup` and it will offer again.
 
@@ -264,7 +266,7 @@ Cause: that file also holds the required `/build` synthetic link (for Immich 2.7
 Fix: upgrade to v1.5.7+ and re-run setup; it now checks for the actual `build` entry and appends it without touching your other lines. Or add it yourself and reboot:
 
 ```bash
-# /etc/synthetic.d/immich-accelerator — needs a build entry (tab-separated)
+# /etc/synthetic.d/immich-accelerator (needs a build entry, tab-separated)
 printf 'build\t%s\n' "${HOME#/}/.immich-accelerator/build-data" | sudo tee -a /etc/synthetic.d/immich-accelerator
 ```
 
@@ -340,7 +342,7 @@ immich-accelerator stop && immich-accelerator start
 - Config file (`~/.immich-accelerator/config.json`) is chmod 600
 - Postgres exposed on `127.0.0.1:5432` (localhost only) by default
 - Redis exposed on `127.0.0.1:6379` (localhost only) by default
-- Dashboard binds on `0.0.0.0:8420` (LAN-accessible) — the Re-queue button triggers job processing via the Immich API. If you're on an untrusted network, don't run the dashboard or bind to localhost only
+- Dashboard binds on `0.0.0.0:8420` (LAN-accessible). The Re-queue button triggers job processing via the Immich API. If you're on an untrusted network, don't run the dashboard or bind to localhost only
 
 ## On agentic engineering
 
