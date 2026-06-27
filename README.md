@@ -157,66 +157,9 @@ Higher isn't always better — oversubscribing the CPU causes thrashing and actu
 
 ## Split deployment (NAS + Mac, or any two hosts)
 
-### The one thing you have to get right
+Run the Immich Docker stack (API, Postgres, Redis) on one host and the native accelerator (worker + ML) on another. The one rule: **both machines must see the same files at the same absolute paths via a shared filesystem.** Setup detects a path mismatch and refuses to save a broken config.
 
-**Both machines need to see the same files at the same absolute paths, via a shared filesystem.** The native worker reads and writes directly to disk — there is no HTTP transport of thumbnails between machines. If the NAS mounts `/volume1/photos` and the Mac mounts that same share over SMB/NFS at `/Volumes/photos`, you now have two different absolute paths for the same bytes, and Immich's database will only know one of them.
-
-You need one absolute path that resolves to the same files on both sides. See "Two ways to get there" below.
-
-### Topology
-
-1. **On the NAS (or wherever Docker lives)**: Immich Docker runs server (API-only), Postgres, and Redis. Expose Postgres and Redis on the LAN (not just localhost).
-2. **On the Mac**: The accelerator runs the microservices worker and ML service. Setup pulls the Immich server directly from ghcr.io — no Docker required on the Mac.
-
-```bash
-immich-accelerator setup --url http://nas:2283 --api-key YOUR_KEY
-```
-
-### Two ways to get there
-
-**Option A — match the Mac's path inside Docker** (recommended for new installs).
-
-Mount your Mac's shared-filesystem path on both sides with the same absolute path. Say the Mac mounts the NAS share at `/Volumes/photos`:
-
-```yaml
-# NAS docker-compose — bind the storage to the same absolute path Docker uses
-volumes:
-  - /volume1/photos:/Volumes/photos
-environment:
-  - IMMICH_MEDIA_LOCATION=/Volumes/photos
-```
-
-Docker writes `/Volumes/photos/...` to Postgres. The Mac worker opens the exact same path via its SMB/NFS mount. Same bytes, same path.
-
-**Option B — match Docker's path on the Mac** (zero Docker changes).
-
-Use a macOS [synthetic link](https://man.cx/synthetic.conf(5)) to make the Mac resolve Docker's internal path to your local mount:
-
-```bash
-# /etc/synthetic.d/immich-accelerator
-data	Volumes/photos/immich/library
-```
-
-Reboot. Now `/data` on the Mac resolves to the SMB/NFS mount, matching what Docker already stores in the database. No `IMMICH_MEDIA_LOCATION` change needed.
-
-> **Synthetic links can only create a single top-level name** (e.g. `/data`, `/immich`) — that's a macOS limitation, not ours. If Docker is using the container default `IMMICH_MEDIA_LOCATION=/usr/src/app/upload`, you **cannot** mirror that path on the Mac (you can't synthesize `/usr/src/app/...`, and `/usr` already exists). Use Option A, or first set `IMMICH_MEDIA_LOCATION` to a top-level path like `/data` and then synthesize that.
-
-### Fresh split deployment: let the frontend initialize geodata first
-
-If your Immich frontend has run **api-only from the very start** (`IMMICH_WORKERS_INCLUDE=api` set before it ever ran its own microservices worker), the reverse-geocoding tables were never initialized. The accelerator then becomes the first microservices worker to touch the database and tries to run Immich's one-time **geodata import** — a large bulk insert that can break over a network database connection (`write EPIPE`), so the worker fails to start.
-
-Fix: initialize geodata once on the frontend, then hand off to the accelerator.
-
-1. On the frontend, temporarily **remove** `IMMICH_WORKERS_INCLUDE=api` (or set it to include the microservices worker) and restart it.
-2. Wait for it to finish the geodata import (watch its logs for "geodata import" completing).
-3. **Re-add** `IMMICH_WORKERS_INCLUDE=api` and restart the frontend.
-4. Start the accelerator — the tables already exist, so it skips the import.
-
-This only affects brand-new split installs. Once geodata is initialized it stays initialized, and normal upgrades are unaffected.
-
-### Changing IMMICH_MEDIA_LOCATION on an existing install
-
-Immich automatically rewrites all file paths in the database on restart when `IMMICH_MEDIA_LOCATION` changes. It's safe — **but back up your database first**.
+See **[docs/split-deployment.md](docs/split-deployment.md)** for the full guide: topology, the two ways to align paths (match the Mac in Docker, or a synthetic link on the Mac), fresh-install geodata initialization, and changing `IMMICH_MEDIA_LOCATION` safely.
 
 ## ML service
 
@@ -287,42 +230,52 @@ The native worker runs Immich's unmodified code. The ffmpeg and image processing
 
 ## Troubleshooting
 
-The accelerator will tell you what's wrong, but here are the most common friction points and the one-command fixes.
+The accelerator will tell you what's wrong. Click a symptom below for the fix.
 
-### Setup says "Upload: not detected"
+<details>
+<summary><b>Setup says "Upload: not detected"</b></summary>
 
-Symptom — `immich-accelerator setup` finds your Immich container but reports `Upload: not detected`.
+Symptom: `immich-accelerator setup` finds your Immich container but reports `Upload: not detected`.
 
-Cause — fixed in v1.5.8. Older versions only recognized uploads mounted under a `/upload` path; the modern Immich compose mounts `${UPLOAD_LOCATION}:/data` and leaves `IMMICH_MEDIA_LOCATION` unset, so detection missed it.
+Cause: fixed in v1.5.8. Older versions only recognized uploads mounted under a `/upload` path; the modern Immich compose mounts `${UPLOAD_LOCATION}:/data` and leaves `IMMICH_MEDIA_LOCATION` unset, so detection missed it.
 
-Fix — `brew upgrade immich-accelerator` and re-run setup. If you're on a same-machine Docker Desktop setup where the container path (`/data`) differs from the host mount, the absolute paths still have to match for the native worker to read them — see [Split deployment](#split-deployment-nas--mac); the simplest fix is to set `IMMICH_MEDIA_LOCATION` (and the bind mount) to the host path so both sides agree.
+Fix: `brew upgrade immich-accelerator` and re-run setup. If you're on a same-machine Docker Desktop setup where the container path (`/data`) differs from the host mount, the absolute paths still have to match for the native worker to read them (see [Split deployment](docs/split-deployment.md)); the simplest fix is to set `IMMICH_MEDIA_LOCATION` (and the bind mount) to the host path so both sides agree.
 
-### Thumbnails 404 in the Immich web UI
+</details>
 
-Symptom — the native worker runs happily, but Immich's API server logs `ENOENT: /data/thumbs/.../xxx_thumbnail.webp` and thumbnails never show up.
+<details>
+<summary><b>Thumbnails 404 in the Immich web UI</b></summary>
 
-Cause — split-setup path mismatch. Docker Immich stores absolute paths like `/data/library/<uuid>/...` in Postgres; the native worker writes to your `upload_mount` which is something else. Docker API then 404s the stored path.
+Symptom: the native worker runs happily, but Immich's API server logs `ENOENT: /data/thumbs/.../xxx_thumbnail.webp` and thumbnails never show up.
 
-Fix — run `immich-accelerator setup --url http://your-nas:2283 --api-key YOUR_KEY` again. v1.4.1+ detects Docker's media root via the API and refuses to save a broken config. You'll see the mismatch explicitly with both walkthroughs (match Docker, or synthetic link on Mac). See [Split deployment](#split-deployment-nas--mac) above for the two options.
+Cause: split-setup path mismatch. Docker Immich stores absolute paths like `/data/library/<uuid>/...` in Postgres; the native worker writes to your `upload_mount` which is something else. Docker API then 404s the stored path.
 
-### Microservices red after editing `/etc/synthetic.d/immich-accelerator` by hand
+Fix: run `immich-accelerator setup --url http://your-nas:2283 --api-key YOUR_KEY` again. v1.4.1+ detects Docker's media root via the API and refuses to save a broken config. You'll see the mismatch explicitly with both walkthroughs (match Docker, or synthetic link on Mac). See [Split deployment](docs/split-deployment.md) for the two options.
 
-Symptom — you added your own line to `/etc/synthetic.d/immich-accelerator` (e.g. a split-deployment upload path), rebooted, and Microservices is red. The native worker won't start because `/build` doesn't resolve.
+</details>
 
-Cause — that file also holds the required `/build` synthetic link (for Immich 2.7+ plugin paths). Before v1.5.7, setup treated the file *existing* as "build link configured" and skipped writing the entry, so a hand-edited file silently lost `/build`.
+<details>
+<summary><b>Microservices red after editing <code>/etc/synthetic.d/immich-accelerator</code> by hand</b></summary>
 
-Fix — upgrade to v1.5.7+ and re-run setup; it now checks for the actual `build` entry and appends it without touching your other lines. Or add it yourself and reboot:
+Symptom: you added your own line to `/etc/synthetic.d/immich-accelerator` (e.g. a split-deployment upload path), rebooted, and Microservices is red. The native worker won't start because `/build` doesn't resolve.
+
+Cause: that file also holds the required `/build` synthetic link (for Immich 2.7+ plugin paths). Before v1.5.7, setup treated the file *existing* as "build link configured" and skipped writing the entry, so a hand-edited file silently lost `/build`.
+
+Fix: upgrade to v1.5.7+ and re-run setup; it now checks for the actual `build` entry and appends it without touching your other lines. Or add it yourself and reboot:
 
 ```bash
 # /etc/synthetic.d/immich-accelerator — needs a build entry (tab-separated)
 printf 'build\t%s\n' "${HOME#/}/.immich-accelerator/build-data" | sudo tee -a /etc/synthetic.d/immich-accelerator
 ```
 
-### ML jobs fail with "Machine learning request failed for all URLs"
+</details>
 
-Symptom — Immich's worker log shows ML requests failing with HTTP 500 on every URL, even though `immich-accelerator status` says the ML service is running.
+<details>
+<summary><b>ML jobs fail with "Machine learning request failed for all URLs"</b></summary>
 
-Diagnose — run:
+Symptom: Immich's worker log shows ML requests failing with HTTP 500 on every URL, even though `immich-accelerator status` says the ML service is running.
+
+Diagnose: run:
 
 ```bash
 immich-accelerator ml-test
@@ -332,19 +285,28 @@ This exercises `/ping`, `/health`, CLIP visual, and OCR with a synthetic image. 
 
 Common causes:
 
-- **Partial HuggingFace model cache** — `rm -rf ~/.cache/huggingface/hub/models--mlx-community--clip-vit-base-patch32` then `immich-accelerator start`
-- **mlx / mlx-clip version mismatch** — `brew reinstall immich-accelerator`
-- **Stale model files** — `rm -rf ~/.immich-accelerator/ml/models` then restart
+- **Partial HuggingFace model cache**: `rm -rf ~/.cache/huggingface/hub/models--mlx-community--clip-vit-base-patch32` then `immich-accelerator start`
+- **mlx / mlx-clip version mismatch**: `brew reinstall immich-accelerator`
+- **Stale model files**: `rm -rf ~/.immich-accelerator/ml/models` then restart
 
-### Dashboard crashes with `ModuleNotFoundError: No module named 'uvicorn'`
+</details>
+
+<details>
+<summary><b>Dashboard crashes with <code>ModuleNotFoundError: No module named 'uvicorn'</code></b></summary>
 
 Fixed in v1.4.1. If you're on an older release, `brew upgrade immich-accelerator` and re-run. The formula wrapper now runs the CLI under the ML venv's Python, which has fastapi + uvicorn installed.
 
-### `immich-accelerator setup` fails with `ENOENT: /build/corePlugin/manifest.json`
+</details>
+
+<details>
+<summary><b><code>immich-accelerator setup</code> fails with <code>ENOENT: /build/corePlugin/manifest.json</code></b></summary>
 
 Fixed in v1.4.1. The OCI image extractor used to skip small layers that contained the Immich 2.7+ `corePlugin` WASM files. Upgrade and re-run setup.
 
-### `brew install` fails with "Refusing to load formula ... from untrusted tap"
+</details>
+
+<details>
+<summary><b><code>brew install</code> fails with "Refusing to load formula ... from untrusted tap"</b></summary>
 
 Homebrew 5.1.15 (June 2026) requires third-party taps to be explicitly trusted before it will load their formulas. The fix is one command:
 
@@ -352,13 +314,16 @@ Homebrew 5.1.15 (June 2026) requires third-party taps to be explicitly trusted b
 brew trust epheterson/immich-accelerator
 ```
 
-Using the fully-qualified name (`brew install epheterson/immich-accelerator/immich-accelerator`, as in the quick start) bypasses the check for that one command — Homebrew treats naming the tap explicitly as consent — but `brew upgrade` still skips the tap until it's trusted.
+Using the fully-qualified name (`brew install epheterson/immich-accelerator/immich-accelerator`, as in the quick start) bypasses the check for that one command (Homebrew treats naming the tap explicitly as consent), but `brew upgrade` still skips the tap until it's trusted.
 
-### `brew upgrade` never finds a new version
+</details>
 
-Symptom — `brew upgrade immich-accelerator` reports nothing to do (and `brew outdated` shows nothing), but GitHub has a newer release. `brew info immich-accelerator` shows the real error: `Refusing to load formula ... from untrusted tap`.
+<details>
+<summary><b><code>brew upgrade</code> never finds a new version</b></summary>
 
-Cause — the same trust requirement as above, but for taps added *before* Homebrew 5.1.15 there's no error: Homebrew *silently skips* untrusted formulas during `outdated`/`upgrade`, so your install goes stale with no warning.
+Symptom: `brew upgrade immich-accelerator` reports nothing to do (and `brew outdated` shows nothing), but GitHub has a newer release. `brew info immich-accelerator` shows the real error: `Refusing to load formula ... from untrusted tap`.
+
+Cause: the same trust requirement as above, but for taps added *before* Homebrew 5.1.15 there's no error: Homebrew *silently skips* untrusted formulas during `outdated`/`upgrade`, so your install goes stale with no warning.
 
 Fix:
 
@@ -367,6 +332,8 @@ brew trust epheterson/immich-accelerator
 brew update && brew upgrade immich-accelerator
 immich-accelerator stop && immich-accelerator start
 ```
+
+</details>
 
 ## Security
 
