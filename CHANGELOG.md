@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.20 — 2026-06-26
+
+### Docs
+- **README house style**: added badges, a Star History chart, and License/Credits sections, and aligned the footer to the canonical form. Documented that Immich's `Transcoding video ... without hardware acceleration` log is expected and benign on macOS (the ffmpeg wrapper does the VideoToolbox encode; Immich has no VideoToolbox option to report). Reported by [@shtefko](https://github.com/shtefko) (#84).
+- **README slimmed**: Troubleshooting is now a collapsible symptom index (`<details>`), and the Split deployment guide moved to `docs/split-deployment.md` with a short pointer. The common path reads top-to-bottom without scrolling past the long tail.
+- **README polish**: promoted the status from Alpha to Beta (in daily use), de-duplicated the Commands table (the `immich-accelerator` prefix is stated once, not on every row), and removed all em-dashes.
+
 ## 1.5.19 — 2026-06-24
 
 ### Fixes

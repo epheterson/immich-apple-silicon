@@ -1,6 +1,12 @@
 # Immich Accelerator
 
-> **Alpha — use at your own risk.** Tested on Mac Mini M4 (24GB) with Immich v2.7.2 and OrbStack. Back up your Immich database before trying this.
+[![Release](https://img.shields.io/github/v/release/epheterson/immich-apple-silicon.svg?label=release)](https://github.com/epheterson/immich-apple-silicon/releases)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-blue.svg)]()
+[![Homebrew](https://img.shields.io/badge/install-Homebrew-orange.svg)](https://github.com/epheterson/homebrew-immich-accelerator)
+[![Immich](https://img.shields.io/badge/Immich-2.7%2B-5b21b6.svg)](https://immich.app/)
+
+> **Beta.** In daily use on a Mac Mini M4 (24GB) against an Immich 2.7.x library. Stable, but back up your Immich database before your first run.
 
 Run Immich's compute natively on Apple Silicon. Thumbnails use the fast M-series CPU, video transcoding uses VideoToolbox hardware encoding, and ML runs on Metal GPU, Neural Engine, and CoreML.
 
@@ -34,7 +40,7 @@ The microservices worker is extracted directly from your running Immich Docker i
 | Expose Postgres/Redis ports | `5432:5432`, `6379:6379` in docker-compose | Remove the port lines | None |
 | Native microservices worker | Extracted from Docker image, runs via `node` | Stop the accelerator | None |
 | Native ML service | Separate Python service | Stop the accelerator | None |
-| `/build` symlink (Immich 2.7+) | `/etc/synthetic.d/immich-accelerator` — requires sudo once during setup | `immich-accelerator uninstall` removes it; reboot to deactivate | Low |
+| `/build` symlink (Immich 2.7+) | `/etc/synthetic.d/immich-accelerator` (requires sudo once during setup) | `immich-accelerator uninstall` removes it; reboot to deactivate | Low |
 
 **Why `/build`?** Immich 2.7+ stores absolute plugin paths like `/build/corePlugin/dist/plugin.wasm` in its database. Both Docker and native workers need `/build` to resolve. macOS SIP prevents creating root-level directories, so we use Apple's [synthetic link](https://man.cx/synthetic.conf(5)) mechanism to map `/build` → `~/.immich-accelerator/build-data`. Setup prompts for sudo once; a reboot may be required to activate.
 
@@ -55,10 +61,10 @@ brew trust epheterson/immich-accelerator  # Homebrew 5.1.15+: lets brew upgrade 
 immich-accelerator setup
 ```
 
-If no Docker is found, setup offers to install [OrbStack](https://orbstack.dev). If no Immich is running, setup creates the entire Docker stack for you — just answer two questions:
+If no Docker is found, setup offers to install [OrbStack](https://orbstack.dev). If no Immich is running, setup creates the entire Docker stack for you. Just answer two questions:
 
-1. **Where are your photos?** (e.g., `~/Pictures`) — mounted read-only for Immich to import
-2. **Where should Immich store its data?** (e.g., `~/.immich-accelerator/data`) — thumbnails, transcoded video, backups
+1. **Where are your photos?** (e.g., `~/Pictures`), mounted read-only for Immich to import
+2. **Where should Immich store its data?** (e.g., `~/.immich-accelerator/data`) for thumbnails, transcoded video, and backups
 
 Setup generates the docker-compose, starts Immich, extracts the native worker, and starts everything. Open `http://localhost:2283` to create your admin account.
 
@@ -72,20 +78,22 @@ This is the directory Immich uses as its media root. It contains these subdirect
 
 ## Commands
 
+Every command is prefixed with `immich-accelerator` (e.g. `immich-accelerator setup`).
+
 | Command | What it does |
 |---------|-------------|
-| `immich-accelerator setup` | Auto-detect local Docker, extract server, configure |
-| `immich-accelerator setup --url URL` | Setup from remote Immich instance |
-| `immich-accelerator setup --manual` | Create config template for manual editing |
-| `immich-accelerator start` | Start worker + ML once, foreground (testing; no auto-restart/update/log-rotation — see [Running as a service](#running-as-a-service-recommended)) |
-| `immich-accelerator stop` | Stop native services |
-| `immich-accelerator status` | Show what's running |
-| `immich-accelerator logs [worker\|ml]` | Tail service logs |
-| `immich-accelerator update` | Update to match new Immich version |
-| `immich-accelerator watch` | Monitor + auto-restart/update + log rotation (what the service runs) |
-| `immich-accelerator dashboard` | Web UI at http://localhost:8420 |
-| `immich-accelerator ml-test` | Diagnose the ML service (health + CLIP + OCR round-trip) |
-| `immich-accelerator uninstall` | Remove services, data, and launchd config |
+| `setup` | Auto-detect local Docker, extract server, configure |
+| `setup --url URL` | Set up from a remote Immich instance |
+| `setup --manual` | Create a config template for manual editing |
+| `start` | Run worker + ML once in the foreground (testing only; use the [service](#running-as-a-service-recommended) for auto-restart/update/log-rotation) |
+| `stop` | Stop native services |
+| `status` | Show what's running |
+| `logs [worker\|ml]` | Tail service logs |
+| `update` | Update to match a new Immich version |
+| `watch` | Monitor + auto-restart/update + log rotation (what the service runs) |
+| `dashboard` | Web UI at http://localhost:8420 |
+| `ml-test` | Diagnose the ML service (health + CLIP + OCR round-trip) |
+| `uninstall` | Remove services, data, and launchd config |
 
 ## Dashboard
 
@@ -95,7 +103,7 @@ Real-time monitoring at `http://your-mac:8420`:
 immich-accelerator dashboard
 ```
 
-Shows service health, processing progress with live rates and ETAs, Apple Silicon hardware utilization, and system metrics. Mobile-friendly -- check from your phone.
+Shows service health, processing progress with live rates and ETAs, Apple Silicon hardware utilization, and system metrics. Mobile-friendly, check from your phone.
 
 The dashboard and setup use the Immich API for job status and queue control. Create an API key from an **admin** account in Administration > API Keys with these permissions:
 
@@ -124,7 +132,7 @@ To update the accelerator itself:
 brew upgrade immich-accelerator
 ```
 
-If you run it as a service (`watch` mode — the recommended setup), that's all you need: within ~30s the watcher notices the new version on disk, relaunches itself, and restarts the worker and ML service on the new code. (A detached worker survives a plain restart, so this version-aware reload is what guarantees the new code actually takes effect — `brew services restart` alone wouldn't reload the worker.)
+If you run it as a service (`watch` mode, the recommended setup), that's all you need: within ~30s the watcher notices the new version on disk, relaunches itself, and restarts the worker and ML service on the new code. (A detached worker survives a plain restart, so this version-aware reload is what guarantees the new code actually takes effect; `brew services restart` alone wouldn't reload the worker.)
 
 If you run the worker manually instead of as a service, restart it yourself after upgrading:
 
@@ -147,70 +155,13 @@ In the Immich admin UI (Administration → Jobs), tune the per-queue concurrency
 | Metadata Extraction | 4 | I/O-bound (exiftool) |
 | Video Conversion | 1 | Hardware-accelerated via VideoToolbox |
 
-Higher isn't always better — oversubscribing the CPU causes thrashing and actually reduces throughput.
+Higher isn't always better. Oversubscribing the CPU causes thrashing and actually reduces throughput.
 
 ## Split deployment (NAS + Mac, or any two hosts)
 
-### The one thing you have to get right
+Run the Immich Docker stack (API, Postgres, Redis) on one host and the native accelerator (worker + ML) on another. The one rule: **both machines must see the same files at the same absolute paths via a shared filesystem.** Setup detects a path mismatch and refuses to save a broken config.
 
-**Both machines need to see the same files at the same absolute paths, via a shared filesystem.** The native worker reads and writes directly to disk — there is no HTTP transport of thumbnails between machines. If the NAS mounts `/volume1/photos` and the Mac mounts that same share over SMB/NFS at `/Volumes/photos`, you now have two different absolute paths for the same bytes, and Immich's database will only know one of them.
-
-You need one absolute path that resolves to the same files on both sides. See "Two ways to get there" below.
-
-### Topology
-
-1. **On the NAS (or wherever Docker lives)**: Immich Docker runs server (API-only), Postgres, and Redis. Expose Postgres and Redis on the LAN (not just localhost).
-2. **On the Mac**: The accelerator runs the microservices worker and ML service. Setup pulls the Immich server directly from ghcr.io — no Docker required on the Mac.
-
-```bash
-immich-accelerator setup --url http://nas:2283 --api-key YOUR_KEY
-```
-
-### Two ways to get there
-
-**Option A — match the Mac's path inside Docker** (recommended for new installs).
-
-Mount your Mac's shared-filesystem path on both sides with the same absolute path. Say the Mac mounts the NAS share at `/Volumes/photos`:
-
-```yaml
-# NAS docker-compose — bind the storage to the same absolute path Docker uses
-volumes:
-  - /volume1/photos:/Volumes/photos
-environment:
-  - IMMICH_MEDIA_LOCATION=/Volumes/photos
-```
-
-Docker writes `/Volumes/photos/...` to Postgres. The Mac worker opens the exact same path via its SMB/NFS mount. Same bytes, same path.
-
-**Option B — match Docker's path on the Mac** (zero Docker changes).
-
-Use a macOS [synthetic link](https://man.cx/synthetic.conf(5)) to make the Mac resolve Docker's internal path to your local mount:
-
-```bash
-# /etc/synthetic.d/immich-accelerator
-data	Volumes/photos/immich/library
-```
-
-Reboot. Now `/data` on the Mac resolves to the SMB/NFS mount, matching what Docker already stores in the database. No `IMMICH_MEDIA_LOCATION` change needed.
-
-> **Synthetic links can only create a single top-level name** (e.g. `/data`, `/immich`) — that's a macOS limitation, not ours. If Docker is using the container default `IMMICH_MEDIA_LOCATION=/usr/src/app/upload`, you **cannot** mirror that path on the Mac (you can't synthesize `/usr/src/app/...`, and `/usr` already exists). Use Option A, or first set `IMMICH_MEDIA_LOCATION` to a top-level path like `/data` and then synthesize that.
-
-### Fresh split deployment: let the frontend initialize geodata first
-
-If your Immich frontend has run **api-only from the very start** (`IMMICH_WORKERS_INCLUDE=api` set before it ever ran its own microservices worker), the reverse-geocoding tables were never initialized. The accelerator then becomes the first microservices worker to touch the database and tries to run Immich's one-time **geodata import** — a large bulk insert that can break over a network database connection (`write EPIPE`), so the worker fails to start.
-
-Fix: initialize geodata once on the frontend, then hand off to the accelerator.
-
-1. On the frontend, temporarily **remove** `IMMICH_WORKERS_INCLUDE=api` (or set it to include the microservices worker) and restart it.
-2. Wait for it to finish the geodata import (watch its logs for "geodata import" completing).
-3. **Re-add** `IMMICH_WORKERS_INCLUDE=api` and restart the frontend.
-4. Start the accelerator — the tables already exist, so it skips the import.
-
-This only affects brand-new split installs. Once geodata is initialized it stays initialized, and normal upgrades are unaffected.
-
-### Changing IMMICH_MEDIA_LOCATION on an existing install
-
-Immich automatically rewrites all file paths in the database on restart when `IMMICH_MEDIA_LOCATION` changes. It's safe — **but back up your database first**.
+See **[docs/split-deployment.md](docs/split-deployment.md)** for the full guide: topology, the two ways to align paths (match the Mac in Docker, or a synthetic link on the Mac), fresh-install geodata initialization, and changing `IMMICH_MEDIA_LOCATION` safely.
 
 ## ML service
 
@@ -229,11 +180,11 @@ Contributions to the ML service are made via [upstream PRs](https://github.com/s
 
 Run the accelerator as a background service, not with a bare `immich-accelerator start`. The service runs `watch` mode, and **only `watch` mode gives you**:
 
-- **Auto-restart** — launchd (`KeepAlive`) restarts the monitor if it dies; the monitor restarts the worker, ML, and dashboard if they crash.
-- **Auto-update** — picks up new Immich versions (re-extracts the worker) and notifies on accelerator updates.
-- **Log rotation** — caps `worker.log`/`ml.log` so they can't grow without bound.
+- **Auto-restart**: launchd (`KeepAlive`) restarts the monitor if it dies; the monitor restarts the worker, ML, and dashboard if they crash.
+- **Auto-update**: picks up new Immich versions (re-extracts the worker) and notifies on accelerator updates.
+- **Log rotation**: caps `worker.log`/`ml.log` so they can't grow without bound.
 
-A plain `immich-accelerator start` runs once in the foreground with none of the above — use it only for quick testing.
+A plain `immich-accelerator start` runs once in the foreground with none of the above. Use it only for quick testing.
 
 **Homebrew install (recommended):**
 
@@ -243,7 +194,7 @@ brew services start epheterson/immich-accelerator/immich-accelerator
 
 This uses the formula's own service definition, survives `brew upgrade`, and restarts at login. Check it with `brew services list`. Stop with `brew services stop epheterson/immich-accelerator/immich-accelerator`.
 
-> Don't also install the launchd plist below if you're using `brew services` — running both double-starts the watcher.
+> Don't also install the launchd plist below if you're using `brew services`. Running both double-starts the watcher.
 
 **Git / non-Homebrew install:** `immich-accelerator setup` offers to install a launchd LaunchAgent (`~/Library/LaunchAgents/com.immich.accelerator.plist`). If you skipped that prompt, re-run `setup` and it will offer again.
 
@@ -263,7 +214,7 @@ The native worker runs Immich's unmodified code. The ffmpeg and image processing
 | Area | Docker | Native (Accelerator) | Impact |
 |------|--------|---------------------|--------|
 | **ffmpeg** | Jellyfin-ffmpeg | Jellyfin-ffmpeg (same binary, macOS arm64 build) | **Identical.** Same `tonemapx` filter, same encoders, same behavior. Downloaded automatically during setup. |
-| **ffmpeg encoders** | Software H.264/HEVC | VideoToolbox hardware H.264/HEVC via wrapper | Hardware-encoded output has slightly different bitstream characteristics. Visually equivalent. A lightweight wrapper remaps Immich's software encoder requests to VideoToolbox hardware equivalents. |
+| **ffmpeg encoders** | Software H.264/HEVC | VideoToolbox hardware H.264/HEVC via wrapper | Hardware-encoded output has slightly different bitstream characteristics. Visually equivalent. A lightweight wrapper remaps Immich's software encoder requests to VideoToolbox hardware equivalents. Immich has no VideoToolbox option, so it logs `Transcoding video ... without hardware acceleration` even though the encode runs on the GPU via the wrapper. That log is expected and benign. |
 | **Sharp / libvips** | Prebuilt linux-arm64 Sharp | Rebuilt against Homebrew system libvips | Identical image output. System libvips handles corrupt HEIF files more gracefully (matches Docker's error handling). |
 | **ML: CLIP** | ONNX Runtime | MLX on Metal GPU | Same model, different runtime. Embeddings are numerically close but not identical (floating-point differences). Search results are equivalent. |
 | **ML: Face detection** | ONNX Runtime | Apple Vision framework (Neural Engine) | Different model entirely. Detection accuracy is comparable; bounding boxes may differ slightly. |
@@ -281,42 +232,52 @@ The native worker runs Immich's unmodified code. The ffmpeg and image processing
 
 ## Troubleshooting
 
-The accelerator will tell you what's wrong, but here are the most common friction points and the one-command fixes.
+The accelerator will tell you what's wrong. Click a symptom below for the fix.
 
-### Setup says "Upload: not detected"
+<details>
+<summary><b>Setup says "Upload: not detected"</b></summary>
 
-Symptom — `immich-accelerator setup` finds your Immich container but reports `Upload: not detected`.
+Symptom: `immich-accelerator setup` finds your Immich container but reports `Upload: not detected`.
 
-Cause — fixed in v1.5.8. Older versions only recognized uploads mounted under a `/upload` path; the modern Immich compose mounts `${UPLOAD_LOCATION}:/data` and leaves `IMMICH_MEDIA_LOCATION` unset, so detection missed it.
+Cause: fixed in v1.5.8. Older versions only recognized uploads mounted under a `/upload` path; the modern Immich compose mounts `${UPLOAD_LOCATION}:/data` and leaves `IMMICH_MEDIA_LOCATION` unset, so detection missed it.
 
-Fix — `brew upgrade immich-accelerator` and re-run setup. If you're on a same-machine Docker Desktop setup where the container path (`/data`) differs from the host mount, the absolute paths still have to match for the native worker to read them — see [Split deployment](#split-deployment-nas--mac); the simplest fix is to set `IMMICH_MEDIA_LOCATION` (and the bind mount) to the host path so both sides agree.
+Fix: `brew upgrade immich-accelerator` and re-run setup. If you're on a same-machine Docker Desktop setup where the container path (`/data`) differs from the host mount, the absolute paths still have to match for the native worker to read them (see [Split deployment](docs/split-deployment.md)); the simplest fix is to set `IMMICH_MEDIA_LOCATION` (and the bind mount) to the host path so both sides agree.
 
-### Thumbnails 404 in the Immich web UI
+</details>
 
-Symptom — the native worker runs happily, but Immich's API server logs `ENOENT: /data/thumbs/.../xxx_thumbnail.webp` and thumbnails never show up.
+<details>
+<summary><b>Thumbnails 404 in the Immich web UI</b></summary>
 
-Cause — split-setup path mismatch. Docker Immich stores absolute paths like `/data/library/<uuid>/...` in Postgres; the native worker writes to your `upload_mount` which is something else. Docker API then 404s the stored path.
+Symptom: the native worker runs happily, but Immich's API server logs `ENOENT: /data/thumbs/.../xxx_thumbnail.webp` and thumbnails never show up.
 
-Fix — run `immich-accelerator setup --url http://your-nas:2283 --api-key YOUR_KEY` again. v1.4.1+ detects Docker's media root via the API and refuses to save a broken config. You'll see the mismatch explicitly with both walkthroughs (match Docker, or synthetic link on Mac). See [Split deployment](#split-deployment-nas--mac) above for the two options.
+Cause: split-setup path mismatch. Docker Immich stores absolute paths like `/data/library/<uuid>/...` in Postgres; the native worker writes to your `upload_mount` which is something else. Docker API then 404s the stored path.
 
-### Microservices red after editing `/etc/synthetic.d/immich-accelerator` by hand
+Fix: run `immich-accelerator setup --url http://your-nas:2283 --api-key YOUR_KEY` again. v1.4.1+ detects Docker's media root via the API and refuses to save a broken config. You'll see the mismatch explicitly with both walkthroughs (match Docker, or synthetic link on Mac). See [Split deployment](docs/split-deployment.md) for the two options.
 
-Symptom — you added your own line to `/etc/synthetic.d/immich-accelerator` (e.g. a split-deployment upload path), rebooted, and Microservices is red. The native worker won't start because `/build` doesn't resolve.
+</details>
 
-Cause — that file also holds the required `/build` synthetic link (for Immich 2.7+ plugin paths). Before v1.5.7, setup treated the file *existing* as "build link configured" and skipped writing the entry, so a hand-edited file silently lost `/build`.
+<details>
+<summary><b>Microservices red after editing <code>/etc/synthetic.d/immich-accelerator</code> by hand</b></summary>
 
-Fix — upgrade to v1.5.7+ and re-run setup; it now checks for the actual `build` entry and appends it without touching your other lines. Or add it yourself and reboot:
+Symptom: you added your own line to `/etc/synthetic.d/immich-accelerator` (e.g. a split-deployment upload path), rebooted, and Microservices is red. The native worker won't start because `/build` doesn't resolve.
+
+Cause: that file also holds the required `/build` synthetic link (for Immich 2.7+ plugin paths). Before v1.5.7, setup treated the file *existing* as "build link configured" and skipped writing the entry, so a hand-edited file silently lost `/build`.
+
+Fix: upgrade to v1.5.7+ and re-run setup; it now checks for the actual `build` entry and appends it without touching your other lines. Or add it yourself and reboot:
 
 ```bash
-# /etc/synthetic.d/immich-accelerator — needs a build entry (tab-separated)
+# /etc/synthetic.d/immich-accelerator (needs a build entry, tab-separated)
 printf 'build\t%s\n' "${HOME#/}/.immich-accelerator/build-data" | sudo tee -a /etc/synthetic.d/immich-accelerator
 ```
 
-### ML jobs fail with "Machine learning request failed for all URLs"
+</details>
 
-Symptom — Immich's worker log shows ML requests failing with HTTP 500 on every URL, even though `immich-accelerator status` says the ML service is running.
+<details>
+<summary><b>ML jobs fail with "Machine learning request failed for all URLs"</b></summary>
 
-Diagnose — run:
+Symptom: Immich's worker log shows ML requests failing with HTTP 500 on every URL, even though `immich-accelerator status` says the ML service is running.
+
+Diagnose: run:
 
 ```bash
 immich-accelerator ml-test
@@ -326,19 +287,28 @@ This exercises `/ping`, `/health`, CLIP visual, and OCR with a synthetic image. 
 
 Common causes:
 
-- **Partial HuggingFace model cache** — `rm -rf ~/.cache/huggingface/hub/models--mlx-community--clip-vit-base-patch32` then `immich-accelerator start`
-- **mlx / mlx-clip version mismatch** — `brew reinstall immich-accelerator`
-- **Stale model files** — `rm -rf ~/.immich-accelerator/ml/models` then restart
+- **Partial HuggingFace model cache**: `rm -rf ~/.cache/huggingface/hub/models--mlx-community--clip-vit-base-patch32` then `immich-accelerator start`
+- **mlx / mlx-clip version mismatch**: `brew reinstall immich-accelerator`
+- **Stale model files**: `rm -rf ~/.immich-accelerator/ml/models` then restart
 
-### Dashboard crashes with `ModuleNotFoundError: No module named 'uvicorn'`
+</details>
+
+<details>
+<summary><b>Dashboard crashes with <code>ModuleNotFoundError: No module named 'uvicorn'</code></b></summary>
 
 Fixed in v1.4.1. If you're on an older release, `brew upgrade immich-accelerator` and re-run. The formula wrapper now runs the CLI under the ML venv's Python, which has fastapi + uvicorn installed.
 
-### `immich-accelerator setup` fails with `ENOENT: /build/corePlugin/manifest.json`
+</details>
+
+<details>
+<summary><b><code>immich-accelerator setup</code> fails with <code>ENOENT: /build/corePlugin/manifest.json</code></b></summary>
 
 Fixed in v1.4.1. The OCI image extractor used to skip small layers that contained the Immich 2.7+ `corePlugin` WASM files. Upgrade and re-run setup.
 
-### `brew install` fails with "Refusing to load formula ... from untrusted tap"
+</details>
+
+<details>
+<summary><b><code>brew install</code> fails with "Refusing to load formula ... from untrusted tap"</b></summary>
 
 Homebrew 5.1.15 (June 2026) requires third-party taps to be explicitly trusted before it will load their formulas. The fix is one command:
 
@@ -346,13 +316,16 @@ Homebrew 5.1.15 (June 2026) requires third-party taps to be explicitly trusted b
 brew trust epheterson/immich-accelerator
 ```
 
-Using the fully-qualified name (`brew install epheterson/immich-accelerator/immich-accelerator`, as in the quick start) bypasses the check for that one command — Homebrew treats naming the tap explicitly as consent — but `brew upgrade` still skips the tap until it's trusted.
+Using the fully-qualified name (`brew install epheterson/immich-accelerator/immich-accelerator`, as in the quick start) bypasses the check for that one command (Homebrew treats naming the tap explicitly as consent), but `brew upgrade` still skips the tap until it's trusted.
 
-### `brew upgrade` never finds a new version
+</details>
 
-Symptom — `brew upgrade immich-accelerator` reports nothing to do (and `brew outdated` shows nothing), but GitHub has a newer release. `brew info immich-accelerator` shows the real error: `Refusing to load formula ... from untrusted tap`.
+<details>
+<summary><b><code>brew upgrade</code> never finds a new version</b></summary>
 
-Cause — the same trust requirement as above, but for taps added *before* Homebrew 5.1.15 there's no error: Homebrew *silently skips* untrusted formulas during `outdated`/`upgrade`, so your install goes stale with no warning.
+Symptom: `brew upgrade immich-accelerator` reports nothing to do (and `brew outdated` shows nothing), but GitHub has a newer release. `brew info immich-accelerator` shows the real error: `Refusing to load formula ... from untrusted tap`.
+
+Cause: the same trust requirement as above, but for taps added *before* Homebrew 5.1.15 there's no error: Homebrew *silently skips* untrusted formulas during `outdated`/`upgrade`, so your install goes stale with no warning.
 
 Fix:
 
@@ -362,17 +335,35 @@ brew update && brew upgrade immich-accelerator
 immich-accelerator stop && immich-accelerator start
 ```
 
+</details>
+
 ## Security
 
 - Config file (`~/.immich-accelerator/config.json`) is chmod 600
 - Postgres exposed on `127.0.0.1:5432` (localhost only) by default
 - Redis exposed on `127.0.0.1:6379` (localhost only) by default
-- Dashboard binds on `0.0.0.0:8420` (LAN-accessible) — the Re-queue button triggers job processing via the Immich API. If you're on an untrusted network, don't run the dashboard or bind to localhost only
+- Dashboard binds on `0.0.0.0:8420` (LAN-accessible). The Re-queue button triggers job processing via the Immich API. If you're on an untrusted network, don't run the dashboard or bind to localhost only
 
 ## On agentic engineering
 
-This project was built iteratively across several sessions with [Claude Code](https://claude.ai/code) (Opus 4.6). From zero knowledge of the Immich codebase to a working native accelerator, including upstream contributions to the ML service and a feature discussion with the Immich maintainers. Inspect the code yourself, use it and share it, or don't.
+This project was built iteratively across several sessions with [Claude Code](https://claude.com/claude-code) (Opus 4.6). From zero knowledge of the Immich codebase to a working native accelerator, including upstream contributions to the ML service and a feature discussion with the Immich maintainers. Inspect the code yourself, use it and share it, or don't.
 
 ---
 
-Built with ❤️ in California by [@epheterson](https://github.com/epheterson) and [Claude Code](https://claude.ai/code).
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=epheterson/immich-apple-silicon&type=Date)](https://star-history.com/#epheterson/immich-apple-silicon&Date)
+
+---
+
+## License
+
+MIT
+
+## Credits
+
+[Immich](https://immich.app/) · [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) · [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) · [Sharp](https://sharp.pixelplumbing.com/)
+
+---
+
+Built with ❤️ in California by [@epheterson](https://github.com/epheterson) and [Claude Code](https://claude.com/claude-code).
