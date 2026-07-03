@@ -100,6 +100,44 @@ function rewriteSpawn(command, args) {
     return rewriteGzip(command, args);
 }
 
+// Diagnostic (issue #89): a `spawn EBADF` crash in fluent-ffmpeg's capability
+// detection reproduces on a reporter's machine but on no environment we can
+// build here (matched Node version, shims, launchd stdio, concurrency, fd
+// limits). Since `spawn` throws synchronously, we capture the file-descriptor
+// state at the point of failure before re-throwing: which of fd 0/1/2 is
+// invalid, the requested stdio, and the process's open fds. Fires only on the
+// error path, so it is silent in normal operation and never alters behavior
+// (the original error is always re-thrown).
+function dumpSpawnFailure(command, options, err) {
+    try {
+        const fs = require('fs');
+        const out = ['[immich-accelerator][spawn-debug] spawn threw: '
+            + ((err && err.code) || (err && err.message) || err)];
+        out.push('  command=' + command);
+        out.push('  stdio=' + JSON.stringify(options && options.stdio));
+        for (const fd of [0, 1, 2]) {
+            try {
+                fs.fstatSync(fd);
+                out.push('  fd' + fd + '=ok');
+            } catch (e) {
+                out.push('  fd' + fd + '=BAD(' + ((e && e.code) || e) + ')');
+            }
+        }
+        let open;
+        try {
+            open = fs.readdirSync('/dev/fd')
+                .map(Number).filter(function (n) { return !Number.isNaN(n); })
+                .sort(function (x, y) { return x - y; });
+        } catch (e) {
+            open = '/dev/fd unreadable: ' + ((e && e.code) || e);
+        }
+        out.push('  open_fds=' + JSON.stringify(open));
+        process.stderr.write(out.join('\n') + '\n');
+    } catch (_e) {
+        // diagnostics must never mask or replace the original failure
+    }
+}
+
 // Node caches modules by specifier, so `require('child_process')` and
 // `require('node:child_process')` may or may not be the same object
 // depending on Node version. Patch both to be safe.
@@ -124,7 +162,12 @@ function install(moduleSpecifier) {
     const origSpawn = cp.spawn;
     cp.spawn = function (command, args, options) {
         const [c, a] = rewriteSpawn(command, args);
-        return origSpawn.call(this, c, a, options);
+        try {
+            return origSpawn.call(this, c, a, options);
+        } catch (err) {
+            dumpSpawnFailure(c, options, err);
+            throw err;
+        }
     };
 
     const origSpawnSync = cp.spawnSync;
