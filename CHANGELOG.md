@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.22 — 2026-07-02
+
+### Fixed
+- **pg_dump shim wrapped `child_process` spawn twice** (#89): the shim called `install()` for both `child_process` and `node:child_process`, which are the same object on modern Node, so every spawn ran through two nested wrappers (two `pg_dump_shim.js` frames in stack traces). Now guarded to patch a given module object once. This is hardening, not a confirmed fix for the reported `spawn EBADF`, which could not be reproduced across Node 22/24, launchd-style stdio, high concurrency, or starved fd limits, and rewrites nothing for ffprobe. Reported by [@KoenM9264](https://github.com/KoenM9264).
+
 ## 1.5.21 — 2026-06-27
 
 ### Fixed

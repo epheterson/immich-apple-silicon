@@ -111,6 +111,16 @@ function install(moduleSpecifier) {
         return;  // specifier not supported on this Node version
     }
 
+    // `require('child_process')` and `require('node:child_process')` return the
+    // SAME object on modern Node, so calling install() for both specifiers would
+    // wrap spawn twice: the second wrap captures the first wrapper as its
+    // "original", and every spawn then runs through two nested wrappers. Harmless
+    // (each forwards the same args) but it doubles the work and shows up as two
+    // confusing pg_dump_shim frames in stack traces. Guard so we patch a given
+    // module object once. (Issue #89.)
+    if (cp.__immichAccelPatched) return;
+    cp.__immichAccelPatched = true;
+
     const origSpawn = cp.spawn;
     cp.spawn = function (command, args, options) {
         const [c, a] = rewriteSpawn(command, args);
