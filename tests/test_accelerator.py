@@ -1496,3 +1496,29 @@ class TestStopAllFast:
 
         termed = {pgid for pgid, sig in sent if sig == signal.SIGTERM}
         assert termed == {111, 222, 333}  # all signalled before any wait
+
+
+class TestBuildHasCorePlugin:
+    """Plugin detection across Immich layouts (2.7 corePlugin, 3.0 plugins/)."""
+
+    def test_detects_27_layout(self, tmp_path):
+        from immich_accelerator.__main__ import _build_has_core_plugin
+
+        (tmp_path / "corePlugin").mkdir()
+        (tmp_path / "corePlugin" / "manifest.json").write_text("{}")
+        assert _build_has_core_plugin(tmp_path) is True
+
+    def test_detects_30_layout(self, tmp_path):
+        from immich_accelerator.__main__ import _build_has_core_plugin
+
+        wasm = tmp_path / "plugins" / "immich-plugin-core" / "dist" / "plugin.wasm"
+        wasm.parent.mkdir(parents=True)
+        wasm.write_bytes(b"\x00asm")
+        assert _build_has_core_plugin(tmp_path) is True
+
+    def test_false_when_absent(self, tmp_path):
+        from immich_accelerator.__main__ import _build_has_core_plugin
+
+        assert _build_has_core_plugin(tmp_path) is False
+        (tmp_path / "plugins").mkdir()  # empty plugins dir is not enough
+        assert _build_has_core_plugin(tmp_path) is False

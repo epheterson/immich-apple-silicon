@@ -1186,6 +1186,22 @@ def _needs_core_plugin(version: str) -> bool:
     return (major, minor) >= (2, 7)
 
 
+def _build_has_core_plugin(build_data: Path) -> bool:
+    """True once the WASM core plugin has been extracted into build-data.
+
+    The layout moved between Immich versions, so recognize both:
+      2.7.x: build-data/corePlugin/manifest.json
+      3.0.x: build-data/plugins/immich-plugin-core/dist/plugin.wasm
+    Keying only on the old 2.7 path made the layer-loop early-exit never
+    fire on 3.0, so setup downloaded every image layer instead of stopping
+    once the (small) plugin layer arrived.
+    """
+    if (build_data / "corePlugin" / "manifest.json").exists():
+        return True
+    plugins = build_data / "plugins"
+    return plugins.is_dir() and any(plugins.glob("*/dist/plugin.wasm"))
+
+
 def _has_everything(
     version: str,
     found_server: bool,
@@ -1293,7 +1309,7 @@ def download_immich_server(version: str) -> Path:
 
     for i, layer in sorted_layers:
         size_mb = layer["size"] / 1024 / 1024
-        has_core = (build_data / "corePlugin" / "manifest.json").exists()
+        has_core = _build_has_core_plugin(build_data)
         if _has_everything(bare_version, found_server, found_build, has_core):
             break
         digest = layer["digest"]

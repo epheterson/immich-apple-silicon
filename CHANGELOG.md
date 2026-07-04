@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.24 — 2026-07-03
+
+### Immich 3.0 support
+- **Plugin-path detection** now recognizes both the 2.7 layout (`corePlugin/`) and the 3.0 layout (`plugins/immich-plugin-core/`). Immich 3.0 renamed the WASM core-plugin directory, which made the layer-download early-exit never fire on 3.0, so setup downloaded every image layer instead of stopping once the small plugin layer arrived. Setup is fast again on 3.0. The rest of the 3.0 worker (extraction, native Sharp, ffmpeg wrapper, plugin load, worker start) was verified end to end.
+- README notes the worker tracks your Immich version, verified with 2.7.x and 3.0.x.
+
+Note: moving your own Docker stack from 2.7 to 3.0 requires Immich's database migration (pgvecto-rs to VectorChord); that is on the Immich side, not the accelerator.
+
 ## 1.5.23 — 2026-07-03
 
 ### Diagnostics
