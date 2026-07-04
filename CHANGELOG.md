@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.23 — 2026-07-03
+
+### Diagnostics
+- **`spawn EBADF` instrumentation** (#89): when a child-process spawn throws (the crash a reporter hits during ffmpeg capability detection, not reproducible on any environment we can build), the shim now logs the file-descriptor state at the point of failure, which of fd 0/1/2 is invalid, the requested stdio, and the process's open fds, then re-throws unchanged. Fires only on the error path; silent in normal operation. This is to capture the root cause on the affected machine.
+
 ## 1.5.22 — 2026-07-02
 
 ### Fixed
