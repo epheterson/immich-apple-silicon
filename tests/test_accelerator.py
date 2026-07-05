@@ -1569,3 +1569,25 @@ class TestProcessFdCount:
 
         with patch("immich_accelerator.__main__._scan_worker_pids", return_value=[]):
             assert _worker_fd_total() is None
+
+
+class TestIntEnv:
+    """Safe int env parsing for the fd-watchdog thresholds (#89)."""
+
+    def test_valid_value(self, monkeypatch):
+        from immich_accelerator.__main__ import _int_env
+
+        monkeypatch.setenv("IAA_TEST_INT", "42")
+        assert _int_env("IAA_TEST_INT", 10) == 42
+
+    def test_missing_falls_back(self, monkeypatch):
+        from immich_accelerator.__main__ import _int_env
+
+        monkeypatch.delenv("IAA_TEST_INT", raising=False)
+        assert _int_env("IAA_TEST_INT", 10) == 10
+
+    def test_bad_value_falls_back_not_raises(self, monkeypatch):
+        from immich_accelerator.__main__ import _int_env
+
+        monkeypatch.setenv("IAA_TEST_INT", "10k")
+        assert _int_env("IAA_TEST_INT", 10) == 10

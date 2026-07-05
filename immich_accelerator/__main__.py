@@ -4009,15 +4009,27 @@ def cmd_update(_args):
     log.info("Updated to %s. Run: python -m immich_accelerator start", running)
 
 
+def _int_env(name: str, default: int) -> int:
+    """Parse an int env var, falling back to default on a missing/bad value.
+
+    Must never raise at import: these are module-level constants, so a bad
+    value would otherwise break every subcommand, not just the watcher.
+    """
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
 # fd-leak safety net (#89): Immich leaks file handles processing some media
 # (e.g. certain Sony XAVC files on an external drive), opening each source file
 # and never closing it. Once the fd table gets huge, macOS starts failing
 # spawn() with EBADF and the worker crashes. A healthy worker sits around 150
 # open fds; restart it well before the wall. 0 disables the check.
-FD_RESTART_THRESHOLD = int(os.environ.get("IMMICH_ACCEL_FD_RESTART_THRESHOLD", "10000"))
+FD_RESTART_THRESHOLD = _int_env("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000)
 # Minimum seconds between fd-triggered restarts, so a fast leak (or a high
 # post-restart baseline) can't thrash the worker with back-to-back restarts.
-FD_RESTART_COOLDOWN = 300
+FD_RESTART_COOLDOWN = _int_env("IMMICH_ACCEL_FD_RESTART_COOLDOWN", 300)
 
 
 def cmd_watch(_args):
@@ -4026,6 +4038,12 @@ def cmd_watch(_args):
     Suitable for launchd KeepAlive — runs forever, checking every 30s.
     """
     log.info("Watching services (Ctrl+C to stop)...")
+
+    if FD_RESTART_THRESHOLD > 0 and _LIBPROC is None:
+        log.warning(
+            "fd-leak watchdog (#89) inactive: libproc unavailable, cannot read "
+            "worker fd counts on this system."
+        )
 
     # `brew services stop`/`restart` send SIGTERM to this watcher, but the
     # worker/ML/dashboard run detached (own session) and would survive — so a
@@ -4149,6 +4167,11 @@ def cmd_watch(_args):
                             cmd_start(argparse.Namespace(force=True))
                         except RuntimeError:
                             log.error("  Worker restart after fd leak failed")
+                        # Skip the crash-check this cycle: we just handled the
+                        # worker, so it must not also log "Worker crashed" and
+                        # double-start. If cmd_start early-returned without a
+                        # live worker, next cycle's crash-check restarts it.
+                        continue
                     else:
                         log.debug(
                             "Worker fd count %d high but within restart "
