@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import logging
 import os
@@ -1651,6 +1652,68 @@ def kill_pid(name: str) -> bool:
 
     (PID_DIR / f"{name}.pid").unlink(missing_ok=True)
     return True
+
+
+try:
+    _LIBPROC = ctypes.CDLL("libproc.dylib", use_errno=True)
+    _LIBPROC.proc_pidinfo.restype = ctypes.c_int
+    _LIBPROC.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+except OSError:
+    _LIBPROC = None
+
+_PROC_PIDLISTFDS = 1
+_PROC_FDINFO_SIZE = 8  # sizeof(struct proc_fdinfo): int32 fd + uint32 fdtype
+
+
+def _process_fd_count(pid: int) -> int | None:
+    """Live open file-descriptor count for a pid via libproc, or None.
+
+    Used by the watcher's fd-leak safety net (#89). proc_pidinfo(PROC_PIDLISTFDS)
+    with a NULL buffer returns the fd-table CAPACITY, a high-water mark that
+    never shrinks when fds close, so we must pass a real buffer and count the
+    bytes actually written (live_nfds * sizeof(proc_fdinfo)). Two syscalls, no
+    subprocess: unlike lsof it can't hang on a stalled mount, does no DNS on the
+    worker's DB/Redis sockets, and stays fast even when the table is huge (the
+    exact case we must catch).
+    """
+    if _LIBPROC is None:
+        return None
+    capacity = _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
+    if capacity <= 0:
+        return None
+    buf = ctypes.create_string_buffer(capacity)
+    written = _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, buf, capacity)
+    if written <= 0:
+        return None
+    return written // _PROC_FDINFO_SIZE
+
+
+def _worker_fd_total() -> int | None:
+    """Total open fds across all live Immich worker processes, or None.
+
+    Immich 2.7+ runs several processes titled 'immich'; the file-handle leak
+    (#89) can accumulate in any of them, not just the one tracked in worker.pid,
+    so sum every worker process rather than measuring a single pid.
+    """
+    if _LIBPROC is None:
+        return None  # can't count fds; skip the ps scan entirely
+    pids = _scan_worker_pids()
+    if not pids:
+        return None
+    total = 0
+    counted = False
+    for pid in pids:
+        count = _process_fd_count(pid)
+        if count is not None:
+            total += count
+            counted = True
+    return total if counted else None
 
 
 def cap_log(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> bool:
@@ -3686,7 +3749,7 @@ def cmd_start(args):
     # /build link points to our build-data dir (set up during setup).
     # Required for Immich 2.7+ plugin WASM paths stored in the shared DB.
     build_data = DATA_DIR / "build-data"
-    has_plugins = (build_data / "corePlugin" / "manifest.json").exists()
+    has_plugins = _build_has_core_plugin(build_data)
 
     if _build_link_ok():
         pass  # /build resolves correctly, both Docker and native see the same paths
@@ -3954,12 +4017,41 @@ def cmd_update(_args):
     log.info("Updated to %s. Run: python -m immich_accelerator start", running)
 
 
+def _int_env(name: str, default: int) -> int:
+    """Parse an int env var, falling back to default on a missing/bad value.
+
+    Must never raise at import: these are module-level constants, so a bad
+    value would otherwise break every subcommand, not just the watcher.
+    """
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+# fd-leak safety net (#89): Immich leaks file handles processing some media
+# (e.g. certain Sony XAVC files on an external drive), opening each source file
+# and never closing it. Once the fd table gets huge, macOS starts failing
+# spawn() with EBADF and the worker crashes. A healthy worker sits around 150
+# open fds; restart it well before the wall. 0 disables the check.
+FD_RESTART_THRESHOLD = _int_env("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000)
+# Minimum seconds between fd-triggered restarts, so a fast leak (or a high
+# post-restart baseline) can't thrash the worker with back-to-back restarts.
+FD_RESTART_COOLDOWN = _int_env("IMMICH_ACCEL_FD_RESTART_COOLDOWN", 300)
+
+
 def cmd_watch(_args):
     """Monitor services and restart on crash. Detects Docker updates.
 
     Suitable for launchd KeepAlive — runs forever, checking every 30s.
     """
     log.info("Watching services (Ctrl+C to stop)...")
+
+    if FD_RESTART_THRESHOLD > 0 and _LIBPROC is None:
+        log.warning(
+            "fd-leak watchdog (#89) inactive: libproc unavailable, cannot read "
+            "worker fd counts on this system."
+        )
 
     # `brew services stop`/`restart` send SIGTERM to this watcher, but the
     # worker/ML/dashboard run detached (own session) and would survive — so a
@@ -4012,10 +4104,15 @@ def cmd_watch(_args):
     check_count = 0
     self_update_notified = False
     shown_worker_hints: set[str] = set()
+    # None until the fd watchdog first restarts the worker. Compared against
+    # time.monotonic() (uptime), so a 0.0 sentinel would wrongly read as "just
+    # restarted" for the first FD_RESTART_COOLDOWN seconds after boot.
+    last_fd_restart: float | None = None
     while True:
         try:
             time.sleep(30)
             config = load_config()  # reload each cycle (setup may have changed it)
+            worker_handled = False  # set by the fd watchdog to skip crash-check
 
             # Auto-apply a `brew upgrade`: if the version installed on disk no
             # longer matches the code we're running, stop the (now-stale)
@@ -4060,8 +4157,49 @@ def cmd_watch(_args):
                     except RuntimeError:
                         log.error("  ML restart failed")
 
+            # fd-leak safety net (#89): restart the worker before a runaway
+            # open-file-descriptor count (an upstream Immich leak on some media)
+            # exhausts the table and crashes it with `spawn EBADF`. Sum fds
+            # across all worker processes (the leak may be in a sibling), and
+            # cool down between restarts so a fast leak can't thrash.
+            if FD_RESTART_THRESHOLD > 0:
+                fd_total = _worker_fd_total()
+                if fd_total is not None and fd_total >= FD_RESTART_THRESHOLD:
+                    cooled = (
+                        last_fd_restart is None
+                        or time.monotonic() - last_fd_restart >= FD_RESTART_COOLDOWN
+                    )
+                    if cooled:
+                        last_fd_restart = time.monotonic()
+                        log.warning(
+                            "Worker fd count %d exceeds %d: Immich leaks file "
+                            "handles on some media (#89). Restarting the worker "
+                            "before it exhausts the fd table and crashes.",
+                            fd_total,
+                            FD_RESTART_THRESHOLD,
+                        )
+                        kill_pid("worker")
+                        try:
+                            cmd_start(argparse.Namespace(force=True))
+                        except RuntimeError:
+                            log.error("  Worker restart after fd leak failed")
+                        # We handled the worker: skip the crash-check below so it
+                        # can't also log "Worker crashed" and double-start this
+                        # cycle. We do NOT `continue` (that would starve the
+                        # update-detection cadence); if cmd_start early-returned
+                        # without a live worker, next cycle's crash-check
+                        # restarts it.
+                        worker_handled = True
+                    else:
+                        log.debug(
+                            "Worker fd count %d high but within restart "
+                            "cooldown (%ds); not restarting yet.",
+                            fd_total,
+                            FD_RESTART_COOLDOWN,
+                        )
+
             # Check worker
-            if not read_pid("worker"):
+            if not worker_handled and not read_pid("worker"):
                 # Surface a known unrecoverable cause once (e.g. a fresh
                 # split-deploy geodata import failing) instead of looping
                 # silently — restarting won't fix it until the user acts.
@@ -4077,9 +4215,12 @@ def cmd_watch(_args):
                 except RuntimeError:
                     log.error("  Worker restart failed, will retry in 30s")
 
-            # Every 5 min, check if Immich updated
+            # Every 5 min, check if Immich updated. Skip on a cycle where the
+            # fd watchdog just restarted the worker, so we don't tear it back
+            # down (cmd_stop + re-extract) in the same tick; check_count stays
+            # >=10 so it runs next cycle instead.
             check_count += 1
-            if check_count >= 10:
+            if check_count >= 10 and not worker_handled:
                 check_count = 0
                 try:
                     cached = config.get("version", "").lstrip("v")

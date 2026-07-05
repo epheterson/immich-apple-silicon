@@ -1522,3 +1522,99 @@ class TestBuildHasCorePlugin:
         assert _build_has_core_plugin(tmp_path) is False
         (tmp_path / "plugins").mkdir()  # empty plugins dir is not enough
         assert _build_has_core_plugin(tmp_path) is False
+
+
+class TestProcessFdCount:
+    """fd-count helpers for the #89 fd-leak watchdog (libproc based)."""
+
+    def test_counts_live_fds_from_buffered_call(self):
+        from immich_accelerator.__main__ import _process_fd_count
+        from unittest.mock import MagicMock
+
+        # First call (NULL buffer) returns the capacity high-water (1600 bytes);
+        # second call (real buffer) returns the LIVE bytes written (960 -> 120).
+        libproc = MagicMock()
+        libproc.proc_pidinfo.side_effect = [1600, 960]
+        with patch("immich_accelerator.__main__._LIBPROC", libproc):
+            assert _process_fd_count(1234) == 120  # live count, not 1600/8
+
+    def test_none_when_buffered_call_fails(self):
+        from immich_accelerator.__main__ import _process_fd_count
+        from unittest.mock import MagicMock
+
+        libproc = MagicMock()
+        libproc.proc_pidinfo.side_effect = [1600, 0]  # capacity ok, write fails
+        with patch("immich_accelerator.__main__._LIBPROC", libproc):
+            assert _process_fd_count(1234) is None
+
+    def test_none_when_libproc_unavailable(self):
+        from immich_accelerator.__main__ import _process_fd_count
+
+        with patch("immich_accelerator.__main__._LIBPROC", None):
+            assert _process_fd_count(1234) is None
+
+    def test_none_on_nonpositive_return(self):
+        from immich_accelerator.__main__ import _process_fd_count
+        from unittest.mock import MagicMock
+
+        libproc = MagicMock()
+        libproc.proc_pidinfo.return_value = 0  # dead pid / error
+        with patch("immich_accelerator.__main__._LIBPROC", libproc):
+            assert _process_fd_count(1234) is None
+
+    def test_worker_fd_total_sums_all_workers(self):
+        from immich_accelerator.__main__ import _worker_fd_total
+        from unittest.mock import MagicMock
+
+        # _LIBPROC must be truthy or _worker_fd_total short-circuits (it is None
+        # on non-macOS CI, where libproc.dylib doesn't exist).
+        with patch("immich_accelerator.__main__._LIBPROC", MagicMock()), patch(
+            "immich_accelerator.__main__._scan_worker_pids",
+            return_value=[10, 20, 30],
+        ), patch(
+            "immich_accelerator.__main__._process_fd_count",
+            side_effect=lambda p: {10: 100, 20: None, 30: 5000}.get(p),
+        ):
+            # 100 + 5000, the None (unreadable pid) is skipped
+            assert _worker_fd_total() == 5100
+
+    def test_worker_fd_total_none_when_no_workers(self):
+        from immich_accelerator.__main__ import _worker_fd_total
+        from unittest.mock import MagicMock
+
+        with patch("immich_accelerator.__main__._LIBPROC", MagicMock()), patch(
+            "immich_accelerator.__main__._scan_worker_pids", return_value=[]
+        ):
+            assert _worker_fd_total() is None
+
+    def test_worker_fd_total_none_when_libproc_unavailable(self):
+        from immich_accelerator.__main__ import _worker_fd_total
+
+        # No libproc: skip the ps scan entirely and report None.
+        with patch("immich_accelerator.__main__._LIBPROC", None), patch(
+            "immich_accelerator.__main__._scan_worker_pids"
+        ) as scan:
+            assert _worker_fd_total() is None
+            scan.assert_not_called()
+
+
+class TestIntEnv:
+    """Safe int env parsing for the fd-watchdog thresholds (#89)."""
+
+    def test_valid_value(self, monkeypatch):
+        from immich_accelerator.__main__ import _int_env
+
+        monkeypatch.setenv("IAA_TEST_INT", "42")
+        assert _int_env("IAA_TEST_INT", 10) == 42
+
+    def test_missing_falls_back(self, monkeypatch):
+        from immich_accelerator.__main__ import _int_env
+
+        monkeypatch.delenv("IAA_TEST_INT", raising=False)
+        assert _int_env("IAA_TEST_INT", 10) == 10
+
+    def test_bad_value_falls_back_not_raises(self, monkeypatch):
+        from immich_accelerator.__main__ import _int_env
+
+        monkeypatch.setenv("IAA_TEST_INT", "10k")
+        assert _int_env("IAA_TEST_INT", 10) == 10
