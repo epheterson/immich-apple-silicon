@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.25 — 2026-07-04
+
+### Fixed
+- **Worker crash from file-descriptor exhaustion** (#89): Immich leaks file handles while processing some media (a reporter hit it on Sony A7IV XAVC files on an external drive) — the worker opens each source file and never closes it. His diagnostic (from v1.5.23) showed ~49,000 open descriptors, all pointing at the source files; once the fd table is that large macOS fails `spawn()` with `EBADF` and the worker crashes. The watcher now monitors the worker's open-fd count and restarts it before the table gets dangerous (default 10,000; a healthy worker sits around 150). Tunable via `IMMICH_ACCEL_FD_RESTART_THRESHOLD` (0 disables). This is a safety net for an upstream Immich leak, not a fix for the leak itself.
+
 ## 1.5.24 — 2026-07-03
 
 ### Immich 3.0 support

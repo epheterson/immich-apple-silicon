@@ -1522,3 +1522,37 @@ class TestBuildHasCorePlugin:
         assert _build_has_core_plugin(tmp_path) is False
         (tmp_path / "plugins").mkdir()  # empty plugins dir is not enough
         assert _build_has_core_plugin(tmp_path) is False
+
+
+class TestProcessFdCount:
+    """fd-count helper for the #89 fd-leak watchdog."""
+
+    def test_counts_lsof_lines_minus_header(self):
+        from immich_accelerator.__main__ import _process_fd_count
+        from types import SimpleNamespace
+
+        # header + 3 fd lines -> 3
+        out = SimpleNamespace(stdout="COMMAND PID USER FD TYPE\na\nb\nc\n")
+        with patch(
+            "immich_accelerator.__main__.subprocess.run", return_value=out
+        ):
+            assert _process_fd_count(1234) == 3
+
+    def test_none_on_empty_output(self):
+        from immich_accelerator.__main__ import _process_fd_count
+        from types import SimpleNamespace
+
+        with patch(
+            "immich_accelerator.__main__.subprocess.run",
+            return_value=SimpleNamespace(stdout=""),
+        ):
+            assert _process_fd_count(1234) is None
+
+    def test_none_on_lsof_error(self):
+        from immich_accelerator.__main__ import _process_fd_count
+
+        with patch(
+            "immich_accelerator.__main__.subprocess.run",
+            side_effect=OSError("no lsof"),
+        ):
+            assert _process_fd_count(1234) is None

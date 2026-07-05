@@ -1653,6 +1653,27 @@ def kill_pid(name: str) -> bool:
     return True
 
 
+def _process_fd_count(pid: int) -> int | None:
+    """Open file-descriptor count for a pid via lsof, or None if unavailable.
+
+    Used by the watcher's fd-leak safety net (#89). lsof prints a header line
+    plus roughly one line per open fd; the exact count doesn't matter, only
+    whether the table is getting dangerously large.
+    """
+    try:
+        out = subprocess.run(
+            ["lsof", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if not out.stdout:
+        return None
+    return max(0, out.stdout.count("\n") - 1)  # minus the header line
+
+
 def cap_log(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> bool:
     """Cap a service log in place once it exceeds max_bytes, preserving the last
     LOG_KEEP_TAIL_LINES lines of context. Returns True if it rotated.
@@ -3954,6 +3975,14 @@ def cmd_update(_args):
     log.info("Updated to %s. Run: python -m immich_accelerator start", running)
 
 
+# fd-leak safety net (#89): Immich leaks file handles processing some media
+# (e.g. certain Sony XAVC files on an external drive) — the worker opens each
+# source file and never closes it. Once the fd table gets huge, macOS starts
+# failing spawn() with EBADF and the worker crashes. A healthy worker sits
+# around 150 open fds; restart it well before the wall. 0 disables the check.
+FD_RESTART_THRESHOLD = int(os.environ.get("IMMICH_ACCEL_FD_RESTART_THRESHOLD", "10000"))
+
+
 def cmd_watch(_args):
     """Monitor services and restart on crash. Detects Docker updates.
 
@@ -4059,6 +4088,25 @@ def cmd_watch(_args):
                         log.info("  ML restarted (PID %d)", pid)
                     except RuntimeError:
                         log.error("  ML restart failed")
+
+            # fd-leak safety net (#89): restart the worker before a runaway
+            # open-file-descriptor count (an upstream Immich leak on some
+            # media) exhausts the table and crashes it with `spawn EBADF`.
+            # Killing it here makes the crash-check just below restart it.
+            if FD_RESTART_THRESHOLD > 0:
+                _wpid = read_pid("worker")
+                if _wpid:
+                    _fds = _process_fd_count(_wpid)
+                    if _fds is not None and _fds >= FD_RESTART_THRESHOLD:
+                        log.warning(
+                            "Worker has %d open file descriptors (limit %d) — "
+                            "Immich leaks file handles on some media (#89). "
+                            "Restarting the worker before it exhausts the fd "
+                            "table and crashes.",
+                            _fds,
+                            FD_RESTART_THRESHOLD,
+                        )
+                        kill_pid("worker")  # crash-check below restarts it
 
             # Check worker
             if not read_pid("worker"):
