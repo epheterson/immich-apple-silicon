@@ -1564,8 +1564,11 @@ class TestProcessFdCount:
 
     def test_worker_fd_total_sums_all_workers(self):
         from immich_accelerator.__main__ import _worker_fd_total
+        from unittest.mock import MagicMock
 
-        with patch(
+        # _LIBPROC must be truthy or _worker_fd_total short-circuits (it is None
+        # on non-macOS CI, where libproc.dylib doesn't exist).
+        with patch("immich_accelerator.__main__._LIBPROC", MagicMock()), patch(
             "immich_accelerator.__main__._scan_worker_pids",
             return_value=[10, 20, 30],
         ), patch(
@@ -1577,9 +1580,22 @@ class TestProcessFdCount:
 
     def test_worker_fd_total_none_when_no_workers(self):
         from immich_accelerator.__main__ import _worker_fd_total
+        from unittest.mock import MagicMock
 
-        with patch("immich_accelerator.__main__._scan_worker_pids", return_value=[]):
+        with patch("immich_accelerator.__main__._LIBPROC", MagicMock()), patch(
+            "immich_accelerator.__main__._scan_worker_pids", return_value=[]
+        ):
             assert _worker_fd_total() is None
+
+    def test_worker_fd_total_none_when_libproc_unavailable(self):
+        from immich_accelerator.__main__ import _worker_fd_total
+
+        # No libproc: skip the ps scan entirely and report None.
+        with patch("immich_accelerator.__main__._LIBPROC", None), patch(
+            "immich_accelerator.__main__._scan_worker_pids"
+        ) as scan:
+            assert _worker_fd_total() is None
+            scan.assert_not_called()
 
 
 class TestIntEnv:
