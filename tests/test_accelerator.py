@@ -1527,14 +1527,25 @@ class TestBuildHasCorePlugin:
 class TestProcessFdCount:
     """fd-count helpers for the #89 fd-leak watchdog (libproc based)."""
 
-    def test_counts_via_libproc(self):
+    def test_counts_live_fds_from_buffered_call(self):
+        from immich_accelerator.__main__ import _process_fd_count
+        from unittest.mock import MagicMock
+
+        # First call (NULL buffer) returns the capacity high-water (1600 bytes);
+        # second call (real buffer) returns the LIVE bytes written (960 -> 120).
+        libproc = MagicMock()
+        libproc.proc_pidinfo.side_effect = [1600, 960]
+        with patch("immich_accelerator.__main__._LIBPROC", libproc):
+            assert _process_fd_count(1234) == 120  # live count, not 1600/8
+
+    def test_none_when_buffered_call_fails(self):
         from immich_accelerator.__main__ import _process_fd_count
         from unittest.mock import MagicMock
 
         libproc = MagicMock()
-        libproc.proc_pidinfo.return_value = 960  # 960 / 8 = 120 fds
+        libproc.proc_pidinfo.side_effect = [1600, 0]  # capacity ok, write fails
         with patch("immich_accelerator.__main__._LIBPROC", libproc):
-            assert _process_fd_count(1234) == 120
+            assert _process_fd_count(1234) is None
 
     def test_none_when_libproc_unavailable(self):
         from immich_accelerator.__main__ import _process_fd_count

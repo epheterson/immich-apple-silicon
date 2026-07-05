@@ -1672,20 +1672,26 @@ _PROC_FDINFO_SIZE = 8  # sizeof(struct proc_fdinfo): int32 fd + uint32 fdtype
 
 
 def _process_fd_count(pid: int) -> int | None:
-    """Open file-descriptor count for a pid via libproc, or None if unavailable.
+    """Live open file-descriptor count for a pid via libproc, or None.
 
-    Used by the watcher's fd-leak safety net (#89). Calls proc_pidinfo with a
-    NULL buffer, which returns the byte size the fd list would need (nfds *
-    sizeof(proc_fdinfo)). A single syscall: no subprocess, so unlike lsof it
-    can't hang on a stalled mount, does no DNS on the worker's DB/Redis sockets,
-    and stays instant even when the table is huge (the exact case we must catch).
+    Used by the watcher's fd-leak safety net (#89). proc_pidinfo(PROC_PIDLISTFDS)
+    with a NULL buffer returns the fd-table CAPACITY, a high-water mark that
+    never shrinks when fds close, so we must pass a real buffer and count the
+    bytes actually written (live_nfds * sizeof(proc_fdinfo)). Two syscalls, no
+    subprocess: unlike lsof it can't hang on a stalled mount, does no DNS on the
+    worker's DB/Redis sockets, and stays fast even when the table is huge (the
+    exact case we must catch).
     """
     if _LIBPROC is None:
         return None
-    nbytes = _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
-    if nbytes <= 0:
+    capacity = _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
+    if capacity <= 0:
         return None
-    return nbytes // _PROC_FDINFO_SIZE
+    buf = ctypes.create_string_buffer(capacity)
+    written = _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, buf, capacity)
+    if written <= 0:
+        return None
+    return written // _PROC_FDINFO_SIZE
 
 
 def _worker_fd_total() -> int | None:
@@ -1695,6 +1701,8 @@ def _worker_fd_total() -> int | None:
     (#89) can accumulate in any of them, not just the one tracked in worker.pid,
     so sum every worker process rather than measuring a single pid.
     """
+    if _LIBPROC is None:
+        return None  # can't count fds; skip the ps scan entirely
     pids = _scan_worker_pids()
     if not pids:
         return None
@@ -3741,7 +3749,7 @@ def cmd_start(args):
     # /build link points to our build-data dir (set up during setup).
     # Required for Immich 2.7+ plugin WASM paths stored in the shared DB.
     build_data = DATA_DIR / "build-data"
-    has_plugins = (build_data / "corePlugin" / "manifest.json").exists()
+    has_plugins = _build_has_core_plugin(build_data)
 
     if _build_link_ok():
         pass  # /build resolves correctly, both Docker and native see the same paths
@@ -4096,11 +4104,15 @@ def cmd_watch(_args):
     check_count = 0
     self_update_notified = False
     shown_worker_hints: set[str] = set()
-    last_fd_restart = 0.0
+    # None until the fd watchdog first restarts the worker. Compared against
+    # time.monotonic() (uptime), so a 0.0 sentinel would wrongly read as "just
+    # restarted" for the first FD_RESTART_COOLDOWN seconds after boot.
+    last_fd_restart: float | None = None
     while True:
         try:
             time.sleep(30)
             config = load_config()  # reload each cycle (setup may have changed it)
+            worker_handled = False  # set by the fd watchdog to skip crash-check
 
             # Auto-apply a `brew upgrade`: if the version installed on disk no
             # longer matches the code we're running, stop the (now-stale)
@@ -4153,7 +4165,11 @@ def cmd_watch(_args):
             if FD_RESTART_THRESHOLD > 0:
                 fd_total = _worker_fd_total()
                 if fd_total is not None and fd_total >= FD_RESTART_THRESHOLD:
-                    if time.monotonic() - last_fd_restart >= FD_RESTART_COOLDOWN:
+                    cooled = (
+                        last_fd_restart is None
+                        or time.monotonic() - last_fd_restart >= FD_RESTART_COOLDOWN
+                    )
+                    if cooled:
                         last_fd_restart = time.monotonic()
                         log.warning(
                             "Worker fd count %d exceeds %d: Immich leaks file "
@@ -4167,11 +4183,13 @@ def cmd_watch(_args):
                             cmd_start(argparse.Namespace(force=True))
                         except RuntimeError:
                             log.error("  Worker restart after fd leak failed")
-                        # Skip the crash-check this cycle: we just handled the
-                        # worker, so it must not also log "Worker crashed" and
-                        # double-start. If cmd_start early-returned without a
-                        # live worker, next cycle's crash-check restarts it.
-                        continue
+                        # We handled the worker: skip the crash-check below so it
+                        # can't also log "Worker crashed" and double-start this
+                        # cycle. We do NOT `continue` (that would starve the
+                        # update-detection cadence); if cmd_start early-returned
+                        # without a live worker, next cycle's crash-check
+                        # restarts it.
+                        worker_handled = True
                     else:
                         log.debug(
                             "Worker fd count %d high but within restart "
@@ -4181,7 +4199,7 @@ def cmd_watch(_args):
                         )
 
             # Check worker
-            if not read_pid("worker"):
+            if not worker_handled and not read_pid("worker"):
                 # Surface a known unrecoverable cause once (e.g. a fresh
                 # split-deploy geodata import failing) instead of looping
                 # silently — restarting won't fix it until the user acts.
