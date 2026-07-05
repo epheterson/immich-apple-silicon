@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import logging
 import os
@@ -1653,25 +1654,58 @@ def kill_pid(name: str) -> bool:
     return True
 
 
-def _process_fd_count(pid: int) -> int | None:
-    """Open file-descriptor count for a pid via lsof, or None if unavailable.
+try:
+    _LIBPROC = ctypes.CDLL("libproc.dylib", use_errno=True)
+    _LIBPROC.proc_pidinfo.restype = ctypes.c_int
+    _LIBPROC.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+except OSError:
+    _LIBPROC = None
 
-    Used by the watcher's fd-leak safety net (#89). lsof prints a header line
-    plus roughly one line per open fd; the exact count doesn't matter, only
-    whether the table is getting dangerously large.
+_PROC_PIDLISTFDS = 1
+_PROC_FDINFO_SIZE = 8  # sizeof(struct proc_fdinfo): int32 fd + uint32 fdtype
+
+
+def _process_fd_count(pid: int) -> int | None:
+    """Open file-descriptor count for a pid via libproc, or None if unavailable.
+
+    Used by the watcher's fd-leak safety net (#89). Calls proc_pidinfo with a
+    NULL buffer, which returns the byte size the fd list would need (nfds *
+    sizeof(proc_fdinfo)). A single syscall: no subprocess, so unlike lsof it
+    can't hang on a stalled mount, does no DNS on the worker's DB/Redis sockets,
+    and stays instant even when the table is huge (the exact case we must catch).
     """
-    try:
-        out = subprocess.run(
-            ["lsof", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (subprocess.SubprocessError, OSError):
+    if _LIBPROC is None:
         return None
-    if not out.stdout:
+    nbytes = _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
+    if nbytes <= 0:
         return None
-    return max(0, out.stdout.count("\n") - 1)  # minus the header line
+    return nbytes // _PROC_FDINFO_SIZE
+
+
+def _worker_fd_total() -> int | None:
+    """Total open fds across all live Immich worker processes, or None.
+
+    Immich 2.7+ runs several processes titled 'immich'; the file-handle leak
+    (#89) can accumulate in any of them, not just the one tracked in worker.pid,
+    so sum every worker process rather than measuring a single pid.
+    """
+    pids = _scan_worker_pids()
+    if not pids:
+        return None
+    total = 0
+    counted = False
+    for pid in pids:
+        count = _process_fd_count(pid)
+        if count is not None:
+            total += count
+            counted = True
+    return total if counted else None
 
 
 def cap_log(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> bool:
@@ -3976,11 +4010,14 @@ def cmd_update(_args):
 
 
 # fd-leak safety net (#89): Immich leaks file handles processing some media
-# (e.g. certain Sony XAVC files on an external drive) — the worker opens each
-# source file and never closes it. Once the fd table gets huge, macOS starts
-# failing spawn() with EBADF and the worker crashes. A healthy worker sits
-# around 150 open fds; restart it well before the wall. 0 disables the check.
+# (e.g. certain Sony XAVC files on an external drive), opening each source file
+# and never closing it. Once the fd table gets huge, macOS starts failing
+# spawn() with EBADF and the worker crashes. A healthy worker sits around 150
+# open fds; restart it well before the wall. 0 disables the check.
 FD_RESTART_THRESHOLD = int(os.environ.get("IMMICH_ACCEL_FD_RESTART_THRESHOLD", "10000"))
+# Minimum seconds between fd-triggered restarts, so a fast leak (or a high
+# post-restart baseline) can't thrash the worker with back-to-back restarts.
+FD_RESTART_COOLDOWN = 300
 
 
 def cmd_watch(_args):
@@ -4041,6 +4078,7 @@ def cmd_watch(_args):
     check_count = 0
     self_update_notified = False
     shown_worker_hints: set[str] = set()
+    last_fd_restart = 0.0
     while True:
         try:
             time.sleep(30)
@@ -4090,23 +4128,34 @@ def cmd_watch(_args):
                         log.error("  ML restart failed")
 
             # fd-leak safety net (#89): restart the worker before a runaway
-            # open-file-descriptor count (an upstream Immich leak on some
-            # media) exhausts the table and crashes it with `spawn EBADF`.
-            # Killing it here makes the crash-check just below restart it.
+            # open-file-descriptor count (an upstream Immich leak on some media)
+            # exhausts the table and crashes it with `spawn EBADF`. Sum fds
+            # across all worker processes (the leak may be in a sibling), and
+            # cool down between restarts so a fast leak can't thrash.
             if FD_RESTART_THRESHOLD > 0:
-                _wpid = read_pid("worker")
-                if _wpid:
-                    _fds = _process_fd_count(_wpid)
-                    if _fds is not None and _fds >= FD_RESTART_THRESHOLD:
+                fd_total = _worker_fd_total()
+                if fd_total is not None and fd_total >= FD_RESTART_THRESHOLD:
+                    if time.monotonic() - last_fd_restart >= FD_RESTART_COOLDOWN:
+                        last_fd_restart = time.monotonic()
                         log.warning(
-                            "Worker has %d open file descriptors (limit %d) — "
-                            "Immich leaks file handles on some media (#89). "
-                            "Restarting the worker before it exhausts the fd "
-                            "table and crashes.",
-                            _fds,
+                            "Worker fd count %d exceeds %d: Immich leaks file "
+                            "handles on some media (#89). Restarting the worker "
+                            "before it exhausts the fd table and crashes.",
+                            fd_total,
                             FD_RESTART_THRESHOLD,
                         )
-                        kill_pid("worker")  # crash-check below restarts it
+                        kill_pid("worker")
+                        try:
+                            cmd_start(argparse.Namespace(force=True))
+                        except RuntimeError:
+                            log.error("  Worker restart after fd leak failed")
+                    else:
+                        log.debug(
+                            "Worker fd count %d high but within restart "
+                            "cooldown (%ds); not restarting yet.",
+                            fd_total,
+                            FD_RESTART_COOLDOWN,
+                        )
 
             # Check worker
             if not read_pid("worker"):

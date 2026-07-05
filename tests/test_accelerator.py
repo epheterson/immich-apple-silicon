@@ -1525,34 +1525,47 @@ class TestBuildHasCorePlugin:
 
 
 class TestProcessFdCount:
-    """fd-count helper for the #89 fd-leak watchdog."""
+    """fd-count helpers for the #89 fd-leak watchdog (libproc based)."""
 
-    def test_counts_lsof_lines_minus_header(self):
+    def test_counts_via_libproc(self):
         from immich_accelerator.__main__ import _process_fd_count
-        from types import SimpleNamespace
+        from unittest.mock import MagicMock
 
-        # header + 3 fd lines -> 3
-        out = SimpleNamespace(stdout="COMMAND PID USER FD TYPE\na\nb\nc\n")
-        with patch(
-            "immich_accelerator.__main__.subprocess.run", return_value=out
-        ):
-            assert _process_fd_count(1234) == 3
+        libproc = MagicMock()
+        libproc.proc_pidinfo.return_value = 960  # 960 / 8 = 120 fds
+        with patch("immich_accelerator.__main__._LIBPROC", libproc):
+            assert _process_fd_count(1234) == 120
 
-    def test_none_on_empty_output(self):
+    def test_none_when_libproc_unavailable(self):
         from immich_accelerator.__main__ import _process_fd_count
-        from types import SimpleNamespace
 
-        with patch(
-            "immich_accelerator.__main__.subprocess.run",
-            return_value=SimpleNamespace(stdout=""),
-        ):
+        with patch("immich_accelerator.__main__._LIBPROC", None):
             assert _process_fd_count(1234) is None
 
-    def test_none_on_lsof_error(self):
+    def test_none_on_nonpositive_return(self):
         from immich_accelerator.__main__ import _process_fd_count
+        from unittest.mock import MagicMock
+
+        libproc = MagicMock()
+        libproc.proc_pidinfo.return_value = 0  # dead pid / error
+        with patch("immich_accelerator.__main__._LIBPROC", libproc):
+            assert _process_fd_count(1234) is None
+
+    def test_worker_fd_total_sums_all_workers(self):
+        from immich_accelerator.__main__ import _worker_fd_total
 
         with patch(
-            "immich_accelerator.__main__.subprocess.run",
-            side_effect=OSError("no lsof"),
+            "immich_accelerator.__main__._scan_worker_pids",
+            return_value=[10, 20, 30],
+        ), patch(
+            "immich_accelerator.__main__._process_fd_count",
+            side_effect=lambda p: {10: 100, 20: None, 30: 5000}.get(p),
         ):
-            assert _process_fd_count(1234) is None
+            # 100 + 5000, the None (unreadable pid) is skipped
+            assert _worker_fd_total() == 5100
+
+    def test_worker_fd_total_none_when_no_workers(self):
+        from immich_accelerator.__main__ import _worker_fd_total
+
+        with patch("immich_accelerator.__main__._scan_worker_pids", return_value=[]):
+            assert _worker_fd_total() is None
