@@ -4215,9 +4215,12 @@ def cmd_watch(_args):
                 except RuntimeError:
                     log.error("  Worker restart failed, will retry in 30s")
 
-            # Every 5 min, check if Immich updated
+            # Every 5 min, check if Immich updated. Skip on a cycle where the
+            # fd watchdog just restarted the worker, so we don't tear it back
+            # down (cmd_stop + re-extract) in the same tick; check_count stays
+            # >=10 so it runs next cycle instead.
             check_count += 1
-            if check_count >= 10:
+            if check_count >= 10 and not worker_handled:
                 check_count = 0
                 try:
                     cached = config.get("version", "").lstrip("v")
