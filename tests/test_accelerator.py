@@ -1536,6 +1536,157 @@ class TestBuildHasCorePlugin:
         assert _build_has_core_plugin(tmp_path) is False
 
 
+class TestBuildIsPluginEra:
+    """Loose plugin-era detection used by cmd_start to decide /build-link need.
+
+    Distinct from _build_has_core_plugin: a partially-extracted 3.0 plugin
+    (wasm but no manifest) is still plugin-era and must require the /build link.
+    """
+
+    def test_partial_30_plugin_is_plugin_era(self, tmp_path):
+        from immich_accelerator.__main__ import (
+            _build_has_core_plugin,
+            _build_is_plugin_era,
+        )
+
+        wasm = tmp_path / "plugins" / "immich-plugin-core" / "dist" / "plugin.wasm"
+        wasm.parent.mkdir(parents=True)
+        wasm.write_bytes(b"\x00asm")
+        # Regression guard for the narrowed-predicate side effect: the strict
+        # check says "incomplete" but the era check must still say "plugin-era"
+        # so the worker requires the /build link instead of the pre-2.7 fallback.
+        assert _build_has_core_plugin(tmp_path) is False
+        assert _build_is_plugin_era(tmp_path) is True
+
+    def test_27_corePlugin_is_plugin_era(self, tmp_path):
+        from immich_accelerator.__main__ import _build_is_plugin_era
+
+        (tmp_path / "corePlugin").mkdir()
+        assert _build_is_plugin_era(tmp_path) is True
+
+    def test_no_plugins_is_not_plugin_era(self, tmp_path):
+        from immich_accelerator.__main__ import _build_is_plugin_era
+
+        assert _build_is_plugin_era(tmp_path) is False
+        (tmp_path / "plugins").mkdir()  # empty plugins dir -> pre-2.7
+        assert _build_is_plugin_era(tmp_path) is False
+
+
+class TestCachedServerIfCurrent:
+    """Version-stamped cache gate: build-data is shared/version-blind, so the
+    per-version server cache must be paired with build-data stamped for the
+    same version (and carrying the plugin) before it is trusted."""
+
+    def _make_server(self, data_dir, version):
+        server_dir = data_dir / "server" / version
+        (server_dir / "dist").mkdir(parents=True)
+        (server_dir / "dist" / "main.js").write_text("//")
+        return server_dir
+
+    def _make_30_build_data(self, data_dir, stamp=None):
+        build_data = data_dir / "build-data"
+        plugin = build_data / "plugins" / "immich-plugin-core"
+        (plugin / "dist").mkdir(parents=True)
+        (plugin / "dist" / "plugin.wasm").write_bytes(b"\x00asm")
+        (plugin / "manifest.json").write_text("{}")
+        if stamp is not None:
+            (build_data / ".accel-version").write_text(stamp + "\n")
+        return build_data
+
+    def test_no_server_returns_none(self, tmp_path):
+        from immich_accelerator import __main__ as m
+
+        with patch.object(m, "DATA_DIR", tmp_path):
+            assert (
+                m._cached_server_if_current(tmp_path / "server" / "3.0.1", "3.0.1")
+                is None
+            )
+
+    def test_pre_27_trusts_server_without_stamp(self, tmp_path):
+        from immich_accelerator import __main__ as m
+
+        server_dir = self._make_server(tmp_path, "2.6.0")
+        with patch.object(m, "DATA_DIR", tmp_path):
+            assert m._cached_server_if_current(server_dir, "2.6.0") == server_dir
+
+    def test_matching_stamp_and_plugin_trusts_cache(self, tmp_path):
+        from immich_accelerator import __main__ as m
+
+        server_dir = self._make_server(tmp_path, "3.0.1")
+        self._make_30_build_data(tmp_path, stamp="3.0.1")
+        with patch.object(m, "DATA_DIR", tmp_path):
+            assert m._cached_server_if_current(server_dir, "3.0.1") == server_dir
+
+    def test_unstamped_plugin_era_reextracts(self, tmp_path):
+        # An old accelerator extracted 3.0 build-data without stamping it. Even
+        # though the plugin is present, we can't prove it belongs to 3.0.1, so
+        # we re-extract rather than risk trusting mismatched build-data.
+        from immich_accelerator import __main__ as m
+
+        server_dir = self._make_server(tmp_path, "3.0.1")
+        self._make_30_build_data(tmp_path, stamp=None)
+        with patch.object(m, "DATA_DIR", tmp_path):
+            assert m._cached_server_if_current(server_dir, "3.0.1") is None
+
+    def test_stale_version_stamp_reextracts(self, tmp_path):
+        # The dominant bug: build-data stamped for a different version (2.7.5
+        # rollback then forward to 3.0.1) must NOT be trusted for 3.0.1.
+        from immich_accelerator import __main__ as m
+
+        server_dir = self._make_server(tmp_path, "3.0.1")
+        self._make_30_build_data(tmp_path, stamp="2.7.5")
+        with patch.object(m, "DATA_DIR", tmp_path):
+            assert m._cached_server_if_current(server_dir, "3.0.1") is None
+
+    def test_stale_27_coreplugin_does_not_falsely_pass(self, tmp_path):
+        # A 2.7 corePlugin/manifest.json left in build-data used to satisfy the
+        # old plugin-presence check for a broken 3.0 cache. The stamp guard now
+        # requires the stamp to match, so it re-extracts.
+        from immich_accelerator import __main__ as m
+
+        server_dir = self._make_server(tmp_path, "3.0.1")
+        build_data = tmp_path / "build-data"
+        (build_data / "corePlugin").mkdir(parents=True)
+        (build_data / "corePlugin" / "manifest.json").write_text("{}")
+        (build_data / ".accel-version").write_text("2.7.5\n")
+        with patch.object(m, "DATA_DIR", tmp_path):
+            assert m._cached_server_if_current(server_dir, "3.0.1") is None
+
+
+class TestFinalizeBuildData:
+    """Stamping is the trust signal, so it must only fire when build-data is
+    genuinely complete for the version."""
+
+    def test_stamps_complete_30_build_data(self, tmp_path):
+        from immich_accelerator import __main__ as m
+
+        build_data = tmp_path / "build-data"
+        plugin = build_data / "plugins" / "immich-plugin-core"
+        (plugin / "dist").mkdir(parents=True)
+        (plugin / "dist" / "plugin.wasm").write_bytes(b"\x00asm")
+        (plugin / "manifest.json").write_text("{}")
+        m._finalize_build_data(build_data, "3.0.1")
+        assert m._build_data_version(build_data) == "3.0.1"
+
+    def test_does_not_stamp_plugin_less_30_build_data(self, tmp_path):
+        # If the plugin is missing for a plugin-era version, we must NOT stamp,
+        # so the next start re-extracts instead of trusting a broken install.
+        from immich_accelerator import __main__ as m
+
+        build_data = tmp_path / "build-data"
+        build_data.mkdir()
+        m._finalize_build_data(build_data, "3.0.1")
+        assert m._build_data_version(build_data) is None
+
+    def test_stamps_pre_27_without_plugin(self, tmp_path):
+        from immich_accelerator import __main__ as m
+
+        build_data = tmp_path / "build-data"
+        build_data.mkdir()
+        m._finalize_build_data(build_data, "2.6.0")
+        assert m._build_data_version(build_data) == "2.6.0"
+
+
 class TestProcessFdCount:
     """fd-count helpers for the #89 fd-leak watchdog (libproc based)."""
 

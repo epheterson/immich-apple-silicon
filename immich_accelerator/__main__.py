@@ -1211,6 +1211,90 @@ def _build_has_core_plugin(build_data: Path) -> bool:
     )
 
 
+def _build_is_plugin_era(build_data: Path) -> bool:
+    """True if build-data looks like a 2.7+ plugin build, even if the plugin is
+    only partially extracted.
+
+    Distinct from _build_has_core_plugin (which requires the plugin to be FULLY
+    extractable): here we only ask "does this build need the /build link". A
+    partially-extracted 3.0 plugin (dist/plugin.wasm but no manifest.json) still
+    needs the link, and the worker should surface the clear "run setup" error
+    rather than falling through to the pre-2.7 IMMICH_BUILD_DATA fallback.
+    """
+    if (build_data / "corePlugin").is_dir():
+        return True
+    plugins = build_data / "plugins"
+    return plugins.is_dir() and any(p.is_dir() for p in plugins.iterdir())
+
+
+# build-data is a SINGLE shared dir (mapped to /build), rewritten on every
+# extraction, so it only ever reflects the last-extracted version. The server
+# cache is per-version (server/<ver>), so the two can drift apart after a
+# version switch (e.g. 2.7 <-> 3.0). Stamp build-data with the version that
+# populated it so the per-version cache check can tell whether the shared
+# build-data actually belongs to the version being served.
+_BUILD_DATA_STAMP = ".accel-version"
+
+
+def _build_data_version(build_data: Path) -> str | None:
+    """Return the version that populated build-data, or None if unstamped."""
+    try:
+        return (build_data / _BUILD_DATA_STAMP).read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _finalize_build_data(build_data: Path, bare_version: str) -> None:
+    """After an extraction, stamp build-data with its version.
+
+    For plugin-era versions we only stamp once the core plugin is fully present:
+    a stamp means "this build-data is complete for <version>", so we must never
+    stamp a plugin-less build-data (that would make the cache trust a broken
+    install forever). If the plugin is missing we warn loudly and skip the
+    stamp, so the next start re-extracts (self-heal) instead of silently
+    serving a worker that cannot import the plugin.
+    """
+    if _needs_core_plugin(bare_version) and not _build_has_core_plugin(build_data):
+        log.warning(
+            "build-data for %s is missing the core plugin after extraction; "
+            "leaving it unstamped so the next start re-extracts.",
+            bare_version,
+        )
+        return
+    try:
+        (build_data / _BUILD_DATA_STAMP).write_text(bare_version + "\n")
+    except OSError as e:
+        log.warning("Could not stamp build-data version: %s", e)
+
+
+def _cached_server_if_current(server_dir: Path, bare_version: str) -> Path | None:
+    """Return the cached server iff it is complete for this exact version.
+
+    A cached server/<ver>/dist/main.js is necessary but not sufficient: for
+    plugin-era versions the shared build-data must also belong to this version
+    AND carry the core plugin. Guarding on the version stamp closes three holes:
+    a stale 2.7 plugin making a broken 3.0 cache look complete; a genuinely
+    complete cache being force re-downloaded on a mere build-data mismatch; and
+    (because we only stamp complete build-data) re-extracting forever.
+    """
+    if not (server_dir.exists() and (server_dir / "dist" / "main.js").exists()):
+        return None
+    if not _needs_core_plugin(bare_version):
+        log.info("Using cached Immich server %s", bare_version)
+        return server_dir
+    build_data = DATA_DIR / "build-data"
+    if _build_data_version(build_data) == bare_version and _build_has_core_plugin(
+        build_data
+    ):
+        log.info("Using cached Immich server %s", bare_version)
+        return server_dir
+    log.info(
+        "Cached server %s is missing/mismatched plugin data, re-extracting.",
+        bare_version,
+    )
+    return None
+
+
 def _has_everything(
     version: str,
     found_server: bool,
@@ -1242,20 +1326,9 @@ def download_immich_server(version: str) -> Path:
     bare_version = version.lstrip("v")
     server_dir = DATA_DIR / "server" / bare_version
 
-    if server_dir.exists() and (server_dir / "dist" / "main.js").exists():
-        # Also require the plugin to be fully extracted for versions that need
-        # it. An older accelerator could have cached a server whose plugin
-        # manifest was dropped (the layer-extraction bug), and re-using that
-        # cache would keep the worker unable to import the plugin. Re-extract if
-        # the cached build-data is incomplete.
-        if not _needs_core_plugin(bare_version) or _build_has_core_plugin(
-            DATA_DIR / "build-data"
-        ):
-            log.info("Using cached Immich server %s", bare_version)
-            return server_dir
-        log.info(
-            "Cached server %s is missing plugin data, re-extracting.", bare_version
-        )
+    cached = _cached_server_if_current(server_dir, bare_version)
+    if cached is not None:
+        return cached
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     registry = "https://ghcr.io"
@@ -1409,6 +1482,7 @@ def download_immich_server(version: str) -> Path:
         shutil.rmtree(server_dir)
     staging.rename(server_dir)
 
+    _finalize_build_data(build_data, bare_version)
     log.info("Immich server %s ready (downloaded from ghcr.io)", bare_version)
     return server_dir
 
@@ -1427,15 +1501,9 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
     server_dir = DATA_DIR / "server" / bare_version
     build_data = DATA_DIR / "build-data"
 
-    if server_dir.exists() and (server_dir / "dist" / "main.js").exists():
-        # Re-extract if a version that needs the core plugin has incomplete
-        # cached plugin data (same self-heal as download_immich_server).
-        if not _needs_core_plugin(bare_version) or _build_has_core_plugin(build_data):
-            log.info("Using cached Immich server %s", bare_version)
-            return server_dir
-        log.info(
-            "Cached server %s is missing plugin data, re-extracting.", bare_version
-        )
+    cached = _cached_server_if_current(server_dir, bare_version)
+    if cached is not None:
+        return cached
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1482,6 +1550,7 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
         shutil.rmtree(server_dir)
     staging.rename(server_dir)
 
+    _finalize_build_data(build_data, bare_version)
     log.info("Immich server %s ready", bare_version)
     return server_dir
 
@@ -3774,7 +3843,11 @@ def cmd_start(args):
     # /build link points to our build-data dir (set up during setup).
     # Required for Immich 2.7+ plugin WASM paths stored in the shared DB.
     build_data = DATA_DIR / "build-data"
-    has_plugins = _build_has_core_plugin(build_data)
+    # Use the loose plugin-era check here, not _build_has_core_plugin: a
+    # partially-extracted 3.0 plugin still needs the /build link and should hit
+    # the clear "run setup" error below, not the pre-2.7 IMMICH_BUILD_DATA
+    # fallback (which would let the worker start and fail at plugin-load time).
+    has_plugins = _build_is_plugin_era(build_data)
 
     if _build_link_ok():
         pass  # /build resolves correctly, both Docker and native see the same paths
