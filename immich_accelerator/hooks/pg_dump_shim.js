@@ -178,18 +178,13 @@ function install(moduleSpecifier) {
 
     const origExecFile = cp.execFile;
     if (typeof origExecFile === 'function') {
-        // Rewrite the file path (and args) the same way spawn does.
-        function rewriteExecFileArgs(file, args) {
-            if (Array.isArray(args)) {
-                return rewriteSpawn(file, args);
-            }
-            const pgRewritten = rewritePostgresBin(file);
-            return [pgRewritten !== null ? pgRewritten : file, args];
-        }
-
+        // rewriteSpawn handles both call forms: (file, argsArray, ...) rewrites
+        // the args; (file, optionsOrCb, ...) passes the non-array through
+        // untouched (rewriteGzip no-ops on non-arrays). Forward the rest of the
+        // arguments variadically so we never materialize a trailing `undefined`
+        // that shifts execFile's (file, args?, options?, cb?) normalization.
         cp.execFile = function (file, args, ...rest) {
-            // execFile's signature is (file, args?, options?, cb?).
-            const [c, a] = rewriteExecFileArgs(file, args);
+            const [c, a] = rewriteSpawn(file, args);
             return origExecFile.call(this, c, a, ...rest);
         };
 
@@ -200,13 +195,15 @@ function install(moduleSpecifier) {
         // bare stdout string. Callers that destructure `const { stdout } = await
         // execFile(...)` then get `undefined` (Immich 3.0 probePackets, #95).
         // Reinstall a custom promisifier that rewrites, then delegates to the
-        // original one so the { stdout, stderr } contract is preserved.
+        // original one so the { stdout, stderr } contract is preserved. Forward
+        // variadically for the same reason as above (the (file, options) form
+        // would otherwise get a stray undefined and never resolve).
         const util = require('util');
         const origCustom = origExecFile[util.promisify.custom];
         if (typeof origCustom === 'function') {
-            cp.execFile[util.promisify.custom] = function (file, args, options) {
-                const [c, a] = rewriteExecFileArgs(file, args);
-                return origCustom.call(this, c, a, options);
+            cp.execFile[util.promisify.custom] = function (file, args, ...rest) {
+                const [c, a] = rewriteSpawn(file, args);
+                return origCustom.call(this, c, a, ...rest);
             };
         }
     }
