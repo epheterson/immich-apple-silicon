@@ -1428,8 +1428,14 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
     build_data = DATA_DIR / "build-data"
 
     if server_dir.exists() and (server_dir / "dist" / "main.js").exists():
-        log.info("Using cached Immich server %s", bare_version)
-        return server_dir
+        # Re-extract if a version that needs the core plugin has incomplete
+        # cached plugin data (same self-heal as download_immich_server).
+        if not _needs_core_plugin(bare_version) or _build_has_core_plugin(build_data):
+            log.info("Using cached Immich server %s", bare_version)
+            return server_dir
+        log.info(
+            "Cached server %s is missing plugin data, re-extracting.", bare_version
+        )
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
