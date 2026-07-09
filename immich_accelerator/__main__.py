@@ -1243,8 +1243,19 @@ def download_immich_server(version: str) -> Path:
     server_dir = DATA_DIR / "server" / bare_version
 
     if server_dir.exists() and (server_dir / "dist" / "main.js").exists():
-        log.info("Using cached Immich server %s", bare_version)
-        return server_dir
+        # Also require the plugin to be fully extracted for versions that need
+        # it. An older accelerator could have cached a server whose plugin
+        # manifest was dropped (the layer-extraction bug), and re-using that
+        # cache would keep the worker unable to import the plugin. Re-extract if
+        # the cached build-data is incomplete.
+        if not _needs_core_plugin(bare_version) or _build_has_core_plugin(
+            DATA_DIR / "build-data"
+        ):
+            log.info("Using cached Immich server %s", bare_version)
+            return server_dir
+        log.info(
+            "Cached server %s is missing plugin data, re-extracting.", bare_version
+        )
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     registry = "https://ghcr.io"

@@ -3,7 +3,7 @@
 ## 1.5.27 — 2026-07-09
 
 ### Fixed
-- **Immich 3.0 core plugin failed to import** (`Failed to import plugin from /build/plugins/immich-plugin-core`): the v1.5.24 layer-download early-exit treated `plugins/<name>/dist/plugin.wasm` as "plugin complete", but 3.0 ships the plugin's `manifest.json` (at the plugin root) in a separate image layer. Extraction stopped after the wasm layer and dropped the manifest, so the worker could not import the plugin and workflow features were unavailable. `_build_has_core_plugin` now requires BOTH the manifest and the wasm before the early-exit fires. Found by dogfooding 3.0.
+- **Immich 3.0 core plugin failed to import** (`Failed to import plugin from /build/plugins/immich-plugin-core`): the v1.5.24 layer-download early-exit treated `plugins/<name>/dist/plugin.wasm` as "plugin complete", but 3.0 ships the plugin's `manifest.json` (at the plugin root) in a separate image layer. Extraction stopped after the wasm layer and dropped the manifest, so the worker could not import the plugin and workflow features were unavailable. Two-part fix: `_build_has_core_plugin` now requires BOTH the manifest and the wasm before the early-exit fires, and the server-extraction cache check re-extracts a cached server whose plugin data is incomplete, so an existing broken 3.0 install self-heals on the next start after upgrading instead of re-using the bad cache. Found by dogfooding 3.0.
 
 ## 1.5.26 — 2026-07-09
 
