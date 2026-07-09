@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.26 — 2026-07-09
+
+### Fixed
+- **Motion-photo / video metadata errors on Immich 3.0** (#95): `probePackets` failed with `TypeError: Cannot read properties of undefined (reading 'split')`. The pg_dump shim wraps `child_process.execFile` but dropped its `util.promisify.custom` symbol, so Immich 3.0's `const execFile = promisify(execFileCb)` fell back to the default promisifier and resolved to a bare stdout string instead of `{ stdout, stderr }`; destructuring `{ stdout }` then yielded `undefined`. The shim now reinstalls a custom promisifier so `promisify(execFile)` keeps the `{ stdout, stderr }` contract. A 3.0-only codepath, latent until now. Reported by [@shtefko](https://github.com/shtefko).
+
 ## 1.5.25 — 2026-07-05
 
 ### Fixed
