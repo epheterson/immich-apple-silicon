@@ -1511,10 +1511,22 @@ class TestBuildHasCorePlugin:
     def test_detects_30_layout(self, tmp_path):
         from immich_accelerator.__main__ import _build_has_core_plugin
 
+        plugin = tmp_path / "plugins" / "immich-plugin-core"
+        (plugin / "dist").mkdir(parents=True)
+        (plugin / "dist" / "plugin.wasm").write_bytes(b"\x00asm")
+        (plugin / "manifest.json").write_text("{}")  # manifest at plugin root
+        assert _build_has_core_plugin(tmp_path) is True
+
+    def test_30_wasm_without_manifest_is_incomplete(self, tmp_path):
+        # The #95-follow-on bug: dist/plugin.wasm alone (manifest.json in a
+        # later, not-yet-extracted layer) must NOT count as complete, or the
+        # layer-loop early-exits and Immich can't import the plugin.
+        from immich_accelerator.__main__ import _build_has_core_plugin
+
         wasm = tmp_path / "plugins" / "immich-plugin-core" / "dist" / "plugin.wasm"
         wasm.parent.mkdir(parents=True)
         wasm.write_bytes(b"\x00asm")
-        assert _build_has_core_plugin(tmp_path) is True
+        assert _build_has_core_plugin(tmp_path) is False
 
     def test_false_when_absent(self, tmp_path):
         from immich_accelerator.__main__ import _build_has_core_plugin

@@ -1188,19 +1188,27 @@ def _needs_core_plugin(version: str) -> bool:
 
 
 def _build_has_core_plugin(build_data: Path) -> bool:
-    """True once the WASM core plugin has been extracted into build-data.
+    """True once the WASM core plugin is FULLY extracted into build-data.
 
     The layout moved between Immich versions, so recognize both:
       2.7.x: build-data/corePlugin/manifest.json
-      3.0.x: build-data/plugins/immich-plugin-core/dist/plugin.wasm
-    Keying only on the old 2.7 path made the layer-loop early-exit never
-    fire on 3.0, so setup downloaded every image layer instead of stopping
-    once the (small) plugin layer arrived.
+      3.0.x: build-data/plugins/<name>/manifest.json + <name>/dist/plugin.wasm
+    3.0 splits the plugin across image layers: the manifest.json (at the plugin
+    root) and dist/ land in separate COPY layers. We must require BOTH before
+    the layer-loop early-exit fires. Keying only on dist/plugin.wasm stopped
+    extraction after the wasm layer but before the manifest layer, so Immich
+    could not import the plugin ("Failed to import plugin from /build/...").
     """
     if (build_data / "corePlugin" / "manifest.json").exists():
         return True
     plugins = build_data / "plugins"
-    return plugins.is_dir() and any(plugins.glob("*/dist/plugin.wasm"))
+    if not plugins.is_dir():
+        return False
+    return any(
+        (p / "manifest.json").exists() and (p / "dist" / "plugin.wasm").exists()
+        for p in plugins.iterdir()
+        if p.is_dir()
+    )
 
 
 def _has_everything(
