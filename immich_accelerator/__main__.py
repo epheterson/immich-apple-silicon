@@ -1187,20 +1187,17 @@ def _needs_core_plugin(version: str) -> bool:
     return (major, minor) >= (2, 7)
 
 
-def _build_has_core_plugin(build_data: Path) -> bool:
-    """True once the WASM core plugin is FULLY extracted into build-data.
+def _has_27_plugin(build_data: Path) -> bool:
+    """2.7.x layout: build-data/corePlugin/manifest.json."""
+    return (build_data / "corePlugin" / "manifest.json").exists()
 
-    The layout moved between Immich versions, so recognize both:
-      2.7.x: build-data/corePlugin/manifest.json
-      3.0.x: build-data/plugins/<name>/manifest.json + <name>/dist/plugin.wasm
+
+def _has_30_plugin(build_data: Path) -> bool:
+    """3.0.x layout: build-data/plugins/<name>/manifest.json + dist/plugin.wasm.
+
     3.0 splits the plugin across image layers: the manifest.json (at the plugin
-    root) and dist/ land in separate COPY layers. We must require BOTH before
-    the layer-loop early-exit fires. Keying only on dist/plugin.wasm stopped
-    extraction after the wasm layer but before the manifest layer, so Immich
-    could not import the plugin ("Failed to import plugin from /build/...").
+    root) and dist/ land in separate COPY layers, so require BOTH.
     """
-    if (build_data / "corePlugin" / "manifest.json").exists():
-        return True
     plugins = build_data / "plugins"
     if not plugins.is_dir():
         return False
@@ -1211,6 +1208,32 @@ def _build_has_core_plugin(build_data: Path) -> bool:
     )
 
 
+def _build_has_core_plugin(build_data: Path) -> bool:
+    """True once the WASM core plugin is FULLY extracted into build-data, in
+    either the 2.7 (corePlugin/) or 3.0 (plugins/<name>/) layout.
+
+    Used as the layer-loop early-exit signal: keying only on dist/plugin.wasm
+    stopped extraction after the wasm layer but before the manifest layer, so
+    Immich could not import the plugin ("Failed to import plugin from /build/").
+    """
+    return _has_27_plugin(build_data) or _has_30_plugin(build_data)
+
+
+def _build_has_core_plugin_for(build_data: Path, bare_version: str) -> bool:
+    """Like _build_has_core_plugin, but only the layout matching this version's
+    era counts.
+
+    A 2.7 corePlugin/ left behind while serving a 3.0 version (or vice-versa)
+    must NOT be mistaken for this version's plugin. When the major can't be
+    parsed, fall back to accepting either layout.
+    """
+    try:
+        major = int(bare_version.lstrip("v").split(".")[0])
+    except (ValueError, IndexError):
+        return _build_has_core_plugin(build_data)
+    return _has_30_plugin(build_data) if major >= 3 else _has_27_plugin(build_data)
+
+
 def _build_is_plugin_era(build_data: Path) -> bool:
     """True if build-data looks like a 2.7+ plugin build, even if the plugin is
     only partially extracted.
@@ -1219,12 +1242,20 @@ def _build_is_plugin_era(build_data: Path) -> bool:
     extractable): here we only ask "does this build need the /build link". A
     partially-extracted 3.0 plugin (dist/plugin.wasm but no manifest.json) still
     needs the link, and the worker should surface the clear "run setup" error
-    rather than falling through to the pre-2.7 IMMICH_BUILD_DATA fallback.
+    rather than falling through to the pre-2.7 IMMICH_BUILD_DATA fallback. We
+    require actual plugin content (a manifest or a wasm), so a stray empty
+    plugins/<x>/ dir on a genuinely pre-2.7 build is not misread as plugin-era.
     """
     if (build_data / "corePlugin").is_dir():
         return True
     plugins = build_data / "plugins"
-    return plugins.is_dir() and any(p.is_dir() for p in plugins.iterdir())
+    if not plugins.is_dir():
+        return False
+    return any(
+        (p / "manifest.json").exists() or (p / "dist" / "plugin.wasm").exists()
+        for p in plugins.iterdir()
+        if p.is_dir()
+    )
 
 
 # build-data is a SINGLE shared dir (mapped to /build), rewritten on every
@@ -1237,11 +1268,24 @@ _BUILD_DATA_STAMP = ".accel-version"
 
 
 def _build_data_version(build_data: Path) -> str | None:
-    """Return the version that populated build-data, or None if unstamped."""
+    """Return the version that populated build-data, or None if unstamped.
+
+    A corrupt/non-UTF8 stamp (UnicodeDecodeError is a ValueError) is treated as
+    unstamped rather than propagating a raw traceback out of the cache gate.
+    """
     try:
         return (build_data / _BUILD_DATA_STAMP).read_text().strip() or None
-    except OSError:
+    except (OSError, ValueError):
         return None
+
+
+def _stamp_build_data(build_data: Path, bare_version: str) -> None:
+    """Record which version populated build-data. Only call once build-data is
+    known-complete for that version (a stamp is a completeness claim)."""
+    try:
+        (build_data / _BUILD_DATA_STAMP).write_text(bare_version + "\n")
+    except OSError as e:
+        log.warning("Could not stamp build-data version: %s", e)
 
 
 def _finalize_build_data(build_data: Path, bare_version: str) -> None:
@@ -1261,10 +1305,28 @@ def _finalize_build_data(build_data: Path, bare_version: str) -> None:
             bare_version,
         )
         return
-    try:
-        (build_data / _BUILD_DATA_STAMP).write_text(bare_version + "\n")
-    except OSError as e:
-        log.warning("Could not stamp build-data version: %s", e)
+    _stamp_build_data(build_data, bare_version)
+
+
+def _build_data_ready(bare_version: str) -> bool:
+    """Is the shared build-data usable for this plugin-era version?
+
+    True when the version stamp matches and the plugin is present, OR (legacy,
+    unstamped build-data from before stamping / from an offline import) the
+    plugin for THIS version's layout is fully present. In the legacy case we
+    adopt the build-data by stamping it, so upgrading users don't eat a needless
+    full re-download. A stamp for a DIFFERENT version is real drift and is
+    rejected (re-extract). Adoption keys on the era-specific layout so a stale
+    cross-era plugin is never adopted.
+    """
+    build_data = DATA_DIR / "build-data"
+    stamp = _build_data_version(build_data)
+    if stamp == bare_version:
+        return _build_has_core_plugin(build_data)
+    if stamp is None and _build_has_core_plugin_for(build_data, bare_version):
+        _stamp_build_data(build_data, bare_version)
+        return True
+    return False
 
 
 def _cached_server_if_current(server_dir: Path, bare_version: str) -> Path | None:
@@ -1273,26 +1335,20 @@ def _cached_server_if_current(server_dir: Path, bare_version: str) -> Path | Non
     A cached server/<ver>/dist/main.js is necessary but not sufficient: for
     plugin-era versions the shared build-data must also belong to this version
     AND carry the core plugin. Guarding on the version stamp closes three holes:
-    a stale 2.7 plugin making a broken 3.0 cache look complete; a genuinely
+    a stale cross-era plugin making a broken cache look complete; a genuinely
     complete cache being force re-downloaded on a mere build-data mismatch; and
     (because we only stamp complete build-data) re-extracting forever.
     """
     if not (server_dir.exists() and (server_dir / "dist" / "main.js").exists()):
         return None
-    if not _needs_core_plugin(bare_version):
-        log.info("Using cached Immich server %s", bare_version)
-        return server_dir
-    build_data = DATA_DIR / "build-data"
-    if _build_data_version(build_data) == bare_version and _build_has_core_plugin(
-        build_data
-    ):
-        log.info("Using cached Immich server %s", bare_version)
-        return server_dir
-    log.info(
-        "Cached server %s is missing/mismatched plugin data, re-extracting.",
-        bare_version,
-    )
-    return None
+    if _needs_core_plugin(bare_version) and not _build_data_ready(bare_version):
+        log.info(
+            "Cached server %s is missing/mismatched plugin data, re-extracting.",
+            bare_version,
+        )
+        return None
+    log.info("Using cached Immich server %s", bare_version)
+    return server_dir
 
 
 def _has_everything(
@@ -2697,6 +2753,10 @@ def _import_server(source: str, version: str) -> Path:
                         bf.extractall(str(build_data), filter="data")
                     except TypeError:
                         bf.extractall(str(build_data))
+                # Stamp so the offline-imported build-data isn't seen as stale
+                # by the cache gate later (which would force a re-download that
+                # defeats the whole point of the offline import path).
+                _finalize_build_data(build_data, bare_version)
                 break
         else:
             if not build_data.exists():

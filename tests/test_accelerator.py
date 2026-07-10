@@ -1564,6 +1564,15 @@ class TestBuildIsPluginEra:
         (tmp_path / "corePlugin").mkdir()
         assert _build_is_plugin_era(tmp_path) is True
 
+    def test_stray_empty_plugin_subdir_is_not_plugin_era(self, tmp_path):
+        # A plugins/<x>/ dir with no manifest or wasm (stray/empty) must not be
+        # read as plugin-era, or a genuinely pre-2.7 build could be refused the
+        # IMMICH_BUILD_DATA fallback and fail to start.
+        from immich_accelerator.__main__ import _build_is_plugin_era
+
+        (tmp_path / "plugins" / "junk").mkdir(parents=True)
+        assert _build_is_plugin_era(tmp_path) is False
+
     def test_no_plugins_is_not_plugin_era(self, tmp_path):
         from immich_accelerator.__main__ import _build_is_plugin_era
 
@@ -1617,20 +1626,36 @@ class TestCachedServerIfCurrent:
         with patch.object(m, "DATA_DIR", tmp_path):
             assert m._cached_server_if_current(server_dir, "3.0.1") == server_dir
 
-    def test_unstamped_plugin_era_reextracts(self, tmp_path):
-        # An old accelerator extracted 3.0 build-data without stamping it. Even
-        # though the plugin is present, we can't prove it belongs to 3.0.1, so
-        # we re-extract rather than risk trusting mismatched build-data.
+    def test_unstamped_matching_layout_is_adopted(self, tmp_path):
+        # Legacy/offline build-data with no stamp but the 3.0 plugin present for
+        # a 3.0 request is adopted (stamped in place) rather than force a
+        # needless full re-download on the first start after upgrading.
         from immich_accelerator import __main__ as m
 
         server_dir = self._make_server(tmp_path, "3.0.1")
-        self._make_30_build_data(tmp_path, stamp=None)
+        build_data = self._make_30_build_data(tmp_path, stamp=None)
+        with patch.object(m, "DATA_DIR", tmp_path):
+            assert m._cached_server_if_current(server_dir, "3.0.1") == server_dir
+            # adoption persists the stamp so later starts skip the layout check
+            assert m._build_data_version(build_data) == "3.0.1"
+
+    def test_unstamped_cross_era_layout_reextracts(self, tmp_path):
+        # The dangerous case: unstamped build-data whose plugin is the WRONG era
+        # (2.7 corePlugin left behind while now serving 3.0.1). The layout does
+        # not match a 3.0 request, so it must NOT be adopted; re-extract.
+        from immich_accelerator import __main__ as m
+
+        server_dir = self._make_server(tmp_path, "3.0.1")
+        build_data = tmp_path / "build-data"
+        (build_data / "corePlugin").mkdir(parents=True)
+        (build_data / "corePlugin" / "manifest.json").write_text("{}")
         with patch.object(m, "DATA_DIR", tmp_path):
             assert m._cached_server_if_current(server_dir, "3.0.1") is None
+            assert m._build_data_version(build_data) is None  # not adopted
 
     def test_stale_version_stamp_reextracts(self, tmp_path):
-        # The dominant bug: build-data stamped for a different version (2.7.5
-        # rollback then forward to 3.0.1) must NOT be trusted for 3.0.1.
+        # A stamp for a DIFFERENT version (2.7.5 rollback then forward to 3.0.1)
+        # is real drift and must NOT be trusted or adopted for 3.0.1.
         from immich_accelerator import __main__ as m
 
         server_dir = self._make_server(tmp_path, "3.0.1")
@@ -1638,19 +1663,17 @@ class TestCachedServerIfCurrent:
         with patch.object(m, "DATA_DIR", tmp_path):
             assert m._cached_server_if_current(server_dir, "3.0.1") is None
 
-    def test_stale_27_coreplugin_does_not_falsely_pass(self, tmp_path):
-        # A 2.7 corePlugin/manifest.json left in build-data used to satisfy the
-        # old plugin-presence check for a broken 3.0 cache. The stamp guard now
-        # requires the stamp to match, so it re-extracts.
+    def test_corrupt_stamp_treated_as_unstamped(self, tmp_path):
+        # A non-UTF8/corrupt stamp must not raise out of the cache gate; it is
+        # treated as unstamped and (here, matching layout) adopted.
         from immich_accelerator import __main__ as m
 
         server_dir = self._make_server(tmp_path, "3.0.1")
-        build_data = tmp_path / "build-data"
-        (build_data / "corePlugin").mkdir(parents=True)
-        (build_data / "corePlugin" / "manifest.json").write_text("{}")
-        (build_data / ".accel-version").write_text("2.7.5\n")
+        build_data = self._make_30_build_data(tmp_path, stamp=None)
+        (build_data / ".accel-version").write_bytes(b"\xff\xfe\x00bad")
         with patch.object(m, "DATA_DIR", tmp_path):
-            assert m._cached_server_if_current(server_dir, "3.0.1") is None
+            assert m._build_data_version(build_data) is None  # no traceback
+            assert m._cached_server_if_current(server_dir, "3.0.1") == server_dir
 
 
 class TestFinalizeBuildData:
