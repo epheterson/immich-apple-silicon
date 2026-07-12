@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.28 — 2026-07-12
+
+### Fixed
+- **HEIC thumbnails failed on headless Macs** (`Input file contains unsupported image format` on `AssetGenerateThumbnails`): the HEIC decode shim transcoded via Apple's `sips`, but `sips` needs a logged-in GUI (Aqua/WindowServer) session, so in a headless launchd service it silently produced empty output and no HEIC thumbnail was generated. The shim now decodes via libheif (`vips`, already a dependency, then `heif-convert`) as the primary path, which works with no GUI session and matches Docker Immich's own libvips+libde265 output; `sips` remains a last-resort fallback for a logged-in desktop. Each decoder's output is validated before use, and the shim logs which decoders it resolved at startup.
+
 ## 1.5.27 — 2026-07-09
 
 ### Fixed

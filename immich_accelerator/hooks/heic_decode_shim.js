@@ -9,18 +9,28 @@
 // thumbnail is produced (issue #62 follow-up). Docker Immich isn't affected
 // because it builds libvips with libde265.
 //
-// Neither off-the-shelf option works on macOS: forcing Sharp onto Homebrew's
-// system libvips reintroduces the #44 JPEG-detection regression AND still
-// can't decode normal tiled iPhone HEICs (libheif's iref-reference security
-// limit rejects them, 45 refs > 16). Apple's own ImageIO (`sips`) decodes
-// every HEIC — tiled or single — natively and fast, with nothing to build.
-//
 // Fix: preload this module via `NODE_OPTIONS=--require ...` and wrap the
-// `sharp` module export. When Sharp is handed a HEVC-family HEIC file path,
-// we transcode it to a lossless TIFF with `sips` and feed that buffer to the
-// real Sharp instead. Everything else (JPEG, PNG, AVIF, buffers, streams)
-// passes through untouched. Immich's source on disk is never modified — same
-// interposition pattern as the ffmpeg wrapper and the pg_dump shim.
+// `sharp` module export. When Sharp is handed a HEVC-family HEIC file path, we
+// transcode it to a lossless intermediate with an external decoder and feed
+// that buffer to the real Sharp instead. Everything else (JPEG, PNG, AVIF,
+// buffers, streams) passes through untouched. Immich's source on disk is never
+// modified — same interposition pattern as the ffmpeg wrapper and pg_dump shim.
+//
+// Decoder preference (first that yields a valid TIFF wins):
+//   1. libheif via `vips autorot` (Homebrew libvips built WITH libde265) — a
+//      lossless TIFF with EXIF orientation baked into the pixels. This is what
+//      Docker Immich uses (libvips + libde265), so it is the closest output
+//      match, it works fully HEADLESS, and `vips` is a formula dependency so it
+//      is always present.
+//   2. Apple ImageIO via `sips` — also a lossless, orientation-baked TIFF. Fast
+//      and native, but it needs a logged-in GUI (Aqua/WindowServer) session, so
+//      in a headless launchd context it SILENTLY produces empty output. Last
+//      resort, only useful on a logged-in desktop.
+//
+// Both decoders BAKE orientation, so the oriented result is identical whichever
+// runs — a thumbnail (and any ML box computed from it) never depends on the
+// host's decoder set. vips is preferred precisely because sips cannot be relied
+// on in a background service.
 //
 // AVIF is deliberately NOT routed here: Sharp's bundled libheif decodes AVIF
 // (via aom) fine, so we leave those alone.
@@ -32,7 +42,53 @@ const os = require('os');
 const path = require('path');
 const cp = require('child_process');
 
-const SIPS = process.env.IMMICH_ACCELERATOR_SIPS || '/usr/bin/sips';
+// Resolve a decoder binary. An explicit env override is honored VERBATIM: an
+// operator forcing a specific build should fail loudly (a bad path errors on
+// use and falls through to the next decoder, logged) rather than be silently
+// ignored. Otherwise the fixed Homebrew prefixes (Apple Silicon + Intel). No
+// PATH lookup, so only a trusted, fixed location is ever executed.
+function findBin(envVar, candidates) {
+    const override = process.env[envVar];
+    if (override) return override;
+    for (const c of candidates) {
+        if (fs.existsSync(c)) return c;
+    }
+    return null;
+}
+
+const VIPS = findBin('IMMICH_ACCELERATOR_VIPS', [
+    '/opt/homebrew/bin/vips',
+    '/usr/local/bin/vips',
+]);
+const SIPS = findBin('IMMICH_ACCELERATOR_SIPS', ['/usr/bin/sips']);
+
+// Decoders in preference order. Both BAKE EXIF orientation into the pixels
+// (vips `autorot`; sips applies orientation on convert) and write a lossless
+// TIFF, so the oriented result is identical no matter which decoder ran — a
+// thumbnail (and any ML box computed from it) never depends on the host's
+// decoder set. vips (Homebrew libvips built with libde265) is primary: it works
+// headless and matches Docker Immich's own libvips output. sips (Apple ImageIO)
+// is a last-resort desktop fallback that needs a logged-in GUI session, so it
+// silently produces nothing in a headless launchd context.
+const DECODERS = [
+    {
+        name: 'vips',
+        bin: VIPS,
+        args: (input, out) => ['autorot', input, out],
+    },
+    {
+        name: 'sips',
+        bin: SIPS,
+        args: (input, out) => ['-s', 'format', 'tiff', input, '--out', out],
+    },
+];
+
+// One-time startup line so the worker log shows the shim is active and which
+// HEIC decoders it resolved (invaluable when HEIC thumbnails misbehave).
+process.stderr.write(
+    '[immich-accelerator] heic-decode-shim active ' +
+    `(decoders: vips=${VIPS || 'no'}, sips=${SIPS || 'no'})\n`
+);
 
 // Brands that specifically imply HEVC-coded HEIF — what the bundled libheif
 // cannot decode. We match against the major brand AND the compatible-brands
@@ -75,39 +131,73 @@ function isHevcHeicPath(input) {
     return brands !== null && brands.some((b) => HEVC_BRANDS.has(b));
 }
 
-// Decode a HEIC file to a lossless TIFF buffer via Apple's ImageIO. Returns
-// the buffer, or null if sips is unavailable or fails (caller falls back to
-// the original input so behavior is never worse than without the shim).
-function sipsDecodeToBuffer(input) {
-    const tmp = path.join(
-        os.tmpdir(),
-        `iaa-heic-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e9)}.tiff`
+// The decode runs synchronously in the sharp() constructor, so a hung decoder
+// stalls the worker's event loop. Cap the TOTAL time across all decoders (not
+// per-decoder) so trying the fallback can't multiply the worst case.
+const DECODE_BUDGET_MS = 30000;
+
+// A real TIFF starts with "II*\0" (little-endian) or "MM\0*" (big-endian). Both
+// our decoders emit TIFF; requiring the magic rejects an empty or half-written
+// file (e.g. a GUI-less sips) so the next decoder gets a turn instead of feeding
+// Sharp garbage.
+function isTiff(buf) {
+    return (
+        buf.length >= 4 &&
+        ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2a && buf[3] === 0x00) ||
+            (buf[0] === 0x4d && buf[1] === 0x4d && buf[2] === 0x00 && buf[3] === 0x2a))
     );
-    try {
-        cp.execFileSync(SIPS, ['-s', 'format', 'tiff', input, '--out', tmp], {
-            stdio: ['ignore', 'ignore', 'pipe'],
-            // The decode runs synchronously in the sharp() constructor, so this
-            // timeout caps how long a hung sips can stall the worker's event
-            // loop. 30s is generous for a single image yet bounds the worst case.
-            timeout: 30000,
-        });
-        return fs.readFileSync(tmp);
-    } catch (e) {
-        process.stderr.write(
-            `[immich-accelerator] HEIC decode via sips failed for ${input}: ` +
-            `${String((e && e.message) || e).split('\n')[0]}\n`
+}
+
+// Decode a HEIC file to a lossless TIFF buffer, trying each available decoder in
+// preference order until one yields a valid TIFF. Returns the buffer, or null if
+// every decoder is unavailable or fails (caller falls back to the real Sharp, so
+// behavior is never worse than without the shim).
+function decodeToBuffer(input) {
+    const deadline = Date.now() + DECODE_BUDGET_MS;
+    let attempted = 0;
+    for (const dec of DECODERS) {
+        if (!dec.bin) continue;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        attempted += 1;
+        const tmp = path.join(
+            os.tmpdir(),
+            `iaa-heic-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e9)}.tiff`
         );
-        return null;
-    } finally {
-        try { fs.unlinkSync(tmp); } catch (_e) { /* ignore */ }
+        try {
+            cp.execFileSync(dec.bin, dec.args(input, tmp), {
+                stdio: ['ignore', 'ignore', 'pipe'],
+                timeout: remaining,
+            });
+            const buf = fs.readFileSync(tmp);
+            if (isTiff(buf)) return buf;
+            process.stderr.write(
+                `[immich-accelerator] HEIC decode via ${dec.name} produced no ` +
+                `usable output for ${input}; trying next decoder.\n`
+            );
+        } catch (e) {
+            process.stderr.write(
+                `[immich-accelerator] HEIC decode via ${dec.name} failed for ` +
+                `${input}: ${String((e && e.message) || e).split('\n')[0]}\n`
+            );
+        } finally {
+            try { fs.unlinkSync(tmp); } catch (_e) { /* ignore */ }
+        }
     }
+    if (attempted === 0) {
+        process.stderr.write(
+            '[immich-accelerator] No HEIC decoder found (install vips for ' +
+            'headless HEIC support); falling back to Sharp.\n'
+        );
+    }
+    return null;
 }
 
 // Wrap the real Sharp factory so HEVC-HEIC paths are pre-decoded.
 function wrapSharp(realSharp) {
     function sharp(input, options) {
         if (isHevcHeicPath(input)) {
-            const buf = sipsDecodeToBuffer(input);
+            const buf = decodeToBuffer(input);
             if (buf !== null) {
                 return realSharp(buf, options);
             }
