@@ -1408,17 +1408,10 @@ class TestHeicDecodeShim:
         )
         assert result.returncode == 0, f"shim syntax error: {result.stderr}"
 
-    def test_intercepts_sharp_routes_heic_passes_through_others(self, tmp_path):
-        """Functional: with a fake `sharp` module and a stub `sips`, the shim
-        must (a) wrap require('sharp'), (b) hand a Buffer to Sharp for a HEIC
-        path, and (c) pass a non-HEIC path through unchanged."""
-        import shutil
+    # --- functional decoder-chain tests (fake sharp + stub decoders) ---
+    _HEIC_BYTES = bytes([0, 0, 0, 0x18]) + b"ftypheic" + b"\x00\x00\x00\x00mif1heic"
 
-        node = shutil.which("node")
-        if not node:
-            pytest.skip("node not installed")
-
-        # Fake sharp module: reports whether it received a Buffer or a string.
+    def _fake_sharp(self, tmp_path):
         sharp_dir = tmp_path / "node_modules" / "sharp"
         sharp_dir.mkdir(parents=True)
         (sharp_dir / "index.js").write_text(
@@ -1430,61 +1423,113 @@ class TestHeicDecodeShim:
             "module.exports=fakeSharp;\n"
         )
 
-        # Stub sips: writes a dummy file to the --out path and exits 0.
-        sips = tmp_path / "sips_stub.sh"
-        sips.write_text(
-            "#!/bin/bash\n"
-            'while [ "$1" != "--out" ] && [ $# -gt 0 ]; do shift; done\n'
-            "shift\n"
-            'printf DUMMY > "$1"\n'
-        )
-        sips.chmod(0o755)
+    def _stub(self, path_, body):
+        # Decoder stubs: the output path is always the last argument (vips
+        # `autorot in out`, sips `... --out out`).
+        path_.write_text('#!/bin/bash\nout="${@: -1}"\n' + body)
+        path_.chmod(0o755)
 
-        # A real HEVC-HEIC file (ftyp box, major brand 'heic').
-        heic = tmp_path / "photo.heic"
-        heic.write_bytes(
-            bytes([0, 0, 0, 0x18]) + b"ftypheic" + b"\x00\x00\x00\x00mif1heic"
-        )
-        # A non-HEIC file that must pass through untouched.
-        notheic = tmp_path / "plain.jpg"
-        notheic.write_bytes(b"\xff\xd8\xff\xe0not-really-but-not-ftyp")
+    # A minimal little-endian TIFF header (II*\0) — enough for the shim's isTiff
+    # gate; the fake Sharp only checks Buffer-vs-string, not pixels.
+    _TIFF = r'printf "II*\000STUBTIFFDATA" > "$out"' + "\n"
 
+    def _run(self, tmp_path, node, env_extra, argv):
         driver = tmp_path / "driver.js"
         driver.write_text(
             "const sharp=require('sharp');"
             "process.stdout.write('WRAPPED:'+(sharp.__heicShimWrapped===true)+'\\n');"
-            "sharp(process.argv[2]);"
-            "sharp(process.argv[3]);\n"
+            + "".join(f"sharp(process.argv[{i + 2}]);" for i in range(len(argv)))
+            + "\n"
         )
-
-        result = subprocess.run(
-            [
-                node,
-                "--require",
-                str(self.SHIM),
-                str(driver),
-                str(heic),
-                str(notheic),
-            ],
+        env = {"PATH": "/usr/bin:/bin", **env_extra}
+        return subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver), *argv],
             cwd=str(tmp_path),
-            env={
-                "PATH": "/usr/bin:/bin",
-                "IMMICH_ACCELERATOR_SIPS": str(sips),
-            },
+            env=env,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=20,
+        )
+
+    def _node_or_skip(self):
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        return node
+
+    def test_routes_heic_to_vips_and_passes_others_through(self, tmp_path):
+        """HEIC path is decoded to a Buffer via the primary (vips) decoder; a
+        non-HEIC path passes through untouched as a string."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(vips, self._TIFF)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+        notheic = tmp_path / "plain.jpg"
+        notheic.write_bytes(b"\xff\xd8\xff\xe0not-really-but-not-ftyp")
+
+        result = self._run(
+            tmp_path,
+            node,
+            {"IMMICH_ACCELERATOR_VIPS": str(vips)},
+            [str(heic), str(notheic)],
         )
         assert result.returncode == 0, f"driver failed: {result.stderr}"
-        lines = result.stdout.strip().splitlines()
-        assert "WRAPPED:true" in lines, f"shim did not wrap sharp: {lines}"
-        # HEIC first → Buffer (decoded via stub sips); non-HEIC → string passthrough.
-        types = [ln for ln in lines if ln.startswith("INPUT_TYPE:")]
-        assert types == [
-            "INPUT_TYPE:buffer",
-            "INPUT_TYPE:string",
-        ], f"expected heic→buffer, other→string; got {types}\n{result.stdout}"
+        assert "WRAPPED:true" in result.stdout.splitlines()
+        types = [ln for ln in result.stdout.splitlines() if ln.startswith("INPUT_TYPE:")]
+        assert types == ["INPUT_TYPE:buffer", "INPUT_TYPE:string"], result.stdout
 
+    def test_prefers_vips_over_sips(self, tmp_path):
+        """vips (libheif, headless) is tried first; when it succeeds sips is
+        never touched — that is what makes HEIC work without a GUI session."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        vips_used = tmp_path / "vips_used"
+        sips_used = tmp_path / "sips_used"
+        vips = tmp_path / "vips_stub.sh"
+        sips = tmp_path / "sips_stub.sh"
+        self._stub(vips, f"touch {vips_used}\n" + self._TIFF)
+        self._stub(sips, f"touch {sips_used}\n" + self._TIFF)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+
+        result = self._run(
+            tmp_path,
+            node,
+            {"IMMICH_ACCELERATOR_VIPS": str(vips), "IMMICH_ACCELERATOR_SIPS": str(sips)},
+            [str(heic)],
+        )
+        assert result.returncode == 0, f"driver failed: {result.stderr}"
+        assert "INPUT_TYPE:buffer" in result.stdout
+        assert vips_used.exists(), "vips (primary) should have run"
+        assert not sips_used.exists(), "sips must not run when vips succeeds"
+
+    def test_falls_through_to_sips_when_vips_produces_empty(self, tmp_path):
+        """The whole point of the rewrite: a decoder that exits 0 but writes an
+        empty/non-TIFF file (a GUI-less sips, or here a stubbed vips) must be
+        rejected so the next decoder gets a turn."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        sips_used = tmp_path / "sips_used"
+        vips = tmp_path / "vips_stub.sh"
+        sips = tmp_path / "sips_stub.sh"
+        self._stub(vips, ': > "$out"\n')  # exit 0, empty output
+        self._stub(sips, f"touch {sips_used}\n" + self._TIFF)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+
+        result = self._run(
+            tmp_path,
+            node,
+            {"IMMICH_ACCELERATOR_VIPS": str(vips), "IMMICH_ACCELERATOR_SIPS": str(sips)},
+            [str(heic)],
+        )
+        assert result.returncode == 0, f"driver failed: {result.stderr}"
+        assert "INPUT_TYPE:buffer" in result.stdout, result.stdout
+        assert sips_used.exists(), "must fall through to sips when vips output is empty"
 
 class TestPgKeepaliveShim:
     """The pg keepalive shim sets keepAlive on Immich's Postgres connections so
