@@ -136,11 +136,20 @@ jobs:
           # Python fetches PyPI itself (urllib) — don't pipe curl into `python3 -`
           # with a heredoc; the pipe and the heredoc both claim stdin.
           NEWER="$(PIN="$PIN" python3 <<'PY'
-          import json, os, urllib.request
+          import json, os, time, urllib.request
           from packaging.version import Version
           pin = Version(os.environ["PIN"])
-          with urllib.request.urlopen("https://pypi.org/pypi/mlx/json", timeout=30) as r:
-              data = json.load(r)
+          # PyPI occasionally resets the TLS handshake from CI runners; retry so a
+          # transient blip doesn't fail the weekly check.
+          for attempt in range(4):
+              try:
+                  with urllib.request.urlopen("https://pypi.org/pypi/mlx/json", timeout=30) as r:
+                      data = json.load(r)
+                  break
+              except Exception:
+                  if attempt == 3:
+                      raise
+                  time.sleep(5 * (attempt + 1))
           newer = []
           for ver, files in data["releases"].items():
               if not files or all(f.get("yanked") for f in files):
@@ -166,6 +175,7 @@ jobs:
         if: steps.mlx.outputs.newer != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           NEWER: ${{ steps.mlx.outputs.newer }}
         run: |
           set -euo pipefail
