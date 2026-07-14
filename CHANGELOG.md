@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.30 - 2026-07-14
+
+### Fixed
+- **Camera RAW thumbnails failed** (#99): Canon CR2 (and other camera RAW such as Nikon NEF, Sony ARW, Adobe DNG, Fujifilm RAF) died in `AssetGenerateThumbnails` with `tiff2vips: Old-style JPEG compression support is not configured`. Sharp's prebuilt libvips on macOS lacks old-style-JPEG support and has no dcraw/libraw loader, so it cannot read a RAW file's embedded image. The HEIC decode shim now also detects RAW by extension and pre-decodes it via Homebrew `vips` (which has libraw), the same libvips+libraw path Docker Immich uses, before handing the result to Sharp. Works headless; OCR and face are untouched (RAW decode affects thumbnail generation only). Verified on an M4 Mac Mini with a real Canon CR2: bundled Sharp alone fails with the tiff2vips error, and with the shim it produces a valid thumbnail. Closes another macOS-only decode gap after the HEIC fix (v1.5.28). Reported by [@shtefko](https://github.com/shtefko).
+
 ## 1.5.29 - 2026-07-14
 
 ### Changed
