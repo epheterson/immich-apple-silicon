@@ -1426,8 +1426,11 @@ class TestHeicDecodeShim:
 
     def _stub(self, path_, body):
         # Decoder stubs: the output path is always the last argument (vips
-        # `autorot in out`, sips `... --out out`).
-        path_.write_text('#!/bin/bash\nout="${@: -1}"\n' + body)
+        # `autorot in out[compression=deflate]`, sips `... --out out`). vips
+        # accepts a trailing `[options]` suffix on the save target and writes to
+        # the base path; strip it (`[[]` is a glob for a literal `[`) so the stub
+        # writes where the shim reads back.
+        path_.write_text('#!/bin/bash\nout="${@: -1}"\nout="${out%%[[]*}"\n' + body)
         path_.chmod(0o755)
 
     # A minimal little-endian TIFF header (II*\0) — enough for the shim's isTiff
@@ -1561,6 +1564,39 @@ class TestHeicDecodeShim:
             "INPUT_TYPE:buffer",
             "INPUT_TYPE:string",
         ], result.stdout
+
+    def test_strips_nonexistent_vipshome_from_decoder_env(self, tmp_path):
+        """Sharp's prebuilt libvips exports a bogus VIPSHOME (its GitHub-runner
+        build path) into the environment. If the spawned Homebrew vips inherits
+        it, vips looks for its loader modules there, fails ("not a known file
+        format"), and decode silently falls to sips (GUI-only). The shim drops a
+        VIPSHOME pointing at a nonexistent dir but keeps a real one."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        marker = tmp_path / "vipshome_seen"
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(vips, 'echo "[${VIPSHOME-UNSET}]" > ' + str(marker) + '\n' + self._TIFF)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+
+        bogus = tmp_path / "does-not-exist"
+        r = self._run(
+            tmp_path, node,
+            {"IMMICH_ACCELERATOR_VIPS": str(vips), "VIPSHOME": str(bogus)},
+            [str(heic)],
+        )
+        assert r.returncode == 0, r.stderr
+        assert marker.read_text().strip() == "[UNSET]", "nonexistent VIPSHOME must be stripped"
+
+        real = tmp_path / "real-vipshome"
+        real.mkdir()
+        r2 = self._run(
+            tmp_path, node,
+            {"IMMICH_ACCELERATOR_VIPS": str(vips), "VIPSHOME": str(real)},
+            [str(heic)],
+        )
+        assert r2.returncode == 0, r2.stderr
+        assert marker.read_text().strip() == "[" + str(real) + "]", "existing VIPSHOME must be preserved"
 
 class TestPgKeepaliveShim:
     """The pg keepalive shim sets keepAlive on Immich's Postgres connections so

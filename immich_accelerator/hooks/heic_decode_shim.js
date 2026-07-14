@@ -82,8 +82,14 @@ const SIPS = findBin('IMMICH_ACCELERATOR_SIPS', ['/usr/bin/sips']);
 const DECODERS = [
     {
         name: 'vips',
+        // Write the intermediate TIFF with lossless deflate compression. Sharp
+        // ingests the whole file into a Node Buffer, and a camera RAW decodes to
+        // a large frame (tens of MB uncompressed, ~40% smaller deflated), so this
+        // trims peak memory and tmp I/O for no pixel change and negligible CPU
+        // (the decode dominates). The magic bytes are unaffected, so isTiff still
+        // gates it. sips (fallback) has no equivalent option and is left plain.
         bin: VIPS,
-        args: (input, out) => ['autorot', input, out],
+        args: (input, out) => ['autorot', input, `${out}[compression=deflate]`],
     },
     {
         name: 'sips',
@@ -195,6 +201,26 @@ function isTiff(buf) {
     );
 }
 
+// Sharp's prebuilt libvips exports VIPSHOME into the process environment,
+// pointing at the build tree it was compiled in (a GitHub-runner path baked into
+// the binary, e.g. /Users/runner/work/sharp-libvips/...). When we spawn the
+// Homebrew `vips`, it inherits that VIPSHOME and hunts for its loader modules
+// (libheif for HEIC, etc.) under that bogus directory, so the decode fails with
+// "not a known file format" and silently falls back to sips (which needs a GUI
+// session, so it produces nothing headless). If VIPSHOME points at a directory
+// that does not exist, drop it from the child's env so the spawned vips uses its
+// own compiled-in module path. A real, existing VIPSHOME (an intentional
+// operator override) is left untouched.
+function decoderEnv() {
+    const home = process.env.VIPSHOME;
+    if (home && !fs.existsSync(home)) {
+        const env = { ...process.env };
+        delete env.VIPSHOME;
+        return env;
+    }
+    return process.env;
+}
+
 // Decode a HEIC file to a lossless TIFF buffer, trying each available decoder in
 // preference order until one yields a valid TIFF. Returns the buffer, or null if
 // every decoder is unavailable or fails (caller falls back to the real Sharp, so
@@ -215,6 +241,7 @@ function decodeToBuffer(input) {
             cp.execFileSync(dec.bin, dec.args(input, tmp), {
                 stdio: ['ignore', 'ignore', 'pipe'],
                 timeout: remaining,
+                env: decoderEnv(),
             });
             const buf = fs.readFileSync(tmp);
             if (isTiff(buf)) return buf;
