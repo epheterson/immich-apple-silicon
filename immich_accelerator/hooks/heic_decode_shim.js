@@ -243,7 +243,9 @@ function decodeToBuffer(input) {
 // Wrap the real Sharp factory so HEVC-HEIC paths are pre-decoded.
 function wrapSharp(realSharp) {
     function sharp(input, options) {
-        if (isHevcHeicPath(input) || isRawPath(input)) {
+        // isRawPath is a pure string check; isHevcHeicPath reads the ftyp box.
+        // Test the cheap one first so RAW paths route with no filesystem I/O.
+        if (isRawPath(input) || isHevcHeicPath(input)) {
             const buf = decodeToBuffer(input);
             if (buf !== null) {
                 return realSharp(buf, options);
