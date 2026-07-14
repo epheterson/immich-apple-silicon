@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.29 - 2026-07-14
+
+### Changed
+- **Lifted the mlx pin now that 0.31.2's CLIP crash is fixed** (#38): the bundled `immich-ml-metal` fork pinned `mlx>=0.22.0,<0.31.2` because mlx 0.31.2 hard-crashed CLIP inference in the worker's thread pool (`std::runtime_error: There is no Stream(gpu, 0) in current thread`, SIGABRT). mlx 0.32.0 is verified to fix it: 1,800 concurrent CLIP inferences from a 4/8-worker `ThreadPoolExecutor` against real `clip-vit-base-patch32` weights on Apple Silicon, zero aborts. The pin is now `mlx>=0.22.0,!=0.31.2,<0.33.0`, which excludes only the known-bad 0.31.2, allows the verified 0.32.x (currently the sole in-range build), and caps below the untested 0.33 minor. The weekly mlx-pin check now tracks that 0.33.0 ceiling instead of 0.31.2, so it stops nagging about 0.32.0. Blast radius is CLIP only: OCR runs on Apple Vision, face on onnxruntime, neither imports mlx.
+
 ## 1.5.28 — 2026-07-12
 
 ### Fixed

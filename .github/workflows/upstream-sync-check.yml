@@ -11,7 +11,8 @@ name: Upstream sync check
 #   3. Merge to fork main, bump the `ml` submodule, release.
 #
 # Standing patches we always carry forward (must survive every sync):
-#   - mlx>=0.22.0,<0.31.2  (issue #38: CLIP threading crash on mlx 0.31.2)
+#   - mlx>=0.22.0,!=0.31.2,<0.33.0  (issue #38: CLIP threading crash on 0.31.2;
+#     0.32.0 verified fixed, capped below the untested 0.33 minor)
 
 on:
   schedule:
@@ -101,7 +102,7 @@ jobs:
           3. Merge to fork \`main\`, bump the \`ml\` submodule here, cut a release.
 
           Standing patches to carry forward every sync:
-          - \`mlx>=0.22.0,<0.31.2\` (#38 — CLIP threading crash)
+          - \`mlx>=0.22.0,!=0.31.2,<0.33.0\` (#38, CLIP threading crash on 0.31.2)
 
           _Opened automatically by the weekly upstream-sync check; updates in place until synced._
           EOF
@@ -118,27 +119,28 @@ jobs:
           fi
 
   mlx-pin:
-    # Notify when a newer mlx than our `<0.31.2` pin (#38) ships, so we can
-    # re-test and potentially lift the pin. 0.31.2 hard-crashes CLIP inference
-    # in pool threads ("There is no Stream(gpu, 0)"); verified live that even
-    # the per-thread stream initializer doesn't save it, so the pin is the only
-    # protection. As of the last check 0.31.2 was still the latest.
+    # Notify when an mlx at or above our exclusion ceiling (`<0.33.0`) ships, so
+    # we re-test before allowing it. History: 0.31.2 hard-crashed CLIP inference
+    # in pool threads ("There is no Stream(gpu, 0)"); 0.32.0 is verified fixed
+    # (1800 concurrent inferences from a worker pool, no abort), so the pin now
+    # allows 0.32.x and caps below the untested 0.33 minor. This fires the day
+    # 0.33.0+ appears on PyPI.
     runs-on: ubuntu-latest
     env:
-      PIN: "0.31.2" # the excluded version: our pin is mlx < PIN
-      MLX_TITLE: "mlx > 0.31.2 is available — re-test the #38 CLIP pin"
+      CEILING: "0.33.0" # our pin excludes this and up (mlx < CEILING); re-test to raise it
+      MLX_TITLE: "mlx >= 0.33.0 is available, re-test the #38 CLIP pin"
     steps:
-      - name: Check PyPI for mlx newer than the pin
+      - name: Check PyPI for mlx at or above the pin ceiling
         id: mlx
         run: |
           set -euo pipefail
           python3 -m pip install --quiet --disable-pip-version-check packaging
-          # Python fetches PyPI itself (urllib) — don't pipe curl into `python3 -`
-          # with a heredoc; the pipe and the heredoc both claim stdin.
-          NEWER="$(PIN="$PIN" python3 <<'PY'
+          # Python fetches PyPI itself (urllib); don't pipe curl into `python3 -`
+          # with a heredoc, the pipe and the heredoc both claim stdin.
+          NEWER="$(CEILING="$CEILING" python3 <<'PY'
           import json, os, time, urllib.request
           from packaging.version import Version
-          pin = Version(os.environ["PIN"])
+          ceiling = Version(os.environ["CEILING"])
           # PyPI occasionally resets the TLS handshake from CI runners; retry so a
           # transient blip doesn't fail the weekly check.
           for attempt in range(4):
@@ -158,7 +160,7 @@ jobs:
                   v = Version(ver)
               except Exception:
                   continue
-              if v > pin and not v.is_prerelease:
+              if v >= ceiling and not v.is_prerelease:
                   newer.append(v)
           newer.sort()
           print(newer[-1] if newer else "")
@@ -166,9 +168,9 @@ jobs:
           )"
           echo "newer=$NEWER" >> "$GITHUB_OUTPUT"
           if [ -n "$NEWER" ]; then
-            echo "⚠️  mlx $NEWER is available (> $PIN) — pin re-test warranted."
+            echo "⚠️  mlx $NEWER is available (>= $CEILING); pin re-test warranted."
           else
-            echo "✅ No mlx > $PIN yet. Pin stands."
+            echo "✅ No mlx >= $CEILING yet. Pin stands."
           fi
 
       - name: Open or update pin re-test issue
@@ -180,15 +182,15 @@ jobs:
         run: |
           set -euo pipefail
           BODY="$(cat <<EOF
-          A newer mlx than our pin is on PyPI: **$NEWER** (we pin \`mlx>=0.22.0,<$PIN\`, #38).
+          mlx at or above our pin ceiling is on PyPI: **$NEWER** (we pin \`mlx>=0.22.0,!=0.31.2,<$CEILING\`, #38).
 
-          \`mlx==$PIN\` hard-crashes CLIP inference in the worker's thread pool
-          (\`std::runtime_error: There is no Stream(gpu, 0) in current thread\`). Don't lift
-          the pin on faith — **re-test $NEWER first**:
+          History: \`mlx==0.31.2\` hard-crashed CLIP inference in the worker's thread pool
+          (\`std::runtime_error: There is no Stream(gpu, 0) in current thread\`); 0.32.0 is
+          verified fixed. Don't raise the ceiling on faith, **re-test $NEWER first**:
 
           1. python@3.11 venv; \`pip install "mlx==$NEWER" "mlx-clip @ git+https://github.com/harperreed/mlx_clip.git@f56e3ecc72c74c68b6b50eb6f50c3f22fc23fe2c" pillow numpy huggingface-hub\`
-          2. Load \`mlx-community/clip-vit-base-patch32\`, run \`model.model(pixel_values=...)\` + \`np.array(out.image_embeds[0])\` from a \`ThreadPoolExecutor(max_workers=4)\` ~24 times concurrently.
-          3. **Pass = no \`Stream(gpu, 0)\` abort.** If it passes, bump the pin to \`<next-bad\` (or drop it) in the ml fork and re-sync.
+          2. Load \`clip-vit-base-patch32\`, run a CLIP image encode from a \`ThreadPoolExecutor(max_workers=4)\` a few hundred times concurrently.
+          3. **Pass = no \`Stream(gpu, 0)\` abort.** If it passes, raise the ceiling (or drop the cap) in the ml fork \`requirements.txt\` and re-sync the submodule.
 
           _Opened automatically by the weekly mlx-pin check; updates in place until resolved._
           EOF
