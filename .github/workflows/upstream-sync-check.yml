@@ -11,8 +11,9 @@ name: Upstream sync check
 #   3. Merge to fork main, bump the `ml` submodule, release.
 #
 # Standing patches we always carry forward (must survive every sync):
-#   - mlx>=0.22.0,!=0.31.2,<0.33.0  (issue #38: CLIP threading crash on 0.31.2;
-#     0.32.0 verified fixed, capped below the untested 0.33 minor)
+#   - mlx>=0.22.0,<0.31.2  (0.31.1 is the last known-good; both 0.31.2 and 0.32.0
+#     hard-crash CLIP inference, #38 / #103). Re-test any lift with the real-model
+#     gate scripts/ml-preflight.py, never a proxy/STUB_MODE test.
 
 on:
   schedule:
@@ -102,7 +103,7 @@ jobs:
           3. Merge to fork \`main\`, bump the \`ml\` submodule here, cut a release.
 
           Standing patches to carry forward every sync:
-          - \`mlx>=0.22.0,!=0.31.2,<0.33.0\` (#38, CLIP threading crash on 0.31.2)
+          - \`mlx>=0.22.0,<0.31.2\` (#38, #103; CLIP threading crash, 0.31.2 and 0.32.0 both bad)
 
           _Opened automatically by the weekly upstream-sync check; updates in place until synced._
           EOF
@@ -119,28 +120,30 @@ jobs:
           fi
 
   mlx-pin:
-    # Notify when an mlx at or above our exclusion ceiling (`<0.33.0`) ships, so
-    # we re-test before allowing it. History: 0.31.2 hard-crashed CLIP inference
-    # in pool threads ("There is no Stream(gpu, 0)"); 0.32.0 is verified fixed
-    # (1800 concurrent inferences from a worker pool, no abort), so the pin now
-    # allows 0.32.x and caps below the untested 0.33 minor. This fires the day
-    # 0.33.0+ appears on PyPI.
+    # Notify when an mlx newer than the latest KNOWN-BAD (0.32.0) ships, so we
+    # re-test before allowing it. Both 0.31.2 (gpu stream) and 0.32.0 (cpu stream)
+    # hard-crash real CLIP inference in the worker thread pool with "There is no
+    # Stream(...)" (#38, #103). The pin is `mlx>=0.22.0,<0.31.2` (0.31.1, the last
+    # known-good). A re-test MUST run the real /predict service via
+    # scripts/ml-preflight.py, not a proxy: both bad versions pass image_encoder
+    # and STUB_MODE tests yet crash the real service (that is what shipped the
+    # v1.5.29 regression).
     runs-on: ubuntu-latest
     env:
-      CEILING: "0.33.0" # our pin excludes this and up (mlx < CEILING); re-test to raise it
-      MLX_TITLE: "mlx >= 0.33.0 is available, re-test the #38 CLIP pin"
+      LATEST_BAD: "0.32.0" # newest mlx known to crash; nag when something newer ships
+      MLX_TITLE: "mlx > 0.32.0 is available, re-test the CLIP pin (#38, #103)"
     steps:
-      - name: Check PyPI for mlx at or above the pin ceiling
+      - name: Check PyPI for mlx newer than the latest known-bad
         id: mlx
         run: |
           set -euo pipefail
           python3 -m pip install --quiet --disable-pip-version-check packaging
           # Python fetches PyPI itself (urllib); don't pipe curl into `python3 -`
           # with a heredoc, the pipe and the heredoc both claim stdin.
-          NEWER="$(CEILING="$CEILING" python3 <<'PY'
+          NEWER="$(LATEST_BAD="$LATEST_BAD" python3 <<'PY'
           import json, os, time, urllib.request
           from packaging.version import Version
-          ceiling = Version(os.environ["CEILING"])
+          latest_bad = Version(os.environ["LATEST_BAD"])
           # PyPI occasionally resets the TLS handshake from CI runners; retry so a
           # transient blip doesn't fail the weekly check.
           for attempt in range(4):
@@ -160,7 +163,7 @@ jobs:
                   v = Version(ver)
               except Exception:
                   continue
-              if v >= ceiling and not v.is_prerelease:
+              if v > latest_bad and not v.is_prerelease:
                   newer.append(v)
           newer.sort()
           print(newer[-1] if newer else "")
@@ -168,9 +171,9 @@ jobs:
           )"
           echo "newer=$NEWER" >> "$GITHUB_OUTPUT"
           if [ -n "$NEWER" ]; then
-            echo "⚠️  mlx $NEWER is available (>= $CEILING); pin re-test warranted."
+            echo "⚠️  mlx $NEWER is available (> $LATEST_BAD); pin re-test warranted."
           else
-            echo "✅ No mlx >= $CEILING yet. Pin stands."
+            echo "✅ No mlx > $LATEST_BAD yet. Pin stands."
           fi
 
       - name: Open or update pin re-test issue
@@ -182,15 +185,15 @@ jobs:
         run: |
           set -euo pipefail
           BODY="$(cat <<EOF
-          mlx at or above our pin ceiling is on PyPI: **$NEWER** (we pin \`mlx>=0.22.0,!=0.31.2,<$CEILING\`, #38).
+          A newer mlx than the latest known-bad is on PyPI: **$NEWER** (we pin \`mlx>=0.22.0,<0.31.2\`, i.e. 0.31.1; #38, #103).
 
-          History: \`mlx==0.31.2\` hard-crashed CLIP inference in the worker's thread pool
-          (\`std::runtime_error: There is no Stream(gpu, 0) in current thread\`); 0.32.0 is
-          verified fixed. Don't raise the ceiling on faith, **re-test $NEWER first**:
+          Both \`mlx==0.31.2\` (\`Stream(gpu, 0)\`) and \`mlx==0.32.0\` (\`Stream(cpu, 1)\`) hard-crash real CLIP inference in the worker thread pool. **Do NOT lift the pin on a proxy test** — a \`STUB_MODE\` test or a bare \`mlx_clip.image_encoder\` loop passes on both bad versions; only the real service crashes (this is what shipped the v1.5.29 regression, #103).
 
-          1. python@3.11 venv; \`pip install "mlx==$NEWER" "mlx-clip @ git+https://github.com/harperreed/mlx_clip.git@f56e3ecc72c74c68b6b50eb6f50c3f22fc23fe2c" pillow numpy huggingface-hub\`
-          2. Load \`clip-vit-base-patch32\`, run a CLIP image encode from a \`ThreadPoolExecutor(max_workers=4)\` a few hundred times concurrently.
-          3. **Pass = no \`Stream(gpu, 0)\` abort.** If it passes, raise the ceiling (or drop the cap) in the ml fork \`requirements.txt\` and re-sync the submodule.
+          Re-test **$NEWER** with the real-model gate on Apple Silicon:
+
+          1. Build a full ml venv (fork \`requirements.txt\`) with \`mlx==$NEWER\` \`mlx-metal==$NEWER\`.
+          2. \`python3 scripts/ml-preflight.py --python <venv>/bin/python3 --src <immich-ml-metal checkout>\` — it boots the real service (\`STUB_MODE=false\`) and hammers \`/predict\` with concurrent CLIP inference.
+          3. **Pass = exit 0, service alive, no \`Stream(...)\` abort.** Only then bump the pin in the ml fork \`requirements.txt\` and re-sync the submodule.
 
           _Opened automatically by the weekly mlx-pin check; updates in place until resolved._
           EOF
