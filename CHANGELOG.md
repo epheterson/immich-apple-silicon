@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.30 - 2026-07-14
+
+### Fixed
+- **Camera RAW thumbnails failed** (#99): Canon CR2 (and other camera RAW such as Nikon NEF, Sony ARW, Adobe DNG, Fujifilm RAF) died in `AssetGenerateThumbnails` with `tiff2vips: Old-style JPEG compression support is not configured`. Sharp's prebuilt libvips on macOS lacks old-style-JPEG support and has no dcraw/libraw loader, so it cannot read a RAW file's embedded image. The HEIC decode shim now also detects RAW by extension and pre-decodes it via Homebrew `vips` (fuller libtiff/libjpeg for TIFF-based RAW like CR2/NEF/ARW/DNG, plus libraw for the rest), the same libvips Docker Immich uses, before handing the result to Sharp. Works headless; OCR and face are untouched (RAW decode affects thumbnail generation only). Verified on an M4 Mac Mini with a real Canon CR2: bundled Sharp alone fails with the tiff2vips error, and with the shim it produces a valid thumbnail. Closes another macOS-only decode gap after the HEIC fix (v1.5.28). Reported by [@shtefko](https://github.com/shtefko).
+- **Headless HEIC decode was silently falling back to `sips`**: Sharp's prebuilt libvips exports a bogus `VIPSHOME` (the GitHub-runner path it was built in, e.g. `/Users/runner/work/sharp-libvips/...`) into the process environment when it loads. The decode shim spawned the Homebrew `vips` with that inherited `VIPSHOME`, so `vips` looked for its loader modules (libheif for HEIC, the RAW loaders) in a nonexistent directory and failed with `VipsForeignLoad: ... is not a known file format`, falling back to Apple's `sips`. Because `sips` needs a logged-in GUI session, on a headless Mac the primary `vips` path (the entire point of the v1.5.28 HEIC fix) never actually ran, so HEIC thumbnails quietly depended on a desktop session. The shim now drops a `VIPSHOME` that points at a nonexistent directory before spawning a decoder, so `vips` uses its own compiled-in module path and decodes HEIC and RAW headless as intended; an intentional, existing `VIPSHOME` is preserved. Surfaced while adding RAW support and verified on a headless M4 Mac Mini (HEIC now decodes via `vips`, not `sips`).
+
+### Performance
+- The `vips` decode intermediate is now written as a lossless deflate-compressed TIFF (roughly 40% smaller than uncompressed) to trim peak memory and temp I/O when decoding large RAW frames. Pixels are unchanged; Sharp reads the deflate TIFF the same way.
+
 ## 1.5.29 - 2026-07-14
 
 ### Changed

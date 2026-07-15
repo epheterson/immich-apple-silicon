@@ -1379,9 +1379,10 @@ class TestDashboardStartsInFreshVenv:
 
 
 class TestHeicDecodeShim:
-    """The HEIC decode shim (issue #62 follow-up) interposes on require('sharp')
-    to route HEVC-HEIC paths through Apple's ImageIO. These guard the JS logic
-    without needing real Sharp/sips (the real decode is verified on-device)."""
+    """The HEIC/RAW decode shim (issues #62, #99) interposes on require('sharp')
+    to route HEVC-HEIC paths (by ftyp brand) and camera-RAW paths (by extension)
+    through Homebrew libvips. These guard the JS logic without needing real
+    Sharp/vips (the real decode is verified on-device)."""
 
     SHIM = REPO_ROOT / "immich_accelerator" / "hooks" / "heic_decode_shim.js"
 
@@ -1425,8 +1426,11 @@ class TestHeicDecodeShim:
 
     def _stub(self, path_, body):
         # Decoder stubs: the output path is always the last argument (vips
-        # `autorot in out`, sips `... --out out`).
-        path_.write_text('#!/bin/bash\nout="${@: -1}"\n' + body)
+        # `autorot in out[compression=deflate]`, sips `... --out out`). vips
+        # accepts a trailing `[options]` suffix on the save target and writes to
+        # the base path; strip it (`[[]` is a glob for a literal `[`) so the stub
+        # writes where the shim reads back.
+        path_.write_text('#!/bin/bash\nout="${@: -1}"\nout="${out%%[[]*}"\n' + body)
         path_.chmod(0o755)
 
     # A minimal little-endian TIFF header (II*\0) — enough for the shim's isTiff
@@ -1530,6 +1534,69 @@ class TestHeicDecodeShim:
         assert result.returncode == 0, f"driver failed: {result.stderr}"
         assert "INPUT_TYPE:buffer" in result.stdout, result.stdout
         assert sips_used.exists(), "must fall through to sips when vips output is empty"
+
+    def test_routes_raw_by_extension_and_leaves_ordinary_tiff_alone(self, tmp_path):
+        """Camera RAW is matched by EXTENSION (issue #99): a .cr2/.nef path is
+        decoded to a Buffer via vips, while an ordinary .tif (which Sharp handles
+        natively) passes through untouched as a string. Guards against the
+        extension set over-matching plain TIFFs."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(vips, self._TIFF)
+        cr2 = tmp_path / "photo.cr2"
+        cr2.write_bytes(b"content-irrelevant-extension-is-what-matters")
+        nef = tmp_path / "photo.nef"
+        nef.write_bytes(b"II*\x00whatever")
+        plain_tif = tmp_path / "scan.tif"
+        plain_tif.write_bytes(b"II*\x00ordinary-tiff-sharp-handles-this")
+
+        result = self._run(
+            tmp_path,
+            node,
+            {"IMMICH_ACCELERATOR_VIPS": str(vips)},
+            [str(cr2), str(nef), str(plain_tif)],
+        )
+        assert result.returncode == 0, f"driver failed: {result.stderr}"
+        types = [ln for ln in result.stdout.splitlines() if ln.startswith("INPUT_TYPE:")]
+        assert types == [
+            "INPUT_TYPE:buffer",
+            "INPUT_TYPE:buffer",
+            "INPUT_TYPE:string",
+        ], result.stdout
+
+    def test_strips_nonexistent_vipshome_from_decoder_env(self, tmp_path):
+        """Sharp's prebuilt libvips exports a bogus VIPSHOME (its GitHub-runner
+        build path) into the environment. If the spawned Homebrew vips inherits
+        it, vips looks for its loader modules there, fails ("not a known file
+        format"), and decode silently falls to sips (GUI-only). The shim drops a
+        VIPSHOME pointing at a nonexistent dir but keeps a real one."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        marker = tmp_path / "vipshome_seen"
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(vips, 'echo "[${VIPSHOME-UNSET}]" > ' + str(marker) + '\n' + self._TIFF)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+
+        bogus = tmp_path / "does-not-exist"
+        r = self._run(
+            tmp_path, node,
+            {"IMMICH_ACCELERATOR_VIPS": str(vips), "VIPSHOME": str(bogus)},
+            [str(heic)],
+        )
+        assert r.returncode == 0, r.stderr
+        assert marker.read_text().strip() == "[UNSET]", "nonexistent VIPSHOME must be stripped"
+
+        real = tmp_path / "real-vipshome"
+        real.mkdir()
+        r2 = self._run(
+            tmp_path, node,
+            {"IMMICH_ACCELERATOR_VIPS": str(vips), "VIPSHOME": str(real)},
+            [str(heic)],
+        )
+        assert r2.returncode == 0, r2.stderr
+        assert marker.read_text().strip() == "[" + str(real) + "]", "existing VIPSHOME must be preserved"
 
 class TestPgKeepaliveShim:
     """The pg keepalive shim sets keepAlive on Immich's Postgres connections so

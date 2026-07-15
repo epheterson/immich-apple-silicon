@@ -1,20 +1,29 @@
 // heic_decode_shim.js
 //
-// Runtime interposition for HEIC decoding in Immich's media pipeline.
+// Runtime interposition for HEIC and camera-RAW decoding in Immich's media
+// pipeline.
 //
-// The native worker uses Sharp's prebuilt libvips (8.17.x), whose bundled
-// libheif is compiled WITHOUT an HEVC decoder — it supports AVIF only. So
-// every HEIC original (the default iPhone format) fails to decode with a
-// "bad seek" / "compression format has not been built in" error, and no
-// thumbnail is produced (issue #62 follow-up). Docker Immich isn't affected
-// because it builds libvips with libde265.
+// The native worker uses Sharp's prebuilt libvips (8.17.x). Two format families
+// it cannot decode on macOS, both of which Docker Immich handles fine:
+//
+//   1. HEVC-HEIC (the default iPhone format): Sharp's bundled libheif is
+//      compiled WITHOUT an HEVC decoder (AVIF only), so every HEIC original
+//      fails with "bad seek" / "compression format has not been built in" and
+//      no thumbnail is produced (issue #62). Docker builds libvips with
+//      libde265, so it is unaffected.
+//   2. Camera RAW (Canon CR2/CR3, Nikon NEF, Sony ARW, Adobe DNG, and friends):
+//      Sharp's bundled libtiff/libjpeg lack old-style-JPEG support and it has no
+//      dcraw/libraw loader, so a CR2 dies in AssetGenerateThumbnails with
+//      "tiff2vips: Old-style JPEG compression support is not configured"
+//      (issue #99). Docker's libvips (fuller libtiff plus libraw) reads it.
 //
 // Fix: preload this module via `NODE_OPTIONS=--require ...` and wrap the
-// `sharp` module export. When Sharp is handed a HEVC-family HEIC file path, we
-// transcode it to a lossless intermediate with an external decoder and feed
-// that buffer to the real Sharp instead. Everything else (JPEG, PNG, AVIF,
-// buffers, streams) passes through untouched. Immich's source on disk is never
-// modified — same interposition pattern as the ffmpeg wrapper and pg_dump shim.
+// `sharp` module export. When Sharp is handed a HEVC-HEIC or camera-RAW file
+// path, we transcode it to a lossless TIFF with Homebrew's fuller libvips and
+// feed that buffer to the real Sharp instead. Everything else (JPEG, PNG, AVIF,
+// ordinary TIFF, buffers, streams) passes through untouched. Immich's source on
+// disk is never modified, the same interposition pattern as the ffmpeg wrapper
+// and pg_dump shim.
 //
 // Decoder preference (first that yields a valid TIFF wins):
 //   1. libheif via `vips autorot` (Homebrew libvips built WITH libde265) — a
@@ -73,8 +82,14 @@ const SIPS = findBin('IMMICH_ACCELERATOR_SIPS', ['/usr/bin/sips']);
 const DECODERS = [
     {
         name: 'vips',
+        // Write the intermediate TIFF with lossless deflate compression. Sharp
+        // ingests the whole file into a Node Buffer, and a camera RAW decodes to
+        // a large frame (tens of MB uncompressed, ~40% smaller deflated), so this
+        // trims peak memory and tmp I/O for no pixel change and negligible CPU
+        // (the decode dominates). The magic bytes are unaffected, so isTiff still
+        // gates it. sips (fallback) has no equivalent option and is left plain.
         bin: VIPS,
-        args: (input, out) => ['autorot', input, out],
+        args: (input, out) => ['autorot', input, `${out}[compression=deflate]`],
     },
     {
         name: 'sips',
@@ -86,7 +101,7 @@ const DECODERS = [
 // One-time startup line so the worker log shows the shim is active and which
 // HEIC decoders it resolved (invaluable when HEIC thumbnails misbehave).
 process.stderr.write(
-    '[immich-accelerator] heic-decode-shim active ' +
+    '[immich-accelerator] heic/raw decode shim active ' +
     `(decoders: vips=${VIPS || 'no'}, sips=${SIPS || 'no'})\n`
 );
 
@@ -131,6 +146,44 @@ function isHevcHeicPath(input) {
     return brands !== null && brands.some((b) => HEVC_BRANDS.has(b));
 }
 
+// Camera-RAW extensions that Sharp's bundled libvips cannot decode on macOS
+// (its libtiff/libjpeg lack old-style-JPEG support and it has no dcraw/libraw
+// loader) but Homebrew libvips can. RAW is matched by EXTENSION, not magic:
+// most RAW containers are TIFF-based, so their magic bytes don't reliably
+// separate them from an ordinary TIFF that Sharp already handles. Routing these
+// through `vips autorot` mirrors Docker Immich's own libvips+libraw path; if a
+// file with one of these extensions is not actually decodable RAW, the decoder
+// fails the TIFF check and we fall back to the real Sharp (no worse than now).
+// Generic `.raw` is intentionally omitted: it is too ambiguous (also raw audio,
+// disk images, etc.) to intercept safely.
+const RAW_EXTS = new Set([
+    'cr2', 'cr3', 'crw',          // Canon
+    'nef', 'nrw',                 // Nikon
+    'arw', 'sr2', 'srf',          // Sony
+    'raf',                        // Fujifilm
+    'orf', 'ori',                 // Olympus
+    'rw2',                        // Panasonic
+    'pef',                        // Pentax
+    'dng',                        // Adobe / generic
+    'rwl',                        // Leica
+    'dcr', 'kdc', 'k25',          // Kodak
+    'mrw',                        // Minolta
+    'x3f',                        // Sigma
+    '3fr', 'fff',                 // Hasselblad
+    'mos', 'iiq',                 // Leaf / Phase One
+    'erf',                        // Epson
+    'mef',                        // Mamiya
+    'mdc',                        // Minolta / Agfa
+    'ari', 'cap',                 // Arri / others
+]);
+
+function isRawPath(input) {
+    if (typeof input !== 'string' || input.length === 0) return false;
+    const dot = input.lastIndexOf('.');
+    if (dot < 0) return false;
+    return RAW_EXTS.has(input.slice(dot + 1).toLowerCase());
+}
+
 // The decode runs synchronously in the sharp() constructor, so a hung decoder
 // stalls the worker's event loop. Cap the TOTAL time across all decoders (not
 // per-decoder) so trying the fallback can't multiply the worst case.
@@ -146,6 +199,26 @@ function isTiff(buf) {
         ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2a && buf[3] === 0x00) ||
             (buf[0] === 0x4d && buf[1] === 0x4d && buf[2] === 0x00 && buf[3] === 0x2a))
     );
+}
+
+// Sharp's prebuilt libvips exports VIPSHOME into the process environment,
+// pointing at the build tree it was compiled in (a GitHub-runner path baked into
+// the binary, e.g. /Users/runner/work/sharp-libvips/...). When we spawn the
+// Homebrew `vips`, it inherits that VIPSHOME and hunts for its loader modules
+// (libheif for HEIC, etc.) under that bogus directory, so the decode fails with
+// "not a known file format" and silently falls back to sips (which needs a GUI
+// session, so it produces nothing headless). If VIPSHOME points at a directory
+// that does not exist, drop it from the child's env so the spawned vips uses its
+// own compiled-in module path. A real, existing VIPSHOME (an intentional
+// operator override) is left untouched.
+function decoderEnv() {
+    const home = process.env.VIPSHOME;
+    if (home && !fs.existsSync(home)) {
+        const env = { ...process.env };
+        delete env.VIPSHOME;
+        return env;
+    }
+    return process.env;
 }
 
 // Decode a HEIC file to a lossless TIFF buffer, trying each available decoder in
@@ -168,6 +241,7 @@ function decodeToBuffer(input) {
             cp.execFileSync(dec.bin, dec.args(input, tmp), {
                 stdio: ['ignore', 'ignore', 'pipe'],
                 timeout: remaining,
+                env: decoderEnv(),
             });
             const buf = fs.readFileSync(tmp);
             if (isTiff(buf)) return buf;
@@ -186,8 +260,8 @@ function decodeToBuffer(input) {
     }
     if (attempted === 0) {
         process.stderr.write(
-            '[immich-accelerator] No HEIC decoder found (install vips for ' +
-            'headless HEIC support); falling back to Sharp.\n'
+            '[immich-accelerator] No HEIC/RAW decoder found (install vips for ' +
+            'headless HEIC and camera-RAW support); falling back to Sharp.\n'
         );
     }
     return null;
@@ -196,7 +270,9 @@ function decodeToBuffer(input) {
 // Wrap the real Sharp factory so HEVC-HEIC paths are pre-decoded.
 function wrapSharp(realSharp) {
     function sharp(input, options) {
-        if (isHevcHeicPath(input)) {
+        // isRawPath is a pure string check; isHevcHeicPath reads the ftyp box.
+        // Test the cheap one first so RAW paths route with no filesystem I/O.
+        if (isRawPath(input) || isHevcHeicPath(input)) {
             const buf = decodeToBuffer(input);
             if (buf !== null) {
                 return realSharp(buf, options);

@@ -3873,10 +3873,11 @@ def cmd_start(args):
             f"{existing} {require_arg}".strip() if existing else require_arg
         )
 
-    # HEIC decode shim (issue #62 follow-up): Sharp's prebuilt libvips ships
-    # without an HEVC decoder (AVIF-only), so iPhone HEICs fail to decode and
-    # never get thumbnails. This preload wraps the `sharp` module to route
-    # HEVC-HEIC file paths through Apple's ImageIO (`sips`) before Sharp.
+    # HEIC + camera-RAW decode shim (issues #62, #99): Sharp's prebuilt libvips
+    # ships without an HEVC decoder (AVIF-only) and without a dcraw/libraw
+    # loader, so iPhone HEICs and Canon/Nikon/Sony RAW files fail to decode and
+    # never get thumbnails. This preload wraps the `sharp` module to route those
+    # file paths through Homebrew libvips (to a lossless TIFF) before Sharp.
     # Same --require interposition; Immich's source on disk is untouched.
     heic_shim = Path(__file__).parent / "hooks" / "heic_decode_shim.js"
     if heic_shim.exists():
