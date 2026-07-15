@@ -20,6 +20,12 @@
 - Use Playwright for dashboard screenshots.
 - Check processing progress via the Immich API, not assumptions.
 
+### mlx / ML changes require the real-model preflight gate (NON-NEGOTIABLE)
+
+Any change to the mlx pin or the `ml` submodule MUST pass `scripts/ml-preflight.py` on real Apple Silicon before merge. The gate boots the actual ML service with `STUB_MODE=false` and hammers `/predict` with real concurrent CLIP inference, then detects the SIGABRT.
+
+A green unit test, a `STUB_MODE=true` test (the fork's own `test_predict.py`), or a bare `mlx_clip.image_encoder` loop is **NOT** sufficient and does **NOT** count as validation. mlx 0.31.2 (gpu-stream) and 0.32.0 (cpu-stream) both pass those proxies yet hard-crash the real `/predict` service (#38, #103). Proxy validation is exactly what shipped the v1.5.29 regression that broke users' ML. Run the real gate, or do not ship the change.
+
 ## Immich compatibility
 
 - Use jellyfin-ffmpeg (same as Docker). Don't patch Homebrew ffmpeg.
