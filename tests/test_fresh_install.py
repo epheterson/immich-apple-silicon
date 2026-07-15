@@ -1035,7 +1035,7 @@ class TestKillStaleProcessesPattern:
     def test_stale_worker_regex_matches_canonical_worker(self):
         cmd = (
             "/opt/homebrew/opt/node@22/bin/node "
-            "/Users/elp/.immich-accelerator/server/2.7.4/dist/main.js"
+            "/Users/someone/.immich-accelerator/server/2.7.4/dist/main.js"
         )
         assert _STALE_WORKER_RE.search(cmd)
 
@@ -1046,7 +1046,7 @@ class TestKillStaleProcessesPattern:
         assert not _STALE_WORKER_RE.search("docker compose ... immich-e2e-stack")
 
     def test_stale_ml_regex_matches_canonical_ml(self):
-        cmd = "/Users/elp/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main"
+        cmd = "/Users/someone/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main"
         assert _STALE_ML_RE.search(cmd)
 
     def test_stale_ml_regex_rejects_prefix_collision(self):
@@ -1062,11 +1062,11 @@ class TestKillStaleProcessesPattern:
             (
                 1001,
                 "/opt/homebrew/opt/node@22/bin/node "
-                "/Users/elp/.immich-accelerator/server/2.7.4/dist/main.js",
+                "/Users/someone/.immich-accelerator/server/2.7.4/dist/main.js",
             ),
             (
                 1002,
-                "/Users/elp/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main",
+                "/Users/someone/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main",
             ),
         ]
         killed = self._run(rows)
@@ -1085,7 +1085,7 @@ class TestKillStaleProcessesPattern:
             (
                 2001,
                 "/opt/homebrew/opt/node@22/bin/node "
-                "/Users/elp/.immich-accelerator/server/2.7.4/dist/main.js",
+                "/Users/someone/.immich-accelerator/server/2.7.4/dist/main.js",
             ),
         ]
         killed = self._run(rows, tracked={"worker": 2001})
@@ -1101,8 +1101,8 @@ class TestKillStaleProcessesPattern:
             (3001, "tart run --no-graphics immich-test-run-20260415-011735"),
             (
                 3002,
-                "/Users/elp/.orbstack/bin/docker compose -f "
-                "/Users/elp/Repos/immich-apple-silicon/scripts/e2e-stack.yml up -d",
+                "/Users/someone/.orbstack/bin/docker compose -f "
+                "/Users/someone/Repos/immich-apple-silicon/scripts/e2e-stack.yml up -d",
             ),
             (
                 3003,
@@ -1112,7 +1112,7 @@ class TestKillStaleProcessesPattern:
             (3004, "ssh -i /tmp/iac-e2e-key admin@192.168.64.38"),
             (
                 3005,
-                "rsync -az /Users/elp/Repos/immich-apple-silicon/"
+                "rsync -az /Users/someone/Repos/immich-apple-silicon/"
                 "immich_accelerator admin@192.168.64.38:/tmp/iac-src/",
             ),
             (3006, "/opt/homebrew/bin/python3 /tmp/drift_check.py"),
@@ -1131,11 +1131,11 @@ class TestKillStaleProcessesPattern:
             (
                 4001,
                 "/opt/homebrew/opt/node@22/bin/node "
-                "/Users/elp/.immich-accelerator/server/2.7.4/dist/main.js",
+                "/Users/someone/.immich-accelerator/server/2.7.4/dist/main.js",
             ),
             (
                 4002,
-                "/Users/elp/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main",
+                "/Users/someone/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main",
             ),
             # Harness + noise — all must survive
             (4101, "tart run --no-graphics immich-test-run-20260415-011735"),
