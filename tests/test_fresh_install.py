@@ -1239,20 +1239,26 @@ class TestNodeVersionPreflight:
         assert err  # we want actionable stderr back
 
     def test_formula_template_pins_node_22(self):
-        """Static check: the CI-generated Homebrew formula must pin
-        node@22. A regression to `depends_on "node"` re-ships the bug.
+        """Static check: the generated Homebrew formula must pin node@22.
+        A regression to `depends_on "node"` re-ships the mainline-node bug.
         """
-        template = (
-            REPO_ROOT / ".github" / "workflows" / "update-homebrew.yml"
-        ).read_text()
+        template = (REPO_ROOT / "scripts" / "render-formula.sh").read_text()
         assert 'depends_on "node@22"' in template, (
-            "Formula template must pin node@22 — "
-            '`depends_on "node"` pulls mainline which breaks sharp.'
+            "Formula renderer must pin node@22; "
+            'depends_on "node" pulls mainline which breaks sharp.'
         )
-        # And the bare version must be GONE — no lingering duplicate.
-        # (Count occurrences to allow the pinned form to exist alongside
-        # comments that mention "node" as text.)
+        # And the bare version must be GONE, no lingering duplicate.
         assert 'depends_on "node"\n' not in template
+
+    def test_formula_renderer_has_no_backticks(self):
+        """The formula is emitted through an UNQUOTED bash heredoc, where a
+        backtick or $( ) is command substitution that injects shell output into
+        the generated formula and corrupts it (a bug that reached #106 before CI
+        caught it). Keep the heredoc body free of both."""
+        script = (REPO_ROOT / "scripts" / "render-formula.sh").read_text()
+        body = script[script.index("cat >"):]
+        assert "`" not in body, "no backticks in the formula heredoc (command substitution)"
+        assert "$(" not in body, "no $( ) in the formula heredoc (command substitution)"
 
     def test_find_node_prefers_node_22_keg(self):
         """find_node must prefer /opt/homebrew/opt/node@22/bin/node

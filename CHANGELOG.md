@@ -1,12 +1,17 @@
 # Changelog
 
+## 1.5.32 - 2026-07-15
+
+### Fixed
+- **Install could silently ship a broken ML venv** (#17, #105): the dashboard (`uvicorn`) and the ML service (`fastapi`) both run out of one venv built in the formula's `post_install`. If that `pip install` partially failed (typically a flaky connection on the large `torch` download that `mlx_clip` pulls in), the venv existed but was missing packages, and nothing caught it, so the CLI reported the new version while the dashboard and ML crashed at runtime with `ModuleNotFoundError: No module named 'uvicorn'` / `'fastapi'`. The formula now (1) retries the dependency install a couple of times so a transient network blip self-recovers, and (2) verifies `fastapi`, `uvicorn`, `mlx`, and the dashboard app actually import after install, failing the install loudly (pointing at `brew reinstall immich-accelerator`) instead of shipping a half-working setup. If you hit this on 1.5.31, `brew reinstall immich-accelerator` rebuilds the venv. Reported by [@jhoogeboom](https://github.com/jhoogeboom) and [@yz47](https://github.com/yz47).
+
 ## 1.5.31 - 2026-07-15
 
 ### Fixed
 - **Reverted the mlx pin lift: mlx 0.32.0 also crashes CLIP** (#103). v1.5.29 lifted `mlx>=0.22.0,<0.31.2` to allow 0.32.0 after a re-test that only exercised `mlx_clip.image_encoder` directly. That was insufficient: the real ML service `/predict` path hard-crashes under 0.32.0 with `std::runtime_error: There is no Stream(cpu, 1) in current thread` (the CPU-stream analogue of 0.31.2's #38 gpu-stream crash), on multiple Macs. The pin is back to `mlx>=0.22.0,<0.31.2` (resolves to 0.31.1, the last known-good). Run `brew upgrade immich-accelerator`; if you were on 1.5.29/1.5.30 with ML failing, this restores it. Reported by [@shtefko](https://github.com/shtefko).
 
 ### Added
-- **`scripts/ml-preflight.py` — a real-model gate for mlx/ML changes.** It boots the actual ML service with `STUB_MODE=false` and hammers `/predict` with concurrent real CLIP inference, detecting the SIGABRT that a `STUB_MODE` test or an `image_encoder`-only loop misses. Verified it fails on mlx 0.32.0 (captures the `Stream(cpu, 1)` abort) and passes on 0.31.1. The mlx pin and the `ml` submodule are now gated on this on Apple Silicon (see CLAUDE.md), and the weekly mlx-pin check points re-tests at it. This is the gap that let the v1.5.29 regression ship.
+- **`scripts/ml-preflight.py`, a real-model gate for mlx/ML changes.** It boots the actual ML service with `STUB_MODE=false` and hammers `/predict` with concurrent real CLIP inference, detecting the SIGABRT that a `STUB_MODE` test or an `image_encoder`-only loop misses. Verified it fails on mlx 0.32.0 (captures the `Stream(cpu, 1)` abort) and passes on 0.31.1. The mlx pin and the `ml` submodule are now gated on this on Apple Silicon (see CLAUDE.md), and the weekly mlx-pin check points re-tests at it. This is the gap that let the v1.5.29 regression ship.
 
 ## 1.5.30 - 2026-07-14
 
