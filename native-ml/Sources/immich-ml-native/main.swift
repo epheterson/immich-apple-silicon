@@ -1,0 +1,84 @@
+import Foundation
+import MLX
+
+// Native Swift ML service prototype: CLIP (mlx-swift) + OCR + face-detect (Vision).
+// Proves the whole ML compute layer can be native — no Python, no venv, no torch.
+
+MLX.Device.setDefault(device: Device(.cpu))   // CPU backend; GPU also works with mlx.metallib present
+
+// --- CLIP text parity harness: encode phrases, dump ids + embeddings for cosine check ---
+if CommandLine.arguments.contains("texttest") {
+    let dir = "/tmp/mlx032test/clipmodel"
+    let tk = CLIPTokenizer(modelDir: dir)
+    let te = CLIPText(modelDir: dir, tokenizer: tk)
+    let phrases = try! JSONSerialization.jsonObject(
+        with: Data(contentsOf: URL(fileURLWithPath: "/tmp/clip_text_phrases.json"))) as! [String]
+    var out = Data()
+    for p in phrases {
+        print("IDS \(p): \(tk.encode(p))")
+        let e = te.encode(p)
+        e.withUnsafeBytes { out.append(contentsOf: $0) }
+    }
+    try! out.write(to: URL(fileURLWithPath: "/tmp/clip_text_swift.f32"))
+    print("wrote \(phrases.count) text embeddings")
+    exit(0)
+}
+
+// --- Face-align parity harness: align /tmp/face_test.jpg with Python's landmarks ---
+if CommandLine.arguments.contains("aligntest") {
+    guard let cg = loadCGImage("/tmp/face_test.jpg") else { fatalError("no face image") }
+    let (rgb, w, h) = rgbBuffer(cg)
+    let raw = try! JSONSerialization.jsonObject(
+        with: Data(contentsOf: URL(fileURLWithPath: "/tmp/face_landmarks.json"))) as! [[Any]]
+    let lm = raw.map { $0.map { ($0 as! NSNumber).doubleValue } }
+    let aligned = FaceAlign.normCrop(rgb: rgb, w: w, h: h, landmarks: lm)
+    try! Data(aligned).write(to: URL(fileURLWithPath: "/tmp/face_aligned_swift.rgb"))
+    print("wrote aligned 112x112 rgb (img \(w)x\(h), \(lm.count) landmarks)")
+    exit(0)
+}
+
+// --- Same-pixel align isolation: align cv2-decoded source, so only warp math differs ---
+if CommandLine.arguments.contains("aligntest2") {
+    let dims = try! JSONSerialization.jsonObject(
+        with: Data(contentsOf: URL(fileURLWithPath: "/tmp/face_src_dims.json"))) as! [Any]
+    let w = (dims[0] as! NSNumber).intValue, h = (dims[1] as! NSNumber).intValue
+    let rgb = [UInt8](try! Data(contentsOf: URL(fileURLWithPath: "/tmp/face_src_rgb.bin")))
+    let raw = try! JSONSerialization.jsonObject(
+        with: Data(contentsOf: URL(fileURLWithPath: "/tmp/face_landmarks.json"))) as! [[Any]]
+    let lm = raw.map { $0.map { ($0 as! NSNumber).doubleValue } }
+    let aligned = FaceAlign.normCrop(rgb: rgb, w: w, h: h, landmarks: lm)
+    try! Data(aligned).write(to: URL(fileURLWithPath: "/tmp/face_aligned_swift2.rgb"))
+    print("wrote aligned from cv2-decoded source (\(w)x\(h))")
+    exit(0)
+}
+
+let MODEL = "/tmp/mlx032test/clipmodel"
+let clip = CLIPEncoder(modelDir: MODEL)
+print("[native-ml] CLIP model loaded from \(MODEL)")
+
+func selfTest() {
+    if let cg = loadCGImage("/tmp/clip_testimg.png") {
+        let e = clip.embed(cg)
+        let l2 = sqrt(e.map { $0 * $0 }.reduce(0, +))
+        print("CLIP  : dim=\(e.count) L2=\(String(format: "%.5f", l2)) first3=\(e.prefix(3).map { String(format: "%.5f", $0) })")
+        let d = e.withUnsafeBytes { Data($0) }
+        try? d.write(to: URL(fileURLWithPath: "/tmp/clip_swift_emb.bin"))
+    }
+    if let cg = loadCGImage("/tmp/ocr_test.png") {
+        let lines = runOCR(cg)
+        print("OCR   : \(lines.count) lines -> \"\(lines.map { $0.text }.joined(separator: " | "))\"")
+    } else { print("OCR   : (no /tmp/ocr_test.png)") }
+    if let cg = loadCGImage("/tmp/face_test.jpg") {
+        let f = detectFaces(cg)
+        print("FACE  : \(f.count) detected, conf=\(f.map { String(format: "%.2f", $0.confidence) })")
+    } else { print("FACE  : (no /tmp/face_test.jpg)") }
+}
+
+if CommandLine.arguments.contains("serve") {
+    let port = UInt16(CommandLine.arguments.last.flatMap { UInt16($0) } ?? 3999)
+    print("[native-ml] serving on :\(port) (/ping /health /predict)")
+    startServer(port: port, clip: clip)
+    dispatchMain()
+} else {
+    selfTest()
+}
