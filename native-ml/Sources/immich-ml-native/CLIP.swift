@@ -20,17 +20,19 @@ final class CLIPEncoder {
     }
     private func w(_ k: String) -> MLXArray { W[k]! }
 
-    // CGImage -> normalized patch matrix [49, 3072]. Resizes to 224 if needed.
+    // CGImage -> normalized patch matrix [49, 3072]. Matches mlx_clip's
+    // img_processor: PIL-style bicubic resize (short side -> 224) then center
+    // crop 224, rescale /255, normalize. Resize filter parity matters for CLIP.
     private func patches(_ cg: CGImage) -> MLXArray {
         let S = Self.IMG
-        var buf = [UInt8](repeating: 0, count: S * S * 4)
-        let ctx = CGContext(data: &buf, width: S, height: S, bitsPerComponent: 8,
-                            bytesPerRow: S * 4, space: CGColorSpaceCreateDeviceRGB(),
-                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-        ctx.interpolationQuality = .high
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: S, height: S))  // resize into 224x224
+        let (full, w, h) = rgbBuffer(cg)
+        let short = min(w, h)
+        let newW = w <= h ? S : Int(Double(S) * Double(w) / Double(short))   // int() truncation, like mlx_clip
+        let newH = w <= h ? Int(Double(S) * Double(h) / Double(short)) : S
+        let resized = (newW == w && newH == h) ? full : Resize.bicubic(full, w: w, h: h, outW: newW, outH: newH)
+        let left = (newW - S) / 2, top = (newH - S) / 2   // center crop 224x224
         func px(_ c: Int, _ y: Int, _ x: Int) -> Float {
-            (Float(buf[(y * S + x) * 4 + c]) / 255.0 - Self.MEAN[c]) / Self.STD[c]
+            (Float(resized[((top + y) * newW + (left + x)) * 3 + c]) / 255.0 - Self.MEAN[c]) / Self.STD[c]
         }
         let nP = S / Self.PATCH, dim = 3 * Self.PATCH * Self.PATCH
         var flat = [Float](repeating: 0, count: nP * nP * dim)
