@@ -112,8 +112,27 @@ jobs:
               # The CLI wrapper also runs through this venv - its existence
               # is load-bearing for every subcommand, not just ML.
               ml_dir = libexec/"ml"
+              venv_py = ml_dir/"venv/bin/python3.11"
               system Formula["python@3.11"].opt_bin/"python3.11", "-m", "venv", ml_dir/"venv"
-              system ml_dir/"venv/bin/pip", "install", "-r", ml_dir/"requirements.txt"
+              # The ML deps are a large download (torch, pulled in by mlx_clip, is a
+              # few hundred MB), so a flaky connection is the common install failure
+              # (issues #17, #105). Retry a couple of times so a transient blip does
+              # not leave a half-installed venv.
+              tries = 0
+              begin
+                tries += 1
+                system venv_py, "-m", "pip", "install", "-r", ml_dir/"requirements.txt"
+              rescue
+                retry if tries < 3
+                raise
+              end
+              # Fail the install LOUDLY if the venv still lacks the deps the CLI and
+              # ML service require, instead of shipping a venv that exists but is
+              # missing fastapi/uvicorn and only errors at runtime with
+              # ModuleNotFoundError (issues #17, #105). system aborts on non-zero, so
+              # a broken install is visible and "brew reinstall immich-accelerator"
+              # fixes it, rather than a silently half-working setup.
+              system venv_py, "-c", "import sys; sys.path.insert(0, '#{libexec}'); import fastapi, uvicorn, mlx; from immich_accelerator.dashboard import create_app"
             end
 
             def caveats

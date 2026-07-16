@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.32 - 2026-07-15
+
+### Fixed
+- **Install could silently ship a broken ML venv** (#17, #105): the dashboard (`uvicorn`) and the ML service (`fastapi`) both run out of one venv built in the formula's `post_install`. If that `pip install` partially failed (typically a flaky connection on the large `torch` download that `mlx_clip` pulls in), the venv existed but was missing packages, and nothing caught it, so the CLI reported the new version while the dashboard and ML crashed at runtime with `ModuleNotFoundError: No module named 'uvicorn'` / `'fastapi'`. The formula now (1) retries the dependency install a couple of times so a transient network blip self-recovers, and (2) verifies `fastapi`, `uvicorn`, `mlx`, and the dashboard app actually import after install, failing the install loudly (pointing at `brew reinstall immich-accelerator`) instead of shipping a half-working setup. If you hit this on 1.5.31, `brew reinstall immich-accelerator` rebuilds the venv. Reported by [@jhoogeboom](https://github.com/jhoogeboom) and [@yz47](https://github.com/yz47).
+
 ## 1.5.31 - 2026-07-15
 
 ### Fixed
