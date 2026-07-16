@@ -3517,6 +3517,58 @@ def _find_python() -> str | None:
     return None
 
 
+def _native_ml_spec(config: dict, env: dict):
+    """Launch spec (cmd, cwd, env) for the native Swift ML engine, or None.
+
+    Opt-in via config ``ml_engine: native``. Needs the relocatable bundle
+    (immich-ml-native + colocated mlx.metallib + libonnxruntime) and a CLIP
+    safetensors dir; the ArcFace ONNX comes from the InsightFace cache. Returns
+    None (caller falls back to the venv) if the bundle or CLIP model is missing.
+    """
+    bundle = Path(
+        config.get("native_ml_dir")
+        or (Path.home() / ".immich-accelerator" / "native-ml")
+    )
+    binary = bundle / "immich-ml-native"
+    clip_dir = Path(
+        config.get("native_clip_dir")
+        or (Path.home() / ".cache" / "immich-ml-native" / "clip")
+    )
+    arcface = Path(
+        config.get("native_arcface")
+        or (Path.home() / ".insightface" / "models" / "buffalo_l" / "w600k_r50.onnx")
+    )
+    if not binary.exists() or not clip_dir.exists():
+        return None
+    env = dict(env)
+    env["ML_CLIP_DIR"] = str(clip_dir)
+    env["ML_ARCFACE"] = str(arcface)
+    ml_port = int(config.get("ml_port", 3003))
+    return [str(binary), "serve", str(ml_port)], str(bundle), env
+
+
+def _ml_launch_spec(config: dict):
+    """Return (cmd, cwd, env) to start the ML service, or None if unavailable.
+
+    Selects the native Swift engine when ``ml_engine == native`` and its bundle
+    is present; otherwise the Python venv service. The native path is strictly
+    opt-in, so default behaviour is unchanged.
+    """
+    env = os.environ.copy()
+    if config.get("ml_engine") == "native":
+        spec = _native_ml_spec(config, env)
+        if spec is not None:
+            return spec
+        log.warning(
+            "ml_engine=native but native bundle/CLIP model missing — using Python venv"
+        )
+    ml_dir = Path(config.get("ml_dir", ""))
+    ml_python = ml_dir / "venv" / "bin" / "python3"
+    if ml_python.exists():
+        return [str(ml_python), "-m", "src.main"], str(ml_dir), env
+    return None
+
+
 def _find_ml_dir() -> Path | None:
     """Find the immich-ml-metal service directory. Sets up venv if needed.
 
@@ -3985,30 +4037,25 @@ def cmd_start(args):
         config["ml_dir"] = str(resolved_ml)
         save_config(config)
 
-    # Start ML service
+    # Start ML service (native Swift engine when ml_engine=native, else venv)
     ml_started_here = False
     ml_pid = read_pid("ml")
     if not ml_pid and config.get("ml_dir"):
-        ml_dir = Path(config["ml_dir"])
-        ml_python = ml_dir / "venv" / "bin" / "python3"
-        if ml_python.exists():
-            log.info("Starting ML service...")
+        spec = _ml_launch_spec(config)
+        if spec is not None:
+            cmd, cwd, env = spec
+            engine = (
+                "native Swift" if cmd[0].endswith("immich-ml-native") else "Python venv"
+            )
+            log.info("Starting ML service (%s)...", engine)
             try:
-                ml_pid = start_service(
-                    "ml",
-                    [str(ml_python), "-m", "src.main"],
-                    os.environ.copy(),
-                    str(ml_dir),
-                )
+                ml_pid = start_service("ml", cmd, env, cwd)
                 ml_started_here = True
                 log.info("  ML service running (PID %d)", ml_pid)
             except RuntimeError:
                 log.warning("  ML service failed to start — CLIP/face/OCR unavailable")
         else:
-            log.warning(
-                "ML venv not found at %s — ML service will not start.",
-                ml_python,
-            )
+            log.warning("ML service will not start — no venv and no native bundle.")
             log.warning(
                 "  If you installed via Homebrew, try: brew reinstall immich-accelerator"
             )
@@ -4302,16 +4349,11 @@ def cmd_watch(_args):
                 if resolved_ml and str(resolved_ml) != config.get("ml_dir"):
                     config["ml_dir"] = str(resolved_ml)
                     save_config(config)
-                ml_dir = Path(config.get("ml_dir", ""))
-                ml_python = ml_dir / "venv" / "bin" / "python3"
-                if ml_python.exists():
+                spec = _ml_launch_spec(config)
+                if spec is not None:
+                    cmd, cwd, env = spec
                     try:
-                        pid = start_service(
-                            "ml",
-                            [str(ml_python), "-m", "src.main"],
-                            os.environ.copy(),
-                            str(ml_dir),
-                        )
+                        pid = start_service("ml", cmd, env, cwd)
                         log.info("  ML restarted (PID %d)", pid)
                     except RuntimeError:
                         log.error("  ML restart failed")
