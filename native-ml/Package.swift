@@ -13,13 +13,28 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.21.0")
     ],
     targets: [
+        // onnxruntime C shim (face embedding). Header/lib paths are Homebrew's
+        // onnxruntime; the release bundle relinks with @loader_path (see plan Task 12).
+        .target(
+            name: "COnnxShim",
+            cSettings: [
+                .unsafeFlags(["-I/opt/homebrew/opt/onnxruntime/include/onnxruntime"])
+            ]
+        ),
         .executableTarget(
             name: "immich-ml-native",
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
+                "COnnxShim",
+            ],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-L/opt/homebrew/opt/onnxruntime/lib", "-lonnxruntime",
+                    "-Xlinker", "-rpath", "-Xlinker", "/opt/homebrew/opt/onnxruntime/lib",
+                ])
             ]
-        )
+        ),
     ]
 )

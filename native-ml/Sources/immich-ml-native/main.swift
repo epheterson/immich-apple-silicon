@@ -52,6 +52,25 @@ if CommandLine.arguments.contains("aligntest2") {
     exit(0)
 }
 
+// --- Full in-process native face pipeline: Vision detect -> align -> ArcFace (onnxruntime) ---
+if CommandLine.arguments.contains("facetest") {
+    let modelPath = NSHomeDirectory() + "/.insightface/models/buffalo_l/w600k_r50.onnx"
+    guard let ort = ORTSession(modelPath: modelPath) else { fatalError("ORT load failed: \(modelPath)") }
+    guard let cg = loadCGImage("/tmp/face_test.jpg") else { fatalError("no face image") }
+    let (rgb, w, h) = rgbBuffer(cg)
+    let imageData = try! Data(contentsOf: URL(fileURLWithPath: "/tmp/face_test.jpg"))
+    let faces = detectFacesWithLandmarks(imageData: imageData, width: w, height: h)
+    let f0 = faces.first
+    print("detected \(faces.count) face(s); box=(\(f0?.x1 ?? -1),\(f0?.y1 ?? -1))-(\(f0?.x2 ?? -1),\(f0?.y2 ?? -1)) score=\(f0.map { String(format: "%.3f", $0.score) } ?? "-")")
+    if let lm = f0?.landmarks { print("landmarks=\(lm.map { $0.map { ($0 * 100).rounded() / 100 } })") }
+    let embs = embedFaces(srcRGB: rgb, w: w, h: h, faces: faces, model: ort)
+    if let e = embs.first ?? nil {
+        e.withUnsafeBytes { try? Data($0).write(to: URL(fileURLWithPath: "/tmp/face_emb_swift.f32")) }
+        print("wrote 512-d embedding; first5=\(e.prefix(5).map { String(format: "%.5f", $0) })")
+    } else { print("no embedding produced") }
+    exit(0)
+}
+
 let MODEL = "/tmp/mlx032test/clipmodel"
 let clip = CLIPEncoder(modelDir: MODEL)
 print("[native-ml] CLIP model loaded from \(MODEL)")
