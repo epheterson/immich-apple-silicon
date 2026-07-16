@@ -71,7 +71,20 @@ if CommandLine.arguments.contains("facetest") {
     exit(0)
 }
 
-let MODEL = "/tmp/mlx032test/clipmodel"
+let MODEL = ProcessInfo.processInfo.environment["ML_CLIP_DIR"] ?? "/tmp/mlx032test/clipmodel"
+let ARCFACE = ProcessInfo.processInfo.environment["ML_ARCFACE"]
+    ?? (NSHomeDirectory() + "/.insightface/models/buffalo_l/w600k_r50.onnx")
+
+// --- Serve the full /predict contract (CLIP visual+text, faces, OCR) ---
+if CommandLine.arguments.contains("serve") {
+    let port = UInt16(CommandLine.arguments.last.flatMap { UInt16($0) } ?? 3999)
+    let models = Models(clipDir: MODEL, arcfacePath: ARCFACE)
+    print("[native-ml] models loaded (clip=\(MODEL), arcface=\(models.arcface != nil ? "ok" : "MISSING"))")
+    print("[native-ml] serving on :\(port) (/ /ping /health /predict)")
+    startServer(port: port, models: models)
+    dispatchMain()
+}
+
 let clip = CLIPEncoder(modelDir: MODEL)
 print("[native-ml] CLIP model loaded from \(MODEL)")
 
@@ -93,11 +106,4 @@ func selfTest() {
     } else { print("FACE  : (no /tmp/face_test.jpg)") }
 }
 
-if CommandLine.arguments.contains("serve") {
-    let port = UInt16(CommandLine.arguments.last.flatMap { UInt16($0) } ?? 3999)
-    print("[native-ml] serving on :\(port) (/ping /health /predict)")
-    startServer(port: port, clip: clip)
-    dispatchMain()
-} else {
-    selfTest()
-}
+selfTest()
