@@ -30,12 +30,20 @@ func processPredict(entries: [String: Any], imageData: Data?, text: String?, mod
         let cfg = cfgAny as? [String: Any] ?? [:]
         switch taskType {
         case "clip":
-            if cfg["visual"] != nil, let cg = cg {
-                try requireDefaultModel(cfg["visual"])
-                response["clip"] = pyListString(models.clipVisual.embed(cg))
-            } else if cfg["textual"] != nil, let t = text {
-                try requireDefaultModel(cfg["textual"])
-                response["clip"] = pyListString(models.clipText.encode(t))
+            if let vCfg = cfg["visual"] as? [String: Any], let cg = cg {
+                let name = Models.normalize(vCfg["modelName"] as? String ?? Models.defaultClip)
+                if name == Models.defaultClip {
+                    response["clip"] = pyListString(models.clipVisual.embed(cg))
+                } else {
+                    response["clip"] = pyListString(try models.zoo(for: name).embedVisual(cg))
+                }
+            } else if let tCfg = cfg["textual"] as? [String: Any], let t = text {
+                let name = Models.normalize(tCfg["modelName"] as? String ?? Models.defaultClip)
+                if name == Models.defaultClip {
+                    response["clip"] = pyListString(models.clipText.encode(t))
+                } else {
+                    response["clip"] = pyListString(try models.zoo(for: name).embedTextual(t))
+                }
             }
 
         case "facial-recognition":
@@ -67,18 +75,6 @@ func processPredict(entries: [String: Any], imageData: Data?, text: String?, mod
         }
     }
     return response
-}
-
-// v1 CLIP scope: the loaded ViT-B-32 default. A different requested modelName
-// would need its own weights (plan Task 11); fail loudly rather than mis-embed.
-private func requireDefaultModel(_ taskCfg: Any?) throws {
-    guard let c = taskCfg as? [String: Any], let name = c["modelName"] as? String else { return }
-    let normalized = name.replacingOccurrences(of: "::", with: "__")
-    let ok = ["ViT-B-32__openai", "default"]
-    if !ok.contains(normalized) {
-        throw PredictError(status: "422 Unprocessable Entity",
-                           message: "native engine v1 supports ViT-B-32__openai; requested \(name)")
-    }
 }
 
 private func optDouble(_ cfg: [String: Any], _ section: String, _ key: String) -> Double? {
