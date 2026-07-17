@@ -1,0 +1,49 @@
+name: native-bundle
+# Build the relocatable native ML bundle on a macOS runner and upload it as an
+# artifact (workflow_dispatch) or a release asset (on release). The metallib is
+# pinned to the mlx version that matches mlx-swift 0.31.6 (validated 0.31.1), so
+# the shipped bundle is the one that was tested, not a mismatched newer metallib.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: version string for the tarball name
+        default: "1.6.0"
+  release:
+    types: [published]
+  # temporary: verify the build on the feature branch before merge
+  push:
+    branches: [feat/native-ml-service]
+    paths: ['.github/workflows/native-bundle.yml']
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: onnxruntime
+        run: brew install onnxruntime
+
+      - name: metallib matching mlx-swift 0.31.6
+        run: |
+          pip3 install --break-system-packages "mlx==0.31.1" 2>/dev/null || pip3 install "mlx==0.31.1"
+          MLX_METALLIB="$(python3 -c 'import mlx, os; print(os.path.join(os.path.dirname(mlx.__file__), "lib", "mlx.metallib"))')"
+          test -f "$MLX_METALLIB" || { echo "no matching metallib at $MLX_METALLIB"; exit 1; }
+          echo "MLX_METALLIB=$MLX_METALLIB" >> "$GITHUB_ENV"
+
+      - name: build bundle
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION="${RELEASE_TAG:-$INPUT_VERSION}"
+          VERSION="${VERSION#v}"
+          cd native-ml && bash scripts/release_bundle.sh "$VERSION"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-bundle
+          path: native-ml/immich-ml-native-*.tar.gz
+          if-no-files-found: error
