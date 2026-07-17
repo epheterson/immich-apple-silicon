@@ -118,6 +118,17 @@ All `job.*` and `library.*` endpoints require admin access. If the dashboard sho
 
 ![Dashboard](docs/dashboard.png)
 
+## Menu bar app
+
+A native menu-bar app shows accelerator health at a glance and covers the daily actions: worker / ML / dashboard status (with a NATIVE or PYTHON engine badge), start / stop / restart, run `ml-test` inline, open Immich, the dashboard, or logs, and launch-at-login. It reads the accelerator's own state directly (no extra services) and weighs about 90KB.
+
+```bash
+brew install --cask epheterson/immich-accelerator/immich-accelerator-menubar
+open "/Applications/Immich Accelerator.app"
+```
+
+Design inspired by [Immich-Accelerator-Helper](https://github.com/pl4za/Immich-Accelerator-Helper) by [@pl4za](https://github.com/pl4za).
+
 ## Updates
 
 The accelerator handles Immich updates automatically:

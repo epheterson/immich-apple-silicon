@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.1 - 2026-07-17
+
+### Added
+- **Menu-bar app.** A native SwiftUI menu-bar app for the accelerator: worker / ML / dashboard health at a glance (with a NATIVE or PYTHON engine badge), start/stop/restart, run `ml-test` with the result inline, open Immich, the dashboard, or logs, and launch-at-login. It reads the accelerator's own state (pidfiles, the ML service's `/ping`, config) with no extra daemons, and ships as a tiny (~90KB) ad-hoc-signed app: `brew install --cask epheterson/immich-accelerator/immich-accelerator-menubar`. Design inspired by [Immich-Accelerator-Helper](https://github.com/pl4za/Immich-Accelerator-Helper) by [@pl4za](https://github.com/pl4za).
+
+### Fixed
+- **Release workflow could not upload the native ML bundle** (HTTP 403): the build job now requests `contents: write`, so release assets attach without manual intervention. The v1.6.0 assets were uploaded by hand; installs were unaffected.
+
 ## 1.6.0 - 2026-07-16
 
 ### Added
