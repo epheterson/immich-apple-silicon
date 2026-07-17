@@ -18,7 +18,9 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-15 ships Xcode 16 / Swift 6, so mlx-swift resolves to the pinned
+    # 0.31.6 (Package.resolved). Older Swift silently falls back to 0.29.x.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 

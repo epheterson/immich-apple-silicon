@@ -18,11 +18,19 @@ swift build -c release >/dev/null
 rm -rf "$OUT"; mkdir -p "$OUT"
 cp .build/release/immich-ml-native "$OUT/"
 cp "$METALLIB" "$OUT/mlx.metallib"
-cp "$ORT/lib/libonnxruntime.1.27.1.dylib" "$OUT/libonnxruntime.1.dylib"
+
+# Resolve the onnxruntime dylib version-agnostically: the real versioned file
+# (e.g. libonnxruntime.1.27.1.dylib) and the exact path the binary links to
+# (whatever brew's onnxruntime version put there). Hardcoding a version breaks
+# on any runner/machine with a different onnxruntime.
+ORT_REAL="$(find "$ORT/lib" -name 'libonnxruntime.*.*.*.dylib' | head -1)"
+ORT_LINK="$(otool -L "$OUT/immich-ml-native" | grep -oE '[^[:space:]]*libonnxruntime[^[:space:]]*\.dylib' | head -1)"
+[ -n "$ORT_REAL" ] && [ -n "$ORT_LINK" ] || { echo "could not resolve onnxruntime dylib (real=$ORT_REAL link=$ORT_LINK)"; exit 1; }
+cp "$ORT_REAL" "$OUT/libonnxruntime.1.dylib"
 
 # make onnxruntime load from beside the binary, not the brew prefix
 install_name_tool -id @loader_path/libonnxruntime.1.dylib "$OUT/libonnxruntime.1.dylib"
-install_name_tool -change "$ORT/lib/libonnxruntime.1.dylib" \
+install_name_tool -change "$ORT_LINK" \
     @loader_path/libonnxruntime.1.dylib "$OUT/immich-ml-native"
 
 # re-sign ad-hoc (install_name_tool invalidates the signature)
