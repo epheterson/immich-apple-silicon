@@ -136,8 +136,12 @@ int ort_run_multi(void *handle, int n_inputs, const void **datas,
             g->ReleaseStatus(st);
         }
     }
-    for (int i = 0; i < n_inputs; i++)
+    for (int i = 0; i < n_inputs; i++) {
         if (vals[i]) g->ReleaseValue(vals[i]);
+        // Input-name strings come from the ORT allocator; free them or every
+        // request leaks a few strings.
+        if (owned[i]) g->AllocatorFree(alloc, owned[i]);
+    }
     if (mem) g->ReleaseMemoryInfo(mem);
     return count;
 }

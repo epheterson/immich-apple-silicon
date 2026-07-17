@@ -66,8 +66,8 @@ final class StatusModel: ObservableObject {
 
     func startPolling(interval: TimeInterval = 3) {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { _ in
-            Task { @MainActor in await self.refresh() }
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.refresh() }
         }
         Task { await refresh() }
     }
