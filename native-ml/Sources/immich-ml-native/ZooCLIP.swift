@@ -54,6 +54,15 @@ final class ZooCLIP {
     ]
 
     init(name: String) throws {
+        // The model name arrives from the network and is used in both a cache
+        // path and a download URL. Constrain it hard: the allowed charset of
+        // real Immich model names, no traversal or URL metacharacters.
+        guard name.range(of: "^[A-Za-z0-9._-]{1,64}$", options: .regularExpression) != nil,
+              !name.hasPrefix("."), !name.contains("..")
+        else {
+            throw PredictError(status: "422 Unprocessable Entity",
+                               message: "invalid model name")
+        }
         self.name = name
         dir = Self.zooDir.appendingPathComponent(name)
         try Self.ensureFiles(name: name, dir: dir)
