@@ -112,8 +112,10 @@ final class StatusModel: ObservableObject {
         let out = Pipe()
         p.standardOutput = out
         try? p.run()
+        // Read before waiting (pipe-buffer deadlock discipline; see Actions.run).
+        let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         p.waitUntilExit()
-        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return text
     }
 
     static func ping(port: Int) async -> Bool {

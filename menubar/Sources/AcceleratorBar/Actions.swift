@@ -20,9 +20,12 @@ enum Actions {
                 do { try p.run() } catch {
                     cont.resume(returning: (-1, "\(error)")); return
                 }
-                p.waitUntilExit()
+                // Drain the pipe BEFORE waiting: a child that fills the 64KB
+                // pipe buffer (ml-test output does) would otherwise deadlock
+                // against our waitUntilExit.
                 let text = String(
                     data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                p.waitUntilExit()
                 cont.resume(returning: (p.terminationStatus, text))
             }
         }
