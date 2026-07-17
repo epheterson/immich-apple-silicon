@@ -111,7 +111,7 @@ struct MenuView: View {
     }
 
     private var footer: some View {
-        VStack(spacing: 2) {
+        VStack(alignment: .leading, spacing: 2) {
             LinkRow(icon: "photo.on.rectangle.angled", title: "Open Immich") {
                 Actions.openImmich(model.snap.immichURL)
             }
@@ -122,11 +122,22 @@ struct MenuView: View {
                 Actions.openLogs()
             }
             Divider().padding(.vertical, 4).padding(.horizontal, 4)
-            Toggle(isOn: $launchAtLogin) {
+            // Full-width settings row so it lines up with the link rows above
+            // instead of a narrow checkbox centering itself in the panel.
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.up.forward.app")
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20)
                 Text("Launch at Login").font(.callout)
+                Spacer()
+                Toggle("", isOn: $launchAtLogin)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
             }
-            .toggleStyle(.checkbox)
             .padding(.horizontal, 6)
+            .padding(.vertical, 2)
             .onChange(of: launchAtLogin) { _, on in
                 try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
             }

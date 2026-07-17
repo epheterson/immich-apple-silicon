@@ -66,9 +66,15 @@ final class StatusModel: ObservableObject {
 
     func startPolling(interval: TimeInterval = 3) {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        // Register in .common modes, not the default .scheduledTimer (.default
+        // only): while the MenuBarExtra panel is open the run loop is in
+        // event-tracking mode, and a .default-mode timer stops firing, so the
+        // panel would freeze on whatever it showed when it opened.
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refresh() }
         }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
         Task { await refresh() }
     }
 
