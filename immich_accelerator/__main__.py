@@ -1370,33 +1370,37 @@ def _has_everything(
     return True
 
 
-def _prune_old_server_versions(current_bare: str, keep_previous: int = 1) -> None:
-    """Remove stale server/<version> builds, keeping the current version plus
-    the `keep_previous` most-recently-used others.
+def _prune_old_server_versions(current_bare: str) -> None:
+    """Remove every server/<version> build except the current one.
 
     Each extracted Immich server is ~0.5GB, and until now nothing removed old
     ones, so a long-running install accumulated every version it had ever run
-    (Eric's Mini had seven, ~3.3GB). This runs whenever a server is resolved on
-    start/upgrade, so the footprint self-limits. Never touches the current
-    build, and a failed delete is logged but non-fatal.
+    (a real box had seven, ~3.3GB). Only the current build is kept: build-data
+    is a single shared directory stamped for one version
+    (_finalize_build_data / _cached_server_if_current), so a retained older
+    build can't be served from cache anyway (a rollback re-downloads), making
+    it dead weight rather than a usable rollback. Deleting everything else also
+    clears any leftover <version>.staging dirs from interrupted extractions.
+
+    Call this only after the worker is up on the current version, so the old
+    (now-stopped) build is safe to delete. Never touches the current build; a
+    failed delete (or an unstattable/vanishing entry) is logged, not fatal.
     """
     server_root = DATA_DIR / "server"
     if not server_root.is_dir():
         return
     try:
-        others = [
-            p for p in server_root.iterdir() if p.is_dir() and p.name != current_bare
-        ]
+        entries = list(server_root.iterdir())
     except OSError:
         return
-    # Most-recently-modified first; keep the newest `keep_previous` as rollback.
-    others.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    for stale in others[max(keep_previous, 0) :]:
+    for entry in entries:
         try:
-            shutil.rmtree(stale)
-            log.info("Pruned old server build: server/%s", stale.name)
+            if not entry.is_dir() or entry.name == current_bare:
+                continue
+            shutil.rmtree(entry)
+            log.info("Pruned old server build: server/%s", entry.name)
         except OSError as e:
-            log.warning("Could not prune server/%s: %s", stale.name, e)
+            log.warning("Could not prune server/%s: %s", entry.name, e)
 
 
 def download_immich_server(version: str) -> Path:
@@ -1413,7 +1417,6 @@ def download_immich_server(version: str) -> Path:
 
     cached = _cached_server_if_current(server_dir, bare_version)
     if cached is not None:
-        _prune_old_server_versions(bare_version)
         return cached
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1570,7 +1573,6 @@ def download_immich_server(version: str) -> Path:
 
     _finalize_build_data(build_data, bare_version)
     log.info("Immich server %s ready (downloaded from ghcr.io)", bare_version)
-    _prune_old_server_versions(bare_version)
     return server_dir
 
 
@@ -1590,7 +1592,6 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
 
     cached = _cached_server_if_current(server_dir, bare_version)
     if cached is not None:
-        _prune_old_server_versions(bare_version)
         return cached
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1640,7 +1641,6 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
 
     _finalize_build_data(build_data, bare_version)
     log.info("Immich server %s ready", bare_version)
-    _prune_old_server_versions(bare_version)
     return server_dir
 
 
@@ -4332,6 +4332,11 @@ def cmd_start(args):
         ml_pid, ml_engine = _ml_verify_or_fallback(config, ml_pid, ml_engine)
         if ml_pid:
             log.info("  ML service ready (PID %d, %s)", ml_pid, ml_engine)
+
+    # Reclaim disk from superseded server builds now that the worker is up on
+    # the current version. Done here, not during extraction, so a still-running
+    # old-version worker is never deleted out from under itself.
+    _prune_old_server_versions(Path(server_dir).name)
 
     log.info("")
     log.info("Immich Accelerator running")

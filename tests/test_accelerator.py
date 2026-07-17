@@ -1497,6 +1497,46 @@ class TestInstalledVersion:
             assert _installed_version() == running
 
 
+class TestPruneServerVersions:
+    """_prune_old_server_versions keeps only the current build and must survive
+    junk (.staging dirs) and unreadable entries without crashing startup."""
+
+    def _make_server_root(self, tmp_path, names):
+        root = tmp_path / "server"
+        root.mkdir()
+        for name in names:
+            (root / name).mkdir()
+        return root
+
+    def test_keeps_only_current_and_clears_staging(self, tmp_path):
+        from immich_accelerator.__main__ import _prune_old_server_versions
+
+        root = self._make_server_root(
+            tmp_path, ["2.6.3", "2.7.5", "3.0.1", "3.0.2", "3.0.2.staging"]
+        )
+        with patch("immich_accelerator.__main__.DATA_DIR", tmp_path):
+            _prune_old_server_versions("3.0.2")
+        assert sorted(p.name for p in root.iterdir()) == ["3.0.2"]
+
+    def test_missing_server_root_is_noop(self, tmp_path):
+        from immich_accelerator.__main__ import _prune_old_server_versions
+
+        with patch("immich_accelerator.__main__.DATA_DIR", tmp_path):
+            _prune_old_server_versions("3.0.2")  # no server/ dir, must not raise
+
+    def test_failed_delete_is_not_fatal(self, tmp_path):
+        from immich_accelerator.__main__ import _prune_old_server_versions
+
+        self._make_server_root(tmp_path, ["2.7.5", "3.0.1", "3.0.2"])
+        # First rmtree raises; the loop must swallow it and still try the other.
+        with patch("immich_accelerator.__main__.DATA_DIR", tmp_path), patch(
+            "immich_accelerator.__main__.shutil.rmtree",
+            side_effect=[OSError("boom"), None],
+        ) as rmtree:
+            _prune_old_server_versions("3.0.2")  # must not raise
+        assert rmtree.call_count == 2
+
+
 class TestStartDashboard:
     """start_dashboard() is called from both `start` and `watch`; it must not
     spawn a second dashboard when one is already running (the double-start race
