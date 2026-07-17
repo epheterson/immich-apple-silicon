@@ -3517,48 +3517,113 @@ def _find_python() -> str | None:
     return None
 
 
-def _native_ml_spec(config: dict, env: dict):
-    """Launch spec (cmd, cwd, env) for the native Swift ML engine, or None.
+# Version-independent native model asset (CLIP safetensors + tokenizer + ArcFace).
+# Fetched once into ~/.cache/immich-ml-native and reused across upgrades.
+NATIVE_MODEL_URL = (
+    "https://github.com/epheterson/immich-apple-silicon/releases/download/"
+    "clip-model-v1/native-models.tar.gz"
+)
+NATIVE_CACHE = Path.home() / ".cache" / "immich-ml-native"
 
-    Opt-in via config ``ml_engine: native``. Needs the relocatable bundle
-    (immich-ml-native + colocated mlx.metallib + libonnxruntime) and a CLIP
-    safetensors dir; the ArcFace ONNX comes from the InsightFace cache. Returns
-    None (caller falls back to the venv) if the bundle or CLIP model is missing.
-    """
-    # Bundle location: explicit config, else the formula install (libexec/native-ml),
-    # else a manual install under the data dir.
+
+def _native_bundle_dir(config: dict) -> Path | None:
+    """The installed native bundle dir (with the immich-ml-native binary), or None."""
     candidates = []
     if config.get("native_ml_dir"):
         candidates.append(Path(config["native_ml_dir"]))
     candidates.append(Path("/opt/homebrew/opt/immich-accelerator/libexec/native-ml"))
     candidates.append(Path.home() / ".immich-accelerator" / "native-ml")
-    bundle = next(
-        (b for b in candidates if (b / "immich-ml-native").exists()), candidates[-1]
-    )
-    binary = bundle / "immich-ml-native"
-    clip_dir = Path(
-        config.get("native_clip_dir")
-        or (Path.home() / ".cache" / "immich-ml-native" / "clip")
-    )
-    arcface = Path(
-        config.get("native_arcface")
-        or (Path.home() / ".insightface" / "models" / "buffalo_l" / "w600k_r50.onnx")
-    )
-    # Require the binary AND both models before choosing native, so a fresh
-    # install (where the models are not fetched yet, or a face model insightface
-    # would normally download lazily is absent) falls back cleanly to the venv
-    # instead of starting native with broken CLIP or face recognition.
-    if not binary.exists():
+    return next((b for b in candidates if (b / "immich-ml-native").exists()), None)
+
+
+def _native_clip_dir(config: dict) -> Path:
+    return Path(config.get("native_clip_dir") or (NATIVE_CACHE / "clip"))
+
+
+def _native_arcface(config: dict) -> Path | None:
+    """Resolve the ArcFace ONNX: explicit config, the InsightFace cache (existing
+    users already have buffalo_l), or the native model cache (fresh fetch)."""
+    if config.get("native_arcface"):
+        p = Path(config["native_arcface"])
+        return p if p.exists() else None
+    for p in (
+        Path.home() / ".insightface" / "models" / "buffalo_l" / "w600k_r50.onnx",
+        NATIVE_CACHE / "arcface" / "w600k_r50.onnx",
+    ):
+        if p.exists():
+            return p
+    return None
+
+
+def _native_ml_spec(config: dict, env: dict):
+    """Launch spec (cmd, cwd, env) for the native Swift ML engine, or None.
+
+    Native is the default. It needs the relocatable bundle (immich-ml-native +
+    colocated mlx.metallib + libonnxruntime), the CLIP safetensors, and the
+    ArcFace ONNX. Requires ALL of them before choosing native, so a fresh install
+    where a model is not fetched yet falls back cleanly to the venv instead of
+    starting native with broken CLIP or face recognition.
+    """
+    bundle = _native_bundle_dir(config)
+    if bundle is None:
         return None
-    if not (clip_dir / "model.safetensors").exists():
-        return None
-    if not arcface.exists():
+    clip_dir = _native_clip_dir(config)
+    arcface = _native_arcface(config)
+    if not (clip_dir / "model.safetensors").exists() or arcface is None:
         return None
     env = dict(env)
     env["ML_CLIP_DIR"] = str(clip_dir)
     env["ML_ARCFACE"] = str(arcface)
     ml_port = int(config.get("ml_port", 3003))
-    return [str(binary), "serve", str(ml_port)], str(bundle), env
+    return [str(bundle / "immich-ml-native"), "serve", str(ml_port)], str(bundle), env
+
+
+def _maybe_fetch_native_models(config: dict) -> None:
+    """If the native bundle is installed but its models are missing, kick off a
+    one-time background download (~740 MB: CLIP + ArcFace) into ~/.cache and
+    return. The accelerator uses the venv until the models arrive; a later ML
+    (re)start then picks up native. Keeps installs fast and upgrades cheap (the
+    models persist across versions). Guarded so it is not started twice.
+    """
+    if config.get("ml_engine") == "python" or _native_bundle_dir(config) is None:
+        return
+    have_clip = (_native_clip_dir(config) / "model.safetensors").exists()
+    have_face = _native_arcface(config) is not None
+    if have_clip and have_face:
+        return
+    marker = NATIVE_CACHE / ".fetching"
+    if marker.exists():
+        try:
+            if time.time() - float(marker.read_text().strip()) < 3600:
+                return  # a fetch is already in flight
+        except (ValueError, OSError):
+            pass
+    url = config.get("native_model_url") or NATIVE_MODEL_URL
+    try:
+        NATIVE_CACHE.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(time.time()))
+    except OSError:
+        return
+    tarball = NATIVE_CACHE / "native-models.tar.gz"
+    script = (
+        f'curl -fL --retry 3 -o "{tarball}" "{url}" && '
+        f'tar -xzf "{tarball}" -C "{NATIVE_CACHE}" && rm -f "{tarball}"; '
+        f'rm -f "{marker}"'
+    )
+    try:
+        logf = open(LOG_DIR / "native-model-fetch.log", "a")
+        subprocess.Popen(
+            ["bash", "-c", script],
+            start_new_session=True,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+        )
+        log.info(
+            "Native ML models missing; fetching in the background (~740MB one time). "
+            "Using the Python engine until they arrive."
+        )
+    except OSError:
+        marker.unlink(missing_ok=True)
 
 
 def _venv_ml_spec(config: dict, env: dict):
@@ -3617,6 +3682,10 @@ def _start_ml_preferred(config: dict):
         native = _native_ml_spec(config, env)
         if native is not None:
             attempts.append(("native Swift", native, True))
+        else:
+            # Native bundle may be installed but its models not fetched yet;
+            # kick off the one-time background download and use the venv for now.
+            _maybe_fetch_native_models(config)
     venv = _venv_ml_spec(config, env)
     if venv is not None:
         attempts.append(("Python venv", venv, False))

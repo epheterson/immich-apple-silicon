@@ -95,8 +95,8 @@ jobs:
           export SRC_URL="https://github.com/${REPO}/archive/refs/tags/v${VERSION}.tar.gz"
           export ML_URL="https://github.com/${OWNER}/immich-ml-metal/archive/${ML_COMMIT}.tar.gz"
           export NATIVE_URL="https://github.com/${REPO}/releases/download/${TAG}/immich-ml-native-${VERSION}-macos-arm64.tar.gz"
-          # CLIP model is version-independent, hosted once under a stable tag.
-          export CLIP_MODEL_URL="https://github.com/${REPO}/releases/download/clip-model-v1/clip-vit-base-patch32.tar.gz"
+          # ML models are fetched by the accelerator on first native start, not
+          # at install time (see _maybe_fetch_native_models), so no model URL here.
           bash acc/scripts/render-formula.sh
           ruby -c "$OUT"
 
