@@ -38,6 +38,7 @@ struct Snapshot: Equatable {
     var externalDomain = ""  // Immich's configured public domain, if any
     var jobsActive = 0       // jobs the worker is running right now
     var jobsWaiting = 0      // jobs queued behind them
+    var dashboardPort = 8420 // where the accelerator dashboard is served
 
     // What "Open Immich" should launch: the public domain the user set in
     // Immich when present, otherwise the local URL the accelerator connects to.
@@ -117,11 +118,17 @@ final class StatusModel: ObservableObject {
             if cmd.contains("immich-ml-native") { s.mlEngine = .native }
             else if cmd.contains("python") { s.mlEngine = .python }
         }
-        s.dashboardUp = Self.pidAlive("dashboard") != nil
+        if let dashPid = Self.pidAlive("dashboard") {
+            // Confirm the tracked pid is really our dashboard, not a foreign
+            // process a mis-adopted pidfile points at (older accelerators would
+            // adopt whatever held the port, e.g. OrbStack).
+            s.dashboardUp = Self.command(of: dashPid).contains("immich_accelerator")
+        }
         s.version = Self.readVersion()
         let config = Self.readConfig()
         s.immichVersion = config["version"] as? String ?? ""
         s.immichURL = config["immich_url"] as? String ?? ""
+        s.dashboardPort = (config["dashboard_port"] as? Int) ?? 8420
         s.externalDomain = await Self.externalDomain(base: s.immichURL)
         let mlPort = (config["ml_port"] as? Int) ?? 3003
         s.mlHealthy = await Self.ping(port: mlPort)
@@ -175,24 +182,37 @@ final class StatusModel: ObservableObject {
 
     static func pidAlive(_ name: String) -> Int32? {
         let f = Paths.dataDir.appendingPathComponent("pids/\(name).pid")
-        guard let text = try? String(contentsOf: f, encoding: .utf8),
-              let pid = Int32(text.split(separator: "\n").first?
-                  .trimmingCharacters(in: .whitespaces) ?? "")
+        guard let text = try? String(contentsOf: f, encoding: .utf8) else { return nil }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let pid = Int32(lines.first?.trimmingCharacters(in: .whitespaces) ?? ""),
+              kill(pid, 0) == 0
         else { return nil }
-        return kill(pid, 0) == 0 ? pid : nil
+        // Guard against PID reuse: the accelerator writes the process start time
+        // (`ps -o lstart`) on the pidfile's second line. If the PID has been
+        // recycled to a different process (e.g. OrbStack squatting the dashboard
+        // port), the start times won't match and this isn't really our process.
+        let storedStart = lines.count > 1 ? lines[1].trimmingCharacters(in: .whitespaces) : ""
+        if !storedStart.isEmpty {
+            let actualStart = psField(pid, "lstart=")
+            if !actualStart.isEmpty && actualStart != storedStart { return nil }
+        }
+        return pid
     }
 
-    static func command(of pid: Int32) -> String {
+    static func command(of pid: Int32) -> String { psField(pid, "command=") }
+
+    // One `ps` field for a pid, e.g. "command=" or "lstart=". Reads before
+    // waiting (pipe-buffer deadlock discipline; see Actions.run).
+    static func psField(_ pid: Int32, _ field: String) -> String {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
-        p.arguments = ["-p", "\(pid)", "-o", "command="]
+        p.arguments = ["-p", "\(pid)", "-o", field]
         let out = Pipe()
         p.standardOutput = out
         try? p.run()
-        // Read before waiting (pipe-buffer deadlock discipline; see Actions.run).
         let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         p.waitUntilExit()
-        return text
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func ping(port: Int) async -> Bool {

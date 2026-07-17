@@ -46,8 +46,8 @@ enum Actions {
         return code == 0 ? "passed" : "failed (exit \(code))"
     }
 
-    static func openDashboard() {
-        NSWorkspace.shared.open(URL(string: "http://localhost:8420")!)
+    static func openDashboard(port: Int) {
+        NSWorkspace.shared.open(URL(string: "http://localhost:\(port)")!)
     }
 
     static func openImmich(_ url: String) {

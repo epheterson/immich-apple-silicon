@@ -55,9 +55,12 @@ struct MenuView: View {
                 detail: mlDetail, ok: model.snap.mlHealthy,
                 badge: model.snap.mlUp ? model.snap.mlEngine.badge : nil,
                 badgeTint: model.snap.mlEngine == .native ? .green : .orange)
+                .contentShape(Rectangle())
+                .onTapGesture { runMLTest() }
+                .help("Click to run an ML self-test")
             StatusRow(
                 icon: "gauge.with.dots.needle.50percent", name: "Dashboard",
-                detail: model.snap.dashboardUp ? "localhost:8420" : "Not running",
+                detail: model.snap.dashboardUp ? "localhost:\(model.snap.dashboardPort)" : "Not running",
                 ok: model.snap.dashboardUp)
         }
         .padding(.horizontal, 8)
@@ -65,9 +68,19 @@ struct MenuView: View {
     }
 
     private var mlDetail: String {
+        if testing { return "Testing…" }
         if model.snap.mlHealthy { return "CLIP · Faces · OCR" }
         if model.snap.mlUp { return "Starting…" }
         return "Not running"
+    }
+
+    private func runMLTest() {
+        guard model.snap.mlHealthy, !testing else { return }
+        testing = true
+        Task {
+            model.lastMLTest = await Actions.mlTest()
+            testing = false
+        }
     }
 
     private var workerDetail: String {
@@ -86,18 +99,12 @@ struct MenuView: View {
                         await Actions.startService(); await model.refresh()
                     }
                 } else {
-                    ActionButton(title: "Restart", icon: "arrow.clockwise") {
-                        await Actions.restartService(); await model.refresh()
-                    }
                     ActionButton(title: "Stop", icon: "stop.fill") {
                         await Actions.stopService(); await model.refresh()
                     }
-                }
-                ActionButton(title: testing ? "Testing…" : "Test ML",
-                             icon: "checkmark.seal", disabled: testing || !model.snap.mlHealthy) {
-                    testing = true
-                    model.lastMLTest = await Actions.mlTest()
-                    testing = false
+                    ActionButton(title: "Restart", icon: "arrow.clockwise") {
+                        await Actions.restartService(); await model.refresh()
+                    }
                 }
             }
             if let result = model.lastMLTest {
@@ -123,7 +130,7 @@ struct MenuView: View {
                 Actions.openImmich(model.snap.openImmichURL)
             }
             LinkRow(icon: "gauge.with.dots.needle.50percent", title: "Open Dashboard") {
-                Actions.openDashboard()
+                Actions.openDashboard(port: model.snap.dashboardPort)
             }
             LinkRow(icon: "doc.text.magnifyingglass", title: "Open Logs") {
                 Actions.openLogs()
