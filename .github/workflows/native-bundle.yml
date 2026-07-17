@@ -42,7 +42,7 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${RELEASE_TAG:-$INPUT_VERSION}"
+          VERSION="${RELEASE_TAG:-${INPUT_VERSION:-1.6.0}}"
           VERSION="${VERSION#v}"
           cd native-ml && bash scripts/release_bundle.sh "$VERSION"
 
