@@ -1512,25 +1512,57 @@ class TestStartDashboard:
             popen.assert_not_called()
 
     def test_adopts_untracked_orphan_on_port(self):
-        # Serving on 8420 but no pid file → adopt the listener's pid (so a later
-        # stop can reach it) instead of spawning a second one.
+        # Serving on the port with no pid file, and it's really our dashboard →
+        # adopt the listener's pid (so a later stop can reach it) instead of
+        # spawning a second one.
         from immich_accelerator.__main__ import start_dashboard
 
         with patch("immich_accelerator.__main__.read_pid", return_value=None), patch(
             "immich_accelerator.__main__._pid_on_port", return_value=729
-        ), patch("immich_accelerator.__main__.write_pid") as wpid, patch(
+        ), patch(
+            "immich_accelerator.__main__._process_is_our_dashboard", return_value=True
+        ), patch(
+            "immich_accelerator.__main__._dashboard_port", return_value=8420
+        ), patch(
+            "immich_accelerator.__main__.write_pid"
+        ) as wpid, patch(
             "immich_accelerator.__main__.subprocess.Popen"
         ) as popen:
             start_dashboard()
             popen.assert_not_called()
             wpid.assert_called_once_with("dashboard", 729)
 
+    def test_does_not_adopt_foreign_process_on_port(self):
+        # Something else holds the port (e.g. OrbStack) → do NOT adopt it and do
+        # NOT spawn (its port is taken); just warn. Adopting a foreign pid meant
+        # we tracked the wrong process and never ran our own dashboard.
+        from immich_accelerator.__main__ import start_dashboard
+
+        with patch("immich_accelerator.__main__.read_pid", return_value=None), patch(
+            "immich_accelerator.__main__._pid_on_port", return_value=729
+        ), patch(
+            "immich_accelerator.__main__._process_is_our_dashboard", return_value=False
+        ), patch(
+            "immich_accelerator.__main__._dashboard_port", return_value=8420
+        ), patch(
+            "immich_accelerator.__main__.write_pid"
+        ) as wpid, patch(
+            "immich_accelerator.__main__.subprocess.Popen"
+        ) as popen:
+            start_dashboard()
+            popen.assert_not_called()
+            wpid.assert_not_called()
+
     def test_starts_fresh_when_nothing_running(self):
         from immich_accelerator.__main__ import start_dashboard
 
         with patch("immich_accelerator.__main__.read_pid", return_value=None), patch(
             "immich_accelerator.__main__._pid_on_port", return_value=None
-        ), patch("immich_accelerator.__main__.write_pid"), patch(
+        ), patch(
+            "immich_accelerator.__main__._dashboard_port", return_value=8420
+        ), patch(
+            "immich_accelerator.__main__.write_pid"
+        ), patch(
             "immich_accelerator.__main__.subprocess.Popen"
         ) as popen:
             popen.return_value.pid = 555

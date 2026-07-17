@@ -2150,25 +2150,75 @@ def _pid_on_port(port: int) -> int | None:
         return None
 
 
+def _dashboard_port() -> int:
+    """Configured dashboard port (default 8420), so it can dodge a collision."""
+    try:
+        return int(load_config().get("dashboard_port", 8420))
+    except (RuntimeError, ValueError, OSError):
+        return 8420
+
+
+def _process_is_our_dashboard(pid: int) -> bool:
+    """Whether a pid is actually our dashboard, not a foreign port squatter.
+
+    Guards the adopt-on-port path below: on some setups another process (e.g.
+    OrbStack proxying a container) already listens on the dashboard port, and
+    blindly adopting its pid meant we never started our own and pointed users
+    at the wrong thing.
+    """
+    start = _get_process_start_time(pid)  # cheap "does it exist" + reuse guard
+    if start is None:
+        return False
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return "immich_accelerator" in out and "dashboard" in out
+
+
 def start_dashboard() -> None:
     """Start the dashboard in the background if it isn't already running.
     Idempotent — used by both `start` and `watch` so either brings the
     dashboard up (#81)."""
     if read_pid("dashboard"):
         return  # already tracked + alive (also guards a just-spawned one)
+    port = _dashboard_port()
     # Untracked but already serving (an orphan from a prior run whose pid file
-    # was lost) — adopt its pid so a later stop can actually reach it, instead
-    # of leaving an unkillable orphan AND refusing to start a tracked one.
-    orphan = _pid_on_port(8420)
+    # was lost) — adopt its pid so a later stop can reach it. Only if it's
+    # actually our dashboard, though: never adopt a foreign process that merely
+    # happens to hold the port.
+    orphan = _pid_on_port(port)
     if orphan:
-        write_pid("dashboard", orphan)
-        log.info("Adopted running dashboard (PID %d)", orphan)
+        if _process_is_our_dashboard(orphan):
+            write_pid("dashboard", orphan)
+            log.info("Adopted running dashboard (PID %d)", orphan)
+            return
+        log.warning(
+            "Dashboard port %d is held by another process (PID %d), not the "
+            'accelerator. Set "dashboard_port" in %s to a free port to run the '
+            "dashboard.",
+            port,
+            orphan,
+            CONFIG_FILE,
+        )
         return
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     dash_log = open(LOG_DIR / "dashboard.log", "a")
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-m", __package__ or "immich_accelerator", "dashboard"],
+            [
+                sys.executable,
+                "-m",
+                __package__ or "immich_accelerator",
+                "dashboard",
+                "--port",
+                str(port),
+            ],
             cwd=str(Path(__file__).parent.parent),
             stdout=dash_log,
             stderr=subprocess.STDOUT,
@@ -2177,7 +2227,7 @@ def start_dashboard() -> None:
     finally:
         dash_log.close()
     write_pid("dashboard", proc.pid)
-    log.info("Dashboard started: http://localhost:8420")
+    log.info("Dashboard started: http://localhost:%d", port)
 
 
 # --- Commands ---
