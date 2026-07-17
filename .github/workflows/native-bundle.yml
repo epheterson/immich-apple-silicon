@@ -9,8 +9,6 @@ on:
       version:
         description: version string for the tarball name
         default: "1.6.0"
-  release:
-    types: [published]
 
 jobs:
   build:
