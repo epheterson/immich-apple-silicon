@@ -49,6 +49,9 @@ jobs:
           gh release upload "$TAG" "$TARBALL" --clobber
       - name: Build + upload menu-bar app asset
         id: menubar
+        # Best-effort: a menubar build failure must not block the core formula
+        # release. The cask render below is skipped when this produces no sha.
+        continue-on-error: true
         env:
           TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}
@@ -119,6 +122,8 @@ jobs:
           ruby -c "$OUT"
 
       - name: Render menu-bar cask
+        # Skipped when the menubar build failed (no sha); formula still ships.
+        if: needs.build-native.outputs.menubar_sha256 != ''
         env:
           VERSION: ${{ steps.version.outputs.version }}
           REPO: ${{ github.repository }}
@@ -144,6 +149,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/immich-accelerator.rb Casks/immich-accelerator-menubar.rb
-          git commit -m "Update formula + menubar cask to v${TAG#v}"
+          git add Formula/immich-accelerator.rb
+          git add Casks/immich-accelerator-menubar.rb 2>/dev/null || true
+          git commit -m "Update formula (+ menubar cask) to v${TAG#v}"
           git push
