@@ -49,8 +49,7 @@ struct MenuView: View {
         VStack(spacing: 2) {
             StatusRow(
                 icon: "gearshape.2.fill", name: "Worker",
-                detail: model.snap.workerUp ? "Processing jobs" : "Not running",
-                ok: model.snap.workerUp)
+                detail: workerDetail, ok: model.snap.workerUp)
             StatusRow(
                 icon: "brain.fill", name: "Machine Learning",
                 detail: mlDetail, ok: model.snap.mlHealthy,
@@ -69,6 +68,14 @@ struct MenuView: View {
         if model.snap.mlHealthy { return "CLIP · Faces · OCR" }
         if model.snap.mlUp { return "Starting…" }
         return "Not running"
+    }
+
+    private var workerDetail: String {
+        guard model.snap.workerUp else { return "Not running" }
+        let active = model.snap.jobsActive, waiting = model.snap.jobsWaiting
+        if active == 0 && waiting == 0 { return "Idle" }
+        if waiting == 0 { return "\(active) processing" }
+        return "\(active) processing · \(waiting) queued"
     }
 
     private var actions: some View {
@@ -113,7 +120,7 @@ struct MenuView: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: 2) {
             LinkRow(icon: "photo.on.rectangle.angled", title: "Open Immich") {
-                Actions.openImmich(model.snap.immichURL)
+                Actions.openImmich(model.snap.openImmichURL)
             }
             LinkRow(icon: "gauge.with.dots.needle.50percent", title: "Open Dashboard") {
                 Actions.openDashboard()

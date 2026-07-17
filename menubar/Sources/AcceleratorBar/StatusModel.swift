@@ -34,7 +34,19 @@ struct Snapshot: Equatable {
     var dashboardUp = false
     var version = ""
     var immichVersion = ""
-    var immichURL = ""
+    var immichURL = ""       // the URL the worker connects to (from config)
+    var externalDomain = ""  // Immich's configured public domain, if any
+    var jobsActive = 0       // jobs the worker is running right now
+    var jobsWaiting = 0      // jobs queued behind them
+
+    // What "Open Immich" should launch: the public domain the user set in
+    // Immich when present, otherwise the local URL the accelerator connects to.
+    var openImmichURL: String {
+        externalDomain.isEmpty ? immichURL : externalDomain
+    }
+
+    // The worker is actively chewing through jobs (drives the amber icon).
+    var processing: Bool { jobsActive > 0 }
 
     var overall: ServiceState {
         if workerUp && mlHealthy { return .running }
@@ -95,9 +107,53 @@ final class StatusModel: ObservableObject {
         let config = Self.readConfig()
         s.immichVersion = config["version"] as? String ?? ""
         s.immichURL = config["immich_url"] as? String ?? ""
+        s.externalDomain = await Self.externalDomain(base: s.immichURL)
         let mlPort = (config["ml_port"] as? Int) ?? 3003
         s.mlHealthy = await Self.ping(port: mlPort)
+        if s.workerUp, let apiKey = config["api_key"] as? String {
+            let jobs = await Self.jobCounts(base: s.immichURL, apiKey: apiKey)
+            s.jobsActive = jobs.active
+            s.jobsWaiting = jobs.waiting
+        }
         snap = s
+    }
+
+    // Sum active/waiting across all of Immich's job queues so the menu bar can
+    // show whether the worker is busy and how deep the backlog is. Immich
+    // authenticates /api/jobs with the x-api-key header (key lives in config).
+    static func jobCounts(base: String, apiKey: String) async -> (active: Int, waiting: Int) {
+        guard !base.isEmpty, !apiKey.isEmpty, let url = URL(string: "\(base)/api/jobs")
+        else { return (0, 0) }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 3
+        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return (0, 0) }
+        var active = 0, waiting = 0
+        for (_, value) in obj {
+            guard let queue = value as? [String: Any],
+                  let counts = queue["jobCounts"] as? [String: Any] else { continue }
+            active += (counts["active"] as? Int) ?? 0
+            waiting += (counts["waiting"] as? Int) ?? 0
+        }
+        return (active, waiting)
+    }
+
+    // Immich's public domain (set in admin settings), used so "Open Immich"
+    // opens the address the user actually reaches Immich at rather than the
+    // internal IP the worker connects to. Empty when unset or unreachable.
+    static func externalDomain(base: String) async -> String {
+        guard !base.isEmpty, let url = URL(string: "\(base)/api/server/config") else { return "" }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let domain = obj["externalDomain"] as? String
+        else { return "" }
+        return domain
     }
 
     // MARK: - probes
