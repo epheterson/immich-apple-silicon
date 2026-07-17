@@ -165,16 +165,20 @@ See **[docs/split-deployment.md](docs/split-deployment.md)** for the full guide:
 
 ## ML service
 
-The ML service is a managed fork of [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) by [@sebastianfredette](https://github.com/sebastianfredette), included as a git submodule. It replaces Immich's Docker ML container with native macOS inference. Upstream changes are reviewed before merging.
+The ML service runs Immich's CLIP, face, and OCR inference natively on Apple Silicon.
 
 | Task | Hardware | Framework |
 |------|----------|-----------|
-| CLIP embeddings | GPU (Metal) | MLX |
-| Face detection | Neural Engine | Apple Vision |
-| Face recognition | CPU / CoreML | InsightFace ONNX |
+| CLIP embeddings (image + text) | GPU (Metal) | mlx-swift |
+| Face detection + landmarks | Neural Engine | Apple Vision |
+| Face recognition | CPU | InsightFace ArcFace (onnxruntime) |
 | OCR | Neural Engine | Apple Vision |
 
-Contributions to the ML service are made via [upstream PRs](https://github.com/sebastianfredette/immich-ml-metal/pulls).
+As of 1.6.0 this runs as a **native Swift engine**: a single binary with the models and libraries bundled, no Python. It replaces the ~1.5 GB Python venv (torch, mlx, onnxruntime, opencv, insightface) and the dependency-pin fragility that came with it. It uses the same weights and models as the Python service, so embeddings stay in the same space as an existing Immich search index and face clusters (no re-index, no re-cluster).
+
+The native engine is the default and is health-checked at startup. If its bundle or model is missing, or it fails to start, the accelerator automatically falls back to the Python service so ML is never left down. Force the Python engine with `"ml_engine": "python"` in `~/.immich-accelerator/config.json`.
+
+The Python fallback is a managed fork of [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) by [@sebastianfredette](https://github.com/sebastianfredette), included as a git submodule; upstream changes are reviewed before merging, and contributions are made via [upstream PRs](https://github.com/sebastianfredette/immich-ml-metal/pulls).
 
 ## Running as a service (recommended)
 
