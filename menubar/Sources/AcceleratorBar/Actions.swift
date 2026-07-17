@@ -1,5 +1,15 @@
 import AppKit
 import Foundation
+import ServiceManagement
+
+// Single source of truth for the login-item state, so the menu panel and the
+// settings window don't each hand-roll (and diverge on) the register logic.
+enum LaunchAtLogin {
+    static var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
+    static func set(_ on: Bool) {
+        try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
+    }
+}
 
 // Daily actions, shelling out to the same commands a user would run.
 enum Actions {
@@ -39,7 +49,7 @@ enum Actions {
     static func mlTest() async -> String {
         let (code, out) = await run(cli, ["ml-test"])
         if let line = out.split(separator: "\n").last(where: { $0.contains("checks passed") }) {
-            // e.g. "ML service OK — 4/4 checks passed"
+            // e.g. "ML service OK - 4/4 checks passed"
             return line.replacingOccurrences(of: #"^\S+\s+\S+\s+"#, with: "", options: .regularExpression)
                 .trimmingCharacters(in: .whitespaces)
         }

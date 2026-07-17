@@ -14,14 +14,14 @@ enum ServiceState: Equatable {
     }
 }
 
-enum MLEngine: Equatable {
+enum MLEngine: Equatable, Sendable {
     case native, python, unknown
 
     var badge: String {
         switch self {
         case .native: return "NATIVE"
         case .python: return "PYTHON"
-        case .unknown: return "—"
+        case .unknown: return "-"
         }
     }
 }
@@ -54,6 +54,21 @@ struct Snapshot: Equatable {
         if !workerUp && !mlUp && !dashboardUp { return .stopped }
         return .degraded
     }
+}
+
+// The result of the blocking pidfile/ps/config probes, gathered off the main
+// actor. Sendable (only value types) so it can cross back to the MainActor.
+struct ProcessProbe: Sendable {
+    var workerUp = false
+    var mlUp = false
+    var mlEngine: MLEngine = .unknown
+    var dashboardUp = false
+    var version = ""
+    var immichVersion = ""
+    var immichURL = ""
+    var dashboardPort = 8420
+    var mlPort = 3003
+    var apiKey = ""
 }
 
 // Filesystem locations shared by the model and actions (not actor-isolated).
@@ -109,41 +124,64 @@ final class StatusModel: ObservableObject {
     func stopPolling() { timer?.invalidate(); timer = nil }
 
     func refresh() async {
+        // The pidfile/ps/config probes fork subprocesses and touch the disk;
+        // run them off the main actor so a poll never hitches the UI thread.
+        let p = await Task.detached(priority: .utility) { Self.probeProcesses() }.value
+
         var s = Snapshot()
-        s.workerUp = Self.pidAlive("worker") != nil
-        let mlPid = Self.pidAlive("ml")
-        s.mlUp = mlPid != nil
-        if let pid = mlPid {
-            let cmd = Self.command(of: pid)
-            if cmd.contains("immich-ml-native") { s.mlEngine = .native }
-            else if cmd.contains("python") { s.mlEngine = .python }
-        }
-        if let dashPid = Self.pidAlive("dashboard") {
-            // Confirm the tracked pid is really our dashboard, not a foreign
-            // process a mis-adopted pidfile points at (older accelerators would
-            // adopt whatever held the port, e.g. OrbStack).
-            s.dashboardUp = Self.command(of: dashPid).contains("immich_accelerator")
-        }
-        s.version = Self.readVersion()
-        let config = Self.readConfig()
-        s.immichVersion = config["version"] as? String ?? ""
-        s.immichURL = config["immich_url"] as? String ?? ""
-        s.dashboardPort = (config["dashboard_port"] as? Int) ?? 8420
-        s.externalDomain = await Self.externalDomain(base: s.immichURL)
-        let mlPort = (config["ml_port"] as? Int) ?? 3003
-        s.mlHealthy = await Self.ping(port: mlPort)
-        if s.workerUp, let apiKey = config["api_key"] as? String {
-            let jobs = await Self.jobCounts(base: s.immichURL, apiKey: apiKey)
-            s.jobsActive = jobs.active
-            s.jobsWaiting = jobs.waiting
-        }
+        s.workerUp = p.workerUp
+        s.mlUp = p.mlUp
+        s.mlEngine = p.mlEngine
+        s.dashboardUp = p.dashboardUp
+        s.version = p.version
+        s.immichVersion = p.immichVersion
+        s.immichURL = p.immichURL
+        s.dashboardPort = p.dashboardPort
+
+        // The three network probes are independent (each has its own timeout),
+        // so run them concurrently: a slow/unreachable service costs the max
+        // latency, not the sum.
+        async let domain = Self.externalDomain(base: p.immichURL)
+        async let healthy = Self.ping(port: p.mlPort)
+        async let jobs = Self.jobCounts(base: p.immichURL, apiKey: p.apiKey)
+        s.externalDomain = await domain
+        s.mlHealthy = await healthy
+        let counts = await jobs
+        s.jobsActive = counts.active
+        s.jobsWaiting = counts.waiting
+
         snap = s
+    }
+
+    // Blocking pidfile/ps/config probes, gathered off the main actor. Confirms
+    // the ML engine and that the tracked dashboard pid is really ours (not a
+    // foreign process a mis-adopted pidfile points at, e.g. OrbStack).
+    nonisolated static func probeProcesses() -> ProcessProbe {
+        var p = ProcessProbe()
+        p.workerUp = pidAlive("worker") != nil
+        if let mlPid = pidAlive("ml") {
+            p.mlUp = true
+            let cmd = command(of: mlPid)
+            if cmd.contains("immich-ml-native") { p.mlEngine = .native }
+            else if cmd.contains("python") { p.mlEngine = .python }
+        }
+        if let dashPid = pidAlive("dashboard") {
+            p.dashboardUp = command(of: dashPid).contains("immich_accelerator")
+        }
+        p.version = readVersion()
+        let config = readConfig()
+        p.immichVersion = config["version"] as? String ?? ""
+        p.immichURL = config["immich_url"] as? String ?? ""
+        p.dashboardPort = (config["dashboard_port"] as? Int) ?? 8420
+        p.mlPort = (config["ml_port"] as? Int) ?? 3003
+        p.apiKey = (p.workerUp ? config["api_key"] as? String : nil) ?? ""
+        return p
     }
 
     // Sum active/waiting across all of Immich's job queues so the menu bar can
     // show whether the worker is busy and how deep the backlog is. Immich
     // authenticates /api/jobs with the x-api-key header (key lives in config).
-    static func jobCounts(base: String, apiKey: String) async -> (active: Int, waiting: Int) {
+    nonisolated static func jobCounts(base: String, apiKey: String) async -> (active: Int, waiting: Int) {
         guard !base.isEmpty, !apiKey.isEmpty, let url = URL(string: "\(base)/api/jobs")
         else { return (0, 0) }
         var req = URLRequest(url: url)
@@ -166,7 +204,7 @@ final class StatusModel: ObservableObject {
     // Immich's public domain (set in admin settings), used so "Open Immich"
     // opens the address the user actually reaches Immich at rather than the
     // internal IP the worker connects to. Empty when unset or unreachable.
-    static func externalDomain(base: String) async -> String {
+    nonisolated static func externalDomain(base: String) async -> String {
         guard !base.isEmpty, let url = URL(string: "\(base)/api/server/config") else { return "" }
         var req = URLRequest(url: url)
         req.timeoutInterval = 2
@@ -180,7 +218,7 @@ final class StatusModel: ObservableObject {
 
     // MARK: - probes
 
-    static func pidAlive(_ name: String) -> Int32? {
+    nonisolated static func pidAlive(_ name: String) -> Int32? {
         let f = Paths.dataDir.appendingPathComponent("pids/\(name).pid")
         guard let text = try? String(contentsOf: f, encoding: .utf8) else { return nil }
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
@@ -199,11 +237,11 @@ final class StatusModel: ObservableObject {
         return pid
     }
 
-    static func command(of pid: Int32) -> String { psField(pid, "command=") }
+    nonisolated static func command(of pid: Int32) -> String { psField(pid, "command=") }
 
     // One `ps` field for a pid, e.g. "command=" or "lstart=". Reads before
     // waiting (pipe-buffer deadlock discipline; see Actions.run).
-    static func psField(_ pid: Int32, _ field: String) -> String {
+    nonisolated static func psField(_ pid: Int32, _ field: String) -> String {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
         p.arguments = ["-p", "\(pid)", "-o", field]
@@ -215,7 +253,7 @@ final class StatusModel: ObservableObject {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    static func ping(port: Int) async -> Bool {
+    nonisolated static func ping(port: Int) async -> Bool {
         guard let url = URL(string: "http://127.0.0.1:\(port)/ping") else { return false }
         var req = URLRequest(url: url)
         req.timeoutInterval = 2
@@ -224,13 +262,13 @@ final class StatusModel: ObservableObject {
         return http.statusCode == 200 && String(data: data, encoding: .utf8) == "pong"
     }
 
-    static func readVersion() -> String {
+    nonisolated static func readVersion() -> String {
         let f = Paths.optDir.appendingPathComponent("libexec/VERSION")
         return (try? String(contentsOf: f, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    static func readConfig() -> [String: Any] {
+    nonisolated static func readConfig() -> [String: Any] {
         let f = Paths.dataDir.appendingPathComponent("config.json")
         guard let data = try? Data(contentsOf: f),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]

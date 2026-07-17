@@ -74,7 +74,7 @@ struct OnboardingView: View {
 
     private var notConfigured: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Label("Installed — let's connect it to Immich", systemImage: "gearshape")
+            Label("Installed. Let's connect it to Immich", systemImage: "gearshape")
                 .font(.headline)
             Text("Setup asks a few questions (your Immich, database, media) and "
                  + "starts the services. It runs in Terminal.")

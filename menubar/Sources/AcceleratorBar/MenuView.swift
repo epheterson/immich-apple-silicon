@@ -1,10 +1,9 @@
 import SwiftUI
-import ServiceManagement
 
 // The dropdown panel. One glance = full picture; one click = any daily action.
 struct MenuView: View {
     @ObservedObject var model: StatusModel
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var launchAtLogin = LaunchAtLogin.isEnabled
     @State private var testing = false
 
     var body: some View {
@@ -161,9 +160,7 @@ struct MenuView: View {
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
-            .onChange(of: launchAtLogin) { _, on in
-                try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
-            }
+            .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
             LinkRow(icon: "power", title: "Quit") { NSApp.terminate(nil) }
         }
         .padding(.horizontal, 8)

@@ -1,4 +1,3 @@
-import ServiceManagement
 import SwiftUI
 
 // A compact settings/info window: see how the accelerator is wired, switch the
@@ -13,7 +12,7 @@ struct SettingsView: View {
     @State private var savedEngine = "native"
     @State private var revealKey = false
     @State private var applying = false
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var launchAtLogin = LaunchAtLogin.isEnabled
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -39,7 +38,7 @@ struct SettingsView: View {
     private var immichSection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 6) {
-                row("Immich", model.snap.immichVersion.isEmpty ? "—" : model.snap.immichVersion)
+                row("Immich", model.snap.immichVersion.isEmpty ? "-" : model.snap.immichVersion)
                 row("Connects to", str("immich_url"))
                 row("Public domain", model.snap.externalDomain.isEmpty
                     ? "not set (Open Immich uses the local address)" : model.snap.externalDomain)
@@ -81,19 +80,27 @@ struct SettingsView: View {
         } label: { Label("Machine Learning", systemImage: "brain.fill") }
     }
 
+    private var apiKey: String { config["api_key"] as? String ?? "" }
+
     private var keySection: some View {
         GroupBox {
             HStack(spacing: 8) {
                 Text("API key").foregroundStyle(.secondary)
                     .frame(width: 90, alignment: .leading)
-                Text(revealKey ? str("api_key") : String(repeating: "•", count: 24))
+                // Distinguish a genuinely-missing key (breaks job counts and
+                // authenticated calls) from a present-but-hidden one.
+                Text(apiKey.isEmpty ? "not set"
+                     : (revealKey ? apiKey : String(repeating: "•", count: 24)))
                     .font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(apiKey.isEmpty ? .secondary : .primary)
                     .textSelection(.enabled)
                 Spacer()
-                Button {
-                    revealKey.toggle()
-                } label: { Image(systemName: revealKey ? "eye.slash" : "eye") }
-                    .buttonStyle(.borderless)
+                if !apiKey.isEmpty {
+                    Button {
+                        revealKey.toggle()
+                    } label: { Image(systemName: revealKey ? "eye.slash" : "eye") }
+                        .buttonStyle(.borderless)
+                }
             }
             .padding(4)
         } label: { Label("Credentials", systemImage: "key.fill") }
@@ -103,9 +110,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle(isOn: $launchAtLogin) { Text("Launch menu bar at login") }
                 .toggleStyle(.switch)
-                .onChange(of: launchAtLogin) { _, on in
-                    try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
-                }
+                .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
             HStack(spacing: 10) {
                 Button("Reveal Config") { Actions.revealConfig() }
                 Button("Open Logs") { Actions.openLogs() }
@@ -120,7 +125,7 @@ struct SettingsView: View {
     private func str(_ key: String) -> String {
         if let s = config[key] as? String { return s }
         if let i = config[key] as? Int { return String(i) }
-        return "—"
+        return "-"
     }
 
     private func row(_ label: String, _ value: String) -> some View {
