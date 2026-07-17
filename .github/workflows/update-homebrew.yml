@@ -9,13 +9,18 @@ on:
 
 jobs:
   build-native:
-    # Build the native ML bundle on macOS (Swift + Metal) and attach it to the
-    # release, so the formula can install a prebuilt, ad-hoc-signed binary (no
-    # notarization; brew does not quarantine its downloads). macos-15 = Swift 6,
-    # so mlx-swift resolves to the validated 0.31.x.
+    # Build the native ML bundle + menu-bar app on macOS (Swift + Metal) and
+    # attach them to the release, so the formula/cask install prebuilt,
+    # ad-hoc-signed binaries (no notarization; brew does not quarantine its
+    # downloads). macos-15 = Swift 6, so mlx-swift resolves to the validated
+    # 0.31.x. contents:write is required to upload release assets (the v1.6.0
+    # run failed 403 without it and was completed by hand).
     runs-on: macos-15
+    permissions:
+      contents: write
     outputs:
       sha256: ${{ steps.pkg.outputs.sha256 }}
+      menubar_sha256: ${{ steps.menubar.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -42,6 +47,19 @@ jobs:
           TARBALL="$(ls immich-ml-native-*.tar.gz)"
           echo "sha256=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           gh release upload "$TAG" "$TARBALL" --clobber
+      - name: Build + upload menu-bar app asset
+        id: menubar
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${TAG#v}"
+          cd menubar && bash scripts/build_app.sh "$VERSION"
+          ZIP="immich-accelerator-menubar-${VERSION}.zip"
+          ditto -c -k --keepParent "Immich Accelerator.app" "$ZIP"
+          echo "sha256=$(shasum -a 256 "$ZIP" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          gh release upload "$TAG" "$ZIP" --clobber
 
   update-tap:
     needs: build-native
@@ -100,11 +118,32 @@ jobs:
           bash acc/scripts/render-formula.sh
           ruby -c "$OUT"
 
-      - name: Push updated formula
+      - name: Render menu-bar cask
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REPO: ${{ github.repository }}
+          MENUBAR_SHA: ${{ needs.build-native.outputs.menubar_sha256 }}
+        run: |
+          mkdir -p tap/Casks
+          cat > tap/Casks/immich-accelerator-menubar.rb <<CASK
+          cask "immich-accelerator-menubar" do
+            version "${VERSION}"
+            sha256 "${MENUBAR_SHA}"
+            url "https://github.com/${REPO}/releases/download/v${VERSION}/immich-accelerator-menubar-${VERSION}.zip"
+            name "Immich Accelerator Menu Bar"
+            desc "Menu-bar status and controls for Immich Accelerator"
+            homepage "https://github.com/${REPO}"
+            depends_on macos: ">= :sonoma"
+            app "Immich Accelerator.app"
+          end
+          CASK
+          ruby -c tap/Casks/immich-accelerator-menubar.rb
+
+      - name: Push updated formula + cask
         working-directory: tap
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/immich-accelerator.rb
-          git commit -m "Update formula to v${TAG#v}"
+          git add Formula/immich-accelerator.rb Casks/immich-accelerator-menubar.rb
+          git commit -m "Update formula + menubar cask to v${TAG#v}"
           git push
