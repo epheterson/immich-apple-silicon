@@ -3553,26 +3553,77 @@ def _native_ml_spec(config: dict, env: dict):
     return [str(binary), "serve", str(ml_port)], str(bundle), env
 
 
-def _ml_launch_spec(config: dict):
-    """Return (cmd, cwd, env) to start the ML service, or None if unavailable.
-
-    Selects the native Swift engine when ``ml_engine == native`` and its bundle
-    is present; otherwise the Python venv service. The native path is strictly
-    opt-in, so default behaviour is unchanged.
-    """
-    env = os.environ.copy()
-    if config.get("ml_engine") == "native":
-        spec = _native_ml_spec(config, env)
-        if spec is not None:
-            return spec
-        log.warning(
-            "ml_engine=native but native bundle/CLIP model missing — using Python venv"
-        )
+def _venv_ml_spec(config: dict, env: dict):
+    """Launch spec (cmd, cwd, env) for the Python venv ML service, or None."""
     ml_dir = Path(config.get("ml_dir", ""))
     ml_python = ml_dir / "venv" / "bin" / "python3"
     if ml_python.exists():
         return [str(ml_python), "-m", "src.main"], str(ml_dir), env
     return None
+
+
+def _ml_healthy(config: dict, pid: int | None = None, timeout: float = 90.0) -> bool:
+    """Poll the ML service /ping until it answers or the timeout elapses.
+
+    The native engine's first start is slow: it loads ~700 MB of weights and
+    compiles mlx's Metal pipeline on first use (a cold start measured well over
+    25 s; warm starts are a few seconds). So the window is generous. But if
+    ``pid`` is given and the process dies, bail immediately so a genuinely
+    broken native falls back to the venv fast instead of waiting out the timeout.
+    """
+    import urllib.request
+
+    port = int(config.get("ml_port", 3003))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return False  # process died, fall back now
+        try:
+            with urllib.request.urlopen(
+                f"http://localhost:{port}/ping", timeout=3
+            ) as r:
+                if r.read().strip() == b"pong":
+                    return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
+def _start_ml_service(config: dict):
+    """Start the ML service, preferring the native Swift engine with the Python
+    venv as an automatic fallback. Returns (pid, engine_label) or (None, None).
+
+    The native engine is the default (set ``ml_engine: python`` to force the
+    venv). If the native bundle/model is absent, or the native process crashes
+    or never becomes healthy, we fall back to the venv so ML is never left down.
+    """
+    env = os.environ.copy()
+    attempts = []
+    if config.get("ml_engine", "native") != "python":
+        native = _native_ml_spec(config, env)
+        if native is not None:
+            attempts.append(("native Swift", native, True))
+    venv = _venv_ml_spec(config, env)
+    if venv is not None:
+        attempts.append(("Python venv", venv, False))
+
+    for label, (cmd, cwd, senv), health_gate in attempts:
+        log.info("Starting ML service (%s)...", label)
+        try:
+            pid = start_service("ml", cmd, senv, cwd)
+        except RuntimeError:
+            log.warning("  %s failed to start", label)
+            continue
+        if health_gate and not _ml_healthy(config, pid=pid):
+            log.warning("  native ML did not become healthy; falling back to venv")
+            kill_pid("ml")
+            continue
+        return pid, label
+    return None, None
 
 
 def _find_ml_dir() -> Path | None:
@@ -4043,25 +4094,16 @@ def cmd_start(args):
         config["ml_dir"] = str(resolved_ml)
         save_config(config)
 
-    # Start ML service (native Swift engine when ml_engine=native, else venv)
+    # Start ML service (native Swift engine by default, Python venv fallback)
     ml_started_here = False
     ml_pid = read_pid("ml")
     if not ml_pid and config.get("ml_dir"):
-        spec = _ml_launch_spec(config)
-        if spec is not None:
-            cmd, cwd, env = spec
-            engine = (
-                "native Swift" if cmd[0].endswith("immich-ml-native") else "Python venv"
-            )
-            log.info("Starting ML service (%s)...", engine)
-            try:
-                ml_pid = start_service("ml", cmd, env, cwd)
-                ml_started_here = True
-                log.info("  ML service running (PID %d)", ml_pid)
-            except RuntimeError:
-                log.warning("  ML service failed to start — CLIP/face/OCR unavailable")
+        ml_pid, engine = _start_ml_service(config)
+        if ml_pid:
+            ml_started_here = True
+            log.info("  ML service running (PID %d, %s)", ml_pid, engine)
         else:
-            log.warning("ML service will not start — no venv and no native bundle.")
+            log.warning("ML service will not start (no native bundle, no venv).")
             log.warning(
                 "  If you installed via Homebrew, try: brew reinstall immich-accelerator"
             )
@@ -4355,14 +4397,11 @@ def cmd_watch(_args):
                 if resolved_ml and str(resolved_ml) != config.get("ml_dir"):
                     config["ml_dir"] = str(resolved_ml)
                     save_config(config)
-                spec = _ml_launch_spec(config)
-                if spec is not None:
-                    cmd, cwd, env = spec
-                    try:
-                        pid = start_service("ml", cmd, env, cwd)
-                        log.info("  ML restarted (PID %d)", pid)
-                    except RuntimeError:
-                        log.error("  ML restart failed")
+                pid, engine = _start_ml_service(config)
+                if pid:
+                    log.info("  ML restarted (PID %d, %s)", pid, engine)
+                else:
+                    log.error("  ML restart failed")
 
             # fd-leak safety net (#89): restart the worker before a runaway
             # open-file-descriptor count (an upstream Immich leak on some media)
