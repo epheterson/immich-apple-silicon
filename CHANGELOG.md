@@ -1,8 +1,9 @@
 # Changelog
 
-## 1.6.1 - 2026-07-17
+## 1.7.0 - 2026-07-17
 
 ### Added
+- **Full CLIP model-zoo support in the native ML engine.** The native Swift engine is no longer limited to the default ViT-B-32: any CLIP model selectable in Immich (ViT-B-16, ViT-L-14, LAION variants, the SigLIP family, and anything else Immich publishes) now runs natively. The engine downloads Immich's own ONNX exports on first use (the same files the Docker ML service uses, cached in `~/.cache/immich-ml-native/zoo`) and runs them through onnxruntime with Immich's exact preprocessing and tokenization (including SigLIP's sentencepiece tokenizer and text canonicalization), so embeddings match the Docker service (textual cosine 1.0, visual ~0.9996 in validation against Immich's own pipeline). The default ViT-B-32 keeps the existing bit-identical mlx fast path. Model switching follows the Python service's semantics; unknown or unsupported models return a clear error instead of a wrong embedding. Architecture insight (running Immich's ONNX zoo natively) credit: [michina-swift](https://github.com/lucka-me/michina-swift) by [@lucka-me](https://github.com/lucka-me).
 - **Menu-bar app.** A native SwiftUI menu-bar app for the accelerator: worker / ML / dashboard health at a glance (with a NATIVE or PYTHON engine badge), start/stop/restart, run `ml-test` with the result inline, open Immich, the dashboard, or logs, and launch-at-login. It reads the accelerator's own state (pidfiles, the ML service's `/ping`, config) with no extra daemons, and ships as a tiny (~90KB) ad-hoc-signed app: `brew install --cask epheterson/immich-accelerator/immich-accelerator-menubar`. Design inspired by [Immich-Accelerator-Helper](https://github.com/pl4za/Immich-Accelerator-Helper) by [@pl4za](https://github.com/pl4za).
 
 ### Fixed

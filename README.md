@@ -187,6 +187,8 @@ The ML service runs Immich's CLIP, face, and OCR inference natively on Apple Sil
 
 As of 1.6.0 this runs as a **native Swift engine**: a single binary with the models and libraries bundled, no Python. It replaces the ~1.5 GB Python venv (torch, mlx, onnxruntime, opencv, insightface) and the dependency-pin fragility that came with it. It uses the same weights and models as the Python service, so embeddings stay in the same space as an existing Immich search index and face clusters (no re-index, no re-cluster).
 
+As of 1.7.0 the native engine supports the **full CLIP model zoo**: whatever model you select in Immich (ViT-B-16, ViT-L-14, LAION variants, the SigLIP family, ...) is downloaded from Immich's own model repository on first use and run natively through onnxruntime with Immich's exact preprocessing and tokenization, so results match the Docker ML service. The default ViT-B-32 uses an even faster mlx path.
+
 The native engine is the default and is health-checked at startup. If its bundle or models are missing, or it fails to start, the accelerator automatically falls back to the Python service so ML is never left down. On a brand-new install the models (~740MB) are downloaded once in the background on first native start, so ML runs on the Python engine for a few minutes until they arrive, then switches to native automatically.
 
 **Switching back to the Python engine.** If you want to force the Python service (for example to compare results, or if native misbehaves), set `ml_engine` in `~/.immich-accelerator/config.json`:
