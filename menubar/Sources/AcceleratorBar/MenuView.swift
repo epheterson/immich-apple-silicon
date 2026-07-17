@@ -128,8 +128,13 @@ struct MenuView: View {
             LinkRow(icon: "photo.on.rectangle.angled", title: "Open Immich") {
                 Actions.openImmich(model.snap.openImmichURL)
             }
-            LinkRow(icon: "gauge.with.dots.needle.50percent", title: "Open Dashboard") {
-                Actions.openDashboard(port: model.snap.dashboardPort)
+            // Only offer this when the dashboard is actually up: if the port is
+            // held by something else (a container proxy, say), opening it would
+            // navigate to that other app instead.
+            if model.snap.dashboardUp {
+                LinkRow(icon: "gauge.with.dots.needle.50percent", title: "Open Dashboard") {
+                    Actions.openDashboard(port: model.snap.dashboardPort)
+                }
             }
             LinkRow(icon: "doc.text.magnifyingglass", title: "Open Logs") {
                 Actions.openLogs()

@@ -18,13 +18,29 @@ final class WindowManager: NSObject {
     private var settings: NSWindow?
 
     func showOnboarding(model: StatusModel) {
+        dismissMenuBarPanel()
         onboarding = present(onboarding, title: "Immich Accelerator Setup",
                              view: OnboardingView(model: model))
     }
 
     func showSettings(model: StatusModel) {
+        dismissMenuBarPanel()
         settings = present(settings, title: "Immich Accelerator Settings",
                            view: SettingsView(model: model))
+    }
+
+    // The MenuBarExtra panel sits at a high window level and does not close when
+    // a button inside it is clicked, so it floats over any window we open from
+    // it. Order it out explicitly. It's the key window at the moment the click
+    // fires; the class-name check is a fallback for other macOS versions. Our
+    // own windows are never touched.
+    private func dismissMenuBarPanel() {
+        for window in NSApp.windows where window !== onboarding && window !== settings {
+            let cls = String(describing: type(of: window))
+            if window.isKeyWindow || cls.contains("MenuBarExtra") || cls.contains("StatusBar") {
+                window.orderOut(nil)
+            }
+        }
     }
 
     private func present<V: View>(_ existing: NSWindow?, title: String, view: V) -> NSWindow {
