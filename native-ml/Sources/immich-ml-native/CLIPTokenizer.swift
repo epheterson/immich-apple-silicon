@@ -100,6 +100,9 @@ final class CLIPTokenizer {
         return word
     }
 
+    // Vocab lookup for pad-token resolution (zoo models pad with e.g. <|endoftext|>).
+    func tokenId(_ token: String) -> Int? { encoder[token] }
+
     func encode(_ text: String) -> [Int] {
         let cleaned = whitespaceClean(text).lowercased()
         var tokens: [Int] = [Self.SOT]

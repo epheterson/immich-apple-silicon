@@ -24,6 +24,32 @@ if CommandLine.arguments.contains("texttest") {
     exit(0)
 }
 
+// --- Zoo parity harness: run ONNX zoo models, dump embeddings for oracle comparison ---
+if CommandLine.arguments.contains("zootest") {
+    let phrases = ["a photo of a cat", "sunset over the mountains", "OCR Test 123",
+                   "A DOG, running!  on the beach?", "immich native swift"]
+    for name in ["ViT-B-16__openai", "ViT-B-16-SigLIP__webli"] {
+        do {
+            let zoo = try ZooCLIP(name: name)
+            guard let cg = loadCGImage("/tmp/face_test.jpg") else { fatalError("no image") }
+            let ve = try zoo.embedVisual(cg)
+            ve.withUnsafeBytes {
+                try? Data($0).write(to: URL(fileURLWithPath: "/tmp/zoo_swift_\(name)_visual.f32"))
+            }
+            var tout = Data()
+            for p in phrases {
+                let te = try zoo.embedTextual(p)
+                te.withUnsafeBytes { tout.append(contentsOf: $0) }
+            }
+            try tout.write(to: URL(fileURLWithPath: "/tmp/zoo_swift_\(name)_textual.f32"))
+            print("\(name): visual dim=\(ve.count) first3=\(ve.prefix(3).map { String(format: "%.5f", $0) }); textual \(phrases.count) phrases dim=\(zoo.embedDim)")
+        } catch {
+            print("\(name): FAILED \(error)")
+        }
+    }
+    exit(0)
+}
+
 // --- Face-align parity harness: align /tmp/face_test.jpg with Python's landmarks ---
 if CommandLine.arguments.contains("aligntest") {
     guard let cg = loadCGImage("/tmp/face_test.jpg") else { fatalError("no face image") }
