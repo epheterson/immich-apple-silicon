@@ -59,4 +59,45 @@ enum Actions {
     static func openLogs() {
         NSWorkspace.shared.open(Paths.dataDir.appendingPathComponent("logs"))
     }
+
+    static func revealConfig() {
+        NSWorkspace.shared.activateFileViewerSelecting([Paths.configFile])
+    }
+
+    // The one-liner shown in onboarding when the accelerator isn't installed.
+    static let installCommand = "brew install epheterson/immich-accelerator/immich-accelerator"
+
+    static func copyToPasteboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    // Setup is an interactive CLI flow (Docker/DB prompts), so hand it to
+    // Terminal rather than trying to reproduce it in the panel.
+    static func runSetupInTerminal() {
+        let script = """
+        tell application "Terminal"
+            activate
+            do script "\(cli) setup"
+        end tell
+        """
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script]
+        try? p.run()
+    }
+
+    // Switch the ML engine by rewriting config.json (preserving every other
+    // key) and restarting so it takes effect. User-initiated from Settings.
+    static func setMLEngine(_ engine: String) async {
+        let url = Paths.configFile
+        guard let data = try? Data(contentsOf: url),
+              var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return }
+        obj["ml_engine"] = engine
+        guard let out = try? JSONSerialization.data(
+            withJSONObject: obj, options: [.prettyPrinted]) else { return }
+        try? out.write(to: url, options: .atomic)
+        await restartService()
+    }
 }

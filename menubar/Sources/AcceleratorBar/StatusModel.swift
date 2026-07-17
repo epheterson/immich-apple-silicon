@@ -60,10 +60,25 @@ enum Paths {
     static let dataDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".immich-accelerator")
     static let optDir = URL(fileURLWithPath: "/opt/homebrew/opt/immich-accelerator")
+    static let configFile = dataDir.appendingPathComponent("config.json")
+
+    // Is the accelerator CLI installed (via Homebrew)?
+    static var isInstalled: Bool {
+        FileManager.default.fileExists(atPath: optDir.appendingPathComponent("bin/immich-accelerator").path)
+    }
+
+    // Has the accelerator been set up (config.json written by `setup`)?
+    static var isConfigured: Bool {
+        FileManager.default.fileExists(atPath: configFile.path)
+    }
 }
 
 @MainActor
 final class StatusModel: ObservableObject {
+    // One shared instance so the menu bar, the app delegate (first-run), and
+    // the onboarding/settings windows all read the same live state.
+    static let shared = StatusModel()
+
     @Published var snap = Snapshot()
     @Published var lastMLTest: String?
     @Published var busy = false

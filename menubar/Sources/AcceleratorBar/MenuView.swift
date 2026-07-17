@@ -128,6 +128,15 @@ struct MenuView: View {
             LinkRow(icon: "doc.text.magnifyingglass", title: "Open Logs") {
                 Actions.openLogs()
             }
+            if Paths.isConfigured {
+                LinkRow(icon: "slider.horizontal.3", title: "Settings…") {
+                    WindowManager.shared.showSettings(model: model)
+                }
+            } else {
+                LinkRow(icon: "wand.and.stars", title: "Set Up Accelerator…") {
+                    WindowManager.shared.showOnboarding(model: model)
+                }
+            }
             Divider().padding(.vertical, 4).padding(.horizontal, 4)
             // Full-width settings row so it lines up with the link rows above
             // instead of a narrow checkbox centering itself in the panel.

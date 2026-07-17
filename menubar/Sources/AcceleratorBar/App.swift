@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // Entry point. `status` argument = one-shot headless status dump so the state
@@ -34,7 +35,8 @@ struct AcceleratorBarMain {
 }
 
 struct AcceleratorBarApp: App {
-    @StateObject private var model = StatusModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @StateObject private var model = StatusModel.shared
 
     var body: some Scene {
         MenuBarExtra {
@@ -43,6 +45,16 @@ struct AcceleratorBarApp: App {
             MenuBarLabel(model: model)
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+// On first launch, if the accelerator isn't set up yet, open the onboarding
+// window so a fresh install has a path forward instead of a dead menu bar.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if !Paths.isConfigured {
+            WindowManager.shared.showOnboarding(model: .shared)
+        }
     }
 }
 
