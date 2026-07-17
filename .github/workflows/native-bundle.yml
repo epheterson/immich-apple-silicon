@@ -27,9 +27,14 @@ jobs:
 
       - name: metallib matching mlx-swift 0.31.6
         run: |
-          pip3 install --break-system-packages "mlx==0.31.1" 2>/dev/null || pip3 install "mlx==0.31.1"
-          MLX_METALLIB="$(python3 -c 'import mlx, os; print(os.path.join(os.path.dirname(mlx.__file__), "lib", "mlx.metallib"))')"
-          test -f "$MLX_METALLIB" || { echo "no matching metallib at $MLX_METALLIB"; exit 1; }
+          pip3 install --break-system-packages "mlx==0.31.1" || pip3 install "mlx==0.31.1"
+          # mlx 0.31.1 splits into namespace packages (mlx + mlx-metal), so
+          # mlx.__file__ is None; find the metallib under mlx.__path__ instead.
+          MLX_DIR="$(python3 -c 'import mlx; print(list(mlx.__path__)[0])')"
+          MLX_METALLIB="$(find "$MLX_DIR" -name mlx.metallib 2>/dev/null | head -1)"
+          [ -n "$MLX_METALLIB" ] || MLX_METALLIB="$(find /opt/homebrew /Library/Frameworks/Python.framework -name mlx.metallib 2>/dev/null | head -1)"
+          test -f "$MLX_METALLIB" || { echo "no mlx.metallib found (mlx dir: $MLX_DIR)"; exit 1; }
+          echo "found metallib: $MLX_METALLIB"
           echo "MLX_METALLIB=$MLX_METALLIB" >> "$GITHUB_ENV"
 
       - name: build bundle
