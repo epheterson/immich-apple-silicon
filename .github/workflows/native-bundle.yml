@@ -11,10 +11,6 @@ on:
         default: "1.6.0"
   release:
     types: [published]
-  # temporary: verify the build on the feature branch before merge
-  push:
-    branches: [feat/native-ml-service]
-    paths: ['.github/workflows/native-bundle.yml']
 
 jobs:
   build:
