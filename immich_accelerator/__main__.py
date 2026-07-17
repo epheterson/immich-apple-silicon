@@ -3525,9 +3525,15 @@ def _native_ml_spec(config: dict, env: dict):
     safetensors dir; the ArcFace ONNX comes from the InsightFace cache. Returns
     None (caller falls back to the venv) if the bundle or CLIP model is missing.
     """
-    bundle = Path(
-        config.get("native_ml_dir")
-        or (Path.home() / ".immich-accelerator" / "native-ml")
+    # Bundle location: explicit config, else the formula install (libexec/native-ml),
+    # else a manual install under the data dir.
+    candidates = []
+    if config.get("native_ml_dir"):
+        candidates.append(Path(config["native_ml_dir"]))
+    candidates.append(Path("/opt/homebrew/opt/immich-accelerator/libexec/native-ml"))
+    candidates.append(Path.home() / ".immich-accelerator" / "native-ml")
+    bundle = next(
+        (b for b in candidates if (b / "immich-ml-native").exists()), candidates[-1]
     )
     binary = bundle / "immich-ml-native"
     clip_dir = Path(
