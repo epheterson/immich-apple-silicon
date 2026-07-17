@@ -807,6 +807,77 @@ class TestStartService:
 
 
 # ---------------------------------------------------------------------------
+# _start_ml_service: native-default engine with venv fallback + health gate
+# ---------------------------------------------------------------------------
+
+
+class TestStartMlService:
+    CFG = {"ml_dir": "/ml", "ml_port": 3003}
+    NATIVE = (["nbin", "serve", "3003"], "/bundle", {})
+    VENV = (["py", "-m", "src.main"], "/ml", {})
+
+    def test_prefers_native_when_healthy(self):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_native_ml_spec", return_value=self.NATIVE), patch.object(
+            m, "_venv_ml_spec", return_value=self.VENV
+        ), patch.object(m, "start_service", return_value=111) as ss, patch.object(
+            m, "_ml_healthy", return_value=True
+        ):
+            pid, engine = m._start_ml_service(dict(self.CFG))
+            assert pid == 111 and engine == "native Swift"
+            ss.assert_called_once()
+
+    def test_falls_back_to_venv_when_native_unhealthy(self):
+        import immich_accelerator.__main__ as m
+
+        started = []
+
+        def fake_start(name, cmd, env, cwd):
+            started.append(cmd[0])
+            return 222
+
+        with patch.object(m, "_native_ml_spec", return_value=self.NATIVE), patch.object(
+            m, "_venv_ml_spec", return_value=self.VENV
+        ), patch.object(m, "start_service", side_effect=fake_start), patch.object(
+            m, "_ml_healthy", return_value=False
+        ), patch.object(
+            m, "kill_pid", return_value=True
+        ):
+            pid, engine = m._start_ml_service(dict(self.CFG))
+            assert engine == "Python venv"
+            assert started == ["nbin", "py"]  # tried native, health-gated, then venv
+
+    def test_venv_when_native_absent(self):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_native_ml_spec", return_value=None), patch.object(
+            m, "_venv_ml_spec", return_value=self.VENV
+        ), patch.object(m, "start_service", return_value=333), patch.object(
+            m, "_ml_healthy", return_value=True
+        ):
+            pid, engine = m._start_ml_service(dict(self.CFG))
+            assert pid == 333 and engine == "Python venv"
+
+    def test_ml_engine_python_forces_venv(self):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "_native_ml_spec", return_value=self.NATIVE
+        ) as nat, patch.object(
+            m, "_venv_ml_spec", return_value=self.VENV
+        ), patch.object(
+            m, "start_service", return_value=444
+        ), patch.object(
+            m, "_ml_healthy", return_value=True
+        ):
+            cfg = dict(self.CFG, ml_engine="python")
+            pid, engine = m._start_ml_service(cfg)
+            assert engine == "Python venv"
+            nat.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Build link functions (_build_link_ok, _ensure_build_link, _remove_build_link)
 # ---------------------------------------------------------------------------
 

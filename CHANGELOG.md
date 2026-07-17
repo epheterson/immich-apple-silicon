@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.0 - 2026-07-16
+
+### Added
+- **Native Swift ML engine, the new default (with automatic Python-venv fallback).** The ML service (CLIP visual and text, face detection and recognition, OCR) can now run as a single native Swift binary instead of the ~1.5 GB Python venv (torch, mlx, onnxruntime, opencv, insightface) and the mlx-pin crash surface that came with it (#38, #103). CLIP runs on `mlx-swift` with the same mlx-community weights; face embedding runs the identical InsightFace ArcFace model through onnxruntime's C API; detection and OCR use Apple's Vision framework. Same models and weights, so embeddings stay in the same space as an existing Immich index and face clusters: no re-index, no re-cluster. Validated against the Python service on real library photos (CLIP visual cosine ~0.996, CLIP text 1.0, face embedding ~0.999 bbox-matched, OCR identical). The native engine is preferred automatically; if its bundle or models are missing, or it fails to start or become healthy, the accelerator falls back to the Python venv so ML is never left down. On a fresh install the models (~740MB) download once in the background on first native start, so ML runs on the Python engine for a few minutes until they arrive. **To switch back to the Python engine**, set `"ml_engine": "python"` in `~/.immich-accelerator/config.json` and restart the accelerator (`brew services restart epheterson/immich-accelerator/immich-accelerator`); set it back to `"native"` or remove the key to return. Distributed as an ad-hoc-signed relocatable bundle over Homebrew, so there is no notarization step and no Gatekeeper friction.
+
 ## 1.5.32 - 2026-07-15
 
 ### Fixed

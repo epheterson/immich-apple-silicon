@@ -1,0 +1,50 @@
+name: native-bundle
+# Build the relocatable native ML bundle on a macOS runner and upload it as an
+# artifact (workflow_dispatch) or a release asset (on release). The metallib is
+# pinned to the mlx version that matches mlx-swift 0.31.6 (validated 0.31.1), so
+# the shipped bundle is the one that was tested, not a mismatched newer metallib.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: version string for the tarball name
+        default: "1.6.0"
+
+jobs:
+  build:
+    # macos-15 ships Xcode 16 / Swift 6, so mlx-swift resolves to the pinned
+    # 0.31.6 (Package.resolved). Older Swift silently falls back to 0.29.x.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: onnxruntime
+        run: brew install onnxruntime
+
+      - name: metallib matching mlx-swift 0.31.6
+        run: |
+          pip3 install --break-system-packages "mlx==0.31.1" || pip3 install "mlx==0.31.1"
+          # mlx 0.31.1 splits into namespace packages (mlx + mlx-metal), so
+          # mlx.__file__ is None; find the metallib under mlx.__path__ instead.
+          MLX_DIR="$(python3 -c 'import mlx; print(list(mlx.__path__)[0])')"
+          MLX_METALLIB="$(find "$MLX_DIR" -name mlx.metallib 2>/dev/null | head -1)"
+          [ -n "$MLX_METALLIB" ] || MLX_METALLIB="$(find /opt/homebrew /Library/Frameworks/Python.framework -name mlx.metallib 2>/dev/null | head -1)"
+          test -f "$MLX_METALLIB" || { echo "no mlx.metallib found (mlx dir: $MLX_DIR)"; exit 1; }
+          echo "found metallib: $MLX_METALLIB"
+          echo "MLX_METALLIB=$MLX_METALLIB" >> "$GITHUB_ENV"
+
+      - name: build bundle
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION="${RELEASE_TAG:-${INPUT_VERSION:-1.6.0}}"
+          VERSION="${VERSION#v}"
+          cd native-ml && bash scripts/release_bundle.sh "$VERSION"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-bundle
+          path: native-ml/immich-ml-native-*.tar.gz
+          if-no-files-found: error

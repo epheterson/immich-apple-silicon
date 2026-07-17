@@ -8,6 +8,29 @@
 set -euo pipefail
 : "${OUT:?} ${SRC_URL:?} ${SRC_SHA:?} ${ML_URL:?} ${ML_SHA:?} ${REPO:?} ${OWNER:?} ${VERSION:?}"
 
+# Native Swift ML engine bundle. Optional: when NATIVE_URL is unset (e.g. the CI
+# formula-check job) the formula renders without it and the accelerator uses the
+# Python venv. When set (release) it installs the prebuilt ad-hoc-signed bundle.
+# The ML models (~740MB) are NOT fetched at install time: the accelerator
+# downloads them once in the background on first native start and caches them in
+# ~/.cache, so installs stay fast, upgrades don't re-download, and a flaky network
+# never blocks the install (the venv covers ML until the models arrive).
+NATIVE_RESOURCE=""
+NATIVE_INSTALL=""
+if [ -n "${NATIVE_URL:-}" ]; then
+  : "${NATIVE_SHA:?}"
+  NATIVE_RESOURCE="
+  resource \"native_ml\" do
+    url \"${NATIVE_URL}\"
+    sha256 \"${NATIVE_SHA}\"
+  end
+"
+  NATIVE_INSTALL="    resource(\"native_ml\").stage do
+      (libexec/\"native-ml\").install Dir[\"*\"]
+    end
+"
+fi
+
 cat > "$OUT" << EOF
 class ImmichAccelerator < Formula
   desc "Run Immich compute natively on Apple Silicon"
@@ -20,7 +43,7 @@ class ImmichAccelerator < Formula
     url "${ML_URL}"
     sha256 "${ML_SHA}"
   end
-
+${NATIVE_RESOURCE}
   depends_on :macos
   depends_on arch: :arm64
   # node@22 is the keg-only LTS that satisfies Immich's
@@ -41,7 +64,7 @@ class ImmichAccelerator < Formula
     resource("ml").stage do
       (libexec/"ml").install Dir["*"]
     end
-    # Wrapper uses the ML venv Python so the CLI inherits its
+${NATIVE_INSTALL}    # Wrapper uses the ML venv Python so the CLI inherits its
     # third-party deps (fastapi, uvicorn - required by the
     # dashboard and already pinned in ml/requirements.txt).
     # Prevents ModuleNotFoundError on fresh installs where

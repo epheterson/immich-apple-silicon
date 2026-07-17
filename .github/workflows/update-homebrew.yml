@@ -8,7 +8,43 @@ on:
         required: true
 
 jobs:
+  build-native:
+    # Build the native ML bundle on macOS (Swift + Metal) and attach it to the
+    # release, so the formula can install a prebuilt, ad-hoc-signed binary (no
+    # notarization; brew does not quarantine its downloads). macos-15 = Swift 6,
+    # so mlx-swift resolves to the validated 0.31.x.
+    runs-on: macos-15
+    outputs:
+      sha256: ${{ steps.pkg.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+      - name: onnxruntime
+        run: brew install onnxruntime
+      - name: metallib matching mlx-swift
+        run: |
+          pip3 install --break-system-packages "mlx==0.31.1" || pip3 install "mlx==0.31.1"
+          MLX_DIR="$(python3 -c 'import mlx; print(list(mlx.__path__)[0])')"
+          MLX_METALLIB="$(find "$MLX_DIR" -name mlx.metallib 2>/dev/null | head -1)"
+          [ -n "$MLX_METALLIB" ] || MLX_METALLIB="$(find /opt/homebrew -name mlx.metallib 2>/dev/null | head -1)"
+          test -f "$MLX_METALLIB" || { echo "no mlx.metallib found"; exit 1; }
+          echo "MLX_METALLIB=$MLX_METALLIB" >> "$GITHUB_ENV"
+      - name: Build + upload native bundle asset
+        id: pkg
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${TAG#v}"
+          cd native-ml && bash scripts/release_bundle.sh "$VERSION"
+          TARBALL="$(ls immich-ml-native-*.tar.gz)"
+          echo "sha256=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          gh release upload "$TAG" "$TARBALL" --clobber
+
   update-tap:
+    needs: build-native
     runs-on: ubuntu-latest
     env:
       TAG: ${{ inputs.tag }}
@@ -54,9 +90,13 @@ jobs:
           ML_SHA: ${{ steps.ml.outputs.sha256 }}
           REPO: ${{ github.repository }}
           OWNER: ${{ github.repository_owner }}
+          NATIVE_SHA: ${{ needs.build-native.outputs.sha256 }}
         run: |
           export SRC_URL="https://github.com/${REPO}/archive/refs/tags/v${VERSION}.tar.gz"
           export ML_URL="https://github.com/${OWNER}/immich-ml-metal/archive/${ML_COMMIT}.tar.gz"
+          export NATIVE_URL="https://github.com/${REPO}/releases/download/${TAG}/immich-ml-native-${VERSION}-macos-arm64.tar.gz"
+          # ML models are fetched by the accelerator on first native start, not
+          # at install time (see _maybe_fetch_native_models), so no model URL here.
           bash acc/scripts/render-formula.sh
           ruby -c "$OUT"
 

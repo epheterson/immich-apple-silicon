@@ -3517,6 +3517,220 @@ def _find_python() -> str | None:
     return None
 
 
+# Version-independent native model asset (CLIP safetensors + tokenizer + ArcFace).
+# Fetched once into ~/.cache/immich-ml-native and reused across upgrades.
+NATIVE_MODEL_URL = (
+    "https://github.com/epheterson/immich-apple-silicon/releases/download/"
+    "clip-model-v1/native-models.tar.gz"
+)
+NATIVE_CACHE = Path.home() / ".cache" / "immich-ml-native"
+
+
+def _native_bundle_dir(config: dict) -> Path | None:
+    """The installed native bundle dir (with the immich-ml-native binary), or None."""
+    candidates = []
+    if config.get("native_ml_dir"):
+        candidates.append(Path(config["native_ml_dir"]))
+    candidates.append(Path("/opt/homebrew/opt/immich-accelerator/libexec/native-ml"))
+    candidates.append(Path.home() / ".immich-accelerator" / "native-ml")
+    return next((b for b in candidates if (b / "immich-ml-native").exists()), None)
+
+
+def _native_clip_dir(config: dict) -> Path:
+    return Path(config.get("native_clip_dir") or (NATIVE_CACHE / "clip"))
+
+
+def _native_arcface(config: dict) -> Path | None:
+    """Resolve the ArcFace ONNX: explicit config, the InsightFace cache (existing
+    users already have buffalo_l), or the native model cache (fresh fetch)."""
+    if config.get("native_arcface"):
+        p = Path(config["native_arcface"])
+        return p if p.exists() else None
+    for p in (
+        Path.home() / ".insightface" / "models" / "buffalo_l" / "w600k_r50.onnx",
+        NATIVE_CACHE / "arcface" / "w600k_r50.onnx",
+    ):
+        if p.exists():
+            return p
+    return None
+
+
+def _native_ml_spec(config: dict, env: dict):
+    """Launch spec (cmd, cwd, env) for the native Swift ML engine, or None.
+
+    Native is the default. It needs the relocatable bundle (immich-ml-native +
+    colocated mlx.metallib + libonnxruntime), the CLIP safetensors, and the
+    ArcFace ONNX. Requires ALL of them before choosing native, so a fresh install
+    where a model is not fetched yet falls back cleanly to the venv instead of
+    starting native with broken CLIP or face recognition.
+    """
+    bundle = _native_bundle_dir(config)
+    if bundle is None:
+        return None
+    clip_dir = _native_clip_dir(config)
+    arcface = _native_arcface(config)
+    if not (clip_dir / "model.safetensors").exists() or arcface is None:
+        return None
+    env = dict(env)
+    env["ML_CLIP_DIR"] = str(clip_dir)
+    env["ML_ARCFACE"] = str(arcface)
+    ml_port = int(config.get("ml_port", 3003))
+    return [str(bundle / "immich-ml-native"), "serve", str(ml_port)], str(bundle), env
+
+
+def _maybe_fetch_native_models(config: dict) -> None:
+    """If the native bundle is installed but its models are missing, kick off a
+    one-time background download (~740 MB: CLIP + ArcFace) into ~/.cache and
+    return. The accelerator uses the venv until the models arrive; a later ML
+    (re)start then picks up native. Keeps installs fast and upgrades cheap (the
+    models persist across versions). Guarded so it is not started twice.
+    """
+    if config.get("ml_engine") == "python" or _native_bundle_dir(config) is None:
+        return
+    have_clip = (_native_clip_dir(config) / "model.safetensors").exists()
+    have_face = _native_arcface(config) is not None
+    if have_clip and have_face:
+        return
+    marker = NATIVE_CACHE / ".fetching"
+    if marker.exists():
+        try:
+            if time.time() - float(marker.read_text().strip()) < 3600:
+                return  # a fetch is already in flight
+        except (ValueError, OSError):
+            pass
+    url = config.get("native_model_url") or NATIVE_MODEL_URL
+    try:
+        NATIVE_CACHE.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(time.time()))
+    except OSError:
+        return
+    tarball = NATIVE_CACHE / "native-models.tar.gz"
+    script = (
+        f'curl -fL --retry 3 -o "{tarball}" "{url}" && '
+        f'tar -xzf "{tarball}" -C "{NATIVE_CACHE}" && rm -f "{tarball}"; '
+        f'rm -f "{marker}"'
+    )
+    try:
+        logf = open(LOG_DIR / "native-model-fetch.log", "a")
+        subprocess.Popen(
+            ["bash", "-c", script],
+            start_new_session=True,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+        )
+        log.info(
+            "Native ML models missing; fetching in the background (~740MB one time). "
+            "Using the Python engine until they arrive."
+        )
+    except OSError:
+        marker.unlink(missing_ok=True)
+
+
+def _venv_ml_spec(config: dict, env: dict):
+    """Launch spec (cmd, cwd, env) for the Python venv ML service, or None."""
+    ml_dir = Path(config.get("ml_dir", ""))
+    ml_python = ml_dir / "venv" / "bin" / "python3"
+    if ml_python.exists():
+        return [str(ml_python), "-m", "src.main"], str(ml_dir), env
+    return None
+
+
+def _ml_healthy(config: dict, pid: int | None = None, timeout: float = 90.0) -> bool:
+    """Poll the ML service /ping until it answers or the timeout elapses.
+
+    The native engine's first start is slow: it loads ~700 MB of weights and
+    compiles mlx's Metal pipeline on first use (a cold start measured well over
+    25 s; warm starts are a few seconds). So the window is generous. But if
+    ``pid`` is given and the process dies, bail immediately so a genuinely
+    broken native falls back to the venv fast instead of waiting out the timeout.
+    """
+    import urllib.request
+
+    port = int(config.get("ml_port", 3003))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return False  # process died, fall back now
+        try:
+            with urllib.request.urlopen(
+                f"http://localhost:{port}/ping", timeout=3
+            ) as r:
+                if r.read().strip() == b"pong":
+                    return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
+def _start_ml_preferred(config: dict):
+    """Start the preferred ML engine (native by default) WITHOUT waiting for it
+    to become healthy. Returns (pid, engine_label, is_native) or (None, None, False).
+
+    Native is the default (set ``ml_engine: python`` to force the venv). If native
+    can't even start (missing bundle, or it crashes within start_service's liveness
+    check), we fall back to the venv immediately. The slow "started but not yet
+    healthy" case is handled separately by _ml_verify_or_fallback, so a native cold
+    start never blocks the caller (e.g. the worker startup).
+    """
+    env = os.environ.copy()
+    attempts = []
+    if config.get("ml_engine", "native") != "python":
+        native = _native_ml_spec(config, env)
+        if native is not None:
+            attempts.append(("native Swift", native, True))
+        else:
+            # Native bundle may be installed but its models not fetched yet;
+            # kick off the one-time background download and use the venv for now.
+            _maybe_fetch_native_models(config)
+    venv = _venv_ml_spec(config, env)
+    if venv is not None:
+        attempts.append(("Python venv", venv, False))
+
+    for label, (cmd, cwd, senv), is_native in attempts:
+        log.info("Starting ML service (%s)...", label)
+        try:
+            pid = start_service("ml", cmd, senv, cwd)
+            return pid, label, is_native
+        except RuntimeError:
+            log.warning("  %s failed to start", label)
+            continue
+    return None, None, False
+
+
+def _ml_verify_or_fallback(config: dict, pid: int, engine: str):
+    """Verify the (already-started) native engine becomes healthy; if not, kill
+    it and start the Python venv. No-op for the venv engine. Returns (pid, engine).
+    """
+    if _ml_healthy(config, pid=pid):
+        return pid, engine
+    log.warning("  native ML did not become healthy; falling back to venv")
+    kill_pid("ml")
+    venv = _venv_ml_spec(config, os.environ.copy())
+    if venv is not None:
+        cmd, cwd, senv = venv
+        log.info("Starting ML service (Python venv)...")
+        try:
+            return start_service("ml", cmd, senv, cwd), "Python venv"
+        except RuntimeError:
+            log.warning("  Python venv failed to start")
+    return None, None
+
+
+def _start_ml_service(config: dict):
+    """Start the ML service (native preferred, venv fallback) and verify it.
+    Blocks on the native health check, so use in the watch loop where there is no
+    worker to hold up; cmd_start uses the split form to avoid delaying the worker.
+    """
+    pid, engine, is_native = _start_ml_preferred(config)
+    if pid and is_native and engine:
+        return _ml_verify_or_fallback(config, pid, engine)
+    return pid, engine
+
+
 def _find_ml_dir() -> Path | None:
     """Find the immich-ml-metal service directory. Sets up venv if needed.
 
@@ -3985,30 +4199,21 @@ def cmd_start(args):
         config["ml_dir"] = str(resolved_ml)
         save_config(config)
 
-    # Start ML service
+    # Start ML service (native Swift engine by default, Python venv fallback).
+    # Start the process now, but verify native health AFTER the worker/dashboard,
+    # so a slow native cold start (loading weights + compiling shaders) never
+    # holds up the worker.
     ml_started_here = False
+    ml_native_pending = False
+    ml_engine = None
     ml_pid = read_pid("ml")
     if not ml_pid and config.get("ml_dir"):
-        ml_dir = Path(config["ml_dir"])
-        ml_python = ml_dir / "venv" / "bin" / "python3"
-        if ml_python.exists():
-            log.info("Starting ML service...")
-            try:
-                ml_pid = start_service(
-                    "ml",
-                    [str(ml_python), "-m", "src.main"],
-                    os.environ.copy(),
-                    str(ml_dir),
-                )
-                ml_started_here = True
-                log.info("  ML service running (PID %d)", ml_pid)
-            except RuntimeError:
-                log.warning("  ML service failed to start — CLIP/face/OCR unavailable")
+        ml_pid, ml_engine, ml_native_pending = _start_ml_preferred(config)
+        if ml_pid:
+            ml_started_here = True
+            log.info("  ML service starting (PID %d, %s)", ml_pid, ml_engine)
         else:
-            log.warning(
-                "ML venv not found at %s — ML service will not start.",
-                ml_python,
-            )
+            log.warning("ML service will not start (no native bundle, no venv).")
             log.warning(
                 "  If you installed via Homebrew, try: brew reinstall immich-accelerator"
             )
@@ -4035,6 +4240,15 @@ def cmd_start(args):
     # Bring up the dashboard too, so `start` is a complete bring-up (#81 — users
     # shouldn't need `watch`/brew-services just to get the dashboard).
     start_dashboard()
+
+    # Now that the worker and dashboard are up, verify the native ML engine
+    # actually became healthy and fall back to the venv if not. Doing this here
+    # (not before the worker) means a slow native cold start never delays the
+    # worker; ML jobs simply queue and retry until the engine is serving.
+    if ml_native_pending and ml_pid and ml_engine:
+        ml_pid, ml_engine = _ml_verify_or_fallback(config, ml_pid, ml_engine)
+        if ml_pid:
+            log.info("  ML service ready (PID %d, %s)", ml_pid, ml_engine)
 
     log.info("")
     log.info("Immich Accelerator running")
@@ -4302,19 +4516,11 @@ def cmd_watch(_args):
                 if resolved_ml and str(resolved_ml) != config.get("ml_dir"):
                     config["ml_dir"] = str(resolved_ml)
                     save_config(config)
-                ml_dir = Path(config.get("ml_dir", ""))
-                ml_python = ml_dir / "venv" / "bin" / "python3"
-                if ml_python.exists():
-                    try:
-                        pid = start_service(
-                            "ml",
-                            [str(ml_python), "-m", "src.main"],
-                            os.environ.copy(),
-                            str(ml_dir),
-                        )
-                        log.info("  ML restarted (PID %d)", pid)
-                    except RuntimeError:
-                        log.error("  ML restart failed")
+                pid, engine = _start_ml_service(config)
+                if pid:
+                    log.info("  ML restarted (PID %d, %s)", pid, engine)
+                else:
+                    log.error("  ML restart failed")
 
             # fd-leak safety net (#89): restart the worker before a runaway
             # open-file-descriptor count (an upstream Immich leak on some media)
