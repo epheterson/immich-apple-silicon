@@ -23,6 +23,9 @@ final class ORTSession {
     // Element type (0=float32, 1=int32, 2=int64) of input `i`, per the model.
     func inputElemType(_ i: Int) -> Int { Int(ort_input_elem_type(handle, Int32(i))) }
 
+    // Number of inputs the model declares (multilingual textual towers take 2).
+    func inputCount() -> Int { Int(ort_input_count(handle)) }
+
     // Run a model with typed inputs bound in declaration order; returns the
     // first output as floats (embedding models have a single output).
     func runMulti(_ inputs: [Tensor], outDim: Int) -> [Float]? {

@@ -13,7 +13,8 @@ final class Models {
     let arcface: ORTSession?
 
     private var zooModel: ZooCLIP?
-    private let zooLock = NSLock()
+    private var zooLoading: String?           // model name currently downloading/loading
+    private let zooCond = NSCondition()
 
     init(clipDir: String, arcfacePath: String) {
         self.clipDir = clipDir
@@ -29,19 +30,48 @@ final class Models {
         return n == "default" ? defaultClip : n
     }
 
-    // Zoo model for a non-default name, switching (and releasing) the previous
-    // one if a different model is requested. First use downloads the model.
+    // Zoo model for a non-default name, switching if a different model is
+    // requested. First use downloads the model (minutes for large towers), so
+    // the lock is NOT held during download/load: concurrent requests for the
+    // same model wait on the condition; the resident model keeps serving and is
+    // only replaced once the new one loaded successfully (a failed load, e.g. a
+    // typo'd name or HF outage, must never evict a healthy model).
     func zoo(for name: String) throws -> ZooCLIP {
-        zooLock.lock()
-        defer { zooLock.unlock() }
-        if let z = zooModel, z.name == name { return z }
-        if zooModel != nil {
-            print("[native-ml] switching zoo model \(zooModel!.name) -> \(name)")
+        zooCond.lock()
+        while true {
+            if let z = zooModel, z.name == name {
+                zooCond.unlock()
+                return z
+            }
+            if zooLoading == nil { break }       // no load in flight: we load
+            if zooLoading == name {
+                zooCond.wait()                   // same model loading: wait for it
+                continue
+            }
+            // A different model is loading; wait rather than downloading two
+            // multi-GB models at once.
+            zooCond.wait()
         }
-        zooModel = nil   // release before loading the next (memory)
-        let z = try ZooCLIP(name: name)
-        zooModel = z
-        return z
+        zooLoading = name
+        zooCond.unlock()
+
+        var loaded: ZooCLIP?
+        var failure: Error?
+        do { loaded = try ZooCLIP(name: name) } catch { failure = error }
+
+        zooCond.lock()
+        zooLoading = nil
+        if let z = loaded {
+            if let old = zooModel, old.name != name {
+                print("[native-ml] switched zoo model \(old.name) -> \(name)")
+            }
+            zooModel = z
+        }
+        zooCond.broadcast()
+        zooCond.unlock()
+
+        if let z = loaded { return z }
+        throw failure ?? PredictError(status: "500 Internal Server Error", message: "zoo load failed")
     }
 }
 

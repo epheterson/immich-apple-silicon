@@ -35,9 +35,17 @@ private func readRequest(_ conn: NWConnection, buffer: Data, models: Models, sem
         if body.count < clen && err == nil && !done {
             readRequest(conn, buffer: buf, models: models, sem: sem); return
         }
-        sem.wait()
-        defer { sem.signal() }
-        handle(conn, method: method, path: path, ctype: ctype, body: Data(body), models: models)
+        // Only /predict is gated by the concurrency cap. /ping and /health must
+        // answer even while all slots are blocked on a first-use model download,
+        // or the watchdog/menubar would see a healthy service as down and a
+        // restart would kill the download mid-transfer.
+        if path == "/predict" {
+            sem.wait()
+            defer { sem.signal() }
+            handle(conn, method: method, path: path, ctype: ctype, body: Data(body), models: models)
+        } else {
+            handle(conn, method: method, path: path, ctype: ctype, body: Data(body), models: models)
+        }
     }
 }
 

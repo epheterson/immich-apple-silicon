@@ -41,9 +41,11 @@ final class ZooCLIP {
     let pre: PreprocessCfg
     private let padId: Int
     private let encodeText: (String) -> [Int]
-    private var visualSession: ORTSession?
-    private var textualSession: ORTSession?
-    private let lock = NSLock()
+    // Sessions load eagerly in init: after init the instance is immutable, so
+    // concurrent requests never mutate shared state (a lazy-cache inout here
+    // trips Swift's exclusivity enforcement under the concurrent server).
+    private let visualSession: ORTSession
+    private let textualSession: ORTSession
 
     static let zooDir = NATIVE_CACHE_DIR.appendingPathComponent("zoo")
 
@@ -69,7 +71,13 @@ final class ZooCLIP {
 
         let cfg = try JSONSerialization.jsonObject(
             with: Data(contentsOf: dir.appendingPathComponent("config.json"))) as? [String: Any] ?? [:]
-        embedDim = cfg["embed_dim"] as? Int ?? 512
+        // embed_dim bounds the output buffer; a wrong guess silently truncates
+        // embeddings, so require the model to declare it.
+        guard let dim = cfg["embed_dim"] as? Int, dim > 0, dim <= 8192 else {
+            throw PredictError(status: "422 Unprocessable Entity",
+                               message: "model \(name): config.json missing embed_dim")
+        }
+        embedDim = dim
         let textCfg = cfg["text_cfg"] as? [String: Any] ?? [:]
         contextLength = textCfg["context_length"] as? Int ?? 77
         canonicalize = ((textCfg["tokenizer_kwargs"] as? [String: Any])?["clean"] as? String) == "canonicalize"
@@ -118,12 +126,24 @@ final class ZooCLIP {
             throw PredictError(status: "422 Unprocessable Entity",
                                message: "model \(name): tokenizer unsupported (\(String(describing: loadError)))")
         }
+
+        visualSession = try Self.loadSession(dir: dir, name: name, tower: "visual", dim: embedDim)
+        textualSession = try Self.loadSession(dir: dir, name: name, tower: "textual", dim: embedDim)
+    }
+
+    private static func loadSession(dir: URL, name: String, tower: String, dim: Int) throws -> ORTSession {
+        let path = dir.appendingPathComponent("\(tower)/model.onnx").path
+        guard let s = ORTSession(modelPath: path, outDim: dim) else {
+            throw PredictError(status: "422 Unprocessable Entity",
+                               message: "model \(name): cannot load \(tower) model")
+        }
+        return s
     }
 
     // MARK: - inference
 
     func embedVisual(_ cg: CGImage) throws -> [Float] {
-        let session = try session(tower: "visual", cache: &visualSession)
+        let session = visualSession
         let size = pre.size.first
         let (rgb, w, h) = rgbBuffer(cg)
         // Exact immich_ml resize_pil: short side -> size, long side int() truncated.
@@ -155,40 +175,51 @@ final class ZooCLIP {
     }
 
     func embedTextual(_ text: String) throws -> [Float] {
-        let session = try session(tower: "textual", cache: &textualSession)
+        let session = textualSession
         // Exact immich_ml clean_text (+ canonicalize for SigLIP-family).
         var t = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         if canonicalize {
             t = t.filter { !$0.isPunctuation }.lowercased()
         }
         var ids = encodeText(t)
-        if ids.count > contextLength { ids = Array(ids.prefix(contextLength)) }
+        let realCount = min(ids.count, contextLength)
+        if ids.count > contextLength {
+            // Keep the trailing EOT/EOS: CLIP towers pool at the EOT position
+            // (argmax baked into the exported graph) and SigLIP pools the last
+            // token. A plain prefix drops it and yields a garbage embedding.
+            let eot = ids.last!
+            ids = Array(ids.prefix(contextLength - 1)) + [eot]
+        }
         while ids.count < contextLength { ids.append(padId) }
-        let input: ORTSession.Tensor = session.inputElemType(0) == 2
-            ? .int64(ids.map(Int64.init), shape: [1, Int64(contextLength)])
-            : .int32(ids.map(Int32.init), shape: [1, Int64(contextLength)])
-        guard let e = session.runMulti([input], outDim: embedDim) else {
+
+        func intTensor(_ v: [Int], type: Int) -> ORTSession.Tensor {
+            type == 2 ? .int64(v.map(Int64.init), shape: [1, Int64(contextLength)])
+                      : .int32(v.map(Int32.init), shape: [1, Int64(contextLength)])
+        }
+        var inputs: [ORTSession.Tensor] = [intTensor(ids, type: session.inputElemType(0))]
+        if session.inputCount() == 2 {
+            // Multilingual towers (XLM-Roberta / nllb families) take an
+            // attention mask as the second input: 1 for real tokens, 0 for pad.
+            let mask = (0..<contextLength).map { $0 < realCount ? 1 : 0 }
+            inputs.append(intTensor(mask, type: session.inputElemType(1)))
+        }
+        guard let e = session.runMulti(inputs, outDim: embedDim) else {
             throw PredictError(status: "500 Internal Server Error", message: "textual inference failed (\(name))")
         }
         return e
     }
 
-    // MARK: - plumbing
-
-    private func session(tower: String, cache: inout ORTSession?) throws -> ORTSession {
-        lock.lock()
-        defer { lock.unlock() }
-        if let s = cache { return s }
-        let path = dir.appendingPathComponent("\(tower)/model.onnx").path
-        guard let s = ORTSession(modelPath: path, outDim: embedDim) else {
-            throw PredictError(status: "500 Internal Server Error", message: "cannot load \(tower) model (\(name))")
-        }
-        cache = s
-        return s
-    }
-
     // Download missing model files from Immich's HF repos (same source the
     // Python service uses). Blocking; runs on the request thread like immich_ml.
+    // Dedicated session: 60s between-bytes timeout, 1h whole-file ceiling so a
+    // stalled transfer fails instead of hanging a request thread indefinitely.
+    private static let downloadSession: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 60
+        cfg.timeoutIntervalForResource = 3600
+        return URLSession(configuration: cfg)
+    }()
+
     static func ensureFiles(name: String, dir: URL, extra: [String] = []) throws {
         for f in files + extra {
             let dst = dir.appendingPathComponent(f)
@@ -199,13 +230,14 @@ final class ZooCLIP {
             let sem = DispatchSemaphore(value: 0)
             var result: URL?
             var status = 0
-            let task = URLSession.shared.downloadTask(with: url) { tmp, resp, _ in
+            var moveError: Error?
+            let task = downloadSession.downloadTask(with: url) { tmp, resp, _ in
                 result = tmp.flatMap { t -> URL? in
                     // move out of the ephemeral location before the handler returns
                     let hold = FileManager.default.temporaryDirectory
                         .appendingPathComponent(UUID().uuidString)
-                    try? FileManager.default.moveItem(at: t, to: hold)
-                    return hold
+                    do { try FileManager.default.moveItem(at: t, to: hold); return hold }
+                    catch { moveError = error; return nil }
                 }
                 status = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 sem.signal()
@@ -214,9 +246,13 @@ final class ZooCLIP {
             sem.wait()
             guard status == 200, let tmp = result else {
                 throw PredictError(status: "422 Unprocessable Entity",
-                                   message: "model \(name): download failed for \(f) (HTTP \(status))")
+                                   message: "model \(name): download failed for \(f) "
+                                       + "(HTTP \(status)\(moveError.map { ", \($0)" } ?? ""))")
             }
-            _ = try? FileManager.default.replaceItemAt(dst, withItemAt: tmp)
+            do { _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp) } catch {
+                throw PredictError(status: "500 Internal Server Error",
+                                   message: "model \(name): cannot store \(f) (\(error))")
+            }
             print("[native-ml] fetched \(name)/\(f)")
         }
     }

@@ -44,8 +44,12 @@ int ort_run(void *handle, const float *input, int64_t *shape, int ndim,
     for (int i = 0; i < ndim; i++) n *= (size_t)shape[i];
 
     OrtValue *in_t = NULL;
-    g->CreateTensorWithDataAsOrtValue(mem, (void *)input, n * sizeof(float), shape,
-                                      (size_t)ndim, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in_t);
+    if (g->CreateTensorWithDataAsOrtValue(mem, (void *)input, n * sizeof(float), shape,
+                                          (size_t)ndim, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                                          &in_t) || !in_t) {
+        if (mem) g->ReleaseMemoryInfo(mem);
+        return -1;
+    }
 
     const char *in_names[] = {h->in_name};
     const char *out_names[] = {h->out_name};
