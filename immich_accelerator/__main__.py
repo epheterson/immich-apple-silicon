@@ -1370,6 +1370,35 @@ def _has_everything(
     return True
 
 
+def _prune_old_server_versions(current_bare: str, keep_previous: int = 1) -> None:
+    """Remove stale server/<version> builds, keeping the current version plus
+    the `keep_previous` most-recently-used others.
+
+    Each extracted Immich server is ~0.5GB, and until now nothing removed old
+    ones, so a long-running install accumulated every version it had ever run
+    (Eric's Mini had seven, ~3.3GB). This runs whenever a server is resolved on
+    start/upgrade, so the footprint self-limits. Never touches the current
+    build, and a failed delete is logged but non-fatal.
+    """
+    server_root = DATA_DIR / "server"
+    if not server_root.is_dir():
+        return
+    try:
+        others = [
+            p for p in server_root.iterdir() if p.is_dir() and p.name != current_bare
+        ]
+    except OSError:
+        return
+    # Most-recently-modified first; keep the newest `keep_previous` as rollback.
+    others.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in others[max(keep_previous, 0) :]:
+        try:
+            shutil.rmtree(stale)
+            log.info("Pruned old server build: server/%s", stale.name)
+        except OSError as e:
+            log.warning("Could not prune server/%s: %s", stale.name, e)
+
+
 def download_immich_server(version: str) -> Path:
     """Download Immich server directly from ghcr.io — no Docker needed.
 
@@ -1384,6 +1413,7 @@ def download_immich_server(version: str) -> Path:
 
     cached = _cached_server_if_current(server_dir, bare_version)
     if cached is not None:
+        _prune_old_server_versions(bare_version)
         return cached
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1540,6 +1570,7 @@ def download_immich_server(version: str) -> Path:
 
     _finalize_build_data(build_data, bare_version)
     log.info("Immich server %s ready (downloaded from ghcr.io)", bare_version)
+    _prune_old_server_versions(bare_version)
     return server_dir
 
 
@@ -1559,6 +1590,7 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
 
     cached = _cached_server_if_current(server_dir, bare_version)
     if cached is not None:
+        _prune_old_server_versions(bare_version)
         return cached
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1608,6 +1640,7 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
 
     _finalize_build_data(build_data, bare_version)
     log.info("Immich server %s ready", bare_version)
+    _prune_old_server_versions(bare_version)
     return server_dir
 
 
