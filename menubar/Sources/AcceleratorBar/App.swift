@@ -68,25 +68,16 @@ struct MenuBarLabel: View {
 
     var body: some View {
         Image(systemName: iconName)
-            .foregroundStyle(iconColor)
     }
 
-    // Traffic-light by glyph AND colour: green idle, amber processing, dim
-    // slashed bolt stopped, orange warning degraded. The glyph alone conveys
-    // state where the menu bar renders the icon monochrome.
+    // Monochrome by design: the menu bar templates the icon so it adapts to
+    // light/dark and matches the other status items. State is carried by the
+    // glyph; the idle/processing detail and job counts live in the panel.
     private var iconName: String {
         switch model.snap.overall {
-        case .running: return model.snap.processing ? "bolt.fill" : "bolt.fill"
+        case .running: return "bolt.fill"
         case .stopped: return "bolt.slash"
         case .degraded: return "exclamationmark.triangle.fill"
-        }
-    }
-
-    private var iconColor: Color {
-        switch model.snap.overall {
-        case .running: return model.snap.processing ? .yellow : .green
-        case .stopped: return .secondary
-        case .degraded: return .orange
         }
     }
 }
