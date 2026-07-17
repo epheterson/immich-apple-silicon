@@ -8,6 +8,42 @@
 set -euo pipefail
 : "${OUT:?} ${SRC_URL:?} ${SRC_SHA:?} ${ML_URL:?} ${ML_SHA:?} ${REPO:?} ${OWNER:?} ${VERSION:?}"
 
+# Native Swift ML engine bundle + model. Optional: when NATIVE_URL is unset (e.g.
+# the CI formula-check job) the formula renders without them and the accelerator
+# uses the Python venv. When set (release) it installs the prebuilt ad-hoc-signed
+# bundle and fetches the CLIP model into a persistent user cache.
+NATIVE_RESOURCE=""
+NATIVE_INSTALL=""
+NATIVE_FETCH=""
+if [ -n "${NATIVE_URL:-}" ]; then
+  : "${NATIVE_SHA:?} ${CLIP_MODEL_URL:?}"
+  NATIVE_RESOURCE="
+  resource \"native_ml\" do
+    url \"${NATIVE_URL}\"
+    sha256 \"${NATIVE_SHA}\"
+  end
+"
+  NATIVE_INSTALL="    resource(\"native_ml\").stage do
+      (libexec/\"native-ml\").install Dir[\"*\"]
+    end
+"
+  # Fetch the CLIP model (~570MB) into ~/.cache, not the Cellar, so upgrades do
+  # not re-download it. Tolerant of failure: the native engine falls back to the
+  # venv until the model is present, so a flaky download never breaks the install.
+  NATIVE_FETCH="    clip_dir = File.expand_path(\"~/.cache/immich-ml-native/clip\")
+    unless File.exist?(\"#{clip_dir}/model.safetensors\")
+      begin
+        mkdir_p clip_dir
+        system \"curl\", \"-fL\", \"--retry\", \"3\", \"-o\", \"#{clip_dir}/clip.tar.gz\", \"${CLIP_MODEL_URL}\"
+        system \"tar\", \"-xzf\", \"#{clip_dir}/clip.tar.gz\", \"-C\", clip_dir, \"--strip-components=1\"
+        rm_f \"#{clip_dir}/clip.tar.gz\"
+      rescue StandardError => e
+        opoo \"native CLIP model fetch failed (#{e}); native engine will use the venv until it is present\"
+      end
+    end
+"
+fi
+
 cat > "$OUT" << EOF
 class ImmichAccelerator < Formula
   desc "Run Immich compute natively on Apple Silicon"
@@ -20,7 +56,7 @@ class ImmichAccelerator < Formula
     url "${ML_URL}"
     sha256 "${ML_SHA}"
   end
-
+${NATIVE_RESOURCE}
   depends_on :macos
   depends_on arch: :arm64
   # node@22 is the keg-only LTS that satisfies Immich's
@@ -41,7 +77,7 @@ class ImmichAccelerator < Formula
     resource("ml").stage do
       (libexec/"ml").install Dir["*"]
     end
-    # Wrapper uses the ML venv Python so the CLI inherits its
+${NATIVE_INSTALL}    # Wrapper uses the ML venv Python so the CLI inherits its
     # third-party deps (fastapi, uvicorn - required by the
     # dashboard and already pinned in ml/requirements.txt).
     # Prevents ModuleNotFoundError on fresh installs where
@@ -92,7 +128,7 @@ class ImmichAccelerator < Formula
     # (issues #17, #105). system aborts on non-zero, so a broken install is
     # visible and "brew reinstall immich-accelerator" fixes it.
     verify_ml_venv venv_py
-  end
+${NATIVE_FETCH}  end
 
   # Single source of truth for "the venv has what the CLI, dashboard and ML
   # service need." Called at install time (to fail a broken install loudly)
