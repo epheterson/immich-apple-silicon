@@ -21,6 +21,7 @@ jobs:
     outputs:
       sha256: ${{ steps.pkg.outputs.sha256 }}
       menubar_sha256: ${{ steps.menubar.outputs.sha256 }}
+      menubar_notarized: ${{ steps.menubar.outputs.notarized }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -47,7 +48,29 @@ jobs:
           TARBALL="$(ls immich-ml-native-*.tar.gz)"
           echo "sha256=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           gh release upload "$TAG" "$TARBALL" --clobber
-      - name: Build + upload menu-bar app asset
+      # Import the Developer ID cert into a throwaway keychain so the menu-bar
+      # build can Developer-ID sign (required before notarization). Skipped when
+      # the secret is absent -- the build then falls back to ad-hoc signing and
+      # the cask keeps its quarantine-stripping postflight (see cask render).
+      - name: Import signing certificate (menu-bar)
+        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 12)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Build + notarize + upload menu-bar app asset
         id: menubar
         # Best-effort: a menubar build failure must not block the core formula
         # release. The cask render below is skipped when this produces no sha.
@@ -56,13 +79,81 @@ jobs:
           TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          # Public key (not secret) baked into Info.plist so Sparkle verifies the
+          # appcast. Set as a repo variable; empty just disables in-app updates.
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
         run: |
           VERSION="${TAG#v}"
-          cd menubar && bash scripts/build_app.sh "$VERSION"
+          cd menubar
+          # Developer-ID sign when the cert keychain is present; else ad-hoc.
+          if [ -n "${KEYCHAIN_PATH:-}" ]; then
+            MACOS_SIGN_ID="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+              | grep 'Developer ID Application' | head -1 | sed 's/.*"\(.*\)"/\1/')"
+            export MACOS_SIGN_ID
+            echo "signing identity: $MACOS_SIGN_ID"
+          fi
+          bash scripts/build_app.sh "$VERSION"
+
+          APP="Immich Accelerator.app"
           ZIP="immich-accelerator-menubar-${VERSION}.zip"
-          ditto -c -k --keepParent "Immich Accelerator.app" "$ZIP"
+          NOTARIZED=false
+          if [ -n "$APPLE_ID" ] && [ -n "${MACOS_SIGN_ID:-}" ]; then
+            ditto -c -k --keepParent "$APP" notarize.zip
+            xcrun notarytool submit notarize.zip \
+              --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" --wait --timeout 15m
+            # Ticket propagation can lag; staple with a few retries.
+            for i in 1 2 3; do
+              xcrun stapler staple "$APP" && { NOTARIZED=true; break; }
+              echo "staple attempt $i failed, retrying in 15s"; sleep 15
+            done
+          fi
+
+          # Final zip carries the stapled app (if notarized).
+          ditto -c -k --keepParent "$APP" "$ZIP"
           echo "sha256=$(shasum -a 256 "$ZIP" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "notarized=$NOTARIZED" >> "$GITHUB_OUTPUT"
           gh release upload "$TAG" "$ZIP" --clobber
+
+          # EdDSA-sign the download and publish an appcast, clobbered onto this
+          # release so SUFeedURL (releases/latest/download/appcast.xml) resolves.
+          if [ -n "$SPARKLE_PRIVATE_KEY" ]; then
+            curl -sL --retry 5 --retry-all-errors --retry-delay 5 \
+              "https://github.com/sparkle-project/Sparkle/releases/download/2.9.4/Sparkle-2.9.4.tar.xz" -o /tmp/sparkle.tar.xz
+            tar -xf /tmp/sparkle.tar.xz -C /tmp
+            SIG="$(/tmp/bin/sign_update "$ZIP" --ed-key-file <(echo "$SPARKLE_PRIVATE_KEY"))"
+            ED_SIG="$(echo "$SIG" | grep -o 'sparkle:edSignature="[^"]*"' | sed 's/.*edSignature="//;s/"//')"
+            LENGTH="$(echo "$SIG" | grep -o 'length="[^"]*"' | sed 's/.*length="//;s/"//')"
+            [ -n "$ED_SIG" ] || { echo "sign_update produced no signature"; exit 1; }
+            DL="https://github.com/${GH_REPO}/releases/download/${TAG}/${ZIP}"
+            cat > appcast.xml <<APPCAST
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <channel>
+              <title>Immich Accelerator Menu Bar</title>
+              <link>https://github.com/${GH_REPO}</link>
+              <description>Menu-bar status and controls for Immich Accelerator</description>
+              <language>en</language>
+              <item>
+                <title>Version ${VERSION}</title>
+                <sparkle:version>${VERSION}</sparkle:version>
+                <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
+                <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+                <pubDate>$(date -u +"%a, %d %b %Y %H:%M:%S +0000")</pubDate>
+                <enclosure url="${DL}" sparkle:version="${VERSION}" sparkle:shortVersionString="${VERSION}" length="${LENGTH}" type="application/octet-stream" sparkle:edSignature="${ED_SIG}" />
+              </item>
+            </channel>
+          </rss>
+          APPCAST
+            gh release upload "$TAG" appcast.xml --clobber
+            echo "published appcast.xml (edSignature len ${#ED_SIG})"
+          else
+            echo "SPARKLE_PRIVATE_KEY absent -- skipping appcast (in-app updates disabled until secrets are set)"
+          fi
 
   update-tap:
     needs: build-native
@@ -128,9 +219,12 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           REPO: ${{ github.repository }}
           MENUBAR_SHA: ${{ needs.build-native.outputs.menubar_sha256 }}
+          NOTARIZED: ${{ needs.build-native.outputs.menubar_notarized }}
         run: |
           mkdir -p tap/Casks
-          cat > tap/Casks/immich-accelerator-menubar.rb <<CASK
+          CASK_FILE=tap/Casks/immich-accelerator-menubar.rb
+          # Shared header for both the notarized and ad-hoc variants.
+          cat > "$CASK_FILE" <<CASK
           cask "immich-accelerator-menubar" do
             version "${VERSION}"
             sha256 "${MENUBAR_SHA}"
@@ -143,17 +237,27 @@ jobs:
             depends_on macos: :sonoma
 
             app "Immich Accelerator.app"
-
-            # The app is ad-hoc signed (no Developer ID / notarization), so a
-            # quarantined download would be Gatekeeper-blocked on first launch.
-            # Strip the quarantine flag after install so it opens cleanly.
-            postflight do
-              system_command "/usr/bin/xattr",
-                             args: ["-dr", "com.apple.quarantine", "#{appdir}/Immich Accelerator.app"]
-            end
-          end
           CASK
-          ruby -c tap/Casks/immich-accelerator-menubar.rb
+          # A notarized app updates itself via Sparkle and passes Gatekeeper on
+          # its own, so declare auto_updates. An ad-hoc build (no secrets) still
+          # needs the postflight to strip quarantine and open on first launch.
+          if [ "$NOTARIZED" = "true" ]; then
+            cat >> "$CASK_FILE" <<'CASK'
+
+              auto_updates true
+            end
+          CASK
+          else
+            cat >> "$CASK_FILE" <<'CASK'
+
+              postflight do
+                system_command "/usr/bin/xattr",
+                               args: ["-dr", "com.apple.quarantine", "#{appdir}/Immich Accelerator.app"]
+              end
+            end
+          CASK
+          fi
+          ruby -c "$CASK_FILE"
 
       - name: Push updated formula + cask
         working-directory: tap
