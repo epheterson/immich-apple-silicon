@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.7.0 - 2026-07-17
+
+### Added
+- **Full CLIP model-zoo support in the native ML engine.** The native Swift engine is no longer limited to the default ViT-B-32: any CLIP model selectable in Immich (ViT-B-16, ViT-L-14, LAION variants, the SigLIP family, and anything else Immich publishes) now runs natively. The engine downloads Immich's own ONNX exports on first use (the same files the Docker ML service uses, cached in `~/.cache/immich-ml-native/zoo`) and runs them through onnxruntime with Immich's exact preprocessing and tokenization (including SigLIP's sentencepiece tokenizer and text canonicalization), so embeddings match the Docker service (textual cosine 1.0, visual ~0.9996 in validation against Immich's own pipeline). The default ViT-B-32 keeps the existing bit-identical mlx fast path. Model switching follows the Python service's semantics; unknown or unsupported models return a clear error instead of a wrong embedding. Architecture insight (running Immich's ONNX zoo natively) credit: [michina-swift](https://github.com/lucka-me/michina-swift) by [@lucka-me](https://github.com/lucka-me).
+- **Menu-bar app.** A native SwiftUI menu-bar app for the accelerator. A traffic-light bolt shows health at a glance (green idle, amber while the worker is processing, dim when stopped), and the panel breaks out worker / ML / dashboard status with a NATIVE or PYTHON engine badge and a live job count (from Immich's `/api/jobs`). It can start / stop / restart the services, run `ml-test` inline, and open Immich, the dashboard, or logs. A first-run flow guides a fresh install through Homebrew install and setup, and a settings window shows how the accelerator is wired, switches the ML engine (native/python), and reveals the API key. It reads the accelerator's own state (pidfiles, the ML service's `/ping`, config) with no extra daemons, and ships as a small ad-hoc-signed app: `brew install --cask epheterson/immich-accelerator/immich-accelerator-menubar`. Design inspired by [Immich-Accelerator-Helper](https://github.com/pl4za/Immich-Accelerator-Helper) by [@pl4za](https://github.com/pl4za).
+
+### Changed
+- **Old Immich server builds are pruned automatically.** Each extracted Immich server (`~/.immich-accelerator/server/<version>`) is roughly half a gigabyte, and until now none were ever removed, so a long-running install accumulated every version it had run. The accelerator now keeps only the current build (build data is shared and stamped for a single version, so an older build can't be served from cache anyway and is dead weight) and prunes the rest, including any leftover `.staging` dirs, once the worker is up on the new version.
+
+### Fixed
+- **Dashboard no longer gets confused with another service on its port.** `start_dashboard` used to adopt whatever process was listening on the dashboard port, so on a machine where something else holds it (e.g. a container proxy like OrbStack on 8420) the accelerator adopted that process and never started its own dashboard. It now verifies a port-holder is actually our dashboard before adopting, and the port is configurable via `"dashboard_port"` in `~/.immich-accelerator/config.json` (default 8420) to dodge a collision.
+- **Release workflow could not upload the native ML bundle** (HTTP 403): the build job now requests `contents: write`, so release assets attach without manual intervention. The v1.6.0 assets were uploaded by hand; installs were unaffected.
+- **Menu bar "Open Immich" now uses your public domain.** It prefers the external domain configured in Immich's server settings and falls back to the local address the worker connects to, instead of always opening the internal IP.
+- **Zoo engine hardening** (from a multi-agent code review): eager-loaded ONNX sessions to fix a Swift exclusive-access crash under concurrent `/predict` requests, strict validation of zoo model names (blocks path-traversal / URL injection from the model string), EOT-token preservation on prompt truncation, and attention-mask support for multilingual (2-input) textual towers.
+
 ## 1.6.0 - 2026-07-16
 
 ### Added

@@ -1,0 +1,259 @@
+import CoreGraphics
+import Foundation
+import Tokenizers
+
+// Native ML cache root (models persist across upgrades).
+let NATIVE_CACHE_DIR = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".cache/immich-ml-native")
+
+// CLIP model zoo: runs Immich's own ONNX exports (huggingface.co/immich-app/*)
+// through onnxruntime, replicating immich_ml's exact preprocessing, so any model
+// a user selects in Immich produces the same embeddings as the Docker service.
+// The default ViT-B-32 keeps the mlx fast path; everything else lands here.
+// Architecture insight (ONNX zoo + ORT natively) credit: lucka-me/michina-swift.
+final class ZooCLIP {
+    struct PreprocessCfg: Decodable {
+        let size: SizeValue
+        let mean: [Float]
+        let std: [Float]
+
+        enum SizeValue: Decodable {
+            case int(Int), list([Int])
+            init(from d: Swift.Decoder) throws {  // Tokenizers exports its own Decoder
+                let c = try d.singleValueContainer()
+                if let i = try? c.decode(Int.self) { self = .int(i) }
+                else { self = .list(try c.decode([Int].self)) }
+            }
+            var first: Int {
+                switch self {
+                case .int(let i): return i
+                case .list(let l): return l.first ?? 224
+                }
+            }
+        }
+    }
+
+    let name: String
+    let dir: URL
+    let embedDim: Int
+    let contextLength: Int
+    let canonicalize: Bool
+    let pre: PreprocessCfg
+    private let padId: Int
+    private let encodeText: (String) -> [Int]
+    // Sessions load eagerly in init: after init the instance is immutable, so
+    // concurrent requests never mutate shared state (a lazy-cache inout here
+    // trips Swift's exclusivity enforcement under the concurrent server).
+    private let visualSession: ORTSession
+    private let textualSession: ORTSession
+
+    static let zooDir = NATIVE_CACHE_DIR.appendingPathComponent("zoo")
+
+    // Files each model needs locally (visual + textual towers).
+    static let files = [
+        "config.json", "visual/model.onnx", "visual/preprocess_cfg.json",
+        "textual/model.onnx", "textual/tokenizer.json", "textual/tokenizer_config.json",
+    ]
+
+    init(name: String) throws {
+        // The model name arrives from the network and is used in both a cache
+        // path and a download URL. Constrain it hard: the allowed charset of
+        // real Immich model names, no traversal or URL metacharacters.
+        guard name.range(of: "^[A-Za-z0-9._-]{1,64}$", options: .regularExpression) != nil,
+              !name.hasPrefix("."), !name.contains("..")
+        else {
+            throw PredictError(status: "422 Unprocessable Entity",
+                               message: "invalid model name")
+        }
+        self.name = name
+        dir = Self.zooDir.appendingPathComponent(name)
+        try Self.ensureFiles(name: name, dir: dir)
+
+        let cfg = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: dir.appendingPathComponent("config.json"))) as? [String: Any] ?? [:]
+        // embed_dim bounds the output buffer; a wrong guess silently truncates
+        // embeddings, so require the model to declare it.
+        guard let dim = cfg["embed_dim"] as? Int, dim > 0, dim <= 8192 else {
+            throw PredictError(status: "422 Unprocessable Entity",
+                               message: "model \(name): config.json missing embed_dim")
+        }
+        embedDim = dim
+        let textCfg = cfg["text_cfg"] as? [String: Any] ?? [:]
+        contextLength = textCfg["context_length"] as? Int ?? 77
+        canonicalize = ((textCfg["tokenizer_kwargs"] as? [String: Any])?["clean"] as? String) == "canonicalize"
+
+        pre = try JSONDecoder().decode(
+            PreprocessCfg.self,
+            from: Data(contentsOf: dir.appendingPathComponent("visual/preprocess_cfg.json")))
+
+        let tokCfg = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: dir.appendingPathComponent("textual/tokenizer_config.json"))) as? [String: Any] ?? [:]
+        guard let padToken = tokCfg["pad_token"] as? String ?? (tokCfg["pad_token"] as? [String: Any])?["content"] as? String else {
+            throw PredictError(status: "422 Unprocessable Entity", message: "model \(name): no pad_token")
+        }
+
+        // swift-transformers reads tokenizer.json (Unigram/sentencepiece for the
+        // SigLIP family, and most others). It does not implement CLIPTokenizer,
+        // so CLIP-family models fall back to our byte-level BPE (proven byte-
+        // exact against the reference), reading the model's own vocab + merges.
+        var loaded: Tokenizer?
+        let sem = DispatchSemaphore(value: 0)
+        var loadError: Error?
+        let d = dir.appendingPathComponent("textual")
+        Task.detached {
+            do { loaded = try await AutoTokenizer.from(modelFolder: d) } catch { loadError = error }
+            sem.signal()
+        }
+        sem.wait()
+        if let tok = loaded {
+            guard let pid = tok.convertTokenToId(padToken) else {
+                throw PredictError(status: "422 Unprocessable Entity",
+                                   message: "model \(name): pad token '\(padToken)' not in vocab")
+            }
+            padId = pid
+            encodeText = { tok.encode(text: $0) }
+        } else if (tokCfg["tokenizer_class"] as? String) == "CLIPTokenizer" {
+            try Self.ensureFiles(name: name, dir: dir,
+                                 extra: ["textual/vocab.json", "textual/merges.txt"])
+            let bpe = CLIPTokenizer(modelDir: d.path)
+            guard let pid = bpe.tokenId(padToken) else {
+                throw PredictError(status: "422 Unprocessable Entity",
+                                   message: "model \(name): pad token '\(padToken)' not in BPE vocab")
+            }
+            padId = pid
+            encodeText = { bpe.encode($0) }
+        } else {
+            throw PredictError(status: "422 Unprocessable Entity",
+                               message: "model \(name): tokenizer unsupported (\(String(describing: loadError)))")
+        }
+
+        visualSession = try Self.loadSession(dir: dir, name: name, tower: "visual", dim: embedDim)
+        textualSession = try Self.loadSession(dir: dir, name: name, tower: "textual", dim: embedDim)
+    }
+
+    private static func loadSession(dir: URL, name: String, tower: String, dim: Int) throws -> ORTSession {
+        let path = dir.appendingPathComponent("\(tower)/model.onnx").path
+        guard let s = ORTSession(modelPath: path, outDim: dim) else {
+            throw PredictError(status: "422 Unprocessable Entity",
+                               message: "model \(name): cannot load \(tower) model")
+        }
+        return s
+    }
+
+    // MARK: - inference
+
+    func embedVisual(_ cg: CGImage) throws -> [Float] {
+        let session = visualSession
+        let size = pre.size.first
+        let (rgb, w, h) = rgbBuffer(cg)
+        // Exact immich_ml resize_pil: short side -> size, long side int() truncated.
+        let newW: Int, newH: Int
+        if w < h {
+            newW = size
+            newH = Int(Double(h) / Double(w) * Double(size))
+        } else {
+            newW = Int(Double(w) / Double(h) * Double(size))
+            newH = size
+        }
+        let resized = (newW == w && newH == h) ? rgb : Resize.bicubic(rgb, w: w, h: h, outW: newW, outH: newH)
+        // Exact immich_ml crop_pil: int() centers.
+        let left = Int(Double(newW) / 2 - Double(size) / 2)
+        let upper = Int(Double(newH) / 2 - Double(size) / 2)
+        var x = [Float](repeating: 0, count: 3 * size * size)
+        for c in 0..<3 {
+            for yy in 0..<size {
+                for xx in 0..<size {
+                    let px = Float(resized[((upper + yy) * newW + (left + xx)) * 3 + c]) / 255.0
+                    x[c * size * size + yy * size + xx] = (px - pre.mean[c]) / pre.std[c]
+                }
+            }
+        }
+        guard let e = session.runMulti(
+            [.float(x, shape: [1, 3, Int64(size), Int64(size)])], outDim: embedDim)
+        else { throw PredictError(status: "500 Internal Server Error", message: "visual inference failed (\(name))") }
+        return e
+    }
+
+    func embedTextual(_ text: String) throws -> [Float] {
+        let session = textualSession
+        // Exact immich_ml clean_text (+ canonicalize for SigLIP-family).
+        var t = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        if canonicalize {
+            t = t.filter { !$0.isPunctuation }.lowercased()
+        }
+        var ids = encodeText(t)
+        let realCount = min(ids.count, contextLength)
+        if ids.count > contextLength {
+            // Keep the trailing EOT/EOS: CLIP towers pool at the EOT position
+            // (argmax baked into the exported graph) and SigLIP pools the last
+            // token. A plain prefix drops it and yields a garbage embedding.
+            let eot = ids.last!
+            ids = Array(ids.prefix(contextLength - 1)) + [eot]
+        }
+        while ids.count < contextLength { ids.append(padId) }
+
+        func intTensor(_ v: [Int], type: Int) -> ORTSession.Tensor {
+            type == 2 ? .int64(v.map(Int64.init), shape: [1, Int64(contextLength)])
+                      : .int32(v.map(Int32.init), shape: [1, Int64(contextLength)])
+        }
+        var inputs: [ORTSession.Tensor] = [intTensor(ids, type: session.inputElemType(0))]
+        if session.inputCount() == 2 {
+            // Multilingual towers (XLM-Roberta / nllb families) take an
+            // attention mask as the second input: 1 for real tokens, 0 for pad.
+            let mask = (0..<contextLength).map { $0 < realCount ? 1 : 0 }
+            inputs.append(intTensor(mask, type: session.inputElemType(1)))
+        }
+        guard let e = session.runMulti(inputs, outDim: embedDim) else {
+            throw PredictError(status: "500 Internal Server Error", message: "textual inference failed (\(name))")
+        }
+        return e
+    }
+
+    // Download missing model files from Immich's HF repos (same source the
+    // Python service uses). Blocking; runs on the request thread like immich_ml.
+    // Dedicated session: 60s between-bytes timeout, 1h whole-file ceiling so a
+    // stalled transfer fails instead of hanging a request thread indefinitely.
+    private static let downloadSession: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 60
+        cfg.timeoutIntervalForResource = 3600
+        return URLSession(configuration: cfg)
+    }()
+
+    static func ensureFiles(name: String, dir: URL, extra: [String] = []) throws {
+        for f in files + extra {
+            let dst = dir.appendingPathComponent(f)
+            if (try? dst.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) ?? 0 > 0 { continue }
+            try FileManager.default.createDirectory(
+                at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let url = URL(string: "https://huggingface.co/immich-app/\(name)/resolve/main/\(f)")!
+            let sem = DispatchSemaphore(value: 0)
+            var result: URL?
+            var status = 0
+            var moveError: Error?
+            let task = downloadSession.downloadTask(with: url) { tmp, resp, _ in
+                result = tmp.flatMap { t -> URL? in
+                    // move out of the ephemeral location before the handler returns
+                    let hold = FileManager.default.temporaryDirectory
+                        .appendingPathComponent(UUID().uuidString)
+                    do { try FileManager.default.moveItem(at: t, to: hold); return hold }
+                    catch { moveError = error; return nil }
+                }
+                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                sem.signal()
+            }
+            task.resume()
+            sem.wait()
+            guard status == 200, let tmp = result else {
+                throw PredictError(status: "422 Unprocessable Entity",
+                                   message: "model \(name): download failed for \(f) "
+                                       + "(HTTP \(status)\(moveError.map { ", \($0)" } ?? ""))")
+            }
+            do { _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp) } catch {
+                throw PredictError(status: "500 Internal Server Error",
+                                   message: "model \(name): cannot store \(f) (\(error))")
+            }
+            print("[native-ml] fetched \(name)/\(f)")
+        }
+    }
+}

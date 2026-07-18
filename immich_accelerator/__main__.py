@@ -1370,6 +1370,39 @@ def _has_everything(
     return True
 
 
+def _prune_old_server_versions(current_bare: str) -> None:
+    """Remove every server/<version> build except the current one.
+
+    Each extracted Immich server is ~0.5GB, and until now nothing removed old
+    ones, so a long-running install accumulated every version it had ever run
+    (a real box had seven, ~3.3GB). Only the current build is kept: build-data
+    is a single shared directory stamped for one version
+    (_finalize_build_data / _cached_server_if_current), so a retained older
+    build can't be served from cache anyway (a rollback re-downloads), making
+    it dead weight rather than a usable rollback. Deleting everything else also
+    clears any leftover <version>.staging dirs from interrupted extractions.
+
+    Call this only after the worker is up on the current version, so the old
+    (now-stopped) build is safe to delete. Never touches the current build; a
+    failed delete (or an unstattable/vanishing entry) is logged, not fatal.
+    """
+    server_root = DATA_DIR / "server"
+    if not server_root.is_dir():
+        return
+    try:
+        entries = list(server_root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if not entry.is_dir() or entry.name == current_bare:
+                continue
+            shutil.rmtree(entry)
+            log.info("Pruned old server build: server/%s", entry.name)
+        except OSError as e:
+            log.warning("Could not prune server/%s: %s", entry.name, e)
+
+
 def download_immich_server(version: str) -> Path:
     """Download Immich server directly from ghcr.io — no Docker needed.
 
@@ -2117,25 +2150,75 @@ def _pid_on_port(port: int) -> int | None:
         return None
 
 
+def _dashboard_port() -> int:
+    """Configured dashboard port (default 8420), so it can dodge a collision."""
+    try:
+        return int(load_config().get("dashboard_port", 8420))
+    except (RuntimeError, ValueError, OSError):
+        return 8420
+
+
+def _process_is_our_dashboard(pid: int) -> bool:
+    """Whether a pid is actually our dashboard, not a foreign port squatter.
+
+    Guards the adopt-on-port path below: on some setups another process (e.g.
+    OrbStack proxying a container) already listens on the dashboard port, and
+    blindly adopting its pid meant we never started our own and pointed users
+    at the wrong thing.
+    """
+    start = _get_process_start_time(pid)  # cheap "does it exist" + reuse guard
+    if start is None:
+        return False
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return "immich_accelerator" in out and "dashboard" in out
+
+
 def start_dashboard() -> None:
     """Start the dashboard in the background if it isn't already running.
     Idempotent — used by both `start` and `watch` so either brings the
     dashboard up (#81)."""
     if read_pid("dashboard"):
         return  # already tracked + alive (also guards a just-spawned one)
+    port = _dashboard_port()
     # Untracked but already serving (an orphan from a prior run whose pid file
-    # was lost) — adopt its pid so a later stop can actually reach it, instead
-    # of leaving an unkillable orphan AND refusing to start a tracked one.
-    orphan = _pid_on_port(8420)
+    # was lost) — adopt its pid so a later stop can reach it. Only if it's
+    # actually our dashboard, though: never adopt a foreign process that merely
+    # happens to hold the port.
+    orphan = _pid_on_port(port)
     if orphan:
-        write_pid("dashboard", orphan)
-        log.info("Adopted running dashboard (PID %d)", orphan)
+        if _process_is_our_dashboard(orphan):
+            write_pid("dashboard", orphan)
+            log.info("Adopted running dashboard (PID %d)", orphan)
+            return
+        log.warning(
+            "Dashboard port %d is held by another process (PID %d), not the "
+            'accelerator. Set "dashboard_port" in %s to a free port to run the '
+            "dashboard.",
+            port,
+            orphan,
+            CONFIG_FILE,
+        )
         return
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     dash_log = open(LOG_DIR / "dashboard.log", "a")
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-m", __package__ or "immich_accelerator", "dashboard"],
+            [
+                sys.executable,
+                "-m",
+                __package__ or "immich_accelerator",
+                "dashboard",
+                "--port",
+                str(port),
+            ],
             cwd=str(Path(__file__).parent.parent),
             stdout=dash_log,
             stderr=subprocess.STDOUT,
@@ -2144,7 +2227,7 @@ def start_dashboard() -> None:
     finally:
         dash_log.close()
     write_pid("dashboard", proc.pid)
-    log.info("Dashboard started: http://localhost:8420")
+    log.info("Dashboard started: http://localhost:%d", port)
 
 
 # --- Commands ---
@@ -4249,6 +4332,11 @@ def cmd_start(args):
         ml_pid, ml_engine = _ml_verify_or_fallback(config, ml_pid, ml_engine)
         if ml_pid:
             log.info("  ML service ready (PID %d, %s)", ml_pid, ml_engine)
+
+    # Reclaim disk from superseded server builds now that the worker is up on
+    # the current version. Done here, not during extraction, so a still-running
+    # old-version worker is never deleted out from under itself.
+    _prune_old_server_versions(Path(server_dir).name)
 
     log.info("")
     log.info("Immich Accelerator running")

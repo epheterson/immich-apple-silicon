@@ -6,7 +6,7 @@
 [![Homebrew](https://img.shields.io/badge/install-Homebrew-orange.svg)](https://github.com/epheterson/homebrew-immich-accelerator)
 [![Immich](https://img.shields.io/badge/Immich-2.7%2B-5b21b6.svg)](https://immich.app/)
 
-> **Beta.** In daily use on a Mac Mini M4 (24GB) against an Immich 2.7.x library. Stable, but back up your Immich database before your first run.
+> **Beta.** In daily use on a Mac Mini M4 (24GB) against an Immich 3.0.x library. Stable, but back up your Immich database before your first run.
 
 Run Immich's compute natively on Apple Silicon. Thumbnails use the fast M-series CPU, video transcoding uses VideoToolbox hardware encoding, and ML runs on Metal GPU, Neural Engine, and CoreML.
 
@@ -39,7 +39,7 @@ The microservices worker is extracted directly from your running Immich Docker i
 | Add env vars to docker-compose | `IMMICH_WORKERS_INCLUDE`, `IMMICH_MACHINE_LEARNING_URL`, `IMMICH_MEDIA_LOCATION` | Remove the lines | None |
 | Expose Postgres/Redis ports | `5432:5432`, `6379:6379` in docker-compose | Remove the port lines | None |
 | Native microservices worker | Extracted from Docker image, runs via `node` | Stop the accelerator | None |
-| Native ML service | Separate Python service | Stop the accelerator | None |
+| Native ML service | Native Swift engine (Python venv fallback) | Stop the accelerator | None |
 | `/build` symlink (Immich 2.7+) | `/etc/synthetic.d/immich-accelerator` (requires sudo once during setup) | `immich-accelerator uninstall` removes it; reboot to deactivate | Low |
 
 **Why `/build`?** Immich 2.7+ stores absolute plugin paths like `/build/corePlugin/dist/plugin.wasm` in its database. Both Docker and native workers need `/build` to resolve. macOS SIP prevents creating root-level directories, so we use Apple's [synthetic link](https://man.cx/synthetic.conf(5)) mechanism to map `/build` → `~/.immich-accelerator/build-data`. Setup prompts for sudo once; a reboot may be required to activate.
@@ -118,6 +118,17 @@ All `job.*` and `library.*` endpoints require admin access. If the dashboard sho
 
 ![Dashboard](docs/dashboard.png)
 
+## Menu bar app
+
+A native menu-bar app shows accelerator health at a glance and covers the daily actions: worker / ML / dashboard status (with a NATIVE or PYTHON engine badge), start / stop / restart, run `ml-test` inline, open Immich, the dashboard, or logs, and launch-at-login. It reads the accelerator's own state directly (no extra services) and weighs about 90KB.
+
+```bash
+brew install --cask epheterson/immich-accelerator/immich-accelerator-menubar
+open "/Applications/Immich Accelerator.app"
+```
+
+Design inspired by [Immich-Accelerator-Helper](https://github.com/pl4za/Immich-Accelerator-Helper) by [@pl4za](https://github.com/pl4za).
+
 ## Updates
 
 The accelerator handles Immich updates automatically:
@@ -176,6 +187,8 @@ The ML service runs Immich's CLIP, face, and OCR inference natively on Apple Sil
 
 As of 1.6.0 this runs as a **native Swift engine**: a single binary with the models and libraries bundled, no Python. It replaces the ~1.5 GB Python venv (torch, mlx, onnxruntime, opencv, insightface) and the dependency-pin fragility that came with it. It uses the same weights and models as the Python service, so embeddings stay in the same space as an existing Immich search index and face clusters (no re-index, no re-cluster).
 
+As of 1.7.0 the native engine supports the **full CLIP model zoo**: whatever model you select in Immich (ViT-B-16, ViT-L-14, LAION variants, the SigLIP family, ...) is downloaded from Immich's own model repository on first use and run natively through onnxruntime with Immich's exact preprocessing and tokenization, so results match the Docker ML service. The default ViT-B-32 uses an even faster mlx path.
+
 The native engine is the default and is health-checked at startup. If its bundle or models are missing, or it fails to start, the accelerator automatically falls back to the Python service so ML is never left down. On a brand-new install the models (~740MB) are downloaded once in the background on first native start, so ML runs on the Python engine for a few minutes until they arrive, then switches to native automatically.
 
 **Switching back to the Python engine.** If you want to force the Python service (for example to compare results, or if native misbehaves), set `ml_engine` in `~/.immich-accelerator/config.json`:
@@ -228,9 +241,9 @@ The native worker runs Immich's unmodified code. The ffmpeg and image processing
 | **ffmpeg** | Jellyfin-ffmpeg | Jellyfin-ffmpeg (same binary, macOS arm64 build) | **Identical.** Same `tonemapx` filter, same encoders, same behavior. Downloaded automatically during setup. |
 | **ffmpeg encoders** | Software H.264/HEVC | VideoToolbox hardware H.264/HEVC via wrapper | Hardware-encoded output has slightly different bitstream characteristics. Visually equivalent. A lightweight wrapper remaps Immich's software encoder requests to VideoToolbox hardware equivalents. Immich has no VideoToolbox option, so it logs `Transcoding video ... without hardware acceleration` even though the encode runs on the GPU via the wrapper. That log is expected and benign. |
 | **Sharp / libvips** | Prebuilt linux-arm64 Sharp | Rebuilt against Homebrew system libvips | Identical image output. System libvips handles corrupt HEIF files more gracefully (matches Docker's error handling). |
-| **ML: CLIP** | ONNX Runtime | MLX on Metal GPU | Same model, different runtime. Embeddings are numerically close but not identical (floating-point differences). Search results are equivalent. |
-| **ML: Face detection** | ONNX Runtime | Apple Vision framework (Neural Engine) | Different model entirely. Detection accuracy is comparable; bounding boxes may differ slightly. |
-| **ML: Face recognition** | ONNX Runtime | ONNX Runtime with CoreML | Same model, CoreML acceleration. Numerically close embeddings. |
+| **ML: CLIP** | ONNX Runtime | Native Swift: mlx (default ViT-B-32) or onnxruntime (any other model, using Immich's own ONNX exports) | Same models and weights. Text embeddings match Docker exactly (cosine 1.0 in validation); image embeddings are numerically close (~0.999, resize-filter floating point). Search results are equivalent; existing indexes stay valid. |
+| **ML: Face detection** | ONNX Runtime (antelopev2/buffalo detector) | Apple Vision framework (Neural Engine) | Different detector. Accuracy is comparable; bounding boxes may differ slightly. |
+| **ML: Face recognition** | ONNX Runtime | Native Swift: same InsightFace ArcFace model via onnxruntime (CPU) | Same model and weights; embeddings match Docker (~0.9997, image-decoder floating point). Existing face clusters stay valid. |
 | **ML: OCR** | PaddleOCR via ONNX | Apple Vision framework (Neural Engine) | Different engine. Vision framework OCR is generally more accurate for Latin text, may differ for CJK. |
 | **HEIC decode** | libvips built with libde265 | Homebrew `vips` (libvips + libde265), then Sharp | Sharp's prebuilt libvips on macOS has no HEVC decoder, so iPhone HEICs are pre-decoded by the Homebrew `vips` (the same libvips + libde265 Docker uses) before Sharp processes them. Works headless; pixels match Docker. Apple ImageIO (`sips`) is a last-resort fallback for a logged-in desktop only. |
 | **Camera RAW decode** | libvips with fuller libtiff/libjpeg + libraw | Homebrew `vips`, then Sharp | Sharp's prebuilt libvips on macOS lacks old-style-JPEG and dcraw/libraw support, so Canon CR2/CR3, Nikon NEF, Sony ARW, Adobe DNG and other RAW originals fail thumbnail generation (`tiff2vips: Old-style JPEG compression support is not configured`, or a `multiband -> srgb` colourspace error). They are pre-decoded by the Homebrew `vips` (fuller libtiff/libjpeg for TIFF-based RAW, plus libraw for the rest), the same libvips Docker uses, before Sharp. Works headless; matches Docker. |
@@ -376,7 +389,9 @@ MIT
 
 ## Credits
 
-[Immich](https://immich.app/) · [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) · [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) · [Sharp](https://sharp.pixelplumbing.com/)
+Built on [Immich](https://immich.app/) · [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) · [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) · [Sharp](https://sharp.pixelplumbing.com/)
+
+Two projects we learned from: the menu-bar app's design is inspired by [Immich-Accelerator-Helper](https://github.com/pl4za/Immich-Accelerator-Helper) by [@pl4za](https://github.com/pl4za), and running Immich's own ONNX model exports natively via onnxruntime was informed by [michina-swift](https://github.com/lucka-me/michina-swift) by [@lucka-me](https://github.com/lucka-me).
 
 ---
 
