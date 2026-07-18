@@ -6,7 +6,7 @@
 [![Homebrew](https://img.shields.io/badge/install-Homebrew-orange.svg)](https://github.com/epheterson/homebrew-immich-accelerator)
 [![Immich](https://img.shields.io/badge/Immich-2.7%2B-5b21b6.svg)](https://immich.app/)
 
-> **Beta.** In daily use on a Mac Mini M4 (24GB) against an Immich 2.7.x library. Stable, but back up your Immich database before your first run.
+> **Beta.** In daily use on a Mac Mini M4 (24GB) against an Immich 3.0.x library. Stable, but back up your Immich database before your first run.
 
 Run Immich's compute natively on Apple Silicon. Thumbnails use the fast M-series CPU, video transcoding uses VideoToolbox hardware encoding, and ML runs on Metal GPU, Neural Engine, and CoreML.
 
@@ -39,7 +39,7 @@ The microservices worker is extracted directly from your running Immich Docker i
 | Add env vars to docker-compose | `IMMICH_WORKERS_INCLUDE`, `IMMICH_MACHINE_LEARNING_URL`, `IMMICH_MEDIA_LOCATION` | Remove the lines | None |
 | Expose Postgres/Redis ports | `5432:5432`, `6379:6379` in docker-compose | Remove the port lines | None |
 | Native microservices worker | Extracted from Docker image, runs via `node` | Stop the accelerator | None |
-| Native ML service | Separate Python service | Stop the accelerator | None |
+| Native ML service | Native Swift engine (Python venv fallback) | Stop the accelerator | None |
 | `/build` symlink (Immich 2.7+) | `/etc/synthetic.d/immich-accelerator` (requires sudo once during setup) | `immich-accelerator uninstall` removes it; reboot to deactivate | Low |
 
 **Why `/build`?** Immich 2.7+ stores absolute plugin paths like `/build/corePlugin/dist/plugin.wasm` in its database. Both Docker and native workers need `/build` to resolve. macOS SIP prevents creating root-level directories, so we use Apple's [synthetic link](https://man.cx/synthetic.conf(5)) mechanism to map `/build` → `~/.immich-accelerator/build-data`. Setup prompts for sudo once; a reboot may be required to activate.
@@ -389,7 +389,9 @@ MIT
 
 ## Credits
 
-[Immich](https://immich.app/) · [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) · [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) · [Sharp](https://sharp.pixelplumbing.com/)
+Built on [Immich](https://immich.app/) · [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) · [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) · [Sharp](https://sharp.pixelplumbing.com/)
+
+Two projects we learned from: the menu-bar app's design is inspired by [Immich-Accelerator-Helper](https://github.com/pl4za/Immich-Accelerator-Helper) by [@pl4za](https://github.com/pl4za), and running Immich's own ONNX model exports natively via onnxruntime was informed by [michina-swift](https://github.com/lucka-me/michina-swift) by [@lucka-me](https://github.com/lucka-me).
 
 ---
 
