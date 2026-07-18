@@ -134,12 +134,23 @@ jobs:
           cask "immich-accelerator-menubar" do
             version "${VERSION}"
             sha256 "${MENUBAR_SHA}"
+
             url "https://github.com/${REPO}/releases/download/v${VERSION}/immich-accelerator-menubar-${VERSION}.zip"
             name "Immich Accelerator Menu Bar"
             desc "Menu-bar status and controls for Immich Accelerator"
             homepage "https://github.com/${REPO}"
+
             depends_on macos: ">= :sonoma"
+
             app "Immich Accelerator.app"
+
+            # The app is ad-hoc signed (no Developer ID / notarization), so a
+            # quarantined download would be Gatekeeper-blocked on first launch.
+            # Strip the quarantine flag after install so it opens cleanly.
+            postflight do
+              system_command "/usr/bin/xattr",
+                             args: ["-dr", "com.apple.quarantine", "#{appdir}/Immich Accelerator.app"]
+            end
           end
           CASK
           ruby -c tap/Casks/immich-accelerator-menubar.rb

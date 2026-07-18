@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.1 - 2026-07-18
+
+### Fixed
+- **Menu-bar cask no longer Gatekeeper-blocks on first launch.** The app is ad-hoc signed (no Developer ID / notarization), and Homebrew quarantines cask downloads, so a fresh `brew install --cask …-menubar` would fail to open on a machine that had never seen the app ("cannot be opened, unidentified developer"). The cask now strips the quarantine flag in a `postflight` step so it launches cleanly. (The core formula was never affected, Homebrew does not quarantine formula bottles.)
+
 ## 1.7.0 - 2026-07-17
 
 ### Added
