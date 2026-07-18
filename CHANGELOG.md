@@ -10,8 +10,10 @@
 - **Old Immich server builds are pruned automatically.** Each extracted Immich server (`~/.immich-accelerator/server/<version>`) is roughly half a gigabyte, and until now none were ever removed, so a long-running install accumulated every version it had run. The accelerator now keeps only the current build (build data is shared and stamped for a single version, so an older build can't be served from cache anyway and is dead weight) and prunes the rest, including any leftover `.staging` dirs, once the worker is up on the new version.
 
 ### Fixed
+- **Dashboard no longer gets confused with another service on its port.** `start_dashboard` used to adopt whatever process was listening on the dashboard port, so on a machine where something else holds it (e.g. a container proxy like OrbStack on 8420) the accelerator adopted that process and never started its own dashboard. It now verifies a port-holder is actually our dashboard before adopting, and the port is configurable via `"dashboard_port"` in `~/.immich-accelerator/config.json` (default 8420) to dodge a collision.
 - **Release workflow could not upload the native ML bundle** (HTTP 403): the build job now requests `contents: write`, so release assets attach without manual intervention. The v1.6.0 assets were uploaded by hand; installs were unaffected.
 - **Menu bar "Open Immich" now uses your public domain.** It prefers the external domain configured in Immich's server settings and falls back to the local address the worker connects to, instead of always opening the internal IP.
+- **Zoo engine hardening** (from a multi-agent code review): eager-loaded ONNX sessions to fix a Swift exclusive-access crash under concurrent `/predict` requests, strict validation of zoo model names (blocks path-traversal / URL injection from the model string), EOT-token preservation on prompt truncation, and attention-mask support for multilingual (2-input) textual towers.
 
 ## 1.6.0 - 2026-07-16
 
