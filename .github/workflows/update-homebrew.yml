@@ -64,8 +64,52 @@ jobs:
           echo "sha256=$(shasum -a 256 "$ZIP" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           gh release upload "$TAG" "$ZIP" --clobber
 
-  update-tap:
+  # Guard against #111: prove the released native bundle actually runs on a clean
+  # Mac with NONE of the ML Homebrew formulae (onnx / onnxruntime / abseil /
+  # protobuf / re2). A bare launch dyld-loads libonnxruntime and its whole chain
+  # at startup, so a bundle that isn't self-contained crashes here with "Library
+  # not loaded" -- before it can reach a user and silently fall back to Python.
+  # This gates the tap publish below, so a broken native bundle never ships.
+  verify-native-clean:
     needs: build-native
+    runs-on: macos-15
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download the released native bundle
+        run: |
+          VERSION="${TAG#v}"
+          gh release download "$TAG" --repo "$GH_REPO" \
+            --pattern "immich-ml-native-${VERSION}-macos-arm64.tar.gz" --dir .
+          mkdir bundle && tar xzf immich-ml-native-*.tar.gz -C bundle --strip-components=1
+      - name: Remove ML Homebrew formulae so this is a genuinely clean machine
+        run: |
+          brew uninstall --ignore-dependencies onnxruntime onnx abseil protobuf re2 2>/dev/null || true
+      - name: Launch the binary; the onnxruntime chain must resolve from the bundle
+        run: |
+          cd bundle
+          # Background + kill: a bare launch resolves the launch-time dylibs
+          # (libonnxruntime -> onnx -> abseil ...) in well under a second; the
+          # sleep is just a safety net in case a future arg change makes it hang.
+          DYLD_PRINT_LIBRARIES=1 ./immich-ml-native __ci_probe__ > probe.log 2>&1 &
+          pid=$!; sleep 15; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+          if grep -qiE 'Library not loaded|image not found|Symbol not found' probe.log; then
+            echo "FAIL: native bundle is not self-contained on a clean machine:"
+            grep -iE 'Library not loaded|image not found|Symbol not found' probe.log | head
+            exit 1
+          fi
+          if ! grep -q 'libonnx.dylib' probe.log; then
+            echo "FAIL: onnxruntime chain never loaded (probe or bundle broken):"; tail -5 probe.log; exit 1
+          fi
+          if grep -E 'libonnx\.dylib|libabsl' probe.log | grep -q '/opt/homebrew'; then
+            echo "FAIL: loaded onnxruntime/abseil from /opt/homebrew, not the bundle"; exit 1
+          fi
+          echo "OK: native bundle loads its onnxruntime chain from itself on a clean runner"
+
+  update-tap:
+    needs: [build-native, verify-native-clean]
     runs-on: ubuntu-latest
     env:
       TAG: ${{ inputs.tag }}
