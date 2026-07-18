@@ -148,6 +148,9 @@ struct MenuView: View {
                     WindowManager.shared.showOnboarding(model: model)
                 }
             }
+            LinkRow(icon: "arrow.down.circle", title: "Check for Updates…") {
+                UpdaterModel.shared.checkForUpdates()
+            }
             Divider().padding(.vertical, 4).padding(.horizontal, 4)
             // Full-width settings row so it lines up with the link rows above
             // instead of a narrow checkbox centering itself in the panel.
