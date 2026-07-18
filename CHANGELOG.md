@@ -3,6 +3,7 @@
 ## 1.7.1 - 2026-07-18
 
 ### Fixed
+- **Native ML now actually runs natively on a fresh install** (#111). The native ML binary's bundled `onnxruntime` linked its own dependencies (`onnx`, `protobuf`, `re2`, and ~80 `abseil` libraries) by absolute Homebrew paths. Those are only present on a machine that already has those formulae installed (like the CI build runner), so on a normal install the libraries were missing, the native binary crashed at startup with `dyld: Library not loaded: …/libonnx.dylib`, and the accelerator silently fell back to the Python engine (the menu bar showed PYTHON regardless of the `ml_engine` setting). The release bundle is now fully self-contained: every non-system dependency is vendored beside the binary with relocatable `@loader_path` paths, and the build now fails if anything still references the Homebrew prefix, so this cannot silently ship again. Reported by [@shtefko](https://github.com/shtefko).
 - **Menu-bar cask no longer Gatekeeper-blocks on first launch.** The app is ad-hoc signed (no Developer ID / notarization), and Homebrew quarantines cask downloads, so a fresh `brew install --cask …-menubar` would fail to open on a machine that had never seen the app ("cannot be opened, unidentified developer"). The cask now strips the quarantine flag in a `postflight` step so it launches cleanly. (The core formula was never affected, Homebrew does not quarantine formula bottles.)
 
 ## 1.7.0 - 2026-07-17
