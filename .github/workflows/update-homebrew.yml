@@ -140,7 +140,7 @@ jobs:
             desc "Menu-bar status and controls for Immich Accelerator"
             homepage "https://github.com/${REPO}"
 
-            depends_on macos: ">= :sonoma"
+            depends_on macos: :sonoma
 
             app "Immich Accelerator.app"
 
