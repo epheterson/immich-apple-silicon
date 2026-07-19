@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.2 - 2026-07-18
+
+### Added
+- **Menu-bar app updates itself (Sparkle).** The menu-bar app now checks for and installs its own updates in the background, with a "Check for Updates…" item in the panel for an on-demand check. Updates are EdDSA-signed and verified against a public key built into the app, so it only installs a build signed with the matching private key. This affects the menu-bar app only; the accelerator itself continues to update through `brew upgrade`.
+
+### Changed
+- **Menu-bar app is now Developer ID signed and notarized.** Earlier menu-bar builds were ad-hoc signed, so the cask stripped macOS quarantine in a `postflight` to open on a fresh machine. The app is now signed and notarized by Apple, so it launches cleanly on its own and the cask declares `auto_updates true` (Sparkle manages upgrades from there). The core formula was never affected; Homebrew does not quarantine formula bottles.
+
 ## 1.7.1 - 2026-07-18
 
 ### Fixed
