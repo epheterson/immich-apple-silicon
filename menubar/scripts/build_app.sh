@@ -21,7 +21,10 @@ VERSION="${1:-dev}"
 APP="${2:-Immich Accelerator.app}"
 
 SIGN_ID="${MACOS_SIGN_ID:--}"
-SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-}"
+# App-scoped Sparkle public EdDSA key (not secret; verifies the appcast). Baked
+# in as the default so even local/dev builds ship a verifying Info.plist; CI may
+# override via the SPARKLE_PUBLIC_ED_KEY env for key rotation.
+SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-P8DlelneVjoU1Uio5uhiHA5d6uqDlgPkxhAhA3dcZqY=}"
 SUFEED_URL="${SUFEED_URL:-https://github.com/epheterson/immich-apple-silicon/releases/latest/download/appcast.xml}"
 
 # codesign flags: a real Developer ID identity gets hardened runtime + a secure
