@@ -139,6 +139,7 @@ struct MenuView: View {
             LinkRow(icon: "doc.text.magnifyingglass", title: "Open Logs") {
                 Actions.openLogs()
             }
+            Divider().padding(.vertical, 4).padding(.horizontal, 4)
             if Paths.isConfigured {
                 LinkRow(icon: "slider.horizontal.3", title: "Settings…") {
                     WindowManager.shared.showSettings(model: model)
@@ -147,6 +148,9 @@ struct MenuView: View {
                 LinkRow(icon: "wand.and.stars", title: "Set Up Accelerator…") {
                     WindowManager.shared.showOnboarding(model: model)
                 }
+            }
+            LinkRow(icon: "arrow.down.circle", title: "Check for Updates…") {
+                UpdaterModel.shared.checkForUpdates()
             }
             Divider().padding(.vertical, 4).padding(.horizontal, 4)
             // Full-width settings row so it lines up with the link rows above
@@ -253,7 +257,11 @@ struct LinkRow: View {
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            action()
+            // Clicking a link dismisses the panel like a normal menu item.
+            WindowManager.shared.dismissMenuBarPanel()
+        } label: {
             HStack(spacing: 10) {
                 Image(systemName: icon)
                     .symbolRenderingMode(.hierarchical)
