@@ -5,6 +5,9 @@
 ### Added
 - **Menu-bar app updates itself (Sparkle).** The menu-bar app now checks for and installs its own updates in the background, with a "Check for Updates…" item in the panel for an on-demand check. Updates are EdDSA-signed and verified against a public key built into the app, so it only installs a build signed with the matching private key. `brew upgrade` continues to update the menu-bar app as well; both track the same release, so they stay in sync.
 
+### Fixed
+- **Menu-bar panel dismisses on click.** Clicking an action in the panel (Open Immich / Dashboard / Logs, Settings, Check for Updates) now closes the panel like a normal menu instead of leaving it floating, and a separator groups the "Open" actions.
+
 ### Changed
 - **Menu-bar app is now Developer ID signed and notarized, and installs to `~/Applications`.** Earlier builds were ad-hoc signed, so the cask stripped macOS quarantine in a `postflight` to open on a fresh machine. The app is now signed and notarized by Apple, so it launches cleanly with no workaround. It installs to `~/Applications` (user-writable), so Sparkle can replace it in place without an admin prompt. `brew` stays the source of truth for the installed version and `brew upgrade` keeps the app current; Sparkle and `brew` track the same release and converge. The core formula was never affected; Homebrew does not quarantine formula bottles.
 

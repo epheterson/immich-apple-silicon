@@ -139,6 +139,7 @@ struct MenuView: View {
             LinkRow(icon: "doc.text.magnifyingglass", title: "Open Logs") {
                 Actions.openLogs()
             }
+            Divider().padding(.vertical, 4).padding(.horizontal, 4)
             if Paths.isConfigured {
                 LinkRow(icon: "slider.horizontal.3", title: "Settings…") {
                     WindowManager.shared.showSettings(model: model)
@@ -256,7 +257,11 @@ struct LinkRow: View {
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            action()
+            // Clicking a link dismisses the panel like a normal menu item.
+            WindowManager.shared.dismissMenuBarPanel()
+        } label: {
             HStack(spacing: 10) {
                 Image(systemName: icon)
                     .symbolRenderingMode(.hierarchical)

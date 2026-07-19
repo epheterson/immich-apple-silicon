@@ -33,8 +33,9 @@ final class WindowManager: NSObject {
     // a button inside it is clicked, so it floats over any window we open from
     // it. Order it out explicitly. It's the key window at the moment the click
     // fires; the class-name check is a fallback for other macOS versions. Our
-    // own windows are never touched.
-    private func dismissMenuBarPanel() {
+    // own windows are never touched. Called by every panel link (see LinkRow) so
+    // clicking any action dismisses the panel like a normal menu.
+    func dismissMenuBarPanel() {
         for window in NSApp.windows where window !== onboarding && window !== settings {
             let cls = String(describing: type(of: window))
             if window.isKeyWindow || cls.contains("MenuBarExtra") || cls.contains("StatusBar") {
