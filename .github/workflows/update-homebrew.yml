@@ -155,8 +155,52 @@ jobs:
             echo "SPARKLE_PRIVATE_KEY absent -- skipping appcast (in-app updates disabled until secrets are set)"
           fi
 
-  update-tap:
+  # Guard against #111: prove the released native bundle actually runs on a clean
+  # Mac with NONE of the ML Homebrew formulae (onnx / onnxruntime / abseil /
+  # protobuf / re2). A bare launch dyld-loads libonnxruntime and its whole chain
+  # at startup, so a bundle that isn't self-contained crashes here with "Library
+  # not loaded" -- before it can reach a user and silently fall back to Python.
+  # This gates the tap publish below, so a broken native bundle never ships.
+  verify-native-clean:
     needs: build-native
+    runs-on: macos-15
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download the released native bundle
+        run: |
+          VERSION="${TAG#v}"
+          gh release download "$TAG" --repo "$GH_REPO" \
+            --pattern "immich-ml-native-${VERSION}-macos-arm64.tar.gz" --dir .
+          mkdir bundle && tar xzf immich-ml-native-*.tar.gz -C bundle --strip-components=1
+      - name: Remove ML Homebrew formulae so this is a genuinely clean machine
+        run: |
+          brew uninstall --ignore-dependencies onnxruntime onnx abseil protobuf re2 2>/dev/null || true
+      - name: Launch the binary; the onnxruntime chain must resolve from the bundle
+        run: |
+          cd bundle
+          # Background + kill: a bare launch resolves the launch-time dylibs
+          # (libonnxruntime -> onnx -> abseil ...) in well under a second; the
+          # sleep is just a safety net in case a future arg change makes it hang.
+          DYLD_PRINT_LIBRARIES=1 ./immich-ml-native __ci_probe__ > probe.log 2>&1 &
+          pid=$!; sleep 15; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+          if grep -qiE 'Library not loaded|image not found|Symbol not found' probe.log; then
+            echo "FAIL: native bundle is not self-contained on a clean machine:"
+            grep -iE 'Library not loaded|image not found|Symbol not found' probe.log | head
+            exit 1
+          fi
+          if ! grep -q 'libonnx.dylib' probe.log; then
+            echo "FAIL: onnxruntime chain never loaded (probe or bundle broken):"; tail -5 probe.log; exit 1
+          fi
+          if grep -E 'libonnx\.dylib|libabsl' probe.log | grep -q '/opt/homebrew'; then
+            echo "FAIL: loaded onnxruntime/abseil from /opt/homebrew, not the bundle"; exit 1
+          fi
+          echo "OK: native bundle loads its onnxruntime chain from itself on a clean runner"
+
+  update-tap:
+    needs: [build-native, verify-native-clean]
     runs-on: ubuntu-latest
     env:
       TAG: ${{ inputs.tag }}
@@ -223,7 +267,12 @@ jobs:
         run: |
           mkdir -p tap/Casks
           CASK_FILE=tap/Casks/immich-accelerator-menubar.rb
-          # Shared header for both the notarized and ad-hoc variants.
+          # Shared header. Install to ~/Applications so the app is user-writable:
+          # Sparkle (and brew) can replace it in place with no admin prompt. We do
+          # NOT set auto_updates, so `brew upgrade` keeps the menu-bar app current
+          # and brew's recorded version stays authoritative. Sparkle and brew both
+          # track the same lockstep release (tap cask + appcast publish together),
+          # so whichever updates first, they converge on the same version.
           cat > "$CASK_FILE" <<CASK
           cask "immich-accelerator-menubar" do
             version "${VERSION}"
@@ -236,23 +285,20 @@ jobs:
 
             depends_on macos: :sonoma
 
-            app "Immich Accelerator.app"
+            app "Immich Accelerator.app", target: "#{Dir.home}/Applications/Immich Accelerator.app"
           CASK
-          # A notarized app updates itself via Sparkle and passes Gatekeeper on
-          # its own, so declare auto_updates. An ad-hoc build (no secrets) still
-          # needs the postflight to strip quarantine and open on first launch.
+          # Notarized builds pass Gatekeeper on their own. An ad-hoc build (no
+          # secrets) still needs the postflight to strip quarantine and open.
           if [ "$NOTARIZED" = "true" ]; then
             cat >> "$CASK_FILE" <<'CASK'
-
-              auto_updates true
-            end
+          end
           CASK
           else
             cat >> "$CASK_FILE" <<'CASK'
 
               postflight do
                 system_command "/usr/bin/xattr",
-                               args: ["-dr", "com.apple.quarantine", "#{appdir}/Immich Accelerator.app"]
+                               args: ["-dr", "com.apple.quarantine", "#{Dir.home}/Applications/Immich Accelerator.app"]
               end
             end
           CASK
