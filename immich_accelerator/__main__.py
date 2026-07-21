@@ -2158,6 +2158,16 @@ def _dashboard_port() -> int:
         return 8420
 
 
+def _dashboard_enabled() -> bool:
+    """Whether the web dashboard is enabled. Defaults True (back-compat: a config
+    written before this option existed has no key). Set "dashboard": false in
+    config.json (or `immich-accelerator dashboard off`) to run headless."""
+    try:
+        return bool(load_config().get("dashboard", True))
+    except (RuntimeError, ValueError, OSError):
+        return True
+
+
 def _process_is_our_dashboard(pid: int) -> bool:
     """Whether a pid is actually our dashboard, not a foreign port squatter.
 
@@ -2184,7 +2194,10 @@ def _process_is_our_dashboard(pid: int) -> bool:
 def start_dashboard() -> None:
     """Start the dashboard in the background if it isn't already running.
     Idempotent — used by both `start` and `watch` so either brings the
-    dashboard up (#81)."""
+    dashboard up (#81). No-op when the dashboard is disabled in config."""
+    if not _dashboard_enabled():
+        log.debug("Dashboard disabled in config; not starting.")
+        return
     if read_pid("dashboard"):
         return  # already tracked + alive (also guards a just-spawned one)
     port = _dashboard_port()
@@ -4746,7 +4759,26 @@ def cmd_watch(_args):
 
 
 def cmd_dashboard(args):
-    """Start the web dashboard."""
+    """Run the web dashboard, or toggle it on/off.
+
+    `dashboard on|off` flips the "dashboard" config key so `start`/`watch` do (or
+    don't) bring the dashboard up, and starts/stops it now to match. With no
+    state it runs the dashboard server in the foreground (what start_dashboard
+    spawns in the background)."""
+    state = getattr(args, "state", None)
+    if state in ("on", "off"):
+        config = load_config()
+        config["dashboard"] = state == "on"
+        save_config(config)
+        if state == "on":
+            start_dashboard()
+            log.info("Dashboard enabled.")
+        else:
+            if read_pid("dashboard"):
+                kill_pid("dashboard")
+            log.info("Dashboard disabled. Worker and ML are unaffected.")
+        return
+
     config = load_config()
     import importlib
 
@@ -5071,6 +5103,12 @@ def main():
     sub.add_parser("update", help="Update to match Immich version")
     sub.add_parser("watch", help="Monitor services, restart on crash (for launchd)")
     dash_p = sub.add_parser("dashboard", help="Web dashboard (http://localhost:8420)")
+    dash_p.add_argument(
+        "state",
+        nargs="?",
+        choices=["on", "off"],
+        help="Enable or disable the dashboard (omit to run it in the foreground)",
+    )
     dash_p.add_argument("--port", type=int, default=8420, help="Dashboard port")
     sub.add_parser(
         "ml-test",
