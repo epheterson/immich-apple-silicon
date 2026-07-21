@@ -52,6 +52,12 @@ struct AcceleratorBarApp: App {
 // window so a fresh install has a path forward instead of a dead menu bar.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Dev/test affordance: open Settings straight away so it can be captured
+        // headlessly (screenshots) without driving the menu-bar panel.
+        if ProcessInfo.processInfo.environment["ACCEL_SHOW_SETTINGS"] != nil {
+            WindowManager.shared.showSettings(model: .shared)
+            return
+        }
         if !Paths.isConfigured {
             WindowManager.shared.showOnboarding(model: .shared)
         }

@@ -7,7 +7,9 @@ struct SettingsView: View {
     @ObservedObject var model: StatusModel
     @AppStorage("hasOnboarded") private var hasOnboarded = false
 
-    @State private var config: [String: Any] = [:]
+    // Populated at construction (not just onAppear) so the window has real
+    // values immediately and an off-screen ImageRenderer capture isn't blank.
+    @State private var config: [String: Any] = StatusModel.readConfig()
     @State private var engine = "native"
     @State private var savedEngine = "native"
     @State private var revealKey = false
