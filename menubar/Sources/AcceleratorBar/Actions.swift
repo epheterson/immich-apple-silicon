@@ -117,4 +117,36 @@ enum Actions {
     static func setDashboard(_ on: Bool) async {
         await run(cli, ["dashboard", on ? "on" : "off"])
     }
+
+    // The available core-formula version if it's behind, else nil.
+    // `brew outdated --verbose` prints "immich-accelerator (1.7.1) < 1.7.2".
+    static func coreOutdated() async -> String? {
+        let (_, out) = await run(brew, ["outdated", "--formula", "--verbose", "immich-accelerator"])
+        guard let r = out.range(of: "< ") else { return nil }
+        let v = out[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty ? nil : v
+    }
+
+    // Upgrade the core formula. The watch loop applies the new code on its own
+    // (stops the stale worker, relaunches), so no explicit restart is needed on
+    // the standard launchd install.
+    @discardableResult
+    static func upgradeCore() async -> Bool {
+        let (code, _) = await run(brew, ["upgrade", "immich-accelerator"])
+        return code == 0
+    }
+
+    // True if semver `a` (\"X.Y.Z\") is newer than `b`. Non-numeric suffixes are
+    // dropped; unparseable inputs return false (never triggers a downgrade).
+    static func versionNewer(_ a: String, than b: String) -> Bool {
+        let pa = a.split(separator: ".").compactMap { Int($0) }
+        let pb = b.split(separator: ".").compactMap { Int($0) }
+        guard !pa.isEmpty, !pb.isEmpty else { return false }
+        for i in 0 ..< max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0
+            let y = i < pb.count ? pb[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
 }

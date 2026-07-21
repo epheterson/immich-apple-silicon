@@ -23,6 +23,7 @@ struct SettingsView: View {
             dashboardSection
             configSection
             keySection
+            updatesSection
             Divider()
             footer
         }
@@ -123,6 +124,26 @@ struct SettingsView: View {
         if !model.snap.dashboardEnabled { return "off" }
         return model.snap.dashboardUp
             ? "running on localhost:\(model.snap.dashboardPort)" : "starting…"
+    }
+
+    private var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+    }
+
+    private var updatesSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 6) {
+                row("Menu bar app", "v\(appVersion)")
+                row("Core", model.snap.version.isEmpty ? "-" : "v\(model.snap.version)")
+                // The core auto-follows the app (see AppDelegate.syncCoreVersion);
+                // this button drives the app's own Sparkle check.
+                HStack {
+                    Button("Check for Updates…") { UpdaterModel.shared.checkForUpdates() }
+                    Spacer()
+                }
+            }
+            .padding(4)
+        } label: { Label("Software Update", systemImage: "arrow.down.circle") }
     }
 
     private var apiKey: String { config["api_key"] as? String ?? "" }

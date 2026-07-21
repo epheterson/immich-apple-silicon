@@ -61,6 +61,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !Paths.isConfigured {
             WindowManager.shared.showOnboarding(model: .shared)
         }
+        // Keep the core in lockstep: if this (possibly Sparkle-updated) app is
+        // newer than the installed core, pull the core forward — always, no
+        // prompt. So a Sparkle update upgrades the whole accelerator.
+        Task { await Self.syncCoreVersion() }
+    }
+
+    @MainActor
+    static func syncCoreVersion() async {
+        let app = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        // Only a clean X.Y.Z release triggers this (never a "1.8.0-dev" build),
+        // so local dev testing can't upgrade someone's core out from under them.
+        let comps = app.split(separator: ".")
+        guard comps.count == 3, comps.allSatisfy({ Int($0) != nil }) else { return }
+        let core = StatusModel.readVersion()
+        guard !core.isEmpty, Actions.versionNewer(app, than: core) else { return }
+        _ = await Actions.upgradeCore()
+        await StatusModel.shared.refresh()
     }
 }
 
