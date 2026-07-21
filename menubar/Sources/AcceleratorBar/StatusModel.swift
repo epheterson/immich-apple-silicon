@@ -39,6 +39,7 @@ struct Snapshot: Equatable {
     var jobsActive = 0       // jobs the worker is running right now
     var jobsWaiting = 0      // jobs queued behind them
     var dashboardPort = 8420 // where the accelerator dashboard is served
+    var dashboardEnabled = true // config "dashboard" (default on); off => hide the row
 
     // What "Open Immich" should launch: the public domain the user set in
     // Immich when present, otherwise the local URL the accelerator connects to.
@@ -67,6 +68,7 @@ struct ProcessProbe: Sendable {
     var immichVersion = ""
     var immichURL = ""
     var dashboardPort = 8420
+    var dashboardEnabled = true
     var mlPort = 3003
     var apiKey = ""
 }
@@ -137,6 +139,7 @@ final class StatusModel: ObservableObject {
         s.immichVersion = p.immichVersion
         s.immichURL = p.immichURL
         s.dashboardPort = p.dashboardPort
+        s.dashboardEnabled = p.dashboardEnabled
 
         // The three network probes are independent (each has its own timeout),
         // so run them concurrently: a slow/unreachable service costs the max
@@ -173,6 +176,7 @@ final class StatusModel: ObservableObject {
         p.immichVersion = config["version"] as? String ?? ""
         p.immichURL = config["immich_url"] as? String ?? ""
         p.dashboardPort = (config["dashboard_port"] as? Int) ?? 8420
+        p.dashboardEnabled = (config["dashboard"] as? Bool) ?? true
         p.mlPort = (config["ml_port"] as? Int) ?? 3003
         p.apiKey = (p.workerUp ? config["api_key"] as? String : nil) ?? ""
         return p

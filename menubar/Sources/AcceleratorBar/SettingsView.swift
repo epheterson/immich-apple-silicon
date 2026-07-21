@@ -12,12 +12,14 @@ struct SettingsView: View {
     @State private var savedEngine = "native"
     @State private var revealKey = false
     @State private var applying = false
+    @State private var dashboardOn = true
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             immichSection
             mlSection
+            dashboardSection
             keySection
             Divider()
             footer
@@ -31,6 +33,7 @@ struct SettingsView: View {
         config = StatusModel.readConfig()
         savedEngine = (config["ml_engine"] as? String) ?? "native"
         engine = savedEngine
+        dashboardOn = (config["dashboard"] as? Bool) ?? true
     }
 
     // MARK: - sections
@@ -78,6 +81,28 @@ struct SettingsView: View {
             }
             .padding(4)
         } label: { Label("Machine Learning", systemImage: "brain.fill") }
+    }
+
+    private var dashboardSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: $dashboardOn) { Text("Web dashboard") }
+                    .toggleStyle(.switch)
+                    .onChange(of: dashboardOn) { _, on in
+                        Task { await Actions.setDashboard(on); await model.refresh() }
+                    }
+                // Live state from the probe (not the toggle): reflects whether
+                // it actually came up, and dodges an OrbStack port collision.
+                row("Status", dashboardStatus)
+            }
+            .padding(4)
+        } label: { Label("Dashboard", systemImage: "gauge.with.dots.needle.50percent") }
+    }
+
+    private var dashboardStatus: String {
+        if !model.snap.dashboardEnabled { return "off" }
+        return model.snap.dashboardUp
+            ? "running on localhost:\(model.snap.dashboardPort)" : "starting…"
     }
 
     private var apiKey: String { config["api_key"] as? String ?? "" }

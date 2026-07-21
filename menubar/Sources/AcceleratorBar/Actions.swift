@@ -110,4 +110,11 @@ enum Actions {
         try? out.write(to: url, options: .atomic)
         await restartService()
     }
+
+    // Enable/disable the web dashboard via the CLI, which flips the "dashboard"
+    // config key and starts/stops it now. Worker and ML are untouched, so no
+    // full service restart is needed.
+    static func setDashboard(_ on: Bool) async {
+        await run(cli, ["dashboard", on ? "on" : "off"])
+    }
 }
