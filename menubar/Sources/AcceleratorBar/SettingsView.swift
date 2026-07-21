@@ -17,9 +17,9 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            immichSection
             mlSection
             dashboardSection
+            configSection
             keySection
             Divider()
             footer
@@ -38,16 +38,34 @@ struct SettingsView: View {
 
     // MARK: - sections
 
-    private var immichSection: some View {
+    private var configSection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 6) {
-                row("Immich", model.snap.immichVersion.isEmpty ? "-" : model.snap.immichVersion)
-                row("Connects to", str("immich_url"))
-                row("Public domain", model.snap.externalDomain.isEmpty
-                    ? "not set (Open Immich uses the local address)" : model.snap.externalDomain)
+                ForEach(Diagnostics.checks(config: config, snap: model.snap)) { c in
+                    HStack(spacing: 8) {
+                        Image(systemName: c.iconName).foregroundStyle(c.tint).frame(width: 16)
+                        Text(c.label).foregroundStyle(.secondary)
+                            .frame(width: 90, alignment: .leading)
+                        Text(c.detail).textSelection(.enabled)
+                            .foregroundStyle(c.level == .fail ? .primary : .secondary)
+                        Spacer()
+                    }
+                    .font(.callout)
+                }
+                HStack {
+                    Spacer()
+                    Button {
+                        Actions.copyToPasteboard(
+                            Diagnostics.copyText(config: config, snap: model.snap))
+                    } label: {
+                        Label("Copy for issue report", systemImage: "doc.on.clipboard")
+                    }
+                    .controlSize(.small)
+                    .help("Copies versions, this checklist, and recent log lines. No API key.")
+                }
             }
             .padding(4)
-        } label: { Label("Immich", systemImage: "photo.on.rectangle.angled") }
+        } label: { Label("Configuration", systemImage: "checklist") }
     }
 
     private var mlSection: some View {
