@@ -1476,6 +1476,41 @@ class TestEnsureMediaReady:
             is False
         )
 
+    def test_symlinked_subdir_on_another_disk_is_allowed(self, tmp_path):
+        """#115: putting thumbs on a fast SSD via a symlink is supported. The
+        link resolves, so the gate passes and writes land on the target."""
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / MEDIA_MARKER_NAME).write_text("abc123")
+        ssd = tmp_path / "ssd" / "thumbs"
+        ssd.mkdir(parents=True)
+        (media / "thumbs").symlink_to(ssd)
+        assert (
+            ensure_media_ready({"upload_mount": str(media), "media_id": "abc123"})
+            is True
+        )
+
+    def test_refuses_when_subdir_symlink_dangles(self, tmp_path):
+        """#115: if that SSD isn't mounted the symlink dangles. Without this
+        check the marker still verifies via the root and we would start, then
+        Immich would fail every thumbnail write with ENOENT."""
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / MEDIA_MARKER_NAME).write_text("abc123")
+        (media / "thumbs").symlink_to(tmp_path / "never-mounted" / "thumbs")
+        assert (
+            ensure_media_ready({"upload_mount": str(media), "media_id": "abc123"})
+            is False
+        )
+
+    def test_first_run_refuses_when_subdir_symlink_dangles(
+        self, tmp_path, tmp_data_dir
+    ):
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / "encoded-video").symlink_to(tmp_path / "never-mounted" / "ev")
+        assert ensure_media_ready({"upload_mount": str(media)}) is False
+
     def test_first_run_refuses_when_root_absent(self, tmp_path):
         # upload_mount points "through" a regular file — the dir doesn't exist,
         # so first-run init has no candidate and we refuse.

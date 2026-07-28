@@ -2009,6 +2009,19 @@ mode, root, want = sys.argv[1], sys.argv[2], sys.argv[3]
 MARKER = ".immich-accelerator-media-id"
 SUBDIRS = ("upload", "library", "thumbs", "encoded-video", "profile", "backups")
 cands = [root] + [os.path.join(root, s) for s in SUBDIRS]
+# A subdir pointed at another disk (the documented way to put thumbs or
+# encoded-video on a fast SSD, #115) is a symlink. If its target isn't
+# mounted the link dangles, and Immich would fail every write to it with
+# ENOENT. isdir() is False for a dangling link, so it would silently drop
+# out of the candidates below while the marker still verifies via another
+# subdir. Fail loudly instead: report the broken path and exit 5.
+dangling = [
+    d for d in cands
+    if os.path.islink(d) and not os.path.exists(os.path.realpath(d))
+]
+if dangling:
+    sys.stderr.write("dangling:" + ",".join(dangling))
+    sys.exit(5)
 cands = [d for d in cands if os.path.isdir(d)]
 try:
     if mode == "verify":
@@ -2038,10 +2051,13 @@ except Exception as e:
 """
 
 
-def _media_probe(mode: str, root: str, media_id: str, timeout: int = 15) -> bool:
-    """Run the marker probe in a child process with a hard timeout. Returns True
-    only on a clean exit 0; any nonzero exit or timeout (e.g. a hung network
-    mount) is treated as not-ready."""
+def _media_probe(
+    mode: str, root: str, media_id: str, timeout: int = 15
+) -> tuple[bool, list[str]]:
+    """Run the marker probe in a child process with a hard timeout. Returns
+    (ok, dangling): ok is True only on a clean exit 0; any nonzero exit or
+    timeout (e.g. a hung network mount) is not-ready. `dangling` lists media
+    subdirs that are symlinks to a missing target (exit 5, see #115)."""
     try:
         result = subprocess.run(
             [sys.executable, "-c", _MEDIA_PROBE, mode, root, media_id],
@@ -2049,9 +2065,13 @@ def _media_probe(mode: str, root: str, media_id: str, timeout: int = 15) -> bool
             text=True,
             timeout=timeout,
         )
-        return result.returncode == 0
+        if result.returncode == 5:
+            err = (result.stderr or "").strip()
+            paths = err.split("dangling:", 1)[-1] if "dangling:" in err else ""
+            return False, [p for p in paths.split(",") if p]
+        return result.returncode == 0, []
     except (subprocess.SubprocessError, OSError):
-        return False
+        return False, []
 
 
 def ensure_media_ready(config: dict) -> bool:
@@ -2063,10 +2083,26 @@ def ensure_media_ready(config: dict) -> bool:
     if not media_root:
         return True  # nothing configured to guard (same-host default path)
 
+    def _report_dangling(paths: list[str]) -> None:
+        """A media subdir points at a disk that isn't mounted (#115). Immich
+        would fail every write to it, so name the exact path instead of letting
+        thumbnail/transcode jobs die one by one with ENOENT."""
+        log.error("Media location not ready: %s", media_root)
+        for p in paths:
+            log.error("  %s is a symlink to a target that does not exist.", p)
+        log.error("  A media folder points at another disk (e.g. thumbs on an")
+        log.error("  SSD) that isn't mounted. Mount it, or remove the symlink,")
+        log.error("  then start again. Refusing to start so Immich can't fail")
+        log.error("  every job that writes there.")
+
     media_id = config.get("media_id")
     if media_id:
-        if _media_probe("verify", media_root, media_id):
+        ok, dangling = _media_probe("verify", media_root, media_id)
+        if ok:
             return True
+        if dangling:
+            _report_dangling(dangling)
+            return False
         log.error("Media location not ready: %s", media_root)
         log.error("  The marker identifying your media root is missing or")
         log.error("  unreadable. Usually a network mount isn't up yet, or the")
@@ -2077,11 +2113,15 @@ def ensure_media_ready(config: dict) -> bool:
 
     # First run: establish the marker. Requires a present, writable root.
     new_id = uuid.uuid4().hex
-    if _media_probe("init", media_root, new_id):
+    ok, dangling = _media_probe("init", media_root, new_id)
+    if ok:
         config["media_id"] = new_id
         save_config(config)
         log.info("Media root verified and marked: %s", media_root)
         return True
+    if dangling:
+        _report_dangling(dangling)
+        return False
     log.error("Media location not writable: %s", media_root)
     log.error("  Refusing to start — check the mount is up and writable.")
     return False

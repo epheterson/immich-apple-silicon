@@ -76,6 +76,20 @@ For NAS + Mac setups, see [Split deployment](#split-deployment-nas--mac) below.
 
 This is the directory Immich uses as its media root. It contains these subdirectories: `upload/`, `thumbs/`, `encoded-video/`, `library/`, `profile/`, `backups/`. Both Docker and the native worker must see this directory at the same absolute path. Setup handles this automatically for same-machine installs.
 
+### Putting thumbnails or transcodes on a faster disk
+
+Immich derives every storage path from `IMMICH_MEDIA_LOCATION`, so there is no separate setting for thumbnails (this is true in Docker too). To keep the library on slow storage while thumbnails live on an SSD, symlink the subdirectory:
+
+```bash
+immich-accelerator stop
+mv /path/to/media/thumbs /Volumes/fast-ssd/thumbs
+ln -s /Volumes/fast-ssd/thumbs /path/to/media/thumbs
+```
+
+The same works for `encoded-video/`. Immich follows the symlink, so reads and writes land on the SSD.
+
+If the SSD is not mounted, that symlink points nowhere and every job writing to it would fail. The accelerator checks for this at startup and refuses to start, naming the broken path, instead of letting those jobs fail one by one.
+
 ## Commands
 
 Every command is prefixed with `immich-accelerator` (e.g. `immich-accelerator setup`).
