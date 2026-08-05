@@ -2809,6 +2809,31 @@ def _query_immich_api(base_url: str, api_key: str) -> dict:
     return {"version": version, "url": base_url}
 
 
+def _immich_clip_model(config: dict) -> str | None:
+    """The CLIP model Immich is configured to send us, or None if unknown.
+
+    Read from Immich's own system config so `ml-test` can say what the running
+    setup actually uses instead of only the model it probes with (#116). Needs
+    an api_key; any failure is non-fatal (the caller just stays quiet).
+    """
+    import urllib.error
+    import urllib.request
+
+    base, key = config.get("immich_url"), config.get("api_key")
+    if not base or not key:
+        return None
+    req = urllib.request.Request(
+        f"{base}/api/system-config", headers={"x-api-key": key}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    model = (data.get("machineLearning") or {}).get("clip", {}).get("modelName")
+    return model if isinstance(model, str) and model else None
+
+
 def _import_server(source: str, version: str) -> Path:
     """Import server files from a directory or tarball.
 
@@ -4977,6 +5002,22 @@ def cmd_ml_test(_args):
     check("health", health)
     check("clip visual (ViT-B-32__openai)", clip_visual)
     check("ocr (Apple Vision)", ocr_check)
+
+    # The CLIP check above deliberately uses a fixed model so the diagnostic is
+    # cheap and always available. That confused a user into thinking a model
+    # switch hadn't taken effect (#116), so say which model Immich actually
+    # asks for, and be explicit that the probe above is not it.
+    configured = _immich_clip_model(config)
+    if configured:
+        log.info("")
+        log.info("Immich is configured to use CLIP model: %s", configured)
+        if configured != "ViT-B-32__openai":
+            log.info("  The check above always probes ViT-B-32__openai, so it does not")
+            log.info(
+                "  reflect your setting. %s is downloaded and loaded the first",
+                configured,
+            )
+            log.info("  time Immich sends a Smart Search job (watch ml.log).")
 
     all_passed = all(ok for _, ok, _ in results)
     log.info("")
