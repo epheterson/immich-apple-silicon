@@ -74,14 +74,21 @@ final class ZooCLIP {
         // later model switch from re-querying the API for an already-complete
         // cache. Written only after every blob is on disk, so an interrupted
         // download is retried next time.
+        //
+        // The marker is written only when the listing actually succeeded. A
+        // transient network failure returns nil, not an empty list: recording
+        // "checked" then would strand the model for good, since every later
+        // load would skip the fetch and fail on the missing weights with no way
+        // back short of deleting a hidden file.
         let marker = dir.appendingPathComponent(".external-data-checked")
         if !FileManager.default.fileExists(atPath: marker.path) {
-            let external = Self.externalDataFiles(name: name)
-            if !external.isEmpty {
-                print("[native-ml] \(name): fetching \(external.count) external data files")
-                try Self.ensureFiles(name: name, dir: dir, extra: external)
+            if let external = Self.externalDataFiles(name: name) {
+                if !external.isEmpty {
+                    print("[native-ml] \(name): fetching \(external.count) external data files")
+                    try Self.ensureFiles(name: name, dir: dir, extra: external)
+                }
+                try? Data().write(to: marker)
             }
-            try? Data().write(to: marker)
         }
 
         let cfg = try JSONSerialization.jsonObject(
@@ -250,7 +257,9 @@ final class ZooCLIP {
     // here. Self-contained models return nothing and download exactly as before.
     static let nonWeightSuffixes = [".onnx", ".armnn", ".rknn", ".json", ".txt", ".md"]
 
-    static func externalDataFiles(name: String) -> [String] {
+    // Returns nil when the file list could not be retrieved (so the caller can
+    // retry later), and an empty array when the model genuinely has none.
+    static func externalDataFiles(name: String) -> [String]? {
         let api = URL(string: "https://huggingface.co/api/models/immich-app/\(name)")!
         var req = URLRequest(url: api)
         req.timeoutInterval = 30
@@ -262,10 +271,10 @@ final class ZooCLIP {
               let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
               let siblings = obj["siblings"] as? [[String: Any]]
         else {
-            // Offline or API change: self-contained models still work off the
-            // fixed list; one that needs external data fails at session load.
+            // Offline or API change. Report "unknown" rather than "none" so the
+            // caller retries on the next load instead of caching the failure.
             print("[native-ml] warning: could not list files for \(name)")
-            return []
+            return nil
         }
         return siblings.compactMap { $0["rfilename"] as? String }.filter { f in
             guard let tower = f.split(separator: "/").first,
