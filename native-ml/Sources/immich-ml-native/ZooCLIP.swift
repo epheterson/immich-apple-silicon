@@ -69,6 +69,21 @@ final class ZooCLIP {
         dir = Self.zooDir.appendingPathComponent(name)
         try Self.ensureFiles(name: name, dir: dir)
 
+        // Large models keep their weights in external data files beside
+        // model.onnx (#116). Resolve those once per model; the marker keeps a
+        // later model switch from re-querying the API for an already-complete
+        // cache. Written only after every blob is on disk, so an interrupted
+        // download is retried next time.
+        let marker = dir.appendingPathComponent(".external-data-checked")
+        if !FileManager.default.fileExists(atPath: marker.path) {
+            let external = Self.externalDataFiles(name: name)
+            if !external.isEmpty {
+                print("[native-ml] \(name): fetching \(external.count) external data files")
+                try Self.ensureFiles(name: name, dir: dir, extra: external)
+            }
+            try? Data().write(to: marker)
+        }
+
         let cfg = try JSONSerialization.jsonObject(
             with: Data(contentsOf: dir.appendingPathComponent("config.json"))) as? [String: Any] ?? [:]
         // embed_dim bounds the output buffer; a wrong guess silently truncates
@@ -219,6 +234,48 @@ final class ZooCLIP {
         cfg.timeoutIntervalForResource = 3600
         return URLSession(configuration: cfg)
     }()
+
+    // Weights for a large model don't fit in the .onnx protobuf, so the export
+    // stores them as ONNX *external data*: sibling files next to model.onnx that
+    // onnxruntime opens by relative name at load time (#116). Fetching only the
+    // fixed list above would leave a graph with no weights, which fails to load.
+    //
+    // The blobs are the direct children of a tower directory that aren't the
+    // graph, a config/tokenizer file, or a build for another runtime. Identify
+    // them by exclusion, because their names are otherwise arbitrary: some look
+    // extension-less (onnx__MatMul_5088) and others are dotted
+    // (text.transformer.resblocks.0.attn.in_proj_bias), so no single naming rule
+    // covers them. Skipping the other-runtime builds matters: model.armnn is
+    // 465 MB on ViT-B-32 and the rknpu/ subdirs are several GB, none of it used
+    // here. Self-contained models return nothing and download exactly as before.
+    static let nonWeightSuffixes = [".onnx", ".armnn", ".rknn", ".json", ".txt", ".md"]
+
+    static func externalDataFiles(name: String) -> [String] {
+        let api = URL(string: "https://huggingface.co/api/models/immich-app/\(name)")!
+        var req = URLRequest(url: api)
+        req.timeoutInterval = 30
+        let sem = DispatchSemaphore(value: 0)
+        var payload: Data?
+        downloadSession.dataTask(with: req) { d, _, _ in payload = d; sem.signal() }.resume()
+        sem.wait()
+        guard let payload,
+              let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              let siblings = obj["siblings"] as? [[String: Any]]
+        else {
+            // Offline or API change: self-contained models still work off the
+            // fixed list; one that needs external data fails at session load.
+            print("[native-ml] warning: could not list files for \(name)")
+            return []
+        }
+        return siblings.compactMap { $0["rfilename"] as? String }.filter { f in
+            guard let tower = f.split(separator: "/").first,
+                  tower == "visual" || tower == "textual" else { return false }
+            let rest = f.dropFirst(tower.count + 1)
+            guard !rest.contains("/") else { return false }  // rknpu/ and friends
+            let lower = rest.lowercased()
+            return !Self.nonWeightSuffixes.contains { lower.hasSuffix($0) }
+        }
+    }
 
     static func ensureFiles(name: String, dir: URL, extra: [String] = []) throws {
         for f in files + extra {
