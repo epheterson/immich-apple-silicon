@@ -2253,7 +2253,7 @@ def stop_dashboard() -> bool:
     """Stop the dashboard, whether or not we still have a valid pidfile.
 
     The pidfile can go missing (an orphan from a prior run, or read_pid
-    discarding it after PID reuse) — start_dashboard has an adopt-the-orphan
+    discarding it after PID reuse). start_dashboard has an adopt-the-orphan
     branch for exactly that state. Without the same fallback here, disabling the
     dashboard would leave it serving while every UI claims it is off. Returns
     whether something was stopped."""
