@@ -2,11 +2,14 @@ import SwiftUI
 
 // A single validated configuration/health fact, shown in Settings and included
 // in the copy-for-issue text. Read-only; computed from config + the live
-// snapshot + a couple of cheap filesystem checks (no blocking work here — the
+// snapshot + a couple of cheap filesystem checks (no blocking work here, the
 // network-derived facts come pre-probed off the snapshot).
 struct Check: Identifiable {
     enum Level { case ok, warn, fail, info }
-    let id = UUID()
+    // The label is the stable identity. A fresh UUID per rebuild would give
+    // SwiftUI a whole new set of rows on every status poll, tearing down the
+    // list and wiping any in-progress text selection every few seconds.
+    var id: String { label }
     let label: String
     let detail: String
     let level: Level
@@ -49,7 +52,7 @@ enum Diagnostics {
             let fellBack = configuredEngine == "native" && snap.mlEngine == .python
             out.append(Check(label: "ML engine",
                              detail: fellBack ? "configured native, running Python (fallback)"
-                                              : "\(snap.mlEngine.badge) — CLIP · Faces · OCR",
+                                              : "\(snap.mlEngine.badge): CLIP · Faces · OCR",
                              level: fellBack ? .warn : .ok))
         } else {
             out.append(Check(label: "ML engine",
@@ -62,10 +65,24 @@ enum Diagnostics {
                          level: snap.immichURL.isEmpty ? .fail : (snap.immichReachable ? .ok : .fail)))
 
         let key = config["api_key"] as? String ?? ""
-        out.append(Check(label: "API key",
-                         detail: key.isEmpty ? "not set (job counts disabled)"
-                            : (snap.apiKeyValid ? "valid" : "set, but Immich rejected it"),
-                         level: key.isEmpty ? .warn : (snap.apiKeyValid ? .ok : .fail)))
+        if key.isEmpty {
+            out.append(Check(label: "API key", detail: "not set (job counts disabled)",
+                             level: .warn))
+        } else {
+            // The key is only exercised while the worker is up, so an unchecked
+            // key reads as "set", never as rejected.
+            switch snap.apiKeyValid {
+            case .some(true):
+                out.append(Check(label: "API key", detail: "valid", level: .ok))
+            case .some(false):
+                out.append(Check(label: "API key", detail: "set, but Immich rejected it",
+                                 level: .fail))
+            case .none:
+                out.append(Check(label: "API key",
+                                 detail: "set (not checked while the worker is stopped)",
+                                 level: .info))
+            }
+        }
 
         if snap.dashboardEnabled {
             out.append(Check(label: "Dashboard",
@@ -112,12 +129,30 @@ enum Diagnostics {
         return lines.joined(separator: "\n")
     }
 
+    // Read only the end of the file. Service logs are capped at 200 MB, so
+    // slurping the whole thing to keep 30 lines would stall the UI and spike
+    // memory by hundreds of MB. Seek to a small window off the end instead.
     private static func logTail(_ name: String, _ n: Int) -> String {
         let f = Paths.dataDir.appendingPathComponent("logs/\(name)")
-        guard let text = try? String(contentsOf: f, encoding: .utf8) else {
+        let header = "--- \(name) (last \(n) lines) ---\n"
+        guard let handle = try? FileHandle(forReadingFrom: f) else {
             return "--- \(name): (not found) ---"
         }
-        let tail = text.split(separator: "\n", omittingEmptySubsequences: false).suffix(n)
-        return "--- \(name) (last \(n) lines) ---\n" + tail.joined(separator: "\n")
+        defer { try? handle.close() }
+
+        // 256 KB comfortably covers n lines of these logs, including stack traces.
+        let window = 256 * 1024
+        guard let end = try? handle.seekToEnd() else { return header }
+        let start = end > UInt64(window) ? end - UInt64(window) : 0
+        try? handle.seek(toOffset: start)
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8)
+                ?? String(data: data, encoding: .isoLatin1)
+        else { return header }
+
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        // The first line is probably truncated mid-way by the seek; drop it.
+        if start > 0, !lines.isEmpty { lines.removeFirst() }
+        return header + lines.suffix(n).joined(separator: "\n")
     }
 }

@@ -113,17 +113,33 @@ enum Actions {
 
     // Enable/disable the web dashboard via the CLI, which flips the "dashboard"
     // config key and starts/stops it now. Worker and ML are untouched, so no
-    // full service restart is needed.
-    static func setDashboard(_ on: Bool) async {
-        await run(cli, ["dashboard", on ? "on" : "off"])
+    // full service restart is needed. Returns false when the CLI is missing or
+    // the command failed, so the caller can undo the switch instead of showing
+    // a state the accelerator never reached.
+    static func setDashboard(_ on: Bool) async -> Bool {
+        guard isBrewInstall else { return false }
+        let (code, _) = await run(cli, ["dashboard", on ? "on" : "off"])
+        return code == 0
     }
 
-    // The available core-formula version if it's behind, else nil.
-    // `brew outdated --verbose` prints "immich-accelerator (1.7.1) < 1.7.2".
+    // Was the core installed by Homebrew? The CLI lives under the formula's opt
+    // prefix, so its presence is the check. A from-source install has no
+    // formula to upgrade.
+    static var isBrewInstall: Bool {
+        FileManager.default.isExecutableFile(atPath: cli)
+    }
+
+    // The available core-formula version if brew says one is ready, else nil.
+    // `brew outdated --verbose` prints "immich-accelerator (1.7.1) < 1.7.2" and
+    // stays silent for an up-to-date OR pinned formula, so nil correctly means
+    // "do not run an upgrade".
     static func coreOutdated() async -> String? {
-        let (_, out) = await run(brew, ["outdated", "--formula", "--verbose", "immich-accelerator"])
-        guard let r = out.range(of: "< ") else { return nil }
-        let v = out[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        let (code, out) = await run(
+            brew, ["outdated", "--formula", "--verbose", "immich-accelerator"])
+        guard code == 0, let r = out.range(of: "< ") else { return nil }
+        let v = out[r.upperBound...]
+            .prefix { !$0.isWhitespace }
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         return v.isEmpty ? nil : v
     }
 

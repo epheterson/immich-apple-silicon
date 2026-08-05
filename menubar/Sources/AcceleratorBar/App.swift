@@ -62,7 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             WindowManager.shared.showOnboarding(model: .shared)
         }
         // Keep the core in lockstep: if this (possibly Sparkle-updated) app is
-        // newer than the installed core, pull the core forward — always, no
+        // newer than the installed core, pull the core forward, always, no
         // prompt. So a Sparkle update upgrades the whole accelerator.
         Task { await Self.syncCoreVersion() }
     }
@@ -76,7 +76,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard comps.count == 3, comps.allSatisfy({ Int($0) != nil }) else { return }
         let core = StatusModel.readVersion()
         guard !core.isEmpty, Actions.versionNewer(app, than: core) else { return }
-        _ = await Actions.upgradeCore()
+
+        // Only Homebrew installs are ours to upgrade. Someone running from
+        // source has no formula to move, and shelling out to a missing brew
+        // just fails on every launch.
+        guard FileManager.default.isExecutableFile(atPath: Actions.brew),
+              Actions.isBrewInstall else { return }
+
+        // Ask brew whether an upgrade is actually available before running one.
+        // Without this, an app that is ahead of the tap (Sparkle shipped before
+        // the formula bump landed) or a deliberately pinned formula would retry
+        // a full `brew upgrade` on every single launch, each one dragging a
+        // `brew update` fetch along and stalling startup for seconds.
+        guard let available = await Actions.coreOutdated() else {
+            print("[accelerator] core \(core) is behind app \(app) but brew reports "
+                  + "no upgrade available; leaving it alone")
+            return
+        }
+        print("[accelerator] upgrading core \(core) -> \(available) to match the app")
+        // brew restarts the service as part of the upgrade, which interrupts
+        // in-flight jobs; they requeue on the next watch cycle.
+        if await Actions.upgradeCore() {
+            print("[accelerator] core upgraded")
+        } else {
+            print("[accelerator] core upgrade failed; will retry on next launch")
+        }
         await StatusModel.shared.refresh()
     }
 }

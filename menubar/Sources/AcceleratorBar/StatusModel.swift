@@ -41,7 +41,10 @@ struct Snapshot: Equatable {
     var dashboardPort = 8420 // where the accelerator dashboard is served
     var dashboardEnabled = true // config "dashboard" (default on); off => hide the row
     var immichReachable = false // Immich answered on immich_url
-    var apiKeyValid = false     // /api/jobs returned 200 with the key
+    // nil = not checked this cycle (the key is only exercised while the worker
+    // is up). Distinguishing that from false matters: a stopped worker must not
+    // make a perfectly good key look rejected.
+    var apiKeyValid: Bool?
 
     // What "Open Immich" should launch: the public domain the user set in
     // Immich when present, otherwise the local URL the accelerator connects to.
@@ -149,12 +152,13 @@ final class StatusModel: ObservableObject {
         async let domain = Self.externalDomain(base: p.immichURL)
         async let healthy = Self.ping(port: p.mlPort)
         async let jobs = Self.jobCounts(base: p.immichURL, apiKey: p.apiKey)
+        async let reachable = Self.serverReachable(base: p.immichURL)
         s.externalDomain = await domain
         s.mlHealthy = await healthy
         let counts = await jobs
         s.jobsActive = counts.active
         s.jobsWaiting = counts.waiting
-        s.immichReachable = counts.reachable
+        s.immichReachable = await reachable
         s.apiKeyValid = counts.authed
 
         snap = s
@@ -189,20 +193,23 @@ final class StatusModel: ObservableObject {
     // Sum active/waiting across all of Immich's job queues so the menu bar can
     // show whether the worker is busy and how deep the backlog is. Immich
     // authenticates /api/jobs with the x-api-key header (key lives in config).
+    // Never call this without a key: an unauthenticated /api/jobs is a
+    // guaranteed 401, and polling one every few seconds would fill the user's
+    // Immich log for no benefit. `authed` is nil when we did not ask.
     nonisolated static func jobCounts(base: String, apiKey: String)
-        async -> (active: Int, waiting: Int, reachable: Bool, authed: Bool) {
-        guard !base.isEmpty, let url = URL(string: "\(base)/api/jobs")
-        else { return (0, 0, false, false) }
+        async -> (active: Int, waiting: Int, authed: Bool?) {
+        guard !base.isEmpty, !apiKey.isEmpty, let url = URL(string: "\(base)/api/jobs")
+        else { return (0, 0, nil) }
         var req = URLRequest(url: url)
         req.timeoutInterval = 3
-        if !apiKey.isEmpty { req.setValue(apiKey, forHTTPHeaderField: "x-api-key") }
-        // Any HTTP response means Immich is reachable; a 200 with our key means
-        // the key is valid (a 401 => reachable but the key is wrong/missing).
+        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              let http = resp as? HTTPURLResponse else { return (0, 0, false, false) }
+              let http = resp as? HTTPURLResponse else { return (0, 0, nil) }
+        // 200 means the key was accepted; 401/403 means it was rejected. Any
+        // other status says nothing about the key, so leave it unknown.
         guard http.statusCode == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return (0, 0, true, false) }
+        else { return (0, 0, [401, 403].contains(http.statusCode) ? false : nil) }
         var active = 0, waiting = 0
         for (_, value) in obj {
             guard let queue = value as? [String: Any],
@@ -210,7 +217,19 @@ final class StatusModel: ObservableObject {
             active += (counts["active"] as? Int) ?? 0
             waiting += (counts["waiting"] as? Int) ?? 0
         }
-        return (active, waiting, true, !apiKey.isEmpty)
+        return (active, waiting, true)
+    }
+
+    // Is Immich itself up? Unauthenticated and independent of the worker, so
+    // "Immich reachable" stays correct while the accelerator is stopped.
+    nonisolated static func serverReachable(base: String) async -> Bool {
+        guard !base.isEmpty, let url = URL(string: "\(base)/api/server/ping")
+        else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 3
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse else { return false }
+        return http.statusCode == 200
     }
 
     // Immich's public domain (set in admin settings), used so "Open Immich"

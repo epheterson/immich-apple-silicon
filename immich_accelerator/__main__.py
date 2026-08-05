@@ -2010,18 +2010,26 @@ MARKER = ".immich-accelerator-media-id"
 SUBDIRS = ("upload", "library", "thumbs", "encoded-video", "profile", "backups")
 cands = [root] + [os.path.join(root, s) for s in SUBDIRS]
 # A subdir pointed at another disk (the documented way to put thumbs or
-# encoded-video on a fast SSD, #115) is a symlink. If its target isn't
-# mounted the link dangles, and Immich would fail every write to it with
-# ENOENT. isdir() is False for a dangling link, so it would silently drop
-# out of the candidates below while the marker still verifies via another
-# subdir. Fail loudly instead: report the broken path and exit 5.
-dangling = [
+# encoded-video on a fast SSD, #115) is a symlink. If its target is missing or
+# is not a directory, Immich fails every write there with ENOENT/ENOTDIR, and
+# isdir() is False either way so it would silently drop out of the candidates
+# below while the marker still verifies via another subdir. Fail loudly.
+#
+# Only the paths Immich writes constantly are worth blocking startup for.
+# `profile` and `backups` are incidental, so a removable drive holding one of
+# those must not take the whole accelerator down; they are reported by the
+# caller as a warning instead.
+CRITICAL = ("upload", "library", "thumbs", "encoded-video")
+broken = [
     d for d in cands
-    if os.path.islink(d) and not os.path.exists(os.path.realpath(d))
+    if os.path.islink(d) and not os.path.isdir(os.path.realpath(d))
 ]
-if dangling:
-    sys.stderr.write("dangling:" + ",".join(dangling))
+fatal = [d for d in broken if d == root or os.path.basename(d) in CRITICAL]
+if fatal:
+    sys.stderr.write("dangling:" + ",".join(fatal))
     sys.exit(5)
+if broken:
+    sys.stderr.write("warn-dangling:" + ",".join(broken))
 cands = [d for d in cands if os.path.isdir(d)]
 try:
     if mode == "verify":
@@ -2065,10 +2073,20 @@ def _media_probe(
             text=True,
             timeout=timeout,
         )
+        err = (result.stderr or "").strip()
         if result.returncode == 5:
-            err = (result.stderr or "").strip()
             paths = err.split("dangling:", 1)[-1] if "dangling:" in err else ""
             return False, [p for p in paths.split(",") if p]
+        # A broken link on a non-critical subdir (profile/backups) is worth
+        # saying out loud, but not worth refusing to start over.
+        if "warn-dangling:" in err:
+            for p in err.split("warn-dangling:", 1)[-1].split(","):
+                if p:
+                    log.warning(
+                        "Media folder %s is a broken symlink; jobs "
+                        "writing there will fail.",
+                        p,
+                    )
         return result.returncode == 0, []
     except (subprocess.SubprocessError, OSError):
         return False, []
@@ -2229,6 +2247,41 @@ def _process_is_our_dashboard(pid: int) -> bool:
     except (subprocess.SubprocessError, OSError):
         return False
     return "immich_accelerator" in out and "dashboard" in out
+
+
+def stop_dashboard() -> bool:
+    """Stop the dashboard, whether or not we still have a valid pidfile.
+
+    The pidfile can go missing (an orphan from a prior run, or read_pid
+    discarding it after PID reuse) — start_dashboard has an adopt-the-orphan
+    branch for exactly that state. Without the same fallback here, disabling the
+    dashboard would leave it serving while every UI claims it is off. Returns
+    whether something was stopped."""
+    if read_pid("dashboard"):
+        kill_pid("dashboard")
+        return True
+    orphan = _pid_on_port(_dashboard_port())
+    if orphan and _process_is_our_dashboard(orphan):
+        log.info("Stopping untracked dashboard (PID %d)", orphan)
+        try:
+            os.kill(orphan, signal.SIGTERM)
+        except OSError as e:
+            log.warning("  Could not stop PID %d: %s", orphan, e)
+            return False
+        return True
+    return False
+
+
+def reconcile_dashboard() -> None:
+    """Make the running state match the "dashboard" config key.
+
+    One enforcement point, called from the watch loop as well as the toggle, so
+    editing config.json (the documented way to turn it off) actually takes
+    effect on a running install instead of only at the next start."""
+    if _dashboard_enabled():
+        start_dashboard()
+    elif read_pid("dashboard") or _pid_on_port(_dashboard_port()):
+        stop_dashboard()
 
 
 def start_dashboard() -> None:
@@ -4632,7 +4685,7 @@ def cmd_watch(_args):
         log.info("Services not running, starting...")
         cmd_start(argparse.Namespace(force=True))
     else:
-        start_dashboard()
+        reconcile_dashboard()
 
     # Warn if auto-update won't work for remote setups
     _watch_config = load_config()
@@ -4673,6 +4726,12 @@ def cmd_watch(_args):
             # Keep service logs bounded — the worker can spew stack traces for
             # unsupported files; left unmanaged a log grew to 10GB.
             cap_service_logs()
+
+            # Match the dashboard to the "dashboard" config key. config is
+            # reloaded above each cycle, so editing config.json (the documented
+            # way to turn it off) takes effect on a running install, and a
+            # crashed dashboard is restarted while it is enabled.
+            reconcile_dashboard()
 
             # Check ML — re-resolve ml_dir each cycle (same stale-
             # path fix as cmd_start; brew upgrade can invalidate it).
@@ -4839,8 +4898,7 @@ def cmd_dashboard(args):
             start_dashboard()
             log.info("Dashboard enabled.")
         else:
-            if read_pid("dashboard"):
-                kill_pid("dashboard")
+            stop_dashboard()
             log.info("Dashboard disabled. Worker and ML are unaffected.")
         return
 

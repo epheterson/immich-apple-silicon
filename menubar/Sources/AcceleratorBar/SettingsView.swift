@@ -15,6 +15,8 @@ struct SettingsView: View {
     @State private var revealKey = false
     @State private var applying = false
     @State private var dashboardOn = true
+    @State private var applyingDashboard = false
+    @State private var dashboardError: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
 
     var body: some View {
@@ -36,7 +38,12 @@ struct SettingsView: View {
         config = StatusModel.readConfig()
         savedEngine = (config["ml_engine"] as? String) ?? "native"
         engine = savedEngine
+        // Seed the switch without treating it as a user action: assigning here
+        // fires .onChange, so an install that already has the dashboard off
+        // would shell out to `dashboard off` merely because the window opened.
+        applyingDashboard = true
         dashboardOn = (config["dashboard"] as? Bool) ?? true
+        applyingDashboard = false
     }
 
     // MARK: - sections
@@ -109,9 +116,30 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Toggle(isOn: $dashboardOn) { Text("Web dashboard") }
                     .toggleStyle(.switch)
+                    .disabled(applyingDashboard)
                     .onChange(of: dashboardOn) { _, on in
-                        Task { await Actions.setDashboard(on); await model.refresh() }
+                        // Ignore the assignment load() makes when seeding state.
+                        guard !applyingDashboard else { return }
+                        applyingDashboard = true
+                        Task {
+                            let ok = await Actions.setDashboard(on)
+                            await model.refresh()
+                            // Never leave the switch claiming something the
+                            // accelerator did not do: put it back and say why.
+                            if !ok {
+                                dashboardError = "Could not reach the accelerator CLI."
+                                applyingDashboard = true
+                                dashboardOn = !on
+                            } else {
+                                dashboardError = nil
+                                config = StatusModel.readConfig()
+                            }
+                            applyingDashboard = false
+                        }
                     }
+                if let dashboardError {
+                    Text(dashboardError).font(.caption).foregroundStyle(.red)
+                }
                 // Live state from the probe (not the toggle): reflects whether
                 // it actually came up, and dodges an OrbStack port collision.
                 row("Status", dashboardStatus)
