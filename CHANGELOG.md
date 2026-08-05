@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.8.0 - 2026-08-05
+
+### Added
+- **The web dashboard is now optional.** It used to start with every `start` and `watch`, and the only way to not have it was a port collision. Set `"dashboard": false` in `~/.immich-accelerator/config.json`, or run `immich-accelerator dashboard off`, and it stays down; `dashboard on` brings it back. The worker and ML service are unaffected either way, so the CLI, the dashboard, and the menu-bar app are now independent choices. Existing installs keep the dashboard on.
+- **Menu-bar app: a Configuration section that validates your setup.** Each item (config file, core version, ML engine, Immich reachability, API key, dashboard, data directory) shows its real path and whether it is actually working, including when the native engine has fallen back to Python. A "Copy for issue report" button puts the same checklist, versions, and recent log lines on the clipboard for pasting into a GitHub issue. The API key is never included, only whether it validated.
+- **Menu-bar app: a dashboard switch and a Software Update section**, showing the menu-bar and core versions side by side.
+
+### Fixed
+- **Large CLIP models could not be used with the native engine** (#116). Models too big for a single file store their weights separately, and the accelerator only downloaded the model definition, so the text tower failed to load with no obvious error. This affected `ViT-SO400M-16-SigLIP2-384__webli`, `ViT-H-14-378-quickgelu__dfn5b`, and `XLM-Roberta-Large-ViT-H-14__frozen_laion5b_s13b_b90k`; smaller models were unaffected, which is why it went unnoticed in 1.7.0. All models in Immich's list now load and run natively. The largest are a multi-gigabyte download on first use, fetched when Immich first requests the model. Reported by [@lesurJ](https://github.com/lesurJ).
+- **`ml-test` no longer implies your CLIP model setting was ignored.** It probes with a fixed `ViT-B-32__openai`, which looked like the configured model had not taken effect. It now also prints the model Immich is actually configured to use, and notes that the check does not reflect it. Reported by [@lesurJ](https://github.com/lesurJ).
+- **Refuse to start when a media folder points at a disk that isn't mounted** (#115). Putting `thumbs/` or `encoded-video/` on a fast SSD via a symlink is supported, but if that disk was not mounted the accelerator started anyway and every job writing there failed. It now names the broken path and stops. The README documents the symlink setup. Raised by [@xobust](https://github.com/xobust).
+- **Menu bar: the Dashboard row is hidden when the dashboard is turned off**, instead of showing a permanent "Not running".
+
+### Changed
+- **Updating the menu-bar app now updates the whole accelerator.** Sparkle only replaces the app itself, so an app updated that way could sit on top of an older core. The app now brings the core up to its own version on launch, keeping the two in lockstep however you update.
+
 ## 1.7.2 - 2026-07-18
 
 ### Added
