@@ -76,6 +76,20 @@ For NAS + Mac setups, see [Split deployment](#split-deployment-nas--mac) below.
 
 This is the directory Immich uses as its media root. It contains these subdirectories: `upload/`, `thumbs/`, `encoded-video/`, `library/`, `profile/`, `backups/`. Both Docker and the native worker must see this directory at the same absolute path. Setup handles this automatically for same-machine installs.
 
+### Putting thumbnails or transcodes on a faster disk
+
+Immich derives every storage path from `IMMICH_MEDIA_LOCATION`, so there is no separate setting for thumbnails (this is true in Docker too). To keep the library on slow storage while thumbnails live on an SSD, symlink the subdirectory:
+
+```bash
+immich-accelerator stop
+mv /path/to/media/thumbs /Volumes/fast-ssd/thumbs
+ln -s /Volumes/fast-ssd/thumbs /path/to/media/thumbs
+```
+
+The same works for `encoded-video/`. Immich follows the symlink, so reads and writes land on the SSD.
+
+If the SSD is not mounted, that symlink points nowhere and every job writing to it would fail. The accelerator checks for this at startup and refuses to start, naming the broken path, instead of letting those jobs fail one by one.
+
 ## Commands
 
 Every command is prefixed with `immich-accelerator` (e.g. `immich-accelerator setup`).
@@ -188,6 +202,10 @@ The ML service runs Immich's CLIP, face, and OCR inference natively on Apple Sil
 As of 1.6.0 this runs as a **native Swift engine**: a single binary with the models and libraries bundled, no Python. It replaces the ~1.5 GB Python venv (torch, mlx, onnxruntime, opencv, insightface) and the dependency-pin fragility that came with it. It uses the same weights and models as the Python service, so embeddings stay in the same space as an existing Immich search index and face clusters (no re-index, no re-cluster).
 
 As of 1.7.0 the native engine supports the **full CLIP model zoo**: whatever model you select in Immich (ViT-B-16, ViT-L-14, LAION variants, the SigLIP family, ...) is downloaded from Immich's own model repository on first use and run natively through onnxruntime with Immich's exact preprocessing and tokenization, so results match the Docker ML service. The default ViT-B-32 uses an even faster mlx path.
+
+Changing the model in Immich takes effect on the next Smart Search job, not immediately: the new model is fetched the first time Immich asks for it, which for the largest models is several GB. While that download runs, the menu bar shows "Downloading model…" with progress, and Immich's search jobs fail and retry until it finishes (nothing is lost, they succeed once the model is ready). You can also follow it with `immich-accelerator logs ml`.
+
+Note that `ml-test` always probes with `ViT-B-32__openai`, so its output does not tell you which model your library is using; it prints your configured model separately.
 
 The native engine is the default and is health-checked at startup. If its bundle or models are missing, or it fails to start, the accelerator automatically falls back to the Python service so ML is never left down. On a brand-new install the models (~740MB) are downloaded once in the background on first native start, so ML runs on the Python engine for a few minutes until they arrive, then switches to native automatically.
 

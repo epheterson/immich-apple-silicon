@@ -39,6 +39,17 @@ struct Snapshot: Equatable {
     var jobsActive = 0       // jobs the worker is running right now
     var jobsWaiting = 0      // jobs queued behind them
     var dashboardPort = 8420 // where the accelerator dashboard is served
+    var dashboardEnabled = true // config "dashboard" (default on); off => hide the row
+    var immichReachable = false // Immich answered on immich_url
+    // Set while the ML service is fetching a model (the largest are several GB
+    // and take minutes, during which Immich's jobs fail and retry).
+    var downloadingModel = ""
+    var downloadDone = 0
+    var downloadTotal = 0
+    // nil = not checked this cycle (the key is only exercised while the worker
+    // is up). Distinguishing that from false matters: a stopped worker must not
+    // make a perfectly good key look rejected.
+    var apiKeyValid: Bool?
 
     // What "Open Immich" should launch: the public domain the user set in
     // Immich when present, otherwise the local URL the accelerator connects to.
@@ -67,6 +78,7 @@ struct ProcessProbe: Sendable {
     var immichVersion = ""
     var immichURL = ""
     var dashboardPort = 8420
+    var dashboardEnabled = true
     var mlPort = 3003
     var apiKey = ""
 }
@@ -137,6 +149,7 @@ final class StatusModel: ObservableObject {
         s.immichVersion = p.immichVersion
         s.immichURL = p.immichURL
         s.dashboardPort = p.dashboardPort
+        s.dashboardEnabled = p.dashboardEnabled
 
         // The three network probes are independent (each has its own timeout),
         // so run them concurrently: a slow/unreachable service costs the max
@@ -144,11 +157,20 @@ final class StatusModel: ObservableObject {
         async let domain = Self.externalDomain(base: p.immichURL)
         async let healthy = Self.ping(port: p.mlPort)
         async let jobs = Self.jobCounts(base: p.immichURL, apiKey: p.apiKey)
+        async let reachable = Self.serverReachable(base: p.immichURL)
+        async let fetching = p.mlUp ? Self.downloadProgress(port: p.mlPort) : nil
         s.externalDomain = await domain
         s.mlHealthy = await healthy
+        if let f = await fetching {
+            s.downloadingModel = f.model
+            s.downloadDone = f.done
+            s.downloadTotal = f.total
+        }
         let counts = await jobs
         s.jobsActive = counts.active
         s.jobsWaiting = counts.waiting
+        s.immichReachable = await reachable
+        s.apiKeyValid = counts.authed
 
         snap = s
     }
@@ -173,6 +195,7 @@ final class StatusModel: ObservableObject {
         p.immichVersion = config["version"] as? String ?? ""
         p.immichURL = config["immich_url"] as? String ?? ""
         p.dashboardPort = (config["dashboard_port"] as? Int) ?? 8420
+        p.dashboardEnabled = (config["dashboard"] as? Bool) ?? true
         p.mlPort = (config["ml_port"] as? Int) ?? 3003
         p.apiKey = (p.workerUp ? config["api_key"] as? String : nil) ?? ""
         return p
@@ -181,16 +204,23 @@ final class StatusModel: ObservableObject {
     // Sum active/waiting across all of Immich's job queues so the menu bar can
     // show whether the worker is busy and how deep the backlog is. Immich
     // authenticates /api/jobs with the x-api-key header (key lives in config).
-    nonisolated static func jobCounts(base: String, apiKey: String) async -> (active: Int, waiting: Int) {
+    // Never call this without a key: an unauthenticated /api/jobs is a
+    // guaranteed 401, and polling one every few seconds would fill the user's
+    // Immich log for no benefit. `authed` is nil when we did not ask.
+    nonisolated static func jobCounts(base: String, apiKey: String)
+        async -> (active: Int, waiting: Int, authed: Bool?) {
         guard !base.isEmpty, !apiKey.isEmpty, let url = URL(string: "\(base)/api/jobs")
-        else { return (0, 0) }
+        else { return (0, 0, nil) }
         var req = URLRequest(url: url)
         req.timeoutInterval = 3
         req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let http = resp as? HTTPURLResponse else { return (0, 0, nil) }
+        // 200 means the key was accepted; 401/403 means it was rejected. Any
+        // other status says nothing about the key, so leave it unknown.
+        guard http.statusCode == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return (0, 0) }
+        else { return (0, 0, [401, 403].contains(http.statusCode) ? false : nil) }
         var active = 0, waiting = 0
         for (_, value) in obj {
             guard let queue = value as? [String: Any],
@@ -198,7 +228,19 @@ final class StatusModel: ObservableObject {
             active += (counts["active"] as? Int) ?? 0
             waiting += (counts["waiting"] as? Int) ?? 0
         }
-        return (active, waiting)
+        return (active, waiting, true)
+    }
+
+    // Is Immich itself up? Unauthenticated and independent of the worker, so
+    // "Immich reachable" stays correct while the accelerator is stopped.
+    nonisolated static func serverReachable(base: String) async -> Bool {
+        guard !base.isEmpty, let url = URL(string: "\(base)/api/server/ping")
+        else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 3
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse else { return false }
+        return http.statusCode == 200
     }
 
     // Immich's public domain (set in admin settings), used so "Open Immich"
@@ -251,6 +293,23 @@ final class StatusModel: ObservableObject {
         let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         p.waitUntilExit()
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // What a long model fetch is doing, so the ML row can explain a stall that
+    // would otherwise look like a broken service. nil when nothing is fetching.
+    nonisolated static func downloadProgress(port: Int) async -> (model: String, done: Int, total: Int)? {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/health") else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let d = obj["downloading"] as? [String: Any],
+              let model = d["model"] as? String,
+              let done = d["files_done"] as? Int,
+              let total = d["files_total"] as? Int
+        else { return nil }
+        return (model, done, total)
     }
 
     nonisolated static func ping(port: Int) async -> Bool {

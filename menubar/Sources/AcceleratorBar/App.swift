@@ -52,9 +52,56 @@ struct AcceleratorBarApp: App {
 // window so a fresh install has a path forward instead of a dead menu bar.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Dev/test affordance: open Settings straight away so it can be captured
+        // headlessly (screenshots) without driving the menu-bar panel.
+        if ProcessInfo.processInfo.environment["ACCEL_SHOW_SETTINGS"] != nil {
+            WindowManager.shared.showSettings(model: .shared)
+            return
+        }
         if !Paths.isConfigured {
             WindowManager.shared.showOnboarding(model: .shared)
         }
+        // Keep the core in lockstep: if this (possibly Sparkle-updated) app is
+        // newer than the installed core, pull the core forward, always, no
+        // prompt. So a Sparkle update upgrades the whole accelerator.
+        Task { await Self.syncCoreVersion() }
+    }
+
+    @MainActor
+    static func syncCoreVersion() async {
+        let app = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        // Only a clean X.Y.Z release triggers this (never a "1.8.0-dev" build),
+        // so local dev testing can't upgrade someone's core out from under them.
+        let comps = app.split(separator: ".")
+        guard comps.count == 3, comps.allSatisfy({ Int($0) != nil }) else { return }
+        let core = StatusModel.readVersion()
+        guard !core.isEmpty, Actions.versionNewer(app, than: core) else { return }
+
+        // Only Homebrew installs are ours to upgrade. Someone running from
+        // source has no formula to move, and shelling out to a missing brew
+        // just fails on every launch.
+        guard FileManager.default.isExecutableFile(atPath: Actions.brew),
+              Actions.isBrewInstall else { return }
+
+        // Ask brew whether an upgrade is actually available before running one.
+        // Without this, an app that is ahead of the tap (Sparkle shipped before
+        // the formula bump landed) or a deliberately pinned formula would retry
+        // a full `brew upgrade` on every single launch, each one dragging a
+        // `brew update` fetch along and stalling startup for seconds.
+        guard let available = await Actions.coreOutdated() else {
+            print("[accelerator] core \(core) is behind app \(app) but brew reports "
+                  + "no upgrade available; leaving it alone")
+            return
+        }
+        print("[accelerator] upgrading core \(core) -> \(available) to match the app")
+        // brew restarts the service as part of the upgrade, which interrupts
+        // in-flight jobs; they requeue on the next watch cycle.
+        if await Actions.upgradeCore() {
+            print("[accelerator] core upgraded")
+        } else {
+            print("[accelerator] core upgrade failed; will retry on next launch")
+        }
+        await StatusModel.shared.refresh()
     }
 }
 

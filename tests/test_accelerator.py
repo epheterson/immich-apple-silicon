@@ -33,6 +33,10 @@ from immich_accelerator.__main__ import (
     cmd_stop,
     cmd_status,
     cmd_logs,
+    cmd_dashboard,
+    start_dashboard,
+    reconcile_dashboard,
+    _dashboard_enabled,
     start_service,
     _setup_manual,
     cap_log,
@@ -683,11 +687,17 @@ class TestCLIParsing:
         args = parser.parse_args(["dashboard"])
         assert args.command == "dashboard"
         assert args.port == 8420
+        assert args.state is None  # no on/off -> run the server
 
     def test_dashboard_custom_port(self):
         parser = self._build_parser()
         args = parser.parse_args(["dashboard", "--port", "9000"])
         assert args.port == 9000
+
+    def test_dashboard_on_off_parse(self):
+        parser = self._build_parser()
+        assert parser.parse_args(["dashboard", "on"]).state == "on"
+        assert parser.parse_args(["dashboard", "off"]).state == "off"
 
     def test_update_command(self):
         parser = self._build_parser()
@@ -731,9 +741,99 @@ class TestCLIParsing:
         sub.add_parser("update")
         sub.add_parser("watch")
         dash_p = sub.add_parser("dashboard")
+        dash_p.add_argument("state", nargs="?", choices=["on", "off"])
         dash_p.add_argument("--port", type=int, default=8420)
         sub.add_parser("uninstall")
         return parser
+
+
+# ---------------------------------------------------------------------------
+# Dashboard toggle (#31)
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardToggle:
+    """The dashboard on/off config toggle: default-on for back-compat, and both
+    start_dashboard and cmd_dashboard honor it."""
+
+    def test_enabled_by_default_when_key_absent(self, saved_config):
+        # sample_config has no "dashboard" key -> default is on.
+        assert _dashboard_enabled() is True
+
+    def test_disabled_when_config_false(self, tmp_data_dir):
+        save_config({"dashboard": False})
+        assert _dashboard_enabled() is False
+
+    def test_start_dashboard_noop_when_disabled(self, tmp_data_dir):
+        save_config({"dashboard": False})
+        with patch("subprocess.Popen") as popen, patch(
+            "immich_accelerator.__main__.read_pid", return_value=None
+        ):
+            start_dashboard()
+            popen.assert_not_called()
+
+    def test_cmd_dashboard_off_disables_and_stops(self, saved_config):
+        args = argparse.Namespace(state="off", port=8420)
+        with patch("immich_accelerator.__main__.read_pid", return_value=4321), patch(
+            "immich_accelerator.__main__.kill_pid"
+        ) as kill:
+            cmd_dashboard(args)
+            kill.assert_called_once_with("dashboard")
+        assert load_config().get("dashboard") is False
+
+    def test_cmd_dashboard_on_enables_and_starts(self, saved_config):
+        args = argparse.Namespace(state="on", port=8420)
+        with patch("immich_accelerator.__main__.start_dashboard") as start:
+            cmd_dashboard(args)
+            start.assert_called_once()
+        assert load_config().get("dashboard") is True
+
+    def test_off_stops_an_untracked_dashboard(self, saved_config):
+        """The pidfile can go missing (orphan from a prior run, PID reuse). If
+        `off` only honored the pidfile, the dashboard would keep serving while
+        the UI reported it disabled."""
+        args = argparse.Namespace(state="off", port=8420)
+        with patch("immich_accelerator.__main__.read_pid", return_value=None), patch(
+            "immich_accelerator.__main__._pid_on_port", return_value=5150
+        ), patch(
+            "immich_accelerator.__main__._process_is_our_dashboard", return_value=True
+        ), patch(
+            "os.kill"
+        ) as kill:
+            cmd_dashboard(args)
+            kill.assert_called_once()
+            assert kill.call_args[0][0] == 5150
+        assert load_config().get("dashboard") is False
+
+    def test_off_leaves_a_foreign_port_holder_alone(self, saved_config):
+        """Something else on the port (OrbStack) is not ours to kill."""
+        args = argparse.Namespace(state="off", port=8420)
+        with patch("immich_accelerator.__main__.read_pid", return_value=None), patch(
+            "immich_accelerator.__main__._pid_on_port", return_value=6000
+        ), patch(
+            "immich_accelerator.__main__._process_is_our_dashboard", return_value=False
+        ), patch(
+            "os.kill"
+        ) as kill:
+            cmd_dashboard(args)
+            kill.assert_not_called()
+
+    def test_reconcile_stops_a_running_dashboard_when_disabled(self, tmp_data_dir):
+        """Editing config.json is the documented off-switch, so the watch loop
+        has to act on it instead of only honoring it at the next start."""
+        save_config({"dashboard": False})
+        with patch("immich_accelerator.__main__.read_pid", return_value=4321), patch(
+            "immich_accelerator.__main__.kill_pid"
+        ) as kill, patch("immich_accelerator.__main__.start_dashboard") as start:
+            reconcile_dashboard()
+            kill.assert_called_once_with("dashboard")
+            start.assert_not_called()
+
+    def test_reconcile_starts_when_enabled(self, tmp_data_dir):
+        save_config({"dashboard": True})
+        with patch("immich_accelerator.__main__.start_dashboard") as start:
+            reconcile_dashboard()
+            start.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1422,6 +1522,69 @@ class TestEnsureMediaReady:
         assert (
             ensure_media_ready({"upload_mount": str(media), "media_id": "abc123"})
             is False
+        )
+
+    def test_symlinked_subdir_on_another_disk_is_allowed(self, tmp_path):
+        """#115: putting thumbs on a fast SSD via a symlink is supported. The
+        link resolves, so the gate passes and writes land on the target."""
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / MEDIA_MARKER_NAME).write_text("abc123")
+        ssd = tmp_path / "ssd" / "thumbs"
+        ssd.mkdir(parents=True)
+        (media / "thumbs").symlink_to(ssd)
+        assert (
+            ensure_media_ready({"upload_mount": str(media), "media_id": "abc123"})
+            is True
+        )
+
+    def test_refuses_when_subdir_symlink_dangles(self, tmp_path):
+        """#115: if that SSD isn't mounted the symlink dangles. Without this
+        check the marker still verifies via the root and we would start, then
+        Immich would fail every thumbnail write with ENOENT."""
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / MEDIA_MARKER_NAME).write_text("abc123")
+        (media / "thumbs").symlink_to(tmp_path / "never-mounted" / "thumbs")
+        assert (
+            ensure_media_ready({"upload_mount": str(media), "media_id": "abc123"})
+            is False
+        )
+
+    def test_first_run_refuses_when_subdir_symlink_dangles(
+        self, tmp_path, tmp_data_dir
+    ):
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / "encoded-video").symlink_to(tmp_path / "never-mounted" / "ev")
+        assert ensure_media_ready({"upload_mount": str(media)}) is False
+
+    def test_refuses_when_subdir_symlink_points_at_a_file(self, tmp_path):
+        """A link whose target exists but is not a directory fails writes with
+        ENOTDIR, which os.path.exists would have called fine."""
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / MEDIA_MARKER_NAME).write_text("abc123")
+        stub = tmp_path / "a-file"
+        stub.write_text("not a directory")
+        (media / "thumbs").symlink_to(stub)
+        assert (
+            ensure_media_ready({"upload_mount": str(media), "media_id": "abc123"})
+            is False
+        )
+
+    def test_non_critical_broken_symlink_does_not_block_startup(self, tmp_path):
+        """A removable drive holding backups/ or profile/ must not take the whole
+        accelerator down: Immich barely touches them, and the worker, ML, and
+        dashboard have no reason to stay off."""
+        media = tmp_path / "media"
+        media.mkdir()
+        (media / MEDIA_MARKER_NAME).write_text("abc123")
+        (media / "backups").symlink_to(tmp_path / "unplugged" / "backups")
+        (media / "profile").symlink_to(tmp_path / "unplugged" / "profile")
+        assert (
+            ensure_media_ready({"upload_mount": str(media), "media_id": "abc123"})
+            is True
         )
 
     def test_first_run_refuses_when_root_absent(self, tmp_path):

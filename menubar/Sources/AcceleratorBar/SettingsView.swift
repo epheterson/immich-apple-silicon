@@ -7,18 +7,25 @@ struct SettingsView: View {
     @ObservedObject var model: StatusModel
     @AppStorage("hasOnboarded") private var hasOnboarded = false
 
-    @State private var config: [String: Any] = [:]
+    // Populated at construction (not just onAppear) so the window has real
+    // values immediately and an off-screen ImageRenderer capture isn't blank.
+    @State private var config: [String: Any] = StatusModel.readConfig()
     @State private var engine = "native"
     @State private var savedEngine = "native"
     @State private var revealKey = false
     @State private var applying = false
+    @State private var dashboardOn = true
+    @State private var applyingDashboard = false
+    @State private var dashboardError: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            immichSection
             mlSection
+            dashboardSection
+            configSection
             keySection
+            updatesSection
             Divider()
             footer
         }
@@ -31,20 +38,44 @@ struct SettingsView: View {
         config = StatusModel.readConfig()
         savedEngine = (config["ml_engine"] as? String) ?? "native"
         engine = savedEngine
+        // Seed the switch without treating it as a user action: assigning here
+        // fires .onChange, so an install that already has the dashboard off
+        // would shell out to `dashboard off` merely because the window opened.
+        applyingDashboard = true
+        dashboardOn = (config["dashboard"] as? Bool) ?? true
+        applyingDashboard = false
     }
 
     // MARK: - sections
 
-    private var immichSection: some View {
+    private var configSection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 6) {
-                row("Immich", model.snap.immichVersion.isEmpty ? "-" : model.snap.immichVersion)
-                row("Connects to", str("immich_url"))
-                row("Public domain", model.snap.externalDomain.isEmpty
-                    ? "not set (Open Immich uses the local address)" : model.snap.externalDomain)
+                ForEach(Diagnostics.checks(config: config, snap: model.snap)) { c in
+                    HStack(spacing: 8) {
+                        Image(systemName: c.iconName).foregroundStyle(c.tint).frame(width: 16)
+                        Text(c.label).foregroundStyle(.secondary)
+                            .frame(width: 90, alignment: .leading)
+                        Text(c.detail).textSelection(.enabled)
+                            .foregroundStyle(c.level == .fail ? .primary : .secondary)
+                        Spacer()
+                    }
+                    .font(.callout)
+                }
+                HStack {
+                    Spacer()
+                    Button {
+                        Actions.copyToPasteboard(
+                            Diagnostics.copyText(config: config, snap: model.snap))
+                    } label: {
+                        Label("Copy for issue report", systemImage: "doc.on.clipboard")
+                    }
+                    .controlSize(.small)
+                    .help("Copies versions, this checklist, and recent log lines. No API key.")
+                }
             }
             .padding(4)
-        } label: { Label("Immich", systemImage: "photo.on.rectangle.angled") }
+        } label: { Label("Configuration", systemImage: "checklist") }
     }
 
     private var mlSection: some View {
@@ -78,6 +109,69 @@ struct SettingsView: View {
             }
             .padding(4)
         } label: { Label("Machine Learning", systemImage: "brain.fill") }
+    }
+
+    private var dashboardSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: $dashboardOn) { Text("Web dashboard") }
+                    .toggleStyle(.switch)
+                    .disabled(applyingDashboard)
+                    .onChange(of: dashboardOn) { _, on in
+                        // Ignore the assignment load() makes when seeding state.
+                        guard !applyingDashboard else { return }
+                        applyingDashboard = true
+                        Task {
+                            let ok = await Actions.setDashboard(on)
+                            await model.refresh()
+                            // Never leave the switch claiming something the
+                            // accelerator did not do: put it back and say why.
+                            if !ok {
+                                dashboardError = "Could not reach the accelerator CLI."
+                                applyingDashboard = true
+                                dashboardOn = !on
+                            } else {
+                                dashboardError = nil
+                                config = StatusModel.readConfig()
+                            }
+                            applyingDashboard = false
+                        }
+                    }
+                if let dashboardError {
+                    Text(dashboardError).font(.caption).foregroundStyle(.red)
+                }
+                // Live state from the probe (not the toggle): reflects whether
+                // it actually came up, and dodges an OrbStack port collision.
+                row("Status", dashboardStatus)
+            }
+            .padding(4)
+        } label: { Label("Dashboard", systemImage: "gauge.with.dots.needle.50percent") }
+    }
+
+    private var dashboardStatus: String {
+        if !model.snap.dashboardEnabled { return "off" }
+        return model.snap.dashboardUp
+            ? "running on localhost:\(model.snap.dashboardPort)" : "starting…"
+    }
+
+    private var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+    }
+
+    private var updatesSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 6) {
+                row("Menu bar app", "v\(appVersion)")
+                row("Core", model.snap.version.isEmpty ? "-" : "v\(model.snap.version)")
+                // The core auto-follows the app (see AppDelegate.syncCoreVersion);
+                // this button drives the app's own Sparkle check.
+                HStack {
+                    Button("Check for Updates…") { UpdaterModel.shared.checkForUpdates() }
+                    Spacer()
+                }
+            }
+            .padding(4)
+        } label: { Label("Software Update", systemImage: "arrow.down.circle") }
     }
 
     private var apiKey: String { config["api_key"] as? String ?? "" }

@@ -57,10 +57,14 @@ struct MenuView: View {
                 .contentShape(Rectangle())
                 .onTapGesture { runMLTest() }
                 .help("Click to run an ML self-test")
-            StatusRow(
-                icon: "gauge.with.dots.needle.50percent", name: "Dashboard",
-                detail: model.snap.dashboardUp ? "localhost:\(model.snap.dashboardPort)" : "Not running",
-                ok: model.snap.dashboardUp)
+            // Only show the dashboard row when it's enabled; a user who turned
+            // it off shouldn't see a permanent red "Not running".
+            if model.snap.dashboardEnabled {
+                StatusRow(
+                    icon: "gauge.with.dots.needle.50percent", name: "Dashboard",
+                    detail: model.snap.dashboardUp ? "localhost:\(model.snap.dashboardPort)" : "Not running",
+                    ok: model.snap.dashboardUp)
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
@@ -68,6 +72,12 @@ struct MenuView: View {
 
     private var mlDetail: String {
         if testing { return "Testing…" }
+        // A model fetch takes minutes on the big models and makes Immich's jobs
+        // fail meanwhile, so say so rather than looking merely slow.
+        if model.snap.downloadTotal > 0 {
+            let pct = model.snap.downloadDone * 100 / max(model.snap.downloadTotal, 1)
+            return "Downloading model… \(pct)%"
+        }
         if model.snap.mlHealthy { return "CLIP · Faces · OCR" }
         if model.snap.mlUp { return "Starting…" }
         return "Not running"

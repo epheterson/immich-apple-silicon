@@ -2009,6 +2009,27 @@ mode, root, want = sys.argv[1], sys.argv[2], sys.argv[3]
 MARKER = ".immich-accelerator-media-id"
 SUBDIRS = ("upload", "library", "thumbs", "encoded-video", "profile", "backups")
 cands = [root] + [os.path.join(root, s) for s in SUBDIRS]
+# A subdir pointed at another disk (the documented way to put thumbs or
+# encoded-video on a fast SSD, #115) is a symlink. If its target is missing or
+# is not a directory, Immich fails every write there with ENOENT/ENOTDIR, and
+# isdir() is False either way so it would silently drop out of the candidates
+# below while the marker still verifies via another subdir. Fail loudly.
+#
+# Only the paths Immich writes constantly are worth blocking startup for.
+# `profile` and `backups` are incidental, so a removable drive holding one of
+# those must not take the whole accelerator down; they are reported by the
+# caller as a warning instead.
+CRITICAL = ("upload", "library", "thumbs", "encoded-video")
+broken = [
+    d for d in cands
+    if os.path.islink(d) and not os.path.isdir(os.path.realpath(d))
+]
+fatal = [d for d in broken if d == root or os.path.basename(d) in CRITICAL]
+if fatal:
+    sys.stderr.write("dangling:" + ",".join(fatal))
+    sys.exit(5)
+if broken:
+    sys.stderr.write("warn-dangling:" + ",".join(broken))
 cands = [d for d in cands if os.path.isdir(d)]
 try:
     if mode == "verify":
@@ -2038,10 +2059,13 @@ except Exception as e:
 """
 
 
-def _media_probe(mode: str, root: str, media_id: str, timeout: int = 15) -> bool:
-    """Run the marker probe in a child process with a hard timeout. Returns True
-    only on a clean exit 0; any nonzero exit or timeout (e.g. a hung network
-    mount) is treated as not-ready."""
+def _media_probe(
+    mode: str, root: str, media_id: str, timeout: int = 15
+) -> tuple[bool, list[str]]:
+    """Run the marker probe in a child process with a hard timeout. Returns
+    (ok, dangling): ok is True only on a clean exit 0; any nonzero exit or
+    timeout (e.g. a hung network mount) is not-ready. `dangling` lists media
+    subdirs that are symlinks to a missing target (exit 5, see #115)."""
     try:
         result = subprocess.run(
             [sys.executable, "-c", _MEDIA_PROBE, mode, root, media_id],
@@ -2049,9 +2073,23 @@ def _media_probe(mode: str, root: str, media_id: str, timeout: int = 15) -> bool
             text=True,
             timeout=timeout,
         )
-        return result.returncode == 0
+        err = (result.stderr or "").strip()
+        if result.returncode == 5:
+            paths = err.split("dangling:", 1)[-1] if "dangling:" in err else ""
+            return False, [p for p in paths.split(",") if p]
+        # A broken link on a non-critical subdir (profile/backups) is worth
+        # saying out loud, but not worth refusing to start over.
+        if "warn-dangling:" in err:
+            for p in err.split("warn-dangling:", 1)[-1].split(","):
+                if p:
+                    log.warning(
+                        "Media folder %s is a broken symlink; jobs "
+                        "writing there will fail.",
+                        p,
+                    )
+        return result.returncode == 0, []
     except (subprocess.SubprocessError, OSError):
-        return False
+        return False, []
 
 
 def ensure_media_ready(config: dict) -> bool:
@@ -2063,10 +2101,26 @@ def ensure_media_ready(config: dict) -> bool:
     if not media_root:
         return True  # nothing configured to guard (same-host default path)
 
+    def _report_dangling(paths: list[str]) -> None:
+        """A media subdir points at a disk that isn't mounted (#115). Immich
+        would fail every write to it, so name the exact path instead of letting
+        thumbnail/transcode jobs die one by one with ENOENT."""
+        log.error("Media location not ready: %s", media_root)
+        for p in paths:
+            log.error("  %s is a symlink to a target that does not exist.", p)
+        log.error("  A media folder points at another disk (e.g. thumbs on an")
+        log.error("  SSD) that isn't mounted. Mount it, or remove the symlink,")
+        log.error("  then start again. Refusing to start so Immich can't fail")
+        log.error("  every job that writes there.")
+
     media_id = config.get("media_id")
     if media_id:
-        if _media_probe("verify", media_root, media_id):
+        ok, dangling = _media_probe("verify", media_root, media_id)
+        if ok:
             return True
+        if dangling:
+            _report_dangling(dangling)
+            return False
         log.error("Media location not ready: %s", media_root)
         log.error("  The marker identifying your media root is missing or")
         log.error("  unreadable. Usually a network mount isn't up yet, or the")
@@ -2077,11 +2131,15 @@ def ensure_media_ready(config: dict) -> bool:
 
     # First run: establish the marker. Requires a present, writable root.
     new_id = uuid.uuid4().hex
-    if _media_probe("init", media_root, new_id):
+    ok, dangling = _media_probe("init", media_root, new_id)
+    if ok:
         config["media_id"] = new_id
         save_config(config)
         log.info("Media root verified and marked: %s", media_root)
         return True
+    if dangling:
+        _report_dangling(dangling)
+        return False
     log.error("Media location not writable: %s", media_root)
     log.error("  Refusing to start — check the mount is up and writable.")
     return False
@@ -2158,6 +2216,16 @@ def _dashboard_port() -> int:
         return 8420
 
 
+def _dashboard_enabled() -> bool:
+    """Whether the web dashboard is enabled. Defaults True (back-compat: a config
+    written before this option existed has no key). Set "dashboard": false in
+    config.json (or `immich-accelerator dashboard off`) to run headless."""
+    try:
+        return bool(load_config().get("dashboard", True))
+    except (RuntimeError, ValueError, OSError):
+        return True
+
+
 def _process_is_our_dashboard(pid: int) -> bool:
     """Whether a pid is actually our dashboard, not a foreign port squatter.
 
@@ -2181,10 +2249,48 @@ def _process_is_our_dashboard(pid: int) -> bool:
     return "immich_accelerator" in out and "dashboard" in out
 
 
+def stop_dashboard() -> bool:
+    """Stop the dashboard, whether or not we still have a valid pidfile.
+
+    The pidfile can go missing (an orphan from a prior run, or read_pid
+    discarding it after PID reuse). start_dashboard has an adopt-the-orphan
+    branch for exactly that state. Without the same fallback here, disabling the
+    dashboard would leave it serving while every UI claims it is off. Returns
+    whether something was stopped."""
+    if read_pid("dashboard"):
+        kill_pid("dashboard")
+        return True
+    orphan = _pid_on_port(_dashboard_port())
+    if orphan and _process_is_our_dashboard(orphan):
+        log.info("Stopping untracked dashboard (PID %d)", orphan)
+        try:
+            os.kill(orphan, signal.SIGTERM)
+        except OSError as e:
+            log.warning("  Could not stop PID %d: %s", orphan, e)
+            return False
+        return True
+    return False
+
+
+def reconcile_dashboard() -> None:
+    """Make the running state match the "dashboard" config key.
+
+    One enforcement point, called from the watch loop as well as the toggle, so
+    editing config.json (the documented way to turn it off) actually takes
+    effect on a running install instead of only at the next start."""
+    if _dashboard_enabled():
+        start_dashboard()
+    elif read_pid("dashboard") or _pid_on_port(_dashboard_port()):
+        stop_dashboard()
+
+
 def start_dashboard() -> None:
     """Start the dashboard in the background if it isn't already running.
     Idempotent — used by both `start` and `watch` so either brings the
-    dashboard up (#81)."""
+    dashboard up (#81). No-op when the dashboard is disabled in config."""
+    if not _dashboard_enabled():
+        log.debug("Dashboard disabled in config; not starting.")
+        return
     if read_pid("dashboard"):
         return  # already tracked + alive (also guards a just-spawned one)
     port = _dashboard_port()
@@ -2754,6 +2860,31 @@ def _query_immich_api(base_url: str, api_key: str) -> dict:
         raise RuntimeError(f"Could not reach Immich at {base_url}: {e}")
 
     return {"version": version, "url": base_url}
+
+
+def _immich_clip_model(config: dict) -> str | None:
+    """The CLIP model Immich is configured to send us, or None if unknown.
+
+    Read from Immich's own system config so `ml-test` can say what the running
+    setup actually uses instead of only the model it probes with (#116). Needs
+    an api_key; any failure is non-fatal (the caller just stays quiet).
+    """
+    import urllib.error
+    import urllib.request
+
+    base, key = config.get("immich_url"), config.get("api_key")
+    if not base or not key:
+        return None
+    req = urllib.request.Request(
+        f"{base}/api/system-config", headers={"x-api-key": key}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    model = (data.get("machineLearning") or {}).get("clip", {}).get("modelName")
+    return model if isinstance(model, str) and model else None
 
 
 def _import_server(source: str, version: str) -> Path:
@@ -4554,7 +4685,7 @@ def cmd_watch(_args):
         log.info("Services not running, starting...")
         cmd_start(argparse.Namespace(force=True))
     else:
-        start_dashboard()
+        reconcile_dashboard()
 
     # Warn if auto-update won't work for remote setups
     _watch_config = load_config()
@@ -4595,6 +4726,12 @@ def cmd_watch(_args):
             # Keep service logs bounded — the worker can spew stack traces for
             # unsupported files; left unmanaged a log grew to 10GB.
             cap_service_logs()
+
+            # Match the dashboard to the "dashboard" config key. config is
+            # reloaded above each cycle, so editing config.json (the documented
+            # way to turn it off) takes effect on a running install, and a
+            # crashed dashboard is restarted while it is enabled.
+            reconcile_dashboard()
 
             # Check ML — re-resolve ml_dir each cycle (same stale-
             # path fix as cmd_start; brew upgrade can invalidate it).
@@ -4746,7 +4883,25 @@ def cmd_watch(_args):
 
 
 def cmd_dashboard(args):
-    """Start the web dashboard."""
+    """Run the web dashboard, or toggle it on/off.
+
+    `dashboard on|off` flips the "dashboard" config key so `start`/`watch` do (or
+    don't) bring the dashboard up, and starts/stops it now to match. With no
+    state it runs the dashboard server in the foreground (what start_dashboard
+    spawns in the background)."""
+    state = getattr(args, "state", None)
+    if state in ("on", "off"):
+        config = load_config()
+        config["dashboard"] = state == "on"
+        save_config(config)
+        if state == "on":
+            start_dashboard()
+            log.info("Dashboard enabled.")
+        else:
+            stop_dashboard()
+            log.info("Dashboard disabled. Worker and ML are unaffected.")
+        return
+
     config = load_config()
     import importlib
 
@@ -4905,6 +5060,22 @@ def cmd_ml_test(_args):
     check("health", health)
     check("clip visual (ViT-B-32__openai)", clip_visual)
     check("ocr (Apple Vision)", ocr_check)
+
+    # The CLIP check above deliberately uses a fixed model so the diagnostic is
+    # cheap and always available. That confused a user into thinking a model
+    # switch hadn't taken effect (#116), so say which model Immich actually
+    # asks for, and be explicit that the probe above is not it.
+    configured = _immich_clip_model(config)
+    if configured:
+        log.info("")
+        log.info("Immich is configured to use CLIP model: %s", configured)
+        if configured != "ViT-B-32__openai":
+            log.info("  The check above always probes ViT-B-32__openai, so it does not")
+            log.info(
+                "  reflect your setting. %s is downloaded and loaded the first",
+                configured,
+            )
+            log.info("  time Immich sends a Smart Search job (watch ml.log).")
 
     all_passed = all(ok for _, ok, _ in results)
     log.info("")
@@ -5071,6 +5242,12 @@ def main():
     sub.add_parser("update", help="Update to match Immich version")
     sub.add_parser("watch", help="Monitor services, restart on crash (for launchd)")
     dash_p = sub.add_parser("dashboard", help="Web dashboard (http://localhost:8420)")
+    dash_p.add_argument(
+        "state",
+        nargs="?",
+        choices=["on", "off"],
+        help="Enable or disable the dashboard (omit to run it in the foreground)",
+    )
     dash_p.add_argument("--port", type=int, default=8420, help="Dashboard port")
     sub.add_parser(
         "ml-test",

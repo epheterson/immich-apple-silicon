@@ -110,4 +110,59 @@ enum Actions {
         try? out.write(to: url, options: .atomic)
         await restartService()
     }
+
+    // Enable/disable the web dashboard via the CLI, which flips the "dashboard"
+    // config key and starts/stops it now. Worker and ML are untouched, so no
+    // full service restart is needed. Returns false when the CLI is missing or
+    // the command failed, so the caller can undo the switch instead of showing
+    // a state the accelerator never reached.
+    static func setDashboard(_ on: Bool) async -> Bool {
+        guard isBrewInstall else { return false }
+        let (code, _) = await run(cli, ["dashboard", on ? "on" : "off"])
+        return code == 0
+    }
+
+    // Was the core installed by Homebrew? The CLI lives under the formula's opt
+    // prefix, so its presence is the check. A from-source install has no
+    // formula to upgrade.
+    static var isBrewInstall: Bool {
+        FileManager.default.isExecutableFile(atPath: cli)
+    }
+
+    // The available core-formula version if brew says one is ready, else nil.
+    // `brew outdated --verbose` prints "immich-accelerator (1.7.1) < 1.7.2" and
+    // stays silent for an up-to-date OR pinned formula, so nil correctly means
+    // "do not run an upgrade".
+    static func coreOutdated() async -> String? {
+        let (code, out) = await run(
+            brew, ["outdated", "--formula", "--verbose", "immich-accelerator"])
+        guard code == 0, let r = out.range(of: "< ") else { return nil }
+        let v = out[r.upperBound...]
+            .prefix { !$0.isWhitespace }
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty ? nil : v
+    }
+
+    // Upgrade the core formula. The watch loop applies the new code on its own
+    // (stops the stale worker, relaunches), so no explicit restart is needed on
+    // the standard launchd install.
+    @discardableResult
+    static func upgradeCore() async -> Bool {
+        let (code, _) = await run(brew, ["upgrade", "immich-accelerator"])
+        return code == 0
+    }
+
+    // True if semver `a` (\"X.Y.Z\") is newer than `b`. Non-numeric suffixes are
+    // dropped; unparseable inputs return false (never triggers a downgrade).
+    static func versionNewer(_ a: String, than b: String) -> Bool {
+        let pa = a.split(separator: ".").compactMap { Int($0) }
+        let pb = b.split(separator: ".").compactMap { Int($0) }
+        guard !pa.isEmpty, !pb.isEmpty else { return false }
+        for i in 0 ..< max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0
+            let y = i < pb.count ? pb[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
 }

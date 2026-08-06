@@ -68,11 +68,20 @@ private func handle(_ conn: NWConnection, method: String, path: String, ctype: S
         respond(conn, status: "200 OK", body: Data("pong".utf8), ctype: "text/plain")
     case "/health":
         let face = models.arcface != nil ? "ok" : "error: model not loaded"
-        respondJSON(conn, status: "200 OK", object: [
+        var health: [String: Any] = [
             "status": models.arcface != nil ? "healthy" : "degraded",
             "stub_mode": false,
             "checks": ["clip": "ok", "face_recognition": face, "vision_framework": "ok"],
-        ])
+        ]
+        // A model fetch can run for minutes on the largest models, during which
+        // Immich's jobs time out and retry. Report it so the menu bar can say
+        // what is happening instead of just looking broken.
+        if let p = ZooCLIP.fetchProgress {
+            health["downloading"] = [
+                "model": p.model, "files_done": p.done, "files_total": p.total,
+            ]
+        }
+        respondJSON(conn, status: "200 OK", object: health)
     case "/predict":
         guard let boundary = ctype.range(of: "boundary=").map({
             String(ctype[$0.upperBound...]).trimmingCharacters(in: .whitespaces)
