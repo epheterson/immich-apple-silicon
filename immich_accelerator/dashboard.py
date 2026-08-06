@@ -187,7 +187,13 @@ def get_status(config: dict) -> dict:
     # deleted/hidden assets — that's how completion read >100% (#68).
     #   live = asset, deletedAt IS NULL, visibility != hidden
     #   awp  = live + has an asset_job_status row + has a Preview file
-    counts_raw = _query_db(
+    #
+    # Skipped entirely in ml-only mode: there's no local Postgres to query
+    # (by design — this box has no worker, no library, no DB), so every
+    # uncached poll would otherwise spawn a doomed psql/docker-exec call and
+    # log a misleading "cannot connect to Postgres" line. Progress bars stay
+    # at 0/0, which is accurate — this node isn't "the" library.
+    counts_raw = "" if config.get("ml_only") else _query_db(
         "WITH live AS ("
         "  SELECT id, type, thumbhash FROM asset"
         "  WHERE \"deletedAt\" IS NULL AND visibility != 'hidden'), "

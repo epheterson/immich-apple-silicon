@@ -650,6 +650,16 @@ class TestCLIParsing:
         args = parser.parse_args(["setup", "--import-server", "/tmp/server.tar.gz"])
         assert args.import_server == "/tmp/server.tar.gz"
 
+    def test_setup_ml_only_flag(self):
+        parser = self._build_parser()
+        args = parser.parse_args(["setup", "--ml-only"])
+        assert args.ml_only is True
+
+    def test_setup_ml_only_defaults_false(self):
+        parser = self._build_parser()
+        args = parser.parse_args(["setup"])
+        assert args.ml_only is False
+
     def test_start_command(self):
         parser = self._build_parser()
         args = parser.parse_args(["start"])
@@ -730,6 +740,7 @@ class TestCLIParsing:
         setup_p.add_argument("--api-key")
         setup_p.add_argument("--manual", action="store_true")
         setup_p.add_argument("--import-server", metavar="DIR")
+        setup_p.add_argument("--ml-only", action="store_true")
         start_p = sub.add_parser("start")
         start_p.add_argument("--force", action="store_true")
         sub.add_parser("stop")
@@ -975,6 +986,240 @@ class TestStartMlService:
             pid, engine = m._start_ml_service(cfg)
             assert engine == "Python venv"
             nat.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# ml-only mode: cmd_start/cmd_watch dispatch to a worker-free counterpart
+# ---------------------------------------------------------------------------
+
+
+class TestStartMlOnly:
+    """_start_ml_only, and cmd_start's dispatch to it."""
+
+    CFG = {"ml_only": True, "ml_dir": "/ml", "ml_port": 3003}
+
+    def test_cmd_start_dispatches_to_ml_only_and_skips_worker_path(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "load_config", return_value=dict(self.CFG)
+        ), patch.object(m, "_start_ml_only") as start_ml_only, patch.object(
+            m, "find_docker"
+        ) as find_docker, patch.object(
+            m, "_preflight_env_health"
+        ) as preflight, patch.object(
+            m, "ensure_media_ready"
+        ) as media_ready:
+            m.cmd_start(argparse.Namespace(force=False))
+            start_ml_only.assert_called_once()
+            find_docker.assert_not_called()
+            preflight.assert_not_called()
+            media_ready.assert_not_called()
+
+    def test_already_running_without_force_skips_start(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_kill_stale_processes"), patch.object(
+            m, "read_pid", return_value=1234
+        ), patch.object(m, "cmd_stop") as stop, patch.object(
+            m, "_start_ml_service"
+        ) as start_ml:
+            m._start_ml_only(dict(self.CFG), argparse.Namespace(force=False))
+            start_ml.assert_not_called()
+            stop.assert_not_called()
+
+    def test_force_stops_then_restarts(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_kill_stale_processes"), patch.object(
+            m, "read_pid", return_value=1234
+        ), patch.object(m, "cmd_stop") as stop, patch.object(
+            m, "_find_ml_dir", return_value=None
+        ), patch.object(
+            m, "_start_ml_service", return_value=(999, "native Swift")
+        ), patch.object(
+            m, "start_dashboard"
+        ) as start_dash:
+            m._start_ml_only(dict(self.CFG), argparse.Namespace(force=True))
+            stop.assert_called_once_with(None)
+            start_dash.assert_called_once()
+
+    def test_starts_dashboard_on_success(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_kill_stale_processes"), patch.object(
+            m, "read_pid", return_value=None
+        ), patch.object(m, "_find_ml_dir", return_value=None), patch.object(
+            m, "_start_ml_service", return_value=(111, "Python venv")
+        ), patch.object(
+            m, "start_dashboard"
+        ) as start_dash:
+            m._start_ml_only(dict(self.CFG), argparse.Namespace(force=False))
+            start_dash.assert_called_once()
+
+    def test_no_engine_available_does_not_start_dashboard(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_kill_stale_processes"), patch.object(
+            m, "read_pid", return_value=None
+        ), patch.object(m, "_find_ml_dir", return_value=None), patch.object(
+            m, "_start_ml_service", return_value=(None, None)
+        ), patch.object(
+            m, "start_dashboard"
+        ) as start_dash:
+            m._start_ml_only(dict(self.CFG), argparse.Namespace(force=False))
+            start_dash.assert_not_called()
+
+
+class TestWatchMlOnly:
+    """_watch_ml_only, and cmd_watch's dispatch to it."""
+
+    CFG = {"ml_only": True, "ml_dir": "/ml", "ml_port": 3003}
+
+    def test_cmd_watch_dispatches_to_ml_only_and_skips_worker_path(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "load_config", return_value=dict(self.CFG)
+        ), patch.object(m, "_watch_ml_only") as watch_ml_only, patch.object(
+            m, "cmd_start"
+        ) as cmd_start:
+            m.cmd_watch(argparse.Namespace())
+            watch_ml_only.assert_called_once()
+            cmd_start.assert_not_called()
+
+    def test_skips_worker_only_checks_in_loop(self, tmp_data_dir):
+        """Regression guard: the ml-only loop must never touch the worker
+        crash-restart path, the fd-leak watchdog, or Docker version polling."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=4321), patch.object(
+            m, "reconcile_dashboard"
+        ), patch.object(m, "load_config", return_value=dict(self.CFG)), patch.object(
+            m, "cap_service_logs"
+        ), patch.object(
+            m, "cmd_start"
+        ) as cmd_start, patch.object(
+            m, "_worker_fd_total"
+        ) as fd_total, patch.object(
+            m, "find_docker"
+        ) as find_docker, patch(
+            "signal.signal"
+        ), patch(
+            "time.sleep", side_effect=KeyboardInterrupt
+        ):
+            m._watch_ml_only(dict(self.CFG))
+            cmd_start.assert_not_called()
+            fd_total.assert_not_called()
+            find_docker.assert_not_called()
+
+    def test_starts_when_not_already_running(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=None), patch.object(
+            m, "reconcile_dashboard"
+        ), patch.object(m, "_start_ml_only") as start_ml_only, patch(
+            "signal.signal"
+        ), patch(
+            "time.sleep", side_effect=KeyboardInterrupt
+        ):
+            m._watch_ml_only(dict(self.CFG))
+            start_ml_only.assert_called_once()
+
+    def test_restarts_ml_on_crash_inside_loop(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        # First read_pid call is the pre-loop check (live -> no initial start).
+        # Second is inside the loop body (crashed -> triggers a restart).
+        with patch.object(
+            m, "read_pid", side_effect=[4321, None]
+        ), patch.object(m, "reconcile_dashboard"), patch.object(
+            m, "load_config", return_value=dict(self.CFG)
+        ), patch.object(
+            m, "cap_service_logs"
+        ), patch.object(
+            m, "_find_ml_dir", return_value=None
+        ), patch.object(
+            m, "_start_ml_service", return_value=(555, "native Swift")
+        ) as start_ml, patch.object(
+            m, "_start_ml_only"
+        ) as start_ml_only, patch(
+            "signal.signal"
+        ), patch(
+            "time.sleep", side_effect=[None, KeyboardInterrupt]
+        ):
+            m._watch_ml_only(dict(self.CFG))
+            start_ml_only.assert_not_called()  # already running at the pre-loop check
+            start_ml.assert_called_once()  # in-loop restart after it "crashed"
+
+
+class TestSetupMlOnly:
+    """_setup_ml_only, cmd_setup's dispatch to it, and the shared
+    _finalize_config's ml-only guard around _ensure_build_link()."""
+
+    def test_cmd_setup_ml_only_dispatches(self):
+        import immich_accelerator.__main__ as m
+
+        args = argparse.Namespace(
+            ml_only=True, manual=False, import_server=None, url=None
+        )
+        with patch.object(m, "_setup_ml_only") as setup_ml_only, patch.object(
+            m, "_setup_local"
+        ) as setup_local, patch.object(
+            m, "_setup_manual"
+        ) as setup_manual, patch.object(
+            m, "_setup_remote"
+        ) as setup_remote:
+            m.cmd_setup(args)
+            setup_ml_only.assert_called_once_with(args)
+            setup_local.assert_not_called()
+            setup_manual.assert_not_called()
+            setup_remote.assert_not_called()
+
+    def test_writes_minimal_config_with_no_worker_fields(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "_find_ml_dir", return_value=Path("/ml")
+        ), patch.object(m, "_finalize_config") as finalize:
+            m._setup_ml_only(argparse.Namespace())
+            finalize.assert_called_once()
+            written = finalize.call_args[0][0]
+            assert written["ml_only"] is True
+            assert written["ml_port"] == 3003
+            assert written["ml_dir"] == "/ml"
+            for worker_key in ("db_hostname", "server_dir", "upload_mount"):
+                assert worker_key not in written
+
+    def test_handles_missing_venv(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_find_ml_dir", return_value=None), patch.object(
+            m, "_finalize_config"
+        ) as finalize:
+            m._setup_ml_only(argparse.Namespace())
+            written = finalize.call_args[0][0]
+            assert written["ml_dir"] is None
+
+    def test_finalize_config_skips_build_link_when_ml_only(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_ensure_build_link") as build_link, patch(
+            "builtins.input", side_effect=EOFError
+        ), patch("subprocess.run"):
+            m._finalize_config({"ml_only": True})
+            build_link.assert_not_called()
+
+    def test_finalize_config_still_calls_build_link_when_not_ml_only(
+        self, tmp_data_dir, sample_config
+    ):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_ensure_build_link") as build_link, patch(
+            "builtins.input", side_effect=EOFError
+        ), patch("subprocess.run"):
+            m._finalize_config(dict(sample_config))
+            build_link.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
