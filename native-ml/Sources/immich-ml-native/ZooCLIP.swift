@@ -286,40 +286,113 @@ final class ZooCLIP {
         }
     }
 
+    // Publishes what a long model fetch is doing so the menu bar can say
+    // "downloading" instead of leaving the user staring at failing jobs. The
+    // largest models are several GB, and the fetch runs on the request thread
+    // (as immich_ml does), so Immich's ML calls time out and retry until it
+    // completes. Retries are harmless: finished files are skipped.
+    struct FetchProgress: Sendable {
+        var model: String
+        var done: Int
+        var total: Int
+    }
+
+    private static let progressLock = NSLock()
+    nonisolated(unsafe) private static var _progress: FetchProgress?
+
+    static var fetchProgress: FetchProgress? {
+        progressLock.lock(); defer { progressLock.unlock() }
+        return _progress
+    }
+
+    private static func setProgress(_ p: FetchProgress?) {
+        progressLock.lock(); _progress = p; progressLock.unlock()
+    }
+
     static func ensureFiles(name: String, dir: URL, extra: [String] = []) throws {
-        for f in files + extra {
+        let all = files + extra
+        // Only advertise a fetch worth reporting: the fixed handful is quick,
+        // the external-data pass is the one measured in gigabytes.
+        let reportable = all.count > files.count
+        var completed = 0
+        if reportable { setProgress(FetchProgress(model: name, done: 0, total: all.count)) }
+        defer { if reportable { setProgress(nil) } }
+
+        for f in all {
             let dst = dir.appendingPathComponent(f)
-            if (try? dst.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) ?? 0 > 0 { continue }
+            if (try? dst.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) ?? 0 > 0 {
+                completed += 1
+                if reportable {
+                    setProgress(FetchProgress(model: name, done: completed, total: all.count))
+                }
+                continue
+            }
             try FileManager.default.createDirectory(
                 at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
             let url = URL(string: "https://huggingface.co/immich-app/\(name)/resolve/main/\(f)")!
-            let sem = DispatchSemaphore(value: 0)
-            var result: URL?
-            var status = 0
-            var moveError: Error?
-            let task = downloadSession.downloadTask(with: url) { tmp, resp, _ in
-                result = tmp.flatMap { t -> URL? in
-                    // move out of the ephemeral location before the handler returns
-                    let hold = FileManager.default.temporaryDirectory
-                        .appendingPathComponent(UUID().uuidString)
-                    do { try FileManager.default.moveItem(at: t, to: hold); return hold }
-                    catch { moveError = error; return nil }
+
+            // A large model is hundreds of files and several GB, so a single
+            // dropped connection should not fail the whole fetch and leave the
+            // model unusable. Retry a few times with backoff; anything already
+            // on disk is skipped, so a retry only re-fetches what is missing.
+            var stored = false
+            var lastError = ""
+            for attempt in 1...3 {
+                let sem = DispatchSemaphore(value: 0)
+                var result: URL?
+                var status = 0
+                var moveError: Error?
+                var transportError: Error?
+                let task = downloadSession.downloadTask(with: url) { tmp, resp, err in
+                    result = tmp.flatMap { t -> URL? in
+                        // move out of the ephemeral location before the handler returns
+                        let hold = FileManager.default.temporaryDirectory
+                            .appendingPathComponent(UUID().uuidString)
+                        do { try FileManager.default.moveItem(at: t, to: hold); return hold }
+                        catch { moveError = error; return nil }
+                    }
+                    status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                    transportError = err
+                    sem.signal()
                 }
-                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                sem.signal()
+                task.resume()
+                sem.wait()
+
+                guard status == 200, let tmp = result else {
+                    lastError = "HTTP \(status)"
+                        + (transportError.map { ", \($0.localizedDescription)" } ?? "")
+                        + (moveError.map { ", \($0)" } ?? "")
+                    // A 4xx is the server telling us this file will never
+                    // arrive; only retry what could plausibly succeed later.
+                    if (400...499).contains(status) { break }
+                    if attempt < 3 {
+                        print("[native-ml] retrying \(name)/\(f) (\(lastError))")
+                        Thread.sleep(forTimeInterval: Double(attempt) * 2)
+                    }
+                    continue
+                }
+                do { _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp) } catch {
+                    throw PredictError(status: "500 Internal Server Error",
+                                       message: "model \(name): cannot store \(f) (\(error))")
+                }
+                stored = true
+                break
             }
-            task.resume()
-            sem.wait()
-            guard status == 200, let tmp = result else {
+            guard stored else {
                 throw PredictError(status: "422 Unprocessable Entity",
-                                   message: "model \(name): download failed for \(f) "
-                                       + "(HTTP \(status)\(moveError.map { ", \($0)" } ?? ""))")
+                                   message: "model \(name): download failed for \(f) (\(lastError))")
             }
-            do { _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp) } catch {
-                throw PredictError(status: "500 Internal Server Error",
-                                   message: "model \(name): cannot store \(f) (\(error))")
+
+            completed += 1
+            if reportable {
+                setProgress(FetchProgress(model: name, done: completed, total: all.count))
+                // One line per file is unreadable at 500 files; log milestones.
+                if completed % 25 == 0 || completed == all.count {
+                    print("[native-ml] \(name): \(completed)/\(all.count) files")
+                }
+            } else {
+                print("[native-ml] fetched \(name)/\(f)")
             }
-            print("[native-ml] fetched \(name)/\(f)")
         }
     }
 }

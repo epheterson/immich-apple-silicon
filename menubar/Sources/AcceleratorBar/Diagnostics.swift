@@ -48,7 +48,14 @@ enum Diagnostics {
         // The most useful ML fact: did it fall back to Python despite native
         // being configured (missing bundle / failed native start)?
         let configuredEngine = (config["ml_engine"] as? String) ?? "native"
-        if snap.mlHealthy {
+        if snap.downloadTotal > 0 {
+            out.append(Check(
+                label: "ML engine",
+                detail: "downloading \(snap.downloadingModel) "
+                    + "(\(snap.downloadDone) of \(snap.downloadTotal) files); "
+                    + "search jobs retry until it finishes",
+                level: .warn))
+        } else if snap.mlHealthy {
             let fellBack = configuredEngine == "native" && snap.mlEngine == .python
             out.append(Check(label: "ML engine",
                              detail: fellBack ? "configured native, running Python (fallback)"

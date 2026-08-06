@@ -41,6 +41,11 @@ struct Snapshot: Equatable {
     var dashboardPort = 8420 // where the accelerator dashboard is served
     var dashboardEnabled = true // config "dashboard" (default on); off => hide the row
     var immichReachable = false // Immich answered on immich_url
+    // Set while the ML service is fetching a model (the largest are several GB
+    // and take minutes, during which Immich's jobs fail and retry).
+    var downloadingModel = ""
+    var downloadDone = 0
+    var downloadTotal = 0
     // nil = not checked this cycle (the key is only exercised while the worker
     // is up). Distinguishing that from false matters: a stopped worker must not
     // make a perfectly good key look rejected.
@@ -153,8 +158,14 @@ final class StatusModel: ObservableObject {
         async let healthy = Self.ping(port: p.mlPort)
         async let jobs = Self.jobCounts(base: p.immichURL, apiKey: p.apiKey)
         async let reachable = Self.serverReachable(base: p.immichURL)
+        async let fetching = p.mlUp ? Self.downloadProgress(port: p.mlPort) : nil
         s.externalDomain = await domain
         s.mlHealthy = await healthy
+        if let f = await fetching {
+            s.downloadingModel = f.model
+            s.downloadDone = f.done
+            s.downloadTotal = f.total
+        }
         let counts = await jobs
         s.jobsActive = counts.active
         s.jobsWaiting = counts.waiting
@@ -282,6 +293,23 @@ final class StatusModel: ObservableObject {
         let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         p.waitUntilExit()
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // What a long model fetch is doing, so the ML row can explain a stall that
+    // would otherwise look like a broken service. nil when nothing is fetching.
+    nonisolated static func downloadProgress(port: Int) async -> (model: String, done: Int, total: Int)? {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/health") else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let d = obj["downloading"] as? [String: Any],
+              let model = d["model"] as? String,
+              let done = d["files_done"] as? Int,
+              let total = d["files_total"] as? Int
+        else { return nil }
+        return (model, done, total)
     }
 
     nonisolated static func ping(port: Int) async -> Bool {

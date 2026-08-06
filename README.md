@@ -203,7 +203,9 @@ As of 1.6.0 this runs as a **native Swift engine**: a single binary with the mod
 
 As of 1.7.0 the native engine supports the **full CLIP model zoo**: whatever model you select in Immich (ViT-B-16, ViT-L-14, LAION variants, the SigLIP family, ...) is downloaded from Immich's own model repository on first use and run natively through onnxruntime with Immich's exact preprocessing and tokenization, so results match the Docker ML service. The default ViT-B-32 uses an even faster mlx path.
 
-Changing the model in Immich takes effect on the next Smart Search job, not immediately: the new model is fetched the first time Immich asks for it, which for the largest models is several GB (watch `immich-accelerator logs ml`). Note that `ml-test` always probes with `ViT-B-32__openai`, so its output does not tell you which model your library is using; it prints your configured model separately.
+Changing the model in Immich takes effect on the next Smart Search job, not immediately: the new model is fetched the first time Immich asks for it, which for the largest models is several GB. While that download runs, the menu bar shows "Downloading model…" with progress, and Immich's search jobs fail and retry until it finishes (nothing is lost, they succeed once the model is ready). You can also follow it with `immich-accelerator logs ml`.
+
+Note that `ml-test` always probes with `ViT-B-32__openai`, so its output does not tell you which model your library is using; it prints your configured model separately.
 
 The native engine is the default and is health-checked at startup. If its bundle or models are missing, or it fails to start, the accelerator automatically falls back to the Python service so ML is never left down. On a brand-new install the models (~740MB) are downloaded once in the background on first native start, so ML runs on the Python engine for a few minutes until they arrive, then switches to native automatically.
 

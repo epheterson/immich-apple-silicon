@@ -72,6 +72,12 @@ struct MenuView: View {
 
     private var mlDetail: String {
         if testing { return "Testing…" }
+        // A model fetch takes minutes on the big models and makes Immich's jobs
+        // fail meanwhile, so say so rather than looking merely slow.
+        if model.snap.downloadTotal > 0 {
+            let pct = model.snap.downloadDone * 100 / max(model.snap.downloadTotal, 1)
+            return "Downloading model… \(pct)%"
+        }
         if model.snap.mlHealthy { return "CLIP · Faces · OCR" }
         if model.snap.mlUp { return "Starting…" }
         return "Not running"
