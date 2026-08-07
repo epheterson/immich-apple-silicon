@@ -39,7 +39,12 @@ struct Snapshot: Equatable {
     var jobsActive = 0       // jobs the worker is running right now
     var jobsWaiting = 0      // jobs queued behind them
     var dashboardPort = 8420 // where the accelerator dashboard is served
-    var dashboardEnabled = true // config "dashboard" (default on); off => hide the row
+    // Which components the user has turned on. A disabled component is hidden
+    // entirely rather than shown red: "off because I said so" and "off because
+    // it broke" are different facts and must not look the same.
+    var workerEnabled = true
+    var mlEnabled = true
+    var dashboardEnabled = true
     var immichReachable = false // Immich answered on immich_url
     // Set while the ML service is fetching a model (the largest are several GB
     // and take minutes, during which Immich's jobs fail and retry).
@@ -60,9 +65,19 @@ struct Snapshot: Equatable {
     // The worker is actively chewing through jobs (drives the amber icon).
     var processing: Bool { jobsActive > 0 }
 
+    // Health is judged only against what the user actually turned on. Judging a
+    // disabled component would leave an ML-only box amber forever for missing a
+    // worker it was told not to run, which is the fastest way to teach someone
+    // to ignore the icon.
     var overall: ServiceState {
-        if workerUp && mlHealthy { return .running }
-        if !workerUp && !mlUp && !dashboardUp { return .stopped }
+        var wanted = 0, healthy = 0, anyAlive = false
+        if workerEnabled { wanted += 1; if workerUp { healthy += 1 } }
+        if mlEnabled { wanted += 1; if mlHealthy { healthy += 1 } }
+        if dashboardEnabled { wanted += 1; if dashboardUp { healthy += 1 } }
+        anyAlive = workerUp || mlUp || dashboardUp
+        if wanted == 0 { return .stopped }   // everything switched off
+        if healthy == wanted { return .running }
+        if !anyAlive { return .stopped }
         return .degraded
     }
 }
@@ -78,6 +93,8 @@ struct ProcessProbe: Sendable {
     var immichVersion = ""
     var immichURL = ""
     var dashboardPort = 8420
+    var workerEnabled = true
+    var mlEnabled = true
     var dashboardEnabled = true
     var mlPort = 3003
     var apiKey = ""
@@ -149,13 +166,15 @@ final class StatusModel: ObservableObject {
         s.immichVersion = p.immichVersion
         s.immichURL = p.immichURL
         s.dashboardPort = p.dashboardPort
+        s.workerEnabled = p.workerEnabled
+        s.mlEnabled = p.mlEnabled
         s.dashboardEnabled = p.dashboardEnabled
 
         // The three network probes are independent (each has its own timeout),
         // so run them concurrently: a slow/unreachable service costs the max
         // latency, not the sum.
         async let domain = Self.externalDomain(base: p.immichURL)
-        async let healthy = Self.ping(port: p.mlPort)
+        async let healthy = p.mlEnabled ? Self.ping(port: p.mlPort) : false
         async let jobs = Self.jobCounts(base: p.immichURL, apiKey: p.apiKey)
         async let reachable = Self.serverReachable(base: p.immichURL)
         async let fetching = p.mlUp ? Self.downloadProgress(port: p.mlPort) : nil
@@ -173,6 +192,15 @@ final class StatusModel: ObservableObject {
         s.apiKeyValid = counts.authed
 
         snap = s
+    }
+
+    // Whether a component is switched on. Mirrors __main__._component_enabled:
+    // absent means enabled, and an explicit key beats the legacy "ml_only"
+    // preset so a box can be switched back without hand-editing config.json.
+    nonisolated static func componentEnabled(_ name: String, _ config: [String: Any]) -> Bool {
+        if let explicit = config[name] as? Bool { return explicit }
+        if (config["ml_only"] as? Bool) == true { return name != "worker" }
+        return true
     }
 
     // Blocking pidfile/ps/config probes, gathered off the main actor. Confirms
@@ -195,7 +223,9 @@ final class StatusModel: ObservableObject {
         p.immichVersion = config["version"] as? String ?? ""
         p.immichURL = config["immich_url"] as? String ?? ""
         p.dashboardPort = (config["dashboard_port"] as? Int) ?? 8420
-        p.dashboardEnabled = (config["dashboard"] as? Bool) ?? true
+        p.workerEnabled = componentEnabled("worker", config)
+        p.mlEnabled = componentEnabled("ml", config)
+        p.dashboardEnabled = componentEnabled("dashboard", config)
         p.mlPort = (config["ml_port"] as? Int) ?? 3003
         p.apiKey = (p.workerUp ? config["api_key"] as? String : nil) ?? ""
         return p

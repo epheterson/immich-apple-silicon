@@ -111,15 +111,23 @@ enum Actions {
         await restartService()
     }
 
-    // Enable/disable the web dashboard via the CLI, which flips the "dashboard"
-    // config key and starts/stops it now. Worker and ML are untouched, so no
-    // full service restart is needed. Returns false when the CLI is missing or
-    // the command failed, so the caller can undo the switch instead of showing
-    // a state the accelerator never reached.
-    static func setDashboard(_ on: Bool) async -> Bool {
-        guard isBrewInstall else { return false }
-        let (code, _) = await run(cli, ["dashboard", on ? "on" : "off"])
-        return code == 0
+    // Enable/disable one component via the CLI, which flips its config key and
+    // starts/stops it now. The other components are untouched, so no full
+    // service restart is needed. Returns false when the CLI is missing or the
+    // command failed, so the caller can undo the switch instead of showing a
+    // state the accelerator never reached.
+    // Returns the CLI's own output on failure rather than a generic message:
+    // turning the worker back on runs a full `start`, which can fail for real
+    // reasons (Docker down, media not mounted, sharp needs a rebuild), and the
+    // CLI already explains each one better than the UI could.
+    static func setComponent(_ name: String, _ on: Bool) async -> (ok: Bool, message: String) {
+        guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
+        let (code, out) = await run(cli, ["component", name, on ? "on" : "off"])
+        if code == 0 { return (true, "") }
+        let detail = out.split(separator: "\n")
+            .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+            .map(String.init) ?? "exit \(code)"
+        return (false, detail)
     }
 
     // Was the core installed by Homebrew? The CLI lives under the formula's opt

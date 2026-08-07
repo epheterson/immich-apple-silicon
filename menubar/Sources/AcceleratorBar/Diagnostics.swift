@@ -45,10 +45,17 @@ enum Diagnostics {
                          detail: snap.version.isEmpty ? "unknown" : "v\(snap.version)",
                          level: snap.version.isEmpty ? .warn : .ok))
 
+        out.append(Check(label: "Worker",
+                         detail: !snap.workerEnabled ? "off"
+                             : (snap.workerUp ? "running" : "enabled, not running"),
+                         level: !snap.workerEnabled ? .info : (snap.workerUp ? .ok : .fail)))
+
         // The most useful ML fact: did it fall back to Python despite native
         // being configured (missing bundle / failed native start)?
         let configuredEngine = (config["ml_engine"] as? String) ?? "native"
-        if snap.downloadTotal > 0 {
+        if !snap.mlEnabled {
+            out.append(Check(label: "ML engine", detail: "off", level: .info))
+        } else if snap.downloadTotal > 0 {
             out.append(Check(
                 label: "ML engine",
                 detail: "downloading \(snap.downloadingModel) "

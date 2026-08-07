@@ -44,26 +44,38 @@ struct MenuView: View {
         return parts.isEmpty ? model.snap.overall.label : parts.joined(separator: "  ·  ")
     }
 
+    // One rule for all three: a row exists only for a component the user turned
+    // on. Disabled and "not running" are different facts, and showing a
+    // permanent red row for something switched off deliberately trains people
+    // to ignore the colors.
     private var statusRows: some View {
         VStack(spacing: 2) {
-            StatusRow(
-                icon: "gearshape.2.fill", name: "Worker",
-                detail: workerDetail, ok: model.snap.workerUp)
-            StatusRow(
-                icon: "brain.fill", name: "Machine Learning",
-                detail: mlDetail, ok: model.snap.mlHealthy,
-                badge: model.snap.mlUp ? model.snap.mlEngine.badge : nil,
-                badgeTint: model.snap.mlEngine == .native ? .green : .orange)
-                .contentShape(Rectangle())
-                .onTapGesture { runMLTest() }
-                .help("Click to run an ML self-test")
-            // Only show the dashboard row when it's enabled; a user who turned
-            // it off shouldn't see a permanent red "Not running".
+            if model.snap.workerEnabled {
+                StatusRow(
+                    icon: "gearshape.2.fill", name: "Worker",
+                    detail: workerDetail, ok: model.snap.workerUp)
+            }
+            if model.snap.mlEnabled {
+                StatusRow(
+                    icon: "brain.fill", name: "Machine Learning",
+                    detail: mlDetail, ok: model.snap.mlHealthy,
+                    badge: model.snap.mlUp ? model.snap.mlEngine.badge : nil,
+                    badgeTint: model.snap.mlEngine == .native ? .green : .orange)
+                    .contentShape(Rectangle())
+                    .onTapGesture { runMLTest() }
+                    .help("Click to run an ML self-test")
+            }
             if model.snap.dashboardEnabled {
                 StatusRow(
                     icon: "gauge.with.dots.needle.50percent", name: "Dashboard",
                     detail: model.snap.dashboardUp ? "localhost:\(model.snap.dashboardPort)" : "Not running",
                     ok: model.snap.dashboardUp)
+            }
+            if !model.snap.workerEnabled && !model.snap.mlEnabled && !model.snap.dashboardEnabled {
+                Text("Every component is switched off.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 6).padding(.vertical, 4)
             }
         }
         .padding(.horizontal, 8)
