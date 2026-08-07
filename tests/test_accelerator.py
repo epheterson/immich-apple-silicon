@@ -2847,16 +2847,26 @@ class TestWatchDispatch:
             kill.assert_called_once_with("worker")
 
     def test_worker_free_loop_hands_back_when_worker_enabled(self, tmp_data_dir):
+        """The config must describe a worker, not merely ask for one.
+
+        This used to pass {"worker": True} and nothing else. That is now the
+        case the loop deliberately refuses (handing over to a cmd_start that
+        cannot succeed crash-loops launchd), so the test asked for the
+        behaviour it exists to prevent and spun forever waiting for it. See
+        TestWorkerFreeWatchDoesNotStrandTheInstall for the refusing half.
+        """
         import immich_accelerator.__main__ as m
 
-        with patch.object(
-            m, "load_config", return_value={"worker": True}
-        ), patch.object(m, "read_pid", return_value=4321), patch.object(
-            m, "reconcile_dashboard"
-        ), patch.object(
+        enabled: dict = {k: "x" for k in m._WORKER_CONFIG_KEYS}
+        enabled["worker"] = True
+        with patch.object(m, "load_config", return_value=enabled), patch.object(
+            m, "read_pid", return_value=4321
+        ), patch.object(m, "reconcile_dashboard"), patch.object(
             m, "reconcile_components"
         ), patch.object(
             m, "cap_service_logs"
+        ), patch.object(
+            m, "_upgraded_on_disk", return_value=False
         ), patch(
             "signal.signal"
         ), patch(
@@ -3077,7 +3087,15 @@ class TestSetupReestablishesComponents:
 
         m.save_config({"ml": False, "ml_url": "http://10.0.0.9:3003", "api_key": "k"})
         fresh = {"version": "3.0.2", "server_dir": "/srv", "node": "/node"}
-        with patch.object(m, "log"):
+        # _finalize_config's tail is interactive (the /build link and the
+        # start prompt). Only the preserve-and-save half is under test.
+        with patch.object(m, "log"), patch.object(
+            m, "_ensure_build_link"
+        ), patch.object(m, "cmd_start"), patch.object(
+            m, "_offer_launchd_service", create=True
+        ), patch(
+            "builtins.input", return_value="n"
+        ):
             m._finalize_config(fresh)
 
         saved = m.load_config()
