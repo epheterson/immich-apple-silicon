@@ -33,18 +33,25 @@ _CACHE_TTL = 3  # seconds
 _static_hw: dict | None = None
 
 
-def _worker_enabled(config: dict) -> bool:
-    """Whether the microservices worker component is on, which is what decides
-    whether there is a local library and database to report on at all.
+def _component_on(config: dict, name: str) -> bool:
+    """Whether a component ("worker", "ml", "dashboard") is switched on.
 
     Deliberately a small duplicate of __main__._component_enabled rather than an
     import: the dashboard is spawned as `python -m immich_accelerator dashboard`,
     so __main__ is the running module, and importing it from here would load a
     second copy of it with its own state. Keep the two in sync.
     """
-    if "worker" in config:
-        return bool(config["worker"])
-    return not config.get("ml_only")
+    if name in config:
+        return bool(config[name])
+    if config.get("ml_only"):  # legacy preset: worker off, everything else on
+        return name != "worker"
+    return True
+
+
+def _worker_enabled(config: dict) -> bool:
+    """Whether the worker is on, which is what decides whether there is a local
+    library and database to report on at all."""
+    return _component_on(config, "worker")
 
 
 def _get_accelerator_version() -> str:
@@ -355,16 +362,25 @@ def get_status(config: dict) -> dict:
     else:
         vid_pct = 0
 
+    # A component the user switched off is omitted, not drawn dead. Same rule as
+    # the menu bar: "off because I said so" must not render as a red dot, or the
+    # dots stop meaning anything. The page renders whatever keys arrive, so
+    # leaving one out is the whole fix.
+    services = {}
+    if _worker_enabled(config):
+        services["worker"] = {
+            "alive": worker_alive,
+            "name": "Microservices Worker",
+            "rss_mb": worker_rss_mb,
+        }
+    if _component_on(config, "ml"):
+        services["ml"] = {"alive": ml_alive, "name": "ML Service"}
+    if _worker_enabled(config):
+        # Docker only means anything where the worker talks to a local library.
+        services["docker"] = {"alive": total_assets > 0, "name": "Docker (API)"}
+
     status = {
-        "services": {
-            "worker": {
-                "alive": worker_alive,
-                "name": "Microservices Worker",
-                "rss_mb": worker_rss_mb,
-            },
-            "ml": {"alive": ml_alive, "name": "ML Service"},
-            "docker": {"alive": total_assets > 0, "name": "Docker (API)"},
-        },
+        "services": services,
         "progress": {
             # Each bar uses Immich's own denominator: thumbnails/OCR over all
             # live assets, CLIP/faces over assets-with-previews.

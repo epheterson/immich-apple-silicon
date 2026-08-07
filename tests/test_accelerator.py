@@ -2648,3 +2648,53 @@ class TestReconcileML:
         ) as start:
             m.reconcile_ml({})
             start.assert_called_once()
+
+
+class TestDashboardComponentAwareness:
+    """The dashboard must agree with the CLI about what is switched on, and it
+    keeps its own copy of the rule (importing __main__ from a module launched as
+    __main__ would load a second copy of it)."""
+
+    def test_matches_main_precedence_exactly(self):
+        from immich_accelerator import dashboard as d
+        from immich_accelerator.__main__ import COMPONENTS, _component_enabled
+
+        configs = [
+            {},
+            {"dashboard": False},
+            {"ml": False},
+            {"worker": False},
+            {"ml_only": True},
+            {"ml_only": True, "worker": True},
+        ]
+        for cfg in configs:
+            for name in COMPONENTS:
+                assert d._component_on(cfg, name) == _component_enabled(
+                    name, cfg
+                ), f"dashboard and CLI disagree on {name} for {cfg}"
+
+    def test_disabled_services_are_omitted_not_drawn_dead(self):
+        """The page renders whatever keys arrive, so omitting one is the fix:
+        a component switched off must not show as a red dot."""
+        from immich_accelerator import dashboard as d
+
+        def status_for(config):
+            # get_status memoizes for _CACHE_TTL seconds; clear it so the second
+            # call re-evaluates instead of replaying the first.
+            d._cache, d._cache_ts = {}, 0
+            return d.get_status(config)["services"]
+
+        with patch.object(d, "_query_db", return_value=""), patch.object(
+            d, "_run", return_value=""
+        ), patch.object(d, "_get_accelerator_version", return_value="1.9.0"):
+            off = status_for({"ml": False, "immich_url": ""})
+            on = status_for({"immich_url": ""})
+            worker_off = status_for({"worker": False, "immich_url": ""})
+        assert "ml" not in off
+        assert "ml" in on
+        assert "worker" in off
+        # No worker means no local library, so the Docker/API dot is meaningless
+        # too and would sit red forever on an ML-only node.
+        assert "worker" not in worker_off
+        assert "docker" not in worker_off
+        assert "ml" in worker_off
