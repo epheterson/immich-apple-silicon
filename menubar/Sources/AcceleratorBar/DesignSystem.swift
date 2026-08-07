@@ -90,6 +90,34 @@ struct InsetDivider: View {
     }
 }
 
+/// Sets the host window's title from SwiftUI.
+///
+/// `navigationTitle` on a `NavigationSplitView` does not place the title the
+/// same way on every macOS: on 15 it lands centered in the title bar, on 26 it
+/// renders leading beside the traffic lights. Setting the NSWindow's own title
+/// and letting AppKit place it is the same on both. It also works for any host,
+/// which the off-screen `render` path needs.
+struct WindowTitle: NSViewRepresentable {
+    let title: String
+
+    func makeNSView(context: Context) -> NSView { NSView() }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        // Deferred: during an update pass the view is not in a window yet on
+        // first appearance.
+        let title = self.title
+        DispatchQueue.main.async {
+            guard let window = view.window else { return }
+            window.title = title
+            // Keep the title as the window's identity (Mission Control, the
+            // Window menu, screenshots) but stop the title bar drawing it, or
+            // it shows twice: once leading from AppKit and once centered from
+            // the .principal toolbar item.
+            window.titleVisibility = .hidden
+        }
+    }
+}
+
 /// A settings sidebar glyph: a white SF Symbol on a tinted rounded square.
 ///
 /// This is the detail that makes a sidebar read as a macOS settings window

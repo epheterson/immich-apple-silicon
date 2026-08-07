@@ -103,12 +103,20 @@ struct SettingsView: View {
             .toolbar(removing: .sidebarToggle)
         } detail: {
             detail
+                // .principal is the supported way to center content in the
+                // title bar. navigationTitle lands centered on macOS 15 but
+                // leading on macOS 26 (the release gate runs 26), and neither
+                // setting NSWindow.title nor dropping the toolbar moved it,
+                // because the split view places its own title.
+                .toolbar {
+                    ToolbarItem(placement: .principal) {
+                        Text(pane?.title ?? "Settings").font(.headline)
+                    }
+                }
         }
-        // On the split view, not on the detail. Applied to the detail it
-        // becomes that column's inline toolbar title and sits left-aligned
-        // above the content; applied here it is the window's title, which
-        // macOS centers, which is where a window title belongs.
-        .navigationTitle(pane?.title ?? "Settings")
+        // Still set on the window, so the title is right in Mission Control,
+        // the Window menu and any screenshot of the title bar.
+        .background(WindowTitle(title: pane?.title ?? "Settings"))
         // Fixed, so switching panes doesn't resize the window under the pointer.
         .frame(width: Metrics.settingsWidth, height: Metrics.settingsHeight)
         .onAppear(perform: load)
@@ -213,9 +221,10 @@ struct SettingsView: View {
                                 "Search, faces, OCR")
                 componentToggle("dashboard", $dashboardOn, "Web dashboard",
                                 dashboardStatus)
-            } header: {
-                Text("What this Mac runs")
             } footer: {
+                // No section header. The window title already says
+                // "Components", and a heading under it restating the same
+                // thing in different words is just noise.
                 Text("Switching a component off stops it now and keeps it off across restarts. The others keep running, and Immich carries on handling that work itself.")
                     .font(.rowDetail).foregroundStyle(.secondary)
             }
