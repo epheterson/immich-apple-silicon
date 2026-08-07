@@ -22,7 +22,13 @@ enum Metrics {
     /// Panel width. 300 is the narrowest that fits "1,234 processing · 5,678
     /// queued" without truncating, which is the longest line the panel shows.
     static let panelWidth: CGFloat = 300
-    static let settingsWidth: CGFloat = 460
+
+    /// Settings window. Fixed in both axes: the four tabs have different
+    /// natural heights, and letting each pick its own means the window jumps
+    /// every time you switch. Height is the tallest tab (Diagnostics), so no
+    /// tab has to scroll on a default install.
+    static let settingsWidth: CGFloat = 520
+    static let settingsHeight: CGFloat = 460
 
     /// The icon gutter. Every leading icon reserves the same width in every
     /// window, so labels form one vertical edge whether or not a given row has

@@ -1,11 +1,25 @@
 import SwiftUI
 
-// A compact settings/info window: see how the accelerator is wired, switch the
-// ML engine, and reach the config and logs. Read-mostly; the one mutation
-// (engine switch) is explicit and warns that it restarts the service.
+/// The settings window.
+///
+/// Four tabs, each a grouped `Form`. That structure is doing real work, not
+/// decoration. The previous version stacked six `GroupBox`es in one scrolling
+/// column and hand-built every row, which produced exactly the defects you get
+/// from hand-building rows: each `Toggle` sat immediately after its own label,
+/// so three switches landed at three different x positions; the Components box
+/// hugged its content and was visibly narrower than its neighbours because
+/// nothing inside it was full width; and the component titles used the default
+/// body font while every other row used `.callout`, so they read oversized.
+///
+/// A grouped `Form` gives all of that away for free. macOS owns the label
+/// column, right-aligns the controls, sizes the cards to the window and picks
+/// the fonts, which is also why it will keep matching System Settings after the
+/// next macOS release instead of drifting away from it.
 struct SettingsView: View {
     @ObservedObject var model: StatusModel
-    @AppStorage("hasOnboarded") private var hasOnboarded = false
+
+    private enum Tab: Hashable { case general, components, ml, diagnostics }
+    @State private var tab: Tab = .general
 
     // Populated at construction (not just onAppear) so the window has real
     // values immediately and an off-screen ImageRenderer capture isn't blank.
@@ -14,6 +28,7 @@ struct SettingsView: View {
     @State private var savedEngine = "native"
     @State private var revealKey = false
     @State private var applying = false
+    @State private var testing = false
     @State private var workerOn = true
     @State private var mlOn = true
     @State private var dashboardOn = true
@@ -26,17 +41,24 @@ struct SettingsView: View {
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Metrics.xl) {
-            mlSection
-            componentsSection
-            configSection
-            keySection
-            updatesSection
-            Divider()
-            footer
+        TabView(selection: $tab) {
+            generalTab
+                .tabItem { Label("General", systemImage: "gearshape") }
+                .tag(Tab.general)
+            componentsTab
+                .tabItem { Label("Components", systemImage: "square.stack.3d.up") }
+                .tag(Tab.components)
+            mlTab
+                .tabItem { Label("Machine Learning", systemImage: "brain") }
+                .tag(Tab.ml)
+            diagnosticsTab
+                .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
+                .tag(Tab.diagnostics)
         }
-        .padding(Metrics.xxl)
-        .frame(width: Metrics.settingsWidth)
+        // Fixed, so switching tabs doesn't resize the window under the pointer.
+        // Sized to the tallest tab (Diagnostics) rather than letting each tab
+        // pick its own height.
+        .frame(width: Metrics.settingsWidth, height: Metrics.settingsHeight)
         .onAppear(perform: load)
     }
 
@@ -56,99 +78,89 @@ struct SettingsView: View {
         dashboardOn = StatusModel.componentEnabled("dashboard", config)
     }
 
-    // MARK: - sections
+    // MARK: - General
 
-    private var configSection: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: Metrics.rowPadV) {
-                ForEach(Diagnostics.checks(config: config, snap: model.snap)) { c in
-                    HStack(alignment: .firstTextBaseline, spacing: Metrics.md) {
-                        Image(systemName: c.iconName)
-                            .symbolRenderingMode(.hierarchical)
-                            .foregroundStyle(c.tint)
-                            .frame(width: Metrics.iconColumn, alignment: .center)
-                        Text(c.label).foregroundStyle(.secondary)
-                            .frame(width: 96, alignment: .leading)
-                        Text(c.detail).textSelection(.enabled)
-                            .foregroundStyle(c.level == .fail ? .primary : .secondary)
-                            // Long paths belong on two lines, not truncated to
-                            // uselessness: this list exists to be read and
-                            // pasted into an issue.
-                            .fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: 0)
+    private var generalTab: some View {
+        Form {
+            Section {
+                LabeledContent("Accelerator") {
+                    HStack(spacing: Metrics.md) {
+                        Text(model.snap.overall.label)
+                        StatusDot(state: model.snap.overall)
                     }
-                    .font(.callout)
                 }
-                HStack {
-                    Spacer()
-                    Button {
-                        Actions.copyToPasteboard(
-                            Diagnostics.copyText(config: config, snap: model.snap))
-                    } label: {
-                        Label("Copy for issue report", systemImage: "doc.on.clipboard")
-                    }
-                    .controlSize(.small)
-                    .help("Copies versions, this checklist, and recent log lines. No API key.")
-                }
+                LabeledContent("Immich", value: immichSummary)
             }
-            .padding(Metrics.sm)
-        } label: { Label("Configuration", systemImage: "checklist") }
-    }
 
-    private var mlSection: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: Metrics.lg) {
-                Picker("Engine", selection: $engine) {
-                    Text("Native (Swift)").tag("native")
-                    Text("Python (venv)").tag("python")
-                }
-                .pickerStyle(.segmented)
-                row("Running", model.snap.mlUp ? model.snap.mlEngine.badge : "stopped")
-                row("Port", str("ml_port"))
-                if engine != savedEngine {
-                    HStack(spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                        Text("Restarts the accelerator to take effect.")
-                            .font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        Button(applying ? "Applying…" : "Apply") {
-                            applying = true
-                            Task {
-                                await Actions.setMLEngine(engine)
-                                savedEngine = engine
-                                await model.refresh()
-                                applying = false
-                            }
-                        }
-                        .disabled(applying)
+            Section {
+                Toggle("Launch menu bar at login", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
+            } header: {
+                Text("Startup")
+            } footer: {
+                // The distinction people actually get wrong: this switch is
+                // about the menu bar icon, not about whether photos get
+                // processed. The background service is brew's, and it runs
+                // whether or not anyone is logged in.
+                Text("The accelerator itself runs as a background service and is unaffected by this.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
+            }
+
+            Section("Software Update") {
+                LabeledContent("Menu bar app", value: "v\(appVersion)")
+                LabeledContent("Core", value: model.snap.version.isEmpty
+                               ? "unknown" : "v\(model.snap.version)")
+                Button("Check for Updates…") { UpdaterModel.shared.checkForUpdates() }
+            }
+
+            Section {
+                LabeledContent("Files") {
+                    HStack(spacing: Metrics.md) {
+                        Button("Reveal Config") { Actions.revealConfig() }
+                        Button("Open Logs") { Actions.openLogs() }
                     }
                 }
             }
-            .padding(Metrics.sm)
-        } label: { Label("Machine Learning", systemImage: "brain.fill") }
+        }
+        .formStyle(.grouped)
     }
 
-    // The accelerator's three separable processes. This is as fine-grained as
-    // it gets: video, thumbnails and RAW decode all run inside the one worker,
-    // so which of those happen is Immich's job scheduler, not ours.
-    private var componentsSection: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: Metrics.lg) {
+    private var immichSummary: String {
+        let url = model.snap.immichURL.isEmpty ? "not configured" : model.snap.immichURL
+        return model.snap.immichVersion.isEmpty ? url : "v\(model.snap.immichVersion) · \(url)"
+    }
+
+    // MARK: - Components
+
+    /// The accelerator's three separable processes. This is as fine-grained as
+    /// it gets: video, thumbnails and RAW decode all run inside the one worker,
+    /// so which of those happen is Immich's job scheduler, not ours.
+    private var componentsTab: some View {
+        Form {
+            Section {
                 componentToggle("worker", $workerOn, "Worker",
                                 "Thumbnails, video transcoding, metadata")
                 componentToggle("ml", $mlOn, "Machine Learning",
                                 "Search, faces, OCR")
                 componentToggle("dashboard", $dashboardOn, "Web dashboard",
                                 dashboardStatus)
-                if let componentError {
+            } header: {
+                Text("What this Mac runs")
+            } footer: {
+                Text("Switching a component off stops it now and keeps it off across restarts. The others keep running, and Immich carries on handling that work itself.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
+            }
+
+            if let componentError {
+                Section {
                     Label(componentError, systemImage: "exclamationmark.triangle.fill")
                         .font(.rowDetail)
                         .foregroundStyle(.red)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .padding(Metrics.sm)
-        } label: { Label("Components", systemImage: "square.stack.3d.up") }
+        }
+        .formStyle(.grouped)
     }
 
     private func componentToggle(
@@ -179,22 +191,27 @@ struct SettingsView: View {
                 }
             })
 
-        return VStack(alignment: .leading, spacing: Metrics.xs) {
-            HStack(spacing: Metrics.md) {
-                Toggle(isOn: action) { Text(title) }
-                    .toggleStyle(.switch)
-                    .disabled(applyingComponent != nil)
-                // Turning the worker on runs a full start (extract, verify
-                // sharp, preflight) and can take minutes. A row that just went
-                // dead with no explanation reads as a hang.
-                if applyingComponent == name {
-                    ProgressView().controlSize(.small)
-                    Text(binding.wrappedValue ? "Starting…" : "Stopping…")
-                        .font(.rowDetail).foregroundStyle(.secondary)
+        // Toggle owns the whole row: in a grouped Form macOS puts the label at
+        // the leading edge and the switch at the trailing edge, so the three
+        // switches line up regardless of how long their labels are.
+        return Toggle(isOn: action) {
+            VStack(alignment: .leading, spacing: Metrics.xs) {
+                HStack(spacing: Metrics.md) {
+                    Text(title)
+                    // Turning the worker on runs a full start (extract, verify
+                    // sharp, preflight) and can take minutes. A row that just
+                    // went dead with no explanation reads as a hang.
+                    if applyingComponent == name {
+                        ProgressView().controlSize(.small)
+                        Text(binding.wrappedValue ? "Starting…" : "Stopping…")
+                            .font(.rowDetail).foregroundStyle(.secondary)
+                    }
                 }
+                Text(caption).font(.rowDetail).foregroundStyle(.secondary)
             }
-            Text(caption).font(.rowDetail).foregroundStyle(.secondary)
         }
+        .toggleStyle(.switch)
+        .disabled(applyingComponent != nil)
     }
 
     // Live state from the probe (not the toggle): reflects whether it actually
@@ -205,80 +222,154 @@ struct SettingsView: View {
             ? "Running on localhost:\(model.snap.dashboardPort)" : "Starting…"
     }
 
-    private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-    }
+    // MARK: - Machine Learning
 
-    private var updatesSection: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 6) {
-                row("Menu bar app", "v\(appVersion)")
-                row("Core", model.snap.version.isEmpty ? "-" : "v\(model.snap.version)")
-                // The core auto-follows the app (see AppDelegate.syncCoreVersion);
-                // this button drives the app's own Sparkle check.
-                HStack {
-                    Button("Check for Updates…") { UpdaterModel.shared.checkForUpdates() }
-                    Spacer()
+    private var mlTab: some View {
+        Form {
+            Section {
+                Picker("Engine", selection: $engine) {
+                    Text("Native (Swift)").tag("native")
+                    Text("Python (venv)").tag("python")
+                }
+                .pickerStyle(.segmented)
+                LabeledContent("Running") {
+                    if model.snap.mlUp {
+                        BadgeLabel(text: model.snap.mlEngine.badge,
+                                   tint: model.snap.mlEngine == .native ? .green : .orange)
+                    } else {
+                        Text(model.snap.mlEnabled ? "Stopped" : "Off")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                LabeledContent("Port", value: str("ml_port"))
+            } header: {
+                Text("Engine")
+            } footer: {
+                if engine != savedEngine {
+                    HStack(spacing: Metrics.md) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text("Restarts the accelerator to take effect.")
+                            .font(.rowDetail).foregroundStyle(.secondary)
+                        Spacer()
+                        Button(applying ? "Applying…" : "Apply") {
+                            applying = true
+                            Task {
+                                await Actions.setMLEngine(engine)
+                                savedEngine = engine
+                                await model.refresh()
+                                applying = false
+                            }
+                        }
+                        .disabled(applying)
+                    }
                 }
             }
-            .padding(4)
-        } label: { Label("Software Update", systemImage: "arrow.down.circle") }
-    }
 
-    private var apiKey: String { config["api_key"] as? String ?? "" }
-
-    private var keySection: some View {
-        GroupBox {
-            HStack(spacing: 8) {
-                Text("API key").foregroundStyle(.secondary)
-                    .frame(width: 90, alignment: .leading)
-                // Distinguish a genuinely-missing key (breaks job counts and
-                // authenticated calls) from a present-but-hidden one.
-                Text(apiKey.isEmpty ? "not set"
-                     : (revealKey ? apiKey : String(repeating: "•", count: 24)))
-                    .font(.system(.callout, design: .monospaced))
-                    .foregroundStyle(apiKey.isEmpty ? .secondary : .primary)
-                    .textSelection(.enabled)
-                Spacer()
-                if !apiKey.isEmpty {
-                    Button {
-                        revealKey.toggle()
-                    } label: { Image(systemName: revealKey ? "eye.slash" : "eye") }
-                        .buttonStyle(.borderless)
+            Section {
+                LabeledContent("Self-test") {
+                    Button(testing ? "Running…" : "Run") { runMLTest() }
+                        .disabled(testing || !model.snap.mlHealthy)
                 }
+                if let result = model.lastMLTest {
+                    let passed = result.contains("OK") || result.contains("passed")
+                    Label(result, systemImage: passed
+                          ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .foregroundStyle(passed ? .green : .red)
+                        .font(.rowDetail)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } footer: {
+                Text("Sends a real image through CLIP, face detection and OCR, and reports what came back.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
             }
-            .padding(4)
-        } label: { Label("Credentials", systemImage: "key.fill") }
+        }
+        .formStyle(.grouped)
     }
 
-    private var footer: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Toggle(isOn: $launchAtLogin) { Text("Launch menu bar at login") }
-                .toggleStyle(.switch)
-                .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
-            HStack(spacing: 10) {
-                Button("Reveal Config") { Actions.revealConfig() }
-                Button("Open Logs") { Actions.openLogs() }
-                Spacer()
-                Text("v\(model.snap.version)").font(.caption).foregroundStyle(.secondary)
-            }
+    private func runMLTest() {
+        guard model.snap.mlHealthy, !testing else { return }
+        testing = true
+        Task {
+            model.lastMLTest = await Actions.mlTest()
+            testing = false
         }
     }
 
+    // MARK: - Diagnostics
+
+    private var diagnosticsTab: some View {
+        Form {
+            Section("Configuration") {
+                ForEach(Diagnostics.checks(config: config, snap: model.snap)) { c in
+                    LabeledContent {
+                        Text(c.detail).textSelection(.enabled)
+                            .foregroundStyle(c.level == .fail ? .primary : .secondary)
+                            // Long paths belong on two lines, not truncated to
+                            // uselessness: this list exists to be read and
+                            // pasted into an issue.
+                            .fixedSize(horizontal: false, vertical: true)
+                            .multilineTextAlignment(.trailing)
+                    } label: {
+                        HStack(spacing: Metrics.md) {
+                            Image(systemName: c.iconName)
+                                .symbolRenderingMode(.hierarchical)
+                                .foregroundStyle(c.tint)
+                                .frame(width: Metrics.iconColumn, alignment: .center)
+                            Text(c.label)
+                        }
+                    }
+                }
+            }
+
+            Section("Credentials") {
+                LabeledContent("API key") {
+                    HStack(spacing: Metrics.md) {
+                        // Distinguish a genuinely-missing key (breaks job counts
+                        // and authenticated calls) from a present-but-hidden one.
+                        Text(apiKey.isEmpty ? "not set"
+                             : (revealKey ? apiKey : String(repeating: "•", count: 24)))
+                            .font(.system(.callout, design: .monospaced))
+                            .foregroundStyle(apiKey.isEmpty ? .secondary : .primary)
+                            .textSelection(.enabled)
+                        if !apiKey.isEmpty {
+                            Button {
+                                revealKey.toggle()
+                            } label: { Image(systemName: revealKey ? "eye.slash" : "eye") }
+                                .buttonStyle(.borderless)
+                        }
+                    }
+                }
+            }
+
+            Section {
+                LabeledContent("Issue report") {
+                    Button {
+                        Actions.copyToPasteboard(
+                            Diagnostics.copyText(config: config, snap: model.snap))
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.clipboard")
+                    }
+                }
+            } footer: {
+                Text("Copies versions, this checklist and recent log lines. Never the API key.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
     // MARK: - helpers
+
+    private var apiKey: String { config["api_key"] as? String ?? "" }
+
+    private var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+    }
 
     private func str(_ key: String) -> String {
         if let s = config[key] as? String { return s }
         if let i = config[key] as? Int { return String(i) }
         return "-"
-    }
-
-    private func row(_ label: String, _ value: String) -> some View {
-        HStack(spacing: 8) {
-            Text(label).foregroundStyle(.secondary).frame(width: 90, alignment: .leading)
-            Text(value).textSelection(.enabled)
-            Spacer()
-        }
-        .font(.callout)
     }
 }
