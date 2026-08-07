@@ -11,6 +11,7 @@
 
 ### Changed
 - **CLIP models in the model zoo are roughly twice as fast.** onnxruntime was pinned to a single thread, set when the engine only ran face recognition and never revisited when the model zoo landed in 1.7.0. Measured on an M4: ViT-B-16 347ms to 181ms, ViT-B-16-SigLIP 357ms to 163ms, with byte-identical embeddings, so existing search indexes are unaffected. Found and fixed by [@lesurJ](https://github.com/lesurJ) ([#118](https://github.com/epheterson/immich-apple-silicon/pull/118)).
+- **Menu bar: per-queue progress.** Thumbnails, Search, Faces, Text and Video each get a progress bar and a remaining count instead of one aggregate "N processing". Only queues with work left are shown. This reads the accelerator's own dashboard API, so it appears when the dashboard is enabled and the panel simply omits it when not; the menu bar still works with the dashboard switched off. The idea comes from [Immich-Accelerator-Helper](https://github.com/pl4za/Immich-Accelerator-Helper) by [@pl4za](https://github.com/pl4za), which surfaced this data before we did.
 - **Menu bar: a component you turn off disappears rather than showing red.** The status icon also stops judging components you turned off, so an ML-only Mac no longer sits amber forever for missing a worker it was told not to run.
 - **`status` distinguishes "disabled" from "stopped".**
 

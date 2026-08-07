@@ -788,11 +788,9 @@ class TestDashboardToggle:
         # Alive until it is killed, gone afterwards. A constant pid would mean
         # "we killed it and it is still running", which the toggle is now
         # supposed to report as a failure.
-        with patch(
-            "immich_accelerator.__main__.read_pid", return_value=4321
-        ), patch("immich_accelerator.__main__.kill_pid") as kill, patch(
-            "immich_accelerator.__main__._pid_on_port", return_value=None
-        ):
+        with patch("immich_accelerator.__main__.read_pid", return_value=4321), patch(
+            "immich_accelerator.__main__.kill_pid"
+        ) as kill, patch("immich_accelerator.__main__._pid_on_port", return_value=None):
             cmd_dashboard(args)
             kill.assert_called_once_with("dashboard")
         assert load_config().get("dashboard") is False
@@ -805,11 +803,11 @@ class TestDashboardToggle:
         args = argparse.Namespace(state="off", port=8420)
         with patch("immich_accelerator.__main__.read_pid", return_value=4321), patch(
             "immich_accelerator.__main__.kill_pid"
-        ), patch(
-            "immich_accelerator.__main__._pid_on_port", return_value=4321
-        ), patch(
+        ), patch("immich_accelerator.__main__._pid_on_port", return_value=4321), patch(
             "immich_accelerator.__main__._process_is_our_dashboard", return_value=True
-        ), pytest.raises(SystemExit) as e:
+        ), pytest.raises(
+            SystemExit
+        ) as e:
             cmd_dashboard(args)
         assert e.value.code == 1
 
@@ -2491,7 +2489,11 @@ class TestComponentToggle:
 
     def test_worker_toggle_reports_failure_when_nothing_started(self, tmp_data_dir):
         """cmd_start reports most failures by logging and returning, so whether
-        a worker actually came up is the only trustworthy signal."""
+        a worker actually came up is the only trustworthy signal.
+
+        _watcher_running MUST be patched. Without it this test asks the machine
+        it happens to run on whether a watcher is up, and inverts its result:
+        green on a laptop, red on the Mac Mini where one really is running."""
         import immich_accelerator.__main__ as m
 
         cfg = {**self.WORKER_CFG, "worker": False}
@@ -2500,7 +2502,7 @@ class TestComponentToggle:
         ), patch.object(m, "cmd_start"), patch.object(
             m, "read_pid", return_value=None
         ), patch.object(
-            m, "_start_lock"
+            m, "_watcher_running", return_value=False
         ):
             assert m._set_component("worker", True) is False
 
@@ -2813,9 +2815,9 @@ class TestStartIsSerialized:
         import immich_accelerator.__main__ as m
 
         for fn in (m._set_component, m._restart_worker):
-            assert "_start_lock" not in inspect.getsource(fn), (
-                f"{fn.__name__} must not take the lock; cmd_start does"
-            )
+            assert "_start_lock" not in inspect.getsource(
+                fn
+            ), f"{fn.__name__} must not take the lock; cmd_start does"
 
 
 class _NullCtx:
@@ -2849,9 +2851,11 @@ class TestRestartWorkerDelegatesToTheWatcher:
         import immich_accelerator.__main__ as m
 
         pids = iter([999, None, None])
-        with patch.object(m, "read_pid", side_effect=lambda n: next(pids)), patch.object(
-            m, "kill_pid"
-        ), patch.object(m, "_watcher_running", return_value=False), patch.object(
+        with patch.object(
+            m, "read_pid", side_effect=lambda n: next(pids)
+        ), patch.object(m, "kill_pid"), patch.object(
+            m, "_watcher_running", return_value=False
+        ), patch.object(
             m, "cmd_start"
         ) as start:
             assert m._restart_worker("for a test") is False
