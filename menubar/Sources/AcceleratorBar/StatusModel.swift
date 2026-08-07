@@ -36,6 +36,10 @@ struct QueueProgress: Equatable, Identifiable {
     var id: String { key }
     var fraction: Double { total > 0 ? min(Double(done) / Double(total), 1) : 0 }
     var complete: Bool { total > 0 && done >= total }
+    /// Clamped: done can briefly exceed total because the asset-total and
+    /// per-stage-done counts are taken by separate queries and the library can
+    /// change between them. "-3 remaining" is not a thing to show anyone.
+    var remaining: Int { max(total - done, 0) }
 }
 
 struct Snapshot: Equatable {
@@ -161,6 +165,12 @@ final class StatusModel: ObservableObject {
     @Published var busy = false
 
     private var timer: Timer?
+    /// True while refresh() is awaiting its probes. The timer skips a tick
+    /// rather than stacking a second pass on top of a slow one: the probes have
+    /// timeouts up to 6s and the panel polls every 3s, so without this a
+    /// wedged endpoint would let ticks pile up and let an older snapshot land
+    /// after a newer one.
+    private var refreshing = false
 
     init() {
         // Background cadence from launch so the menu-bar icon is accurate before
@@ -175,7 +185,10 @@ final class StatusModel: ObservableObject {
         // event-tracking mode, and a .default-mode timer stops firing, so the
         // panel would freeze on whatever it showed when it opened.
         let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.refresh() }
+            Task { @MainActor in
+                guard let self, !self.refreshing else { return }
+                await self.refresh()
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
@@ -185,6 +198,8 @@ final class StatusModel: ObservableObject {
     func stopPolling() { timer?.invalidate(); timer = nil }
 
     func refresh() async {
+        refreshing = true
+        defer { refreshing = false }
         // The pidfile/ps/config probes fork subprocesses and touch the disk;
         // run them off the main actor so a poll never hitches the UI thread.
         let p = await Task.detached(priority: .utility) { Self.probeProcesses() }.value
@@ -209,6 +224,10 @@ final class StatusModel: ObservableObject {
         async let healthy = p.mlEnabled ? Self.ping(port: p.mlPort) : false
         async let jobs = Self.jobCounts(base: p.immichURL, apiKey: p.apiKey)
         async let reachable = Self.serverReachable(base: p.immichURL)
+        // No dashboard, no source: [] rather than nil, because "we have nowhere
+        // to ask" really is "no queue data", and holding stale rows from before
+        // the dashboard was switched off would keep showing numbers nothing is
+        // refreshing.
         async let queues = p.dashboardUp
             ? Self.queueProgress(port: p.dashboardPort) : []
         async let fetching = p.mlUp ? Self.downloadProgress(port: p.mlPort) : nil
@@ -224,7 +243,10 @@ final class StatusModel: ObservableObject {
         s.jobsWaiting = counts.waiting
         s.immichReachable = await reachable
         s.apiKeyValid = counts.authed
-        s.queues = await queues
+        // nil means the dashboard did not answer in time. Keep what we last
+        // knew: a slow poll is not news, and dropping the rows for one cycle
+        // resizes the panel under the user's pointer.
+        s.queues = (await queues) ?? snap.queues
 
         snap = s
     }
@@ -272,18 +294,24 @@ final class StatusModel: ObservableObject {
     /// read it here, so the panel showed one aggregate number while the data
     /// for five real progress bars sat one HTTP call away.
     ///
-    /// Returns [] on any failure. A dashboard that is down, slow or wedged must
-    /// cost the panel nothing but these rows.
-    nonisolated static func queueProgress(port: Int) async -> [QueueProgress] {
+    /// Returns nil when we could not ask, which is not the same as "no queues"
+    /// and must not be rendered as one. This endpoint runs real SQL against
+    /// Immich's database behind a 5s cache: on a 174k-asset library it answers
+    /// in ~20ms warm and ~1.4s cold, so a 3s poll pays the cold cost about
+    /// every other time and a load spike pushes it past any tight timeout.
+    /// Treating that as "no data" blanked the rows, and the panel visibly
+    /// shrank and regrew every few seconds. The caller keeps the last good
+    /// answer instead (see refresh).
+    nonisolated static func queueProgress(port: Int) async -> [QueueProgress]? {
         guard let url = URL(string: "http://127.0.0.1:\(port)/api/status")
-        else { return [] }
+        else { return nil }
         var req = URLRequest(url: url)
-        req.timeoutInterval = 2
+        req.timeoutInterval = 6
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let progress = root["progress"] as? [String: Any]
-        else { return [] }
+        else { return nil }
 
         // Fixed order and our own labels: the API keys are storage names, and
         // the order they serialize in is not a thing to show a person.

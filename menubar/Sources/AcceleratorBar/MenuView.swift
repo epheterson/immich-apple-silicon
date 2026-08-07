@@ -5,6 +5,9 @@ struct MenuView: View {
     @ObservedObject var model: StatusModel
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
     @State private var testing = false
+    /// The queue rows on screen. Which rows exist is decided once per opening
+    /// and then frozen; only their values track the model. See syncQueueRows.
+    @State private var queueRows: [QueueProgress] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -17,8 +20,36 @@ struct MenuView: View {
             footer
         }
         .frame(width: Metrics.panelWidth)
-        .onAppear { model.startPolling(interval: 3) }
-        .onDisappear { model.startPolling(interval: 15) }
+        .onAppear {
+            model.startPolling(interval: 3)
+            syncQueueRows(model.snap.queues)
+        }
+        .onChange(of: model.snap.queues) { _, new in syncQueueRows(new) }
+        .onDisappear {
+            model.startPolling(interval: 15)
+            // Re-decide on the next opening, so a queue that finished while the
+            // panel was shut stops taking up a row.
+            queueRows = []
+        }
+    }
+
+    /// Update the queue rows without ever changing how many there are.
+    ///
+    /// A menu that resizes while the pointer is in it is the single worst thing
+    /// a panel like this can do, and this one had two ways to do it: a queue
+    /// crossing 100% dropped its row, and any slow dashboard poll dropped all
+    /// of them at once. The second is fixed at the source (StatusModel keeps
+    /// the last good answer); this fixes the first, and makes the panel's
+    /// height a function of when you opened it rather than of what happened to
+    /// finish while you were reading it.
+    private func syncQueueRows(_ incoming: [QueueProgress]) {
+        guard !incoming.isEmpty else { return }
+        if queueRows.isEmpty {
+            queueRows = incoming.filter { !$0.complete }
+            return
+        }
+        let latest = Dictionary(incoming.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
+        queueRows = queueRows.map { latest[$0.key] ?? $0 }
     }
 
     private var header: some View {
@@ -33,11 +64,16 @@ struct MenuView: View {
                 Text(subtitle).font(.rowDetail).foregroundStyle(.secondary)
             }
             Spacer(minLength: Metrics.md)
-            // One state signal, not two. The bolt tints with health already;
-            // a dot beside it repeated the same fact in a second vocabulary.
-            Text(model.snap.overall.label)
-                .font(.badge)
-                .foregroundStyle(model.snap.overall == .running ? .secondary : .primary)
+            // The word only when it is worth saying. "Running" next to a green
+            // dot next to a tinted bolt states one fact three times, and the
+            // healthy case is the one the user sees every day. Degraded and
+            // stopped are worth naming, because a color alone does not say
+            // which of the two it is.
+            if model.snap.overall != .running {
+                Text(model.snap.overall.label)
+                    .font(.badge)
+                    .foregroundStyle(.primary)
+            }
             StatusDot(state: model.snap.overall)
         }
         .panelGutter()
@@ -63,11 +99,13 @@ struct MenuView: View {
                     detail: workerDetail, ok: model.snap.workerUp)
             }
             if model.snap.mlEnabled {
+                // The engine (NATIVE / PYTHON) used to ride here as a badge.
+                // It is a setting, not a status: it changes when you change it
+                // and never on its own, so it belongs in Settings next to the
+                // control that sets it, not in the line you glance at daily.
                 StatusRow(
                     icon: "brain.fill", name: "Machine Learning",
-                    detail: mlDetail, ok: model.snap.mlHealthy,
-                    badge: model.snap.mlUp ? model.snap.mlEngine.badge : nil,
-                    badgeTint: model.snap.mlEngine == .native ? .green : .orange)
+                    detail: mlDetail, ok: model.snap.mlHealthy)
                     .contentShape(Rectangle())
                     .onTapGesture { runMLTest() }
                     .help("Click to run an ML self-test")
@@ -75,23 +113,30 @@ struct MenuView: View {
             // Per-queue progress, when the dashboard is serving it. Only the
             // queues with work left: five bars pinned at 100% is furniture, and
             // the interesting question is always what is still outstanding.
-            if model.snap.workerEnabled {
-                let pending = model.snap.queues.filter { !$0.complete }
-                if !pending.isEmpty {
-                    VStack(spacing: Metrics.sm) {
-                        ForEach(pending) { q in QueueRow(queue: q) }
-                    }
-                    .padding(.leading, Metrics.iconColumn + Metrics.md)
-                    .padding(.trailing, Metrics.rowPadV)
-                    .padding(.top, Metrics.xs)
-                    .padding(.bottom, Metrics.sm)
+            if model.snap.workerEnabled && !queueRows.isEmpty {
+                VStack(spacing: Metrics.sm) {
+                    ForEach(queueRows) { q in QueueRow(queue: q) }
                 }
+                .padding(.leading, Metrics.iconColumn + Metrics.md)
+                .padding(.trailing, Metrics.rowPadV)
+                .padding(.top, Metrics.xs)
+                .padding(.bottom, Metrics.sm)
             }
             if model.snap.dashboardEnabled {
                 StatusRow(
                     icon: "gauge.with.dots.needle.50percent", name: "Dashboard",
                     detail: model.snap.dashboardUp ? "localhost:\(model.snap.dashboardPort)" : "Not running",
                     ok: model.snap.dashboardUp)
+                    // The row names a URL, so clicking it should go there. The
+                    // footer link stays for discoverability; this is for the
+                    // people who point at the thing they want.
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        guard model.snap.dashboardUp else { return }
+                        Actions.openDashboard(port: model.snap.dashboardPort)
+                        WindowManager.shared.dismissMenuBarPanel()
+                    }
+                    .help(model.snap.dashboardUp ? "Click to open the dashboard" : "")
             }
             if !model.snap.workerEnabled && !model.snap.mlEnabled && !model.snap.dashboardEnabled {
                 Text("Every component is switched off.")
@@ -241,19 +286,12 @@ struct StatusRow: View {
     let name: String
     let detail: String
     let ok: Bool
-    var badge: String? = nil
-    var badgeTint: Color = .green
 
     var body: some View {
         HStack(spacing: Metrics.md) {
             RowIcon(systemName: icon, active: ok)
             VStack(alignment: .leading, spacing: Metrics.xs) {
-                HStack(spacing: Metrics.sm) {
-                    Text(name).font(.rowTitle)
-                    if let badge {
-                        BadgeLabel(text: badge, tint: badgeTint)
-                    }
-                }
+                Text(name).font(.rowTitle)
                 Text(detail).font(.rowDetail).foregroundStyle(.secondary)
             }
             Spacer(minLength: Metrics.md)
@@ -280,13 +318,15 @@ struct QueueRow: View {
             ProgressView(value: queue.fraction)
                 .progressViewStyle(.linear)
                 .controlSize(.small)
-            Text("\(queue.total - queue.done)")
+            // Grouped, because six-figure backlogs are normal here and
+            // "106220" is a number you have to count digits on.
+            Text(queue.remaining, format: .number.grouping(.automatic))
                 .font(.rowDetail)
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-                .frame(minWidth: 34, alignment: .trailing)
+                .frame(minWidth: 52, alignment: .trailing)
         }
-        .help("\(queue.done) of \(queue.total) done")
+        .help("\(queue.done.formatted()) of \(queue.total.formatted()) done")
     }
 }
 
