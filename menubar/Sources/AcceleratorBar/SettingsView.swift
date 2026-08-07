@@ -91,7 +91,13 @@ struct SettingsView: View {
                 }
                 .padding(.vertical, Metrics.xs)
             }
-            .navigationSplitViewColumnWidth(Metrics.settingsSidebarWidth)
+            // A plain frame, because neither form of
+            // navigationSplitViewColumnWidth moved it off the split view's own
+            // ~140pt default, which truncated "Machine Learning" to
+            // "Machine Le...". The width is not negotiable here anyway: the
+            // window is fixed, so there is nothing for the split view to
+            // trade against.
+            .frame(width: Metrics.settingsSidebarWidth)
             // No collapse control: a settings window with a hideable sidebar
             // can be left in a state with no way back to the other panes.
             .toolbar(removing: .sidebarToggle)

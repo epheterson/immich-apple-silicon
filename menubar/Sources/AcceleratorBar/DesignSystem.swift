@@ -33,7 +33,10 @@ enum Metrics {
     /// of checks, and scrolling a list is not a defect.
     static let settingsWidth: CGFloat = 700
     static let settingsHeight: CGFloat = 480
-    static let settingsSidebarWidth: CGFloat = 190
+    /// Wide enough for "Machine Learning" beside its glyph. At 190 it
+    /// truncated to "Machine Le...", which is the sort of thing that only
+    /// shows up when you render the window and look at it.
+    static let settingsSidebarWidth: CGFloat = 215
 
     /// The tinted rounded square behind a sidebar glyph. 20pt with a 5pt
     /// radius is what System Settings uses; smaller reads as a bullet and

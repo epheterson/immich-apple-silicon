@@ -17,7 +17,55 @@ struct AcceleratorBarMain {
             printStatus()
             return
         }
+        if let i = CommandLine.arguments.firstIndex(of: "render"),
+           CommandLine.arguments.count > i + 2 {
+            renderSettings(pane: CommandLine.arguments[i + 1],
+                           to: CommandLine.arguments[i + 2])
+            return
+        }
         AcceleratorBarApp.main()
+    }
+
+    /// Draw a Settings pane straight to a PNG. `render <pane> <path>`.
+    ///
+    /// Not a screenshot: the window renders itself into a bitmap through
+    /// cacheDisplay, so this needs no Screen Recording permission and works
+    /// over ssh on a headless session. Both matter here, because the Mac this
+    /// is validated on refuses screen capture and the release Mini has no GUI
+    /// session at all, which is why UI changes kept shipping unlooked-at.
+    @MainActor
+    private static func renderSettings(pane: String, to path: String) {
+        setenv("ACCEL_SETTINGS_TAB", pane, 1)
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+
+        let host = NSHostingController(rootView: SettingsView(model: .shared))
+        let window = NSWindow(contentViewController: host)
+        window.styleMask = [.titled, .closable]
+        window.title = "Immich Accelerator Settings"
+        window.orderFrontRegardless()
+
+        // Let layout, the status poll and any async row content settle. A
+        // single spin renders an empty split view.
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+
+        guard let view = window.contentView,
+              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)
+        else { print("render failed: no view"); return }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        guard let png = rep.representation(using: .png, properties: [:]) else {
+            print("render failed: no png")
+            return
+        }
+        do {
+            try png.write(to: URL(fileURLWithPath: path))
+            print("\(pane) -> \(path) \(rep.pixelsWide)x\(rep.pixelsHigh)")
+        } catch {
+            print("render failed: \(error)")
+        }
     }
 
     // Drive the @MainActor status dump to completion without blocking the main
