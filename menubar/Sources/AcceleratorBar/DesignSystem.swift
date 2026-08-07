@@ -25,10 +25,15 @@ enum Metrics {
 
     /// Settings window. Fixed in both axes: the four tabs have different
     /// natural heights, and letting each pick its own means the window jumps
-    /// every time you switch. Height is the tallest tab (Diagnostics), so no
-    /// tab has to scroll on a default install.
+    /// every time you switch tabs.
+    ///
+    /// 500 is set by General, the tallest tab that must not scroll, because
+    /// its last row is a pair of buttons and a half-visible button reads as a
+    /// broken window. Diagnostics can run past it and scroll: it is a list of
+    /// facts, it grows with the number of checks, and scrolling a list is
+    /// not a defect.
     static let settingsWidth: CGFloat = 520
-    static let settingsHeight: CGFloat = 460
+    static let settingsHeight: CGFloat = 500
 
     /// The icon gutter. Every leading icon reserves the same width in every
     /// window, so labels form one vertical edge whether or not a given row has

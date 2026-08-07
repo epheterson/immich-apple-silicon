@@ -18,8 +18,14 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var model: StatusModel
 
-    private enum Tab: Hashable { case general, components, ml, diagnostics }
-    @State private var tab: Tab = .general
+    private enum Tab: String, Hashable {
+        case general, components, ml, diagnostics
+    }
+    // ACCEL_SETTINGS_TAB picks the opening tab, so each one can be captured
+    // headlessly. Same dev affordance as ACCEL_SHOW_SETTINGS (see AppDelegate).
+    @State private var tab: Tab = Tab(
+        rawValue: ProcessInfo.processInfo.environment["ACCEL_SETTINGS_TAB"] ?? ""
+    ) ?? .general
 
     // Populated at construction (not just onAppear) so the window has real
     // values immediately and an off-screen ImageRenderer capture isn't blank.
@@ -242,8 +248,6 @@ struct SettingsView: View {
                     }
                 }
                 LabeledContent("Port", value: str("ml_port"))
-            } header: {
-                Text("Engine")
             } footer: {
                 if engine != savedEngine {
                     HStack(spacing: Metrics.md) {
