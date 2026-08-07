@@ -184,7 +184,9 @@ In the Immich admin UI (Administration → Jobs), tune the per-queue concurrency
 
 Higher isn't always better. Oversubscribing the CPU causes thrashing and actually reduces throughput.
 
-The ONNX models in the CLIP zoo (anything that isn't the default MLX model) let onnxruntime use every core, which is right on a Mac doing nothing else and less obviously right while the worker is transcoding on the same machine. `IMMICH_ACCEL_ML_THREADS=4` caps it without touching the worker. Unset means "use every core", which stays the default.
+The ONNX models in the CLIP zoo (anything that isn't the default MLX model) let onnxruntime use every core, which is right on a Mac doing nothing else and less obviously right while the worker is transcoding on the same machine. `IMMICH_ACCEL_ML_THREADS` caps it without touching the worker; unset means "use every core", which stays the default.
+
+The cap is close to free, because the parallelism saturates early. On an M4 with ViT-B-16, capping to 2 measured 179ms against 175ms uncapped, for 8 fewer threads competing with the worker. Try it if search feels like it's making the rest of the machine sluggish.
 
 ## Split deployment (NAS + Mac, or any two hosts)
 

@@ -2222,6 +2222,13 @@ def _dashboard_port() -> int:
 # so "video but not thumbnails" is Immich's job scheduler, not ours.
 COMPONENTS = ("worker", "ml", "dashboard")
 
+# How to say each one in a sentence. str.capitalize() turns "ml" into "Ml".
+COMPONENT_LABELS = {
+    "worker": "Worker",
+    "ml": "ML service",
+    "dashboard": "Dashboard",
+}
+
 
 def _component_enabled(name: str, config: dict | None = None) -> bool:
     """Whether a component should be running. Defaults True.
@@ -5186,12 +5193,12 @@ def _set_component(name: str, on: bool) -> None:
         elif read_pid("worker"):
             kill_pid("worker")
 
-    others = " and ".join(c for c in COMPONENTS if c != name)
+    others = " and ".join(COMPONENT_LABELS[c] for c in COMPONENTS if c != name)
     log.info(
         "%s %s. %s unaffected.",
-        name.capitalize(),
+        COMPONENT_LABELS[name],
         "enabled" if on else "disabled",
-        others.capitalize(),
+        others,
     )
     if not any(_component_enabled(c) for c in COMPONENTS):
         log.warning("Every component is now off, so nothing will run.")
