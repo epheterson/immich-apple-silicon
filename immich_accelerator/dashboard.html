@@ -294,7 +294,7 @@
   <div class="chip-grid" id="chips">
     <div class="chip-card"><div class="chip-header cpu">CPU (NEON)</div><div class="task-row"><div class="task-top"><div class="task-label">Thumbnails</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill cpu" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
     <div class="chip-card"><div class="chip-header gpu">Metal GPU</div><div class="task-row"><div class="task-top"><div class="task-label">CLIP Embeddings</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill gpu" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
-    <div class="chip-card"><div class="chip-header ane">Neural Engine</div><div class="task-row"><div class="task-top"><div class="task-label">Face Detection · OCR</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill ane" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
+    <div class="chip-card"><div class="chip-header ane">Neural Engine</div><div class="task-row"><div class="task-top"><div class="task-label">Face Detection</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill ane" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div><hr class="task-divider"><div class="task-row"><div class="task-top"><div class="task-label">Text (OCR)</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill ane" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
     <div class="chip-card"><div class="chip-header vtb">VideoToolbox</div><div class="task-row"><div class="task-top"><div class="task-label">Video Transcode</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill vtb" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
   </div>
 
@@ -320,8 +320,14 @@ const CHIPS = [
   { chip: 'gpu', chipLabel: 'Metal GPU', tasks: [
     { key: 'clip', rk: 'clip', label: 'CLIP Embeddings' },
   ]},
+  // Two rows, not one. These were merged into a single "Face Detection · OCR"
+  // bar, which could not be right: faces is counted over assets-with-previews
+  // and OCR over all live assets, so the two have different denominators and
+  // one bar had to misreport at least one of them. They also disagree whenever
+  // only one of the two queues has been run.
   { chip: 'ane', chipLabel: 'Neural Engine', tasks: [
-    { key: 'faces', rk: 'faces', label: 'Face Detection · OCR', altKey: 'ocr', altRk: 'ocr' },
+    { key: 'faces', rk: 'faces', label: 'Face Detection' },
+    { key: 'ocr', rk: 'ocr', label: 'Text (OCR)' },
   ]},
   { chip: 'vtb', chipLabel: 'VideoToolbox', tasks: [
     { key: 'video', rk: 'video', label: 'Video Transcode' },
@@ -416,15 +422,9 @@ function render(d) {
     const isMulti = chip.tasks.length > 1;
 
     chip.tasks.forEach((t, idx) => {
-      let p = d.progress[t.key];
-      let rate = rates[t.rk] || 0;
-      let qc = (d.queue_counts && d.queue_counts[t.key]) || 0;
-      if (t.altKey) {
-        const alt = d.progress[t.altKey];
-        if (alt.pct < p.pct) p = alt;
-        rate = Math.max(rate, rates[t.altRk] || 0);
-        qc += (d.queue_counts && d.queue_counts[t.altKey]) || 0;
-      }
+      const p = d.progress[t.key];
+      const rate = rates[t.rk] || 0;
+      const qc = (d.queue_counts && d.queue_counts[t.key]) || 0;
       const rem = qc > 0 ? qc : (p.total - p.done);
       const eta = etaStr(rem, rate);
       const qActive = d.queue_active && d.queue_active[t.key];
@@ -478,13 +478,8 @@ function render(d) {
       const stats = document.createElement('div');
       stats.className = 'task-stats';
       const countSpan = document.createElement('span');
-      if (t.key === 'video') {
-        countSpan.textContent = n(p.done) + ' transcoded';
-      } else if (p.skipped > 0) {
-        countSpan.textContent = n(p.done) + ' / ' + n(p.total) + ' · ' + n(p.skipped) + ' skipped';
-      } else {
-        countSpan.textContent = n(p.done) + ' / ' + n(p.total);
-      }
+      countSpan.textContent = n(p.done) + ' / ' + n(p.total)
+        + (p.unqueued > 0 ? ' · ' + n(p.unqueued) + ' not queued' : '');
       const rateSpan = document.createElement('span');
       rateSpan.className = 'task-rate';
       rateSpan.textContent = rateText;

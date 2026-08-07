@@ -370,33 +370,39 @@ def get_status(config: dict) -> dict:
     # Versions
     version = config.get("version", "?")
 
-    # When all queues are confirmed idle (API responded, nothing active),
-    # unprocessable assets are "skipped." Only apply when we actually got
-    # queue data — empty queue_status means API unreachable, not "idle."
+    # Whether we actually reached the jobs API this cycle. An empty
+    # queue_status means unreachable, not idle, and the two must never be
+    # confused: one is "nothing is scheduled", the other is "we have no idea".
     queues_known = bool(queue_status)
     any_active = queues_known and any(queue_status.values())
 
     def prog(done, tot):
-        if queues_known and not any_active and done < tot:
-            return {"done": done, "total": tot, "pct": 100.0, "skipped": tot - done}
-        # Clamp to 100: done can briefly exceed tot from count skew between the
-        # asset-total and per-stage-done queries (assets added/removed mid-scan),
-        # and a completion percentage can't exceed 100% (#68).
+        """One stage's completion, reported honestly.
+
+        This used to return a flat 100% whenever Immich's queues were idle and
+        call the remainder "skipped", on the theory that anything still undone
+        after a drained queue must be unprocessable. That theory holds for a
+        handful of corrupt files and collapses for a library that simply has
+        not been queued yet: on a 174k-asset library with 106k assets missing
+        embeddings it drew four full bars and reported everything complete.
+
+        Idle is not finished. The percentage is now always done/total, and the
+        nuance moves to "unqueued", which is literally true in both cases:
+        that work exists, nothing is running it, and nothing will until
+        someone queues it (the dashboard's Re-queue Missing button, or
+        Immich's own Jobs page).
+        """
         return {
             "done": done,
             "total": tot,
+            # Clamp to 100: done can briefly exceed tot from count skew between
+            # the asset-total and per-stage-done queries (assets added/removed
+            # mid-scan), and a completion percentage can't exceed 100% (#68).
             "pct": min(round(done / max(tot, 1) * 100, 1), 100.0),
-            "skipped": 0,
+            "unqueued": (
+                max(tot - done, 0) if (queues_known and not any_active) else 0
+            ),
         }
-
-    # Video transcode: use queue state for pct when active, 100% when idle + transcoded
-    vid_active = queue_status.get("video", False)
-    if vid_active and total_videos > 0:
-        vid_pct = min(round(encoded_videos / total_videos * 100, 1), 100.0)
-    elif encoded_videos > 0:
-        vid_pct = 100.0
-    else:
-        vid_pct = 0
 
     # A component the user switched off is omitted, not drawn dead. Same rule as
     # the menu bar: "off because I said so" must not render as a red dot, or the
@@ -426,12 +432,11 @@ def get_status(config: dict) -> dict:
             "clip": prog(clip, total_previews),
             "faces": prog(faces, total_previews),
             "ocr": prog(ocr, total_assets),
-            "video": {
-                "done": encoded_videos,
-                "total": total_videos,
-                "pct": vid_pct,
-                "skipped": 0,
-            },
+            # Video went through the same "idle means done" special case and
+            # gets the same honest treatment. Videos Immich's transcode policy
+            # never selects show up as unqueued, which is exactly what they
+            # are: no encoded copy, and nothing scheduled to make one.
+            "video": prog(encoded_videos, total_videos),
         },
         "system": {
             "load_1m": load_1m,
