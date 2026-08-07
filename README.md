@@ -243,7 +243,7 @@ immich-accelerator component worker off   # this Mac does ML only
 
 Changes apply immediately, including to a running service, and they persist as plain keys in `~/.immich-accelerator/config.json`. The menu bar app's Settings window has the same three switches, and a component you turn off disappears from the menu rather than showing as a red failure.
 
-**Turning `ml` off leaves the ML URL alone.** The accelerator normally tells the worker to use its own ML engine on `localhost`. With `ml` off it says nothing, so whatever you configured in Immich under **Administration → Machine Learning Settings** applies, which is how the Mac hands ML off to another box. Set `"ml_url"` in `config.json` if you'd rather name the remote engine here.
+**Turning `ml` off hands ML to another machine, so tell it where.** The accelerator normally points the worker at its own engine on `localhost`. With `ml` off it stops setting that, and whatever you configured in Immich under **Administration → Machine Learning Settings** applies instead. Immich's default there is `immich-machine-learning:3003`, a Docker-internal hostname a worker running natively on macOS cannot resolve, so if you never changed it every ML job will fail. Either set that URL in Immich to a reachable engine, or set `"ml_url"` in `config.json` to name it here. Toggling `ml` restarts the worker, because that URL is fixed when the worker starts.
 
 **This goes as far as the process boundaries and no further.** Video, thumbnails, metadata and RAW decode all happen inside the single Immich microservices worker, so "video but not thumbnails" isn't something the accelerator can offer. That split is Immich's job scheduler: use **Administration → Jobs** to pause individual queues, and see [performance tuning](#performance-tuning) for concurrency.
 
@@ -273,8 +273,10 @@ immich-accelerator setup --ml-only
 
 Finds (or offers to build) the Python venv fallback engine, writes a minimal config
 (`"worker": false`), and offers to start now and install as a launch-at-login service —
-same as a full install, minus every Docker/worker/database step. Run
-`immich-accelerator component worker on` later to turn this into a full install.
+same as a full install, minus every Docker/worker/database step. To turn this
+node into a full install later, re-run `immich-accelerator setup`: the worker
+needs the Docker, database and library details that ML-only setup never collects,
+so `component worker on` cannot conjure them and will tell you so.
 
 ### What's different from a full install
 

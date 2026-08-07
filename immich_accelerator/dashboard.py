@@ -25,6 +25,8 @@ from pathlib import Path
 
 log = logging.getLogger("dashboard")
 
+CONFIG_FILE = Path.home() / ".immich-accelerator" / "config.json"
+
 # Cache to avoid hammering the DB on every request
 _cache: dict = {}
 _cache_ts: float = 0
@@ -49,9 +51,19 @@ def _component_on(config: dict, name: str) -> bool:
 
 
 def _worker_enabled(config: dict) -> bool:
-    """Whether the worker is on, which is what decides whether there is a local
-    library and database to report on at all."""
+    """Whether the worker component is switched on."""
     return _component_on(config, "worker")
+
+
+def _has_database(config: dict) -> bool:
+    """Whether this install has an Immich database to report on.
+
+    A config shape question, not a component question. `setup --ml-only` writes
+    no db fields at all; every other setup path writes db_hostname. Keeping this
+    separate from the worker switch matters, because a full install with the
+    worker merely turned off still owns its library and its progress bars must
+    keep working."""
+    return bool(config.get("db_hostname"))
 
 
 def _get_accelerator_version() -> str:
@@ -158,6 +170,22 @@ def _query_db(sql: str, config: dict) -> str:
     return ""
 
 
+def _reload_config(config: dict) -> dict:
+    """Re-read config.json, falling back to the caller's copy.
+
+    create_app closes over the dict read once at process start, so without this
+    a component toggled while the dashboard is running would never reach it: the
+    page would keep drawing a service that was switched off minutes ago. Cheap
+    enough at the cache TTL, and a partially-written file just means we use the
+    previous copy for one cycle.
+    """
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return config
+
+
 def get_status(config: dict) -> dict:
     """Get full accelerator status. Cached for _CACHE_TTL seconds."""
     global _cache, _cache_ts
@@ -165,6 +193,8 @@ def get_status(config: dict) -> dict:
     now = time.monotonic()
     if now - _cache_ts < _CACHE_TTL and _cache:
         return _cache
+
+    config = _reload_config(config)
 
     # Service health
     import urllib.request as _urlreq
@@ -209,14 +239,17 @@ def get_status(config: dict) -> dict:
     #   live = asset, deletedAt IS NULL, visibility != hidden
     #   awp  = live + has an asset_job_status row + has a Preview file
     #
-    # Skipped entirely when the worker component is off: there's no local
-    # Postgres to query (by design — that box has no worker, no library, no DB),
-    # so every uncached poll would otherwise spawn a doomed psql/docker-exec
-    # call and log a misleading "cannot connect to Postgres" line. Progress bars
-    # stay at 0/0, which is accurate — this node isn't "the" library.
+    # Skipped only when this box has no database to ask, which is a statement
+    # about config shape, not about the worker switch. A node set up by
+    # `setup --ml-only` has no db credentials at all, and querying would spawn a
+    # doomed psql/docker-exec call every uncached poll and log a misleading
+    # "cannot connect to Postgres". But a full install with the worker merely
+    # switched off still owns its library, so its progress bars must keep
+    # working: gating those on the worker would zero them out for the exact
+    # user watching to see whether turning the worker off was a good idea.
     counts_raw = (
         ""
-        if not _worker_enabled(config)
+        if not _has_database(config)
         else _query_db(
             "WITH live AS ("
             "  SELECT id, type, thumbhash FROM asset"
@@ -375,8 +408,10 @@ def get_status(config: dict) -> dict:
         }
     if _component_on(config, "ml"):
         services["ml"] = {"alive": ml_alive, "name": "ML Service"}
-    if _worker_enabled(config):
-        # Docker only means anything where the worker talks to a local library.
+    if _has_database(config):
+        # Derived from the asset count, so it only means anything where there is
+        # a library to count. Tied to the database, not to the worker switch: an
+        # install with the worker off still has both.
         services["docker"] = {"alive": total_assets > 0, "name": "Docker (API)"}
 
     status = {

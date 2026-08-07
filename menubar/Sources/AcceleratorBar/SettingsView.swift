@@ -17,9 +17,11 @@ struct SettingsView: View {
     @State private var workerOn = true
     @State private var mlOn = true
     @State private var dashboardOn = true
-    // One flag for all three: applying a change shells out to the CLI, and the
-    // toggles should not race each other into a contradictory config.
-    @State private var applyingComponent = false
+    // Which component is being applied, or nil. Doubles as the "seeding state,
+    // ignore onChange" guard and as the row that shows a spinner: applying a
+    // change shells out to the CLI, and the toggles must not race each other
+    // into a contradictory config.
+    @State private var applyingComponent: String?
     @State private var componentError: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
 
@@ -45,11 +47,11 @@ struct SettingsView: View {
         // Seed the switches without treating it as a user action: assigning
         // here fires .onChange, so an install that already has a component off
         // would shell out to turn it off merely because the window opened.
-        applyingComponent = true
+        applyingComponent = "seeding"
         workerOn = StatusModel.componentEnabled("worker", config)
         mlOn = StatusModel.componentEnabled("ml", config)
         dashboardOn = StatusModel.componentEnabled("dashboard", config)
-        applyingComponent = false
+        applyingComponent = nil
     }
 
     // MARK: - sections
@@ -141,29 +143,38 @@ struct SettingsView: View {
         _ name: String, _ binding: Binding<Bool>, _ title: String, _ caption: String
     ) -> some View {
         VStack(alignment: .leading, spacing: 1) {
-            Toggle(isOn: binding) { Text(title) }
-                .toggleStyle(.switch)
-                .disabled(applyingComponent)
-                .onChange(of: binding.wrappedValue) { _, on in
-                    // Ignore the assignment load() makes when seeding state.
-                    guard !applyingComponent else { return }
-                    applyingComponent = true
-                    Task {
-                        let result = await Actions.setComponent(name, on)
-                        await model.refresh()
-                        // Never leave a switch claiming something the
-                        // accelerator did not do: put it back and say why.
-                        if !result.ok {
-                            componentError = result.message
-                            applyingComponent = true
-                            binding.wrappedValue = !on
-                        } else {
-                            componentError = nil
-                            config = StatusModel.readConfig()
+            HStack(spacing: 8) {
+                Toggle(isOn: binding) { Text(title) }
+                    .toggleStyle(.switch)
+                    .disabled(applyingComponent != nil)
+                    .onChange(of: binding.wrappedValue) { _, on in
+                        // Ignore the assignment load() makes when seeding state.
+                        guard applyingComponent == nil else { return }
+                        applyingComponent = name
+                        Task {
+                            let result = await Actions.setComponent(name, on)
+                            await model.refresh()
+                            // Never leave a switch claiming something the
+                            // accelerator did not do: put it back and say why.
+                            if !result.ok {
+                                componentError = result.message
+                                binding.wrappedValue = !on
+                            } else {
+                                componentError = nil
+                                config = StatusModel.readConfig()
+                            }
+                            applyingComponent = nil
                         }
-                        applyingComponent = false
                     }
+                // Turning the worker on runs a full start (extract, verify
+                // sharp, preflight) and can take minutes. A row that just went
+                // dead with no explanation reads as a hang.
+                if applyingComponent == name {
+                    ProgressView().controlSize(.small)
+                    Text(binding.wrappedValue ? "Starting…" : "Stopping…")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
+            }
             Text(caption).font(.caption).foregroundStyle(.secondary)
         }
     }

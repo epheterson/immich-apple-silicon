@@ -65,18 +65,22 @@ struct Snapshot: Equatable {
     // The worker is actively chewing through jobs (drives the amber icon).
     var processing: Bool { jobsActive > 0 }
 
-    // Health is judged only against what the user actually turned on. Judging a
-    // disabled component would leave an ML-only box amber forever for missing a
-    // worker it was told not to run, which is the fastest way to teach someone
-    // to ignore the icon.
+    // Health is judged only against the components that actually process
+    // photos, and only those the user turned on. Judging a disabled component
+    // would leave an ML-only box amber forever for missing a worker it was told
+    // not to run, which is the fastest way to teach someone to ignore the icon.
+    //
+    // The dashboard is deliberately excluded even when enabled: it is a way to
+    // look at the work, not a way to do it. A wedged dashboard (or an OrbStack
+    // process squatting port 8420) must not make a perfectly healthy install
+    // report degraded. The Dashboard row still shows its own real state.
     var overall: ServiceState {
-        var wanted = 0, healthy = 0, anyAlive = false
+        var wanted = 0, healthy = 0
         if workerEnabled { wanted += 1; if workerUp { healthy += 1 } }
         if mlEnabled { wanted += 1; if mlHealthy { healthy += 1 } }
-        if dashboardEnabled { wanted += 1; if dashboardUp { healthy += 1 } }
-        anyAlive = workerUp || mlUp || dashboardUp
-        if wanted == 0 { return .stopped }   // everything switched off
+        if wanted == 0 { return .stopped }   // nothing that processes is enabled
         if healthy == wanted { return .running }
+        let anyAlive = workerUp || mlUp || dashboardUp
         if !anyAlive { return .stopped }
         return .degraded
     }

@@ -785,12 +785,30 @@ class TestDashboardToggle:
 
     def test_cmd_dashboard_off_disables_and_stops(self, saved_config):
         args = argparse.Namespace(state="off", port=8420)
-        with patch("immich_accelerator.__main__.read_pid", return_value=4321), patch(
-            "immich_accelerator.__main__.kill_pid"
+        # Alive until it is killed, gone afterwards. A constant pid would mean
+        # "we killed it and it is still running", which the toggle is now
+        # supposed to report as a failure.
+        alive = {"pid": 4321}
+        with patch(
+            "immich_accelerator.__main__.read_pid",
+            side_effect=lambda name: alive["pid"],
+        ), patch(
+            "immich_accelerator.__main__.kill_pid",
+            side_effect=lambda name: alive.update(pid=None),
         ) as kill:
             cmd_dashboard(args)
             kill.assert_called_once_with("dashboard")
         assert load_config().get("dashboard") is False
+
+    def test_cmd_dashboard_off_reports_failure_when_it_survives(self, saved_config):
+        """The whole point of the exit code: the menu bar reads it, so a stop
+        that did not stop must not look like success."""
+        args = argparse.Namespace(state="off", port=8420)
+        with patch("immich_accelerator.__main__.read_pid", return_value=4321), patch(
+            "immich_accelerator.__main__.kill_pid"
+        ), pytest.raises(SystemExit) as e:
+            cmd_dashboard(args)
+        assert e.value.code == 1
 
     def test_cmd_dashboard_on_enables_and_starts(self, saved_config):
         args = argparse.Namespace(state="on", port=8420)
@@ -2405,6 +2423,16 @@ class TestComponentEnabled:
 class TestComponentToggle:
     """cmd_component / _set_component: flipping a key and applying it now."""
 
+    # A config that actually describes a worker, so the ml-only guard lets the
+    # toggle through. An `--ml-only` config has none of these keys.
+    WORKER_CFG = {
+        "server_dir": "/srv",
+        "version": "3.0.1",
+        "db_hostname": "localhost",
+        "db_username": "postgres",
+        "db_name": "immich",
+    }
+
     def test_off_writes_key_and_stops_it(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
 
@@ -2422,23 +2450,56 @@ class TestComponentToggle:
         import immich_accelerator.__main__ as m
 
         saved = {}
-        with patch.object(
-            m, "load_config", return_value={"ml_only": True, "worker": False}
-        ), patch.object(
+        cfg = {**self.WORKER_CFG, "ml_only": True, "worker": False}
+        with patch.object(m, "load_config", return_value=cfg), patch.object(
             m, "save_config", side_effect=lambda c: saved.update(c)
+        ), patch.object(m, "cmd_start"), patch.object(
+            m, "read_pid", return_value=1234
         ), patch.object(
-            m, "cmd_start"
+            m, "_start_lock"
         ):
-            m._set_component("worker", True)
+            assert m._set_component("worker", True) is True
         assert saved["worker"] is True
         assert "ml_only" not in saved
+
+    def test_enabling_worker_refuses_on_an_ml_only_install(self, tmp_data_dir):
+        """The blocker this guards: cmd_start dereferences config["server_dir"],
+        which an ml-only config has never had. That KeyError is not caught by
+        main(), so the launchd watcher would relaunch and crash forever."""
+        import immich_accelerator.__main__ as m
+
+        ml_only = {"ml_only": True, "worker": False, "ml": True, "ml_port": 3003}
+        with patch.object(m, "load_config", return_value=ml_only), patch.object(
+            m, "save_config"
+        ) as save, patch.object(m, "cmd_start") as start:
+            assert m._set_component("worker", True) is False
+            start.assert_not_called()  # never reaches the KeyError
+            save.assert_not_called()  # and does not leave worker:true behind
+
+    def test_worker_toggle_reports_failure_when_nothing_started(self, tmp_data_dir):
+        """cmd_start reports most failures by logging and returning, so whether
+        a worker actually came up is the only trustworthy signal."""
+        import immich_accelerator.__main__ as m
+
+        cfg = {**self.WORKER_CFG, "worker": False}
+        with patch.object(m, "load_config", return_value=cfg), patch.object(
+            m, "save_config"
+        ), patch.object(m, "cmd_start"), patch.object(
+            m, "read_pid", return_value=None
+        ), patch.object(
+            m, "_start_lock"
+        ):
+            assert m._set_component("worker", True) is False
 
     def test_unknown_component_is_rejected(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
 
-        with patch.object(m, "_set_component") as setter:
+        with patch.object(m, "_set_component") as setter, pytest.raises(
+            SystemExit
+        ) as e:
             m.cmd_component(argparse.Namespace(name="thumbnails", state="off"))
-            setter.assert_not_called()
+        assert e.value.code == 2
+        setter.assert_not_called()
 
     def test_listing_does_not_write_config(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
@@ -2466,6 +2527,19 @@ class TestWorkerWithoutML:
     def test_localhost_used_when_ml_is_on(self, tmp_data_dir):
         env = _worker_env_for({})
         assert env["IMMICH_MACHINE_LEARNING_URL"] == "http://localhost:3003"
+
+    def test_an_inherited_ml_url_is_actively_removed(self, tmp_data_dir, monkeypatch):
+        """worker_env starts as os.environ.copy(), so merely not setting the var
+        is not enough: an inherited one would survive and point the worker at a
+        port with nothing behind it."""
+        monkeypatch.setenv("IMMICH_MACHINE_LEARNING_URL", "http://stale:3003")
+        env = _worker_env_for({"ml": False})
+        assert "IMMICH_MACHINE_LEARNING_URL" not in env
+
+    def test_config_ml_url_beats_an_inherited_one(self, tmp_data_dir, monkeypatch):
+        monkeypatch.setenv("IMMICH_MACHINE_LEARNING_URL", "http://stale:3003")
+        env = _worker_env_for({"ml": False, "ml_url": "http://gpubox:3003"})
+        assert env["IMMICH_MACHINE_LEARNING_URL"] == "http://gpubox:3003"
 
 
 def _worker_env_for(overrides: dict) -> dict:
