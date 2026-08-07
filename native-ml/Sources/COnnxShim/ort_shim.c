@@ -19,7 +19,15 @@ void *ort_load(const char *model_path) {
     if (!h) return NULL;
     if (g->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "immich-ml", &h->env)) goto fail;
     g->CreateSessionOptions(&h->opts);
-    g->SetIntraOpNumThreads(h->opts, 1);
+    // 0 = onnxruntime picks its own default (hardware_concurrency-based).
+    // Was hardcoded to 1 since the engine's original ArcFace-only use case
+    // (a small face-embedding model, where single-threaded is plenty), but
+    // the v1.7.0 model zoo feature reuses this same session setup for CLIP
+    // models up to ~400M params, where single-threaded CPU is a real
+    // bottleneck (measured ~14x slower than the mlx default-model path on
+    // the same machine, and slower than the Python venv fallback's MPS
+    // path for the same model).
+    g->SetIntraOpNumThreads(h->opts, 0);
     g->SetSessionGraphOptimizationLevel(h->opts, ORT_ENABLE_ALL);
     if (g->CreateSession(h->env, model_path, h->opts, &h->session)) goto fail;
     OrtAllocator *alloc;

@@ -5,8 +5,8 @@
 // Minimal C wrapper over onnxruntime's C API, called from Swift. Keeps the
 // verbose OrtApi function-pointer dance in C where it reads naturally.
 
-// Load an ONNX model (CPU provider, single intra-op thread). Returns an opaque
-// handle, or NULL on failure.
+// Load an ONNX model (CPU provider, onnxruntime's default intra-op thread
+// count). Returns an opaque handle, or NULL on failure.
 void *ort_load(const char *model_path);
 
 // Run a single float tensor through the model. `shape`/`ndim` describe the input
