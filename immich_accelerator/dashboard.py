@@ -374,9 +374,8 @@ def get_status(config: dict) -> dict:
     # queue_status means unreachable, not idle, and the two must never be
     # confused: one is "nothing is scheduled", the other is "we have no idea".
     queues_known = bool(queue_status)
-    any_active = queues_known and any(queue_status.values())
 
-    def prog(done, tot):
+    def prog(queue, done, tot):
         """One stage's completion, reported honestly.
 
         This used to return a flat 100% whenever Immich's queues were idle and
@@ -391,6 +390,13 @@ def get_status(config: dict) -> dict:
         that work exists, nothing is running it, and nothing will until
         someone queues it (the dashboard's Re-queue Missing button, or
         Immich's own Jobs page).
+
+        "unqueued" is judged per queue, not globally. Asking "is ANY queue
+        busy" would blank the hint on every bar the moment one unrelated queue
+        picked up work, so a video transcode backlog, or the first seconds
+        after Re-queue Missing, would hide "106,220 not queued" from the CLIP
+        bar precisely while someone was watching it, then flash it back when
+        the last queue drained. queue_status already answers this per queue.
         """
         return {
             "done": done,
@@ -400,7 +406,9 @@ def get_status(config: dict) -> dict:
             # mid-scan), and a completion percentage can't exceed 100% (#68).
             "pct": min(round(done / max(tot, 1) * 100, 1), 100.0),
             "unqueued": (
-                max(tot - done, 0) if (queues_known and not any_active) else 0
+                max(tot - done, 0)
+                if (queues_known and not queue_status.get(queue, False))
+                else 0
             ),
         }
 
@@ -428,15 +436,15 @@ def get_status(config: dict) -> dict:
         "progress": {
             # Each bar uses Immich's own denominator: thumbnails/OCR over all
             # live assets, CLIP/faces over assets-with-previews.
-            "thumbnails": prog(thumbs, total_assets),
-            "clip": prog(clip, total_previews),
-            "faces": prog(faces, total_previews),
-            "ocr": prog(ocr, total_assets),
+            "thumbnails": prog("thumbnails", thumbs, total_assets),
+            "clip": prog("clip", clip, total_previews),
+            "faces": prog("faces", faces, total_previews),
+            "ocr": prog("ocr", ocr, total_assets),
             # Video went through the same "idle means done" special case and
             # gets the same honest treatment. Videos Immich's transcode policy
             # never selects show up as unqueued, which is exactly what they
             # are: no encoded copy, and nothing scheduled to make one.
-            "video": prog(encoded_videos, total_videos),
+            "video": prog("video", encoded_videos, total_videos),
         },
         "system": {
             "load_1m": load_1m,

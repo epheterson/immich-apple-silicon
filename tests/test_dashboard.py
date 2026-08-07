@@ -386,6 +386,40 @@ class TestGetStatus:
         assert status["progress"]["clip"]["pct"] == 40.0
         assert status["progress"]["clip"]["unqueued"] == 0
 
+    def test_unqueued_is_judged_per_queue_not_globally(self, sample_config):
+        """One busy queue must not blank the hint on all the others.
+
+        Gating on "is ANY queue busy" meant a video transcode backlog, or the
+        first seconds after Re-queue Missing, hid "106,220 not queued" from the
+        CLIP bar precisely while someone was watching it, then flashed it back
+        when the last queue drained.
+        """
+        import immich_accelerator.dashboard as d
+
+        busy_video = json.dumps(
+            {
+                "videoConversion": {"jobCounts": {"active": 3, "waiting": 40}},
+                "thumbnailGeneration": {"jobCounts": {"active": 0, "waiting": 0}},
+                "smartSearch": {"jobCounts": {"active": 0, "waiting": 0}},
+                "faceDetection": {"jobCounts": {"active": 0, "waiting": 0}},
+                "ocr": {"jobCounts": {"active": 0, "waiting": 0}},
+            }
+        ).encode()
+        resp = MagicMock()
+        resp.read.return_value = busy_video
+        resp.__enter__ = lambda s: resp
+        resp.__exit__ = MagicMock(return_value=False)
+
+        d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
+        with patch("urllib.request.urlopen", return_value=resp), patch(
+            "immich_accelerator.dashboard._query_db",
+            return_value="100|100|10|100|40|40|40|5",
+        ), patch("immich_accelerator.dashboard._run", return_value=""):
+            status = get_status(sample_config)
+
+        assert status["progress"]["clip"]["unqueued"] == 60, "idle queue lost its hint"
+        assert status["progress"]["video"]["unqueued"] == 0, "this one really is busy"
+
     def test_unqueued_never_negative_on_count_skew(self, sample_config):
         """done > total (assets removed mid-scan) must not report -10 unqueued."""
         status = self._status_with_idle_queues(

@@ -165,12 +165,27 @@ final class StatusModel: ObservableObject {
     @Published var busy = false
 
     private var timer: Timer?
-    /// True while refresh() is awaiting its probes. The timer skips a tick
-    /// rather than stacking a second pass on top of a slow one: the probes have
-    /// timeouts up to 6s and the panel polls every 3s, so without this a
-    /// wedged endpoint would let ticks pile up and let an older snapshot land
-    /// after a newer one.
-    private var refreshing = false
+    /// How many refreshes are awaiting their probes. The timer skips a tick
+    /// while any is in flight rather than stacking a pass on top of a slow one:
+    /// the probes have timeouts up to 6s and the panel polls every 3s, so
+    /// without this a wedged endpoint would let ticks pile up.
+    ///
+    /// A count, not a flag. Six call sites refresh directly (the panel,
+    /// Settings, onboarding, and startPolling's immediate kick), none of which
+    /// consult this, so a single bool would be cleared by whichever overlapping
+    /// pass returned first and the timer would start stacking again.
+    private var inFlight = 0
+    /// Ordering for those overlapping passes: each refresh takes a ticket, and
+    /// a pass whose ticket is older than what has already been published drops
+    /// its result. Without this a slow refresh could land a snapshot captured
+    /// seconds earlier on top of a fresh one, which is exactly what happens
+    /// right after a toggle, when an action-driven refresh races the poller.
+    private var refreshTicket = 0
+    private var publishedTicket = 0
+    /// Set while the panel is open. Gates the one probe expensive enough that
+    /// polling it in the background is a real cost to the user's Immich
+    /// server, not just to us.
+    var wantsQueueDetail = false
 
     init() {
         // Background cadence from launch so the menu-bar icon is accurate before
@@ -186,7 +201,7 @@ final class StatusModel: ObservableObject {
         // panel would freeze on whatever it showed when it opened.
         let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, !self.refreshing else { return }
+                guard let self, self.inFlight == 0 else { return }
                 await self.refresh()
             }
         }
@@ -198,8 +213,10 @@ final class StatusModel: ObservableObject {
     func stopPolling() { timer?.invalidate(); timer = nil }
 
     func refresh() async {
-        refreshing = true
-        defer { refreshing = false }
+        inFlight += 1
+        refreshTicket += 1
+        let ticket = refreshTicket
+        defer { inFlight -= 1 }
         // The pidfile/ps/config probes fork subprocesses and touch the disk;
         // run them off the main actor so a poll never hitches the UI thread.
         let p = await Task.detached(priority: .utility) { Self.probeProcesses() }.value
@@ -224,12 +241,21 @@ final class StatusModel: ObservableObject {
         async let healthy = p.mlEnabled ? Self.ping(port: p.mlPort) : false
         async let jobs = Self.jobCounts(base: p.immichURL, apiKey: p.apiKey)
         async let reachable = Self.serverReachable(base: p.immichURL)
-        // No dashboard, no source: [] rather than nil, because "we have nowhere
-        // to ask" really is "no queue data", and holding stale rows from before
-        // the dashboard was switched off would keep showing numbers nothing is
-        // refreshing.
-        async let queues = p.dashboardUp
-            ? Self.queueProgress(port: p.dashboardPort) : []
+        // Only while the panel is open. /api/status is the most expensive
+        // thing this app can ask for: a full aggregate over Immich's asset
+        // table through a spawned psql (measured ~1.4s cold on a 174k-asset
+        // library) plus a jobs API call, behind a cache shorter than our
+        // background poll, so every background poll would miss. Merely having
+        // the menu bar running would put a seconds-long query on the user's
+        // Immich database every 15 seconds forever, to compute rows nobody is
+        // looking at.
+        //
+        // Closed: nil, meaning "did not ask", so the last values survive and
+        // are on screen the instant the panel opens. No dashboard: [], because
+        // "nowhere to ask" really is no queue data, and keeping rows from
+        // before it was switched off would show numbers nothing refreshes.
+        async let queues: [QueueProgress]? = !p.dashboardUp ? []
+            : (wantsQueueDetail ? Self.queueProgress(port: p.dashboardPort) : nil)
         async let fetching = p.mlUp ? Self.downloadProgress(port: p.mlPort) : nil
         s.externalDomain = await domain
         s.mlHealthy = await healthy
@@ -248,6 +274,10 @@ final class StatusModel: ObservableObject {
         // resizes the panel under the user's pointer.
         s.queues = (await queues) ?? snap.queues
 
+        // A pass that started later has already published: its snapshot is
+        // newer than ours by construction, so leave it alone.
+        guard ticket > publishedTicket else { return }
+        publishedTicket = ticket
         snap = s
     }
 

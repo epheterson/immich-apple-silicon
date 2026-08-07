@@ -21,11 +21,15 @@ struct MenuView: View {
         }
         .frame(width: Metrics.panelWidth)
         .onAppear {
+            // Order matters: ask for queue detail before the poll starts, or
+            // the first pass skips it and the rows arrive a cycle late.
+            model.wantsQueueDetail = true
             model.startPolling(interval: 3)
             syncQueueRows(model.snap.queues)
         }
         .onChange(of: model.snap.queues) { _, new in syncQueueRows(new) }
         .onDisappear {
+            model.wantsQueueDetail = false
             model.startPolling(interval: 15)
             // Re-decide on the next opening, so a queue that finished while the
             // panel was shut stops taking up a row.
@@ -33,23 +37,33 @@ struct MenuView: View {
         }
     }
 
-    /// Update the queue rows without ever changing how many there are.
+    /// Update the queue rows, holding their membership steady while the panel
+    /// is open.
     ///
     /// A menu that resizes while the pointer is in it is the single worst thing
     /// a panel like this can do, and this one had two ways to do it: a queue
     /// crossing 100% dropped its row, and any slow dashboard poll dropped all
     /// of them at once. The second is fixed at the source (StatusModel keeps
-    /// the last good answer); this fixes the first, and makes the panel's
-    /// height a function of when you opened it rather than of what happened to
-    /// finish while you were reading it.
+    /// the last good answer when it could not ask); this handles the first, and
+    /// makes the panel's height a function of when you opened it rather than of
+    /// what finished while you were reading.
+    ///
+    /// "Steady" is not "frozen". An empty array is StatusModel saying the
+    /// dashboard is gone, not saying nothing came back, and a row whose queue
+    /// stops being reported has no live number behind it. Both must clear, or
+    /// the panel keeps showing counts nothing is refreshing, which is the same
+    /// lie as the resize, only quieter.
     private func syncQueueRows(_ incoming: [QueueProgress]) {
-        guard !incoming.isEmpty else { return }
-        if queueRows.isEmpty {
-            queueRows = incoming.filter { !$0.complete }
+        guard !incoming.isEmpty else {
+            queueRows = []
             return
         }
         let latest = Dictionary(incoming.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
-        queueRows = queueRows.map { latest[$0.key] ?? $0 }
+        guard !queueRows.isEmpty else {
+            queueRows = incoming.filter { !$0.complete }
+            return
+        }
+        queueRows = queueRows.compactMap { latest[$0.key] }
     }
 
     private var header: some View {

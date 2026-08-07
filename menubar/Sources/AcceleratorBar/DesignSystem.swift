@@ -23,17 +23,23 @@ enum Metrics {
     /// queued" without truncating, which is the longest line the panel shows.
     static let panelWidth: CGFloat = 300
 
-    /// Settings window. Fixed in both axes: the four tabs have different
-    /// natural heights, and letting each pick its own means the window jumps
-    /// every time you switch tabs.
+    /// Settings window: sidebar plus detail, sized like the system's own.
+    /// Fixed in both axes, because the four panes have different natural
+    /// heights and letting each pick its own resizes the window under the
+    /// pointer every time you switch.
     ///
-    /// 500 is set by General, the tallest tab that must not scroll, because
-    /// its last row is a pair of buttons and a half-visible button reads as a
-    /// broken window. Diagnostics can run past it and scroll: it is a list of
-    /// facts, it grows with the number of checks, and scrolling a list is
-    /// not a defect.
-    static let settingsWidth: CGFloat = 520
-    static let settingsHeight: CGFloat = 500
+    /// Height is set by the tallest pane that must not scroll. Diagnostics may
+    /// run past it and scroll: it is a list of facts that grows with the number
+    /// of checks, and scrolling a list is not a defect.
+    static let settingsWidth: CGFloat = 700
+    static let settingsHeight: CGFloat = 480
+    static let settingsSidebarWidth: CGFloat = 190
+
+    /// The tinted rounded square behind a sidebar glyph. 20pt with a 5pt
+    /// radius is what System Settings uses; smaller reads as a bullet and
+    /// larger crowds the label.
+    static let paneIcon: CGFloat = 20
+    static let paneIconRadius: CGFloat = 5
 
     /// The icon gutter. Every leading icon reserves the same width in every
     /// window, so labels form one vertical edge whether or not a given row has
@@ -78,6 +84,28 @@ extension View {
 struct InsetDivider: View {
     var body: some View {
         Divider().padding(.horizontal, Metrics.gutter)
+    }
+}
+
+/// A settings sidebar glyph: a white SF Symbol on a tinted rounded square.
+///
+/// This is the detail that makes a sidebar read as a macOS settings window
+/// rather than as a generic list. A bare symbol in the same slot looks like a
+/// developer's list of sections; the tinted tile is what the system uses and
+/// what people recognize.
+struct PaneIcon: View {
+    let systemName: String
+    let tint: Color
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: Metrics.paneIconRadius, style: .continuous)
+            .fill(tint.gradient)
+            .frame(width: Metrics.paneIcon, height: Metrics.paneIcon)
+            .overlay(
+                Image(systemName: systemName)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white)
+            )
     }
 }
 

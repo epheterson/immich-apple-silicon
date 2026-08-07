@@ -1,29 +1,64 @@
 import SwiftUI
 
-/// The settings window.
+/// The settings window: a sidebar and a grouped `Form`, which is what a macOS
+/// settings window has looked like since Ventura replaced System Preferences.
 ///
-/// Four tabs, each a grouped `Form`. That structure is doing real work, not
-/// decoration. The previous version stacked six `GroupBox`es in one scrolling
-/// column and hand-built every row, which produced exactly the defects you get
-/// from hand-building rows: each `Toggle` sat immediately after its own label,
-/// so three switches landed at three different x positions; the Components box
-/// hugged its content and was visibly narrower than its neighbours because
-/// nothing inside it was full width; and the component titles used the default
-/// body font while every other row used `.callout`, so they read oversized.
+/// The shape is the point. Before this it was six `GroupBox`es stacked in one
+/// scrolling column with every row hand-built, which produced exactly the
+/// defects hand-built rows produce: each `Toggle` sat immediately after its own
+/// label, so three switches landed at three different x positions; the
+/// Components box hugged its content and was visibly narrower than its
+/// neighbours; and component titles used the default body font while every
+/// other row used `.callout`.
 ///
-/// A grouped `Form` gives all of that away for free. macOS owns the label
-/// column, right-aligns the controls, sizes the cards to the window and picks
-/// the fonts, which is also why it will keep matching System Settings after the
-/// next macOS release instead of drifting away from it.
+/// A grouped `Form` inside a `NavigationSplitView` gives all of that away for
+/// free: macOS owns the label column, right-aligns the controls, sizes the
+/// cards and picks the fonts. That is also why it will still look current after
+/// the next macOS release, instead of drifting away from the system again.
 struct SettingsView: View {
     @ObservedObject var model: StatusModel
 
-    private enum Tab: String, Hashable {
+    /// One sidebar row. The tinted rounded square is not decoration: it is the
+    /// thing that makes a sidebar read as macOS settings rather than as a
+    /// generic list, and System Settings gives every pane one.
+    private enum Pane: String, Hashable, CaseIterable, Identifiable {
         case general, components, ml, diagnostics
+
+        // Identity is the case itself, so List's selection binding is a Pane?
+        // rather than the String? an id-of-String would demand. Getting this
+        // wrong still compiles, via a different List overload, and then simply
+        // fails to track the selection.
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .general: return "General"
+            case .components: return "Components"
+            case .ml: return "Machine Learning"
+            case .diagnostics: return "Diagnostics"
+            }
+        }
+        var symbol: String {
+            switch self {
+            case .general: return "gearshape.fill"
+            case .components: return "square.stack.3d.up.fill"
+            case .ml: return "brain.head.profile"
+            case .diagnostics: return "stethoscope"
+            }
+        }
+        var tint: Color {
+            switch self {
+            case .general: return .gray
+            case .components: return .blue
+            case .ml: return .purple
+            case .diagnostics: return .teal
+            }
+        }
     }
-    // ACCEL_SETTINGS_TAB picks the opening tab, so each one can be captured
+
+    // ACCEL_SETTINGS_TAB picks the opening pane, so each one can be captured
     // headlessly. Same dev affordance as ACCEL_SHOW_SETTINGS (see AppDelegate).
-    @State private var tab: Tab = Tab(
+    @State private var pane: Pane? = Pane(
         rawValue: ProcessInfo.processInfo.environment["ACCEL_SETTINGS_TAB"] ?? ""
     ) ?? .general
 
@@ -47,25 +82,36 @@ struct SettingsView: View {
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
 
     var body: some View {
-        TabView(selection: $tab) {
-            generalTab
-                .tabItem { Label("General", systemImage: "gearshape") }
-                .tag(Tab.general)
-            componentsTab
-                .tabItem { Label("Components", systemImage: "square.stack.3d.up") }
-                .tag(Tab.components)
-            mlTab
-                .tabItem { Label("Machine Learning", systemImage: "brain") }
-                .tag(Tab.ml)
-            diagnosticsTab
-                .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
-                .tag(Tab.diagnostics)
+        NavigationSplitView {
+            List(Pane.allCases, selection: $pane) { p in
+                Label {
+                    Text(p.title)
+                } icon: {
+                    PaneIcon(systemName: p.symbol, tint: p.tint)
+                }
+                .padding(.vertical, Metrics.xs)
+            }
+            .navigationSplitViewColumnWidth(Metrics.settingsSidebarWidth)
+            // No collapse control: a settings window with a hideable sidebar
+            // can be left in a state with no way back to the other panes.
+            .toolbar(removing: .sidebarToggle)
+        } detail: {
+            detail
+                .navigationTitle(pane?.title ?? "Settings")
         }
-        // Fixed, so switching tabs doesn't resize the window under the pointer.
-        // Sized to the tallest tab (Diagnostics) rather than letting each tab
-        // pick its own height.
+        // Fixed, so switching panes doesn't resize the window under the pointer.
         .frame(width: Metrics.settingsWidth, height: Metrics.settingsHeight)
         .onAppear(perform: load)
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        switch pane {
+        case .components: componentsTab
+        case .ml: mlTab
+        case .diagnostics: diagnosticsTab
+        default: generalTab
+        }
     }
 
     private func load() {
