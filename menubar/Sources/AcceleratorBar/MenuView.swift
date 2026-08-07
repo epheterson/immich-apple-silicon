@@ -72,6 +72,21 @@ struct MenuView: View {
                     .onTapGesture { runMLTest() }
                     .help("Click to run an ML self-test")
             }
+            // Per-queue progress, when the dashboard is serving it. Only the
+            // queues with work left: five bars pinned at 100% is furniture, and
+            // the interesting question is always what is still outstanding.
+            if model.snap.workerEnabled {
+                let pending = model.snap.queues.filter { !$0.complete }
+                if !pending.isEmpty {
+                    VStack(spacing: Metrics.sm) {
+                        ForEach(pending) { q in QueueRow(queue: q) }
+                    }
+                    .padding(.leading, Metrics.iconColumn + Metrics.md)
+                    .padding(.trailing, Metrics.rowPadV)
+                    .padding(.top, Metrics.xs)
+                    .padding(.bottom, Metrics.sm)
+                }
+            }
             if model.snap.dashboardEnabled {
                 StatusRow(
                     icon: "gauge.with.dots.needle.50percent", name: "Dashboard",
@@ -246,6 +261,32 @@ struct StatusRow: View {
         }
         .padding(.horizontal, Metrics.rowPadV)
         .padding(.vertical, Metrics.rowPadV)
+    }
+}
+
+/// One queue's completion: name, a thin bar, and what is left.
+///
+/// Indented under the Worker row rather than given its own icon, because these
+/// are that row's detail, not five more services.
+struct QueueRow: View {
+    let queue: QueueProgress
+
+    var body: some View {
+        HStack(spacing: Metrics.md) {
+            Text(queue.label)
+                .font(.rowDetail)
+                .foregroundStyle(.secondary)
+                .frame(width: 64, alignment: .leading)
+            ProgressView(value: queue.fraction)
+                .progressViewStyle(.linear)
+                .controlSize(.small)
+            Text("\(queue.total - queue.done)")
+                .font(.rowDetail)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 34, alignment: .trailing)
+        }
+        .help("\(queue.done) of \(queue.total) done")
     }
 }
 

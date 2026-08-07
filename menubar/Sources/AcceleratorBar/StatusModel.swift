@@ -26,6 +26,18 @@ enum MLEngine: Equatable, Sendable {
     }
 }
 
+/// One Immich processing queue's completion, as the dashboard reports it.
+struct QueueProgress: Equatable, Identifiable {
+    let key: String
+    let label: String
+    let done: Int
+    let total: Int
+
+    var id: String { key }
+    var fraction: Double { total > 0 ? min(Double(done) / Double(total), 1) : 0 }
+    var complete: Bool { total > 0 && done >= total }
+}
+
 struct Snapshot: Equatable {
     var workerUp = false
     var mlUp = false          // process alive
@@ -55,6 +67,13 @@ struct Snapshot: Equatable {
     // is up). Distinguishing that from false matters: a stopped worker must not
     // make a perfectly good key look rejected.
     var apiKeyValid: Bool?
+    /// Per-queue completion, populated only when the dashboard is serving.
+    ///
+    /// The dashboard is an enrichment here, never a dependency: 1.8.0 made the
+    /// menu bar work with the dashboard switched off, and reading this from it
+    /// must not quietly undo that. Empty means "we could not ask", and the
+    /// panel falls back to the aggregate it computes from Immich directly.
+    var queues: [QueueProgress] = []
 
     // What "Open Immich" should launch: the public domain the user set in
     // Immich when present, otherwise the local URL the accelerator connects to.
@@ -190,6 +209,8 @@ final class StatusModel: ObservableObject {
         async let healthy = p.mlEnabled ? Self.ping(port: p.mlPort) : false
         async let jobs = Self.jobCounts(base: p.immichURL, apiKey: p.apiKey)
         async let reachable = Self.serverReachable(base: p.immichURL)
+        async let queues = p.dashboardUp
+            ? Self.queueProgress(port: p.dashboardPort) : []
         async let fetching = p.mlUp ? Self.downloadProgress(port: p.mlPort) : nil
         s.externalDomain = await domain
         s.mlHealthy = await healthy
@@ -203,6 +224,7 @@ final class StatusModel: ObservableObject {
         s.jobsWaiting = counts.waiting
         s.immichReachable = await reachable
         s.apiKeyValid = counts.authed
+        s.queues = await queues
 
         snap = s
     }
@@ -242,6 +264,40 @@ final class StatusModel: ObservableObject {
         p.mlPort = (config["ml_port"] as? Int) ?? 3003
         p.apiKey = (p.workerUp ? config["api_key"] as? String : nil) ?? ""
         return p
+    }
+
+    /// Per-queue completion from the accelerator's own dashboard API.
+    ///
+    /// We already compute this server-side for the web dashboard and have never
+    /// read it here, so the panel showed one aggregate number while the data
+    /// for five real progress bars sat one HTTP call away.
+    ///
+    /// Returns [] on any failure. A dashboard that is down, slow or wedged must
+    /// cost the panel nothing but these rows.
+    nonisolated static func queueProgress(port: Int) async -> [QueueProgress] {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/status")
+        else { return [] }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let progress = root["progress"] as? [String: Any]
+        else { return [] }
+
+        // Fixed order and our own labels: the API keys are storage names, and
+        // the order they serialize in is not a thing to show a person.
+        let order = [
+            ("thumbnails", "Thumbnails"), ("clip", "Search"),
+            ("faces", "Faces"), ("ocr", "Text"), ("video", "Video"),
+        ]
+        return order.compactMap { key, label in
+            guard let e = progress[key] as? [String: Any],
+                  let total = (e["total"] as? NSNumber)?.intValue, total > 0,
+                  let done = (e["done"] as? NSNumber)?.intValue
+            else { return nil }
+            return QueueProgress(key: key, label: label, done: done, total: total)
+        }
     }
 
     // Sum active/waiting across all of Immich's job queues so the menu bar can
