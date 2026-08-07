@@ -1657,6 +1657,10 @@ def save_config(config: dict) -> None:
     tmp = CONFIG_FILE.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(config, f, indent=2)
+        # POSIX text files end in a newline. Without it every editor and diff
+        # tool reports "\ No newline at end of file" on a file people are
+        # expected to open and read.
+        f.write("\n")
     os.chmod(tmp, 0o600)
     tmp.rename(CONFIG_FILE)
 
@@ -4382,8 +4386,16 @@ def _start_without_worker(config: dict, args) -> None:
 # escaping one takes down the launchd watcher, which KeepAlive then relaunches
 # into the same crash: that is why this is an explicit gate and not a try block.
 _WORKER_CONFIG_KEYS = (
-    "server_dir", "version", "node", "db_hostname", "db_port", "db_username",
-    "db_name", "redis_hostname", "redis_port", "ml_port",
+    "server_dir",
+    "version",
+    "node",
+    "db_hostname",
+    "db_port",
+    "db_username",
+    "db_name",
+    "redis_hostname",
+    "redis_port",
+    "ml_port",
 )
 
 
@@ -5318,7 +5330,9 @@ def _watcher_running() -> bool:
     try:
         out = subprocess.run(
             ["pgrep", "-f", "immich_accelerator.*watch"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
     except (subprocess.SubprocessError, OSError):
         return False
@@ -5344,8 +5358,9 @@ def _restart_worker(reason: str) -> bool:
         return True
     cmd_start(argparse.Namespace(force=False))
     if not read_pid("worker"):
-        log.error("  The worker did not come back. Start it with: "
-                  "immich-accelerator start")
+        log.error(
+            "  The worker did not come back. Start it with: " "immich-accelerator start"
+        )
         return False
     return True
 
