@@ -2567,12 +2567,20 @@ def _validate_connectivity(config: dict) -> bool:
 # from scratch from what it detects, so anything the user set by hand or by
 # toggle has to be carried across explicitly or it is lost on the next re-run.
 #
-# Component keys are deliberately NOT preserved wholesale: each setup path
-# states the components it is establishing, so re-running a full `setup` on an
-# ml-only box turns the worker back on rather than silently inheriting
-# "worker": false from the node it used to be. Preserving "dashboard" is safe
-# and wanted, so it is listed; "worker" and "ml" are set by the setup paths.
-_PRESERVED_CONFIG_KEYS = ("api_key", "ml_url", "dashboard_port", "dashboard")
+# "ml" belongs here for the same reason "dashboard" does. Neither full setup
+# path writes it, so leaving it out did not mean "setup decides", it meant
+# "setup silently discards". Someone who offloaded ML to another machine
+# (`component ml off` plus an "ml_url") and then re-ran setup, which is the
+# documented repair step and what _require_worker_config's own error text
+# tells them to do, would get a local engine started behind their back,
+# several GB of models downloaded, and the worker repointed from the remote
+# node back at localhost.
+#
+# "worker" is the one component key still not preserved, and that is
+# deliberate: each setup path states whether it establishes a worker, so
+# re-running a full `setup` on an ml-only box is how you turn the worker back
+# on. `setup --ml-only` writes "worker": false itself.
+_PRESERVED_CONFIG_KEYS = ("api_key", "ml_url", "dashboard_port", "dashboard", "ml")
 
 
 def _finalize_config(config: dict) -> None:
@@ -4326,6 +4334,18 @@ def _start_without_worker(config: dict, args) -> None:
     """
     _kill_stale_processes()
 
+    # Stop a worker that is still running despite being switched off.
+    # _kill_stale_processes deliberately spares anything listed in a pidfile,
+    # so a live tracked worker walks straight through it. This path used to be
+    # ml-only-preset-only, where a worker could not exist; now that any full
+    # install can reach it, skipping this leaves the worker pulling jobs while
+    # `status`, the menu bar and the dashboard all report it off. Two workers
+    # competing over one queue with nothing in any UI admitting the second one
+    # exists is a worse failure than the one the toggle was meant to fix.
+    if read_pid("worker"):
+        log.info("Worker disabled in config, stopping it.")
+        kill_pid("worker")
+
     if not _component_enabled("ml", config):
         # Stop a leftover engine first. The worker path does this too; without it
         # here, an ml-only box that turns ML off keeps serving /predict from a
@@ -4994,6 +5014,33 @@ FD_RESTART_THRESHOLD = _int_env("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000)
 FD_RESTART_COOLDOWN = _int_env("IMMICH_ACCEL_FD_RESTART_COOLDOWN", 300)
 
 
+def _upgraded_on_disk() -> bool:
+    """Did a `brew upgrade` land while we were running? If so, stop the now
+    stale services and say yes; the caller returns and launchd KeepAlive
+    relaunches watch with the new code.
+
+    Both watch loops need this. It lived inline in the worker loop only, which
+    meant that turning the worker off (now an ordinary supported choice, not
+    just the ml-only preset) silently opted that install out of ever applying
+    an upgrade: brew would write the new code and the KeepAlive'd watcher would
+    keep executing the old one forever. That is #79 all over again, reachable
+    from a documented command.
+
+    No-op on non-Homebrew installs, where the opt symlink is absent and
+    _installed_version falls back to __version__.
+    """
+    installed = _installed_version()  # read once (the symlink can change)
+    if installed == __version__:
+        return False
+    log.info(
+        "Accelerator upgraded on disk (%s -> %s) — relaunching.",
+        __version__,
+        installed,
+    )
+    cmd_stop(argparse.Namespace())
+    return True
+
+
 def _watch_without_worker(config: dict) -> str | None:
     """cmd_watch's worker-free counterpart: monitor and restart only the ML
     service (and dashboard), forever. No fd-leak watchdog (that leak is
@@ -5024,16 +5071,45 @@ def _watch_without_worker(config: dict) -> str | None:
     else:
         reconcile_dashboard()
 
+    # Say "the worker is on but cannot start" once, not every 30s forever.
+    _warned_unstartable_worker = False
+
     while True:
         try:
             time.sleep(30)
             config = load_config()  # reload each cycle (setup may have changed it)
 
             # The worker can be switched back on while this loop runs. Hand
-            # back to cmd_watch rather than sitting here ignoring it.
+            # back to cmd_watch rather than sitting here ignoring it, but only
+            # if a worker could actually start.
+            #
+            # `component worker on` refuses when the config has no worker
+            # section, but these are documented as plain keys in config.json,
+            # and a hand-edited or restored file reaches here without ever
+            # passing that check. Handing over anyway means cmd_start raises
+            # RuntimeError out of cmd_watch, main() exits 1, launchd relaunches
+            # into the same crash, and the node loops forever with its ML
+            # engine and dashboard unsupervised. Staying put keeps the engine
+            # serving and names what is missing.
             if _component_enabled("worker", config):
-                log.info("Worker enabled in config, switching to full watch.")
-                return _SWITCH
+                try:
+                    _require_worker_config(config)
+                except RuntimeError as e:
+                    if not _warned_unstartable_worker:
+                        log.error("%s", e)
+                        log.error("  Staying on ML only; the engine keeps running.")
+                        _warned_unstartable_worker = True
+                else:
+                    log.info("Worker enabled in config, switching to full watch.")
+                    return _SWITCH
+            else:
+                _warned_unstartable_worker = False
+
+            # Same as the worker loop: a `brew upgrade` must take effect here
+            # too. Without this an install with the worker switched off never
+            # applies an upgrade at all.
+            if _upgraded_on_disk():
+                return None
 
             # Keep service logs bounded, same as the worker path.
             cap_service_logs()
@@ -5156,21 +5232,7 @@ def _watch_worker(config: dict) -> str | None:
                     kill_pid("worker")
                 return _SWITCH
 
-            # Auto-apply a `brew upgrade`: if the version installed on disk no
-            # longer matches the code we're running, stop the (now-stale)
-            # services and exit so launchd KeepAlive relaunches watch with the
-            # new code, which then starts a fresh worker. Makes `brew upgrade`
-            # take effect on its own; no manual restart needed. No-op on
-            # non-Homebrew installs (opt symlink absent → _installed_version
-            # falls back to __version__).
-            installed = _installed_version()  # read once (symlink can change)
-            if installed != __version__:
-                log.info(
-                    "Accelerator upgraded on disk (%s -> %s) — relaunching.",
-                    __version__,
-                    installed,
-                )
-                cmd_stop(argparse.Namespace())
+            if _upgraded_on_disk():
                 return  # launchd KeepAlive relaunches with the new code
 
             # Keep service logs bounded — the worker can spew stack traces for
@@ -5423,13 +5485,20 @@ def _set_component(name: str, on: bool) -> bool:
             if not ok:
                 log.error("The worker did not start. See the errors above.")
 
-    others = " and ".join(COMPONENT_LABELS[c] for c in COMPONENTS if c != name)
-    log.info(
-        "%s %s. %s unaffected.",
-        COMPONENT_LABELS[name],
-        "enabled" if on else "disabled",
-        others,
-    )
+    # Only on success. The menu bar shows the CLI's last output line as the
+    # reason a toggle failed, and this sentence logged unconditionally, so
+    # every failure banner in Settings read "Worker enabled. ML service and
+    # Dashboard unaffected." while the real cause (Docker down, sharp broken,
+    # media mount missing) scrolled past above it. Announcing success on the
+    # way out of a failure is wrong on its own terms, too.
+    if ok:
+        others = " and ".join(COMPONENT_LABELS[c] for c in COMPONENTS if c != name)
+        log.info(
+            "%s %s. %s unaffected.",
+            COMPONENT_LABELS[name],
+            "enabled" if on else "disabled",
+            others,
+        )
     if not any(_component_enabled(c, config) for c in COMPONENTS):
         log.warning("Every component is now off, so nothing will run.")
     return ok

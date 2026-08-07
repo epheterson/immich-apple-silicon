@@ -2455,6 +2455,49 @@ class TestComponentToggle:
         assert saved["ml"] is False
         reconcile.assert_called_once()
 
+    def test_a_failed_toggle_does_not_announce_success(self, tmp_data_dir):
+        """The menu bar shows the CLI's last output line as the failure reason.
+
+        This sentence was logged unconditionally, after the failure, so every
+        error banner in Settings read "Worker enabled. ML service and Dashboard
+        unaffected." while the real cause (Docker down, sharp broken, media
+        mount missing) scrolled past above it. Claiming success on the way out
+        of a failure is wrong on its own terms too.
+        """
+        import immich_accelerator.__main__ as m
+
+        cfg = dict(self.WORKER_CFG, worker=False)
+        with patch.object(m, "load_config", return_value=cfg), patch.object(
+            m, "save_config"
+        ), patch.object(m, "_watcher_running", return_value=False), patch.object(
+            m, "cmd_start"
+        ), patch.object(
+            m, "read_pid", return_value=None  # cmd_start logged and gave up
+        ), patch.object(
+            m, "log"
+        ) as log:
+            assert m._set_component("worker", True) is False
+
+        said = " ".join(str(c) for c in log.info.call_args_list)
+        assert "unaffected" not in said, "announced success after failing"
+
+    def test_a_successful_toggle_still_says_so(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "load_config", return_value={"ml": True}), patch.object(
+            m, "save_config"
+        ), patch.object(m, "reconcile_ml"), patch.object(
+            m, "read_pid", return_value=None
+        ), patch.object(
+            m, "_restart_worker", return_value=True
+        ), patch.object(
+            m, "log"
+        ) as log:
+            assert m._set_component("ml", False) is True
+
+        said = " ".join(str(c) for c in log.info.call_args_list)
+        assert "unaffected" in said
+
     def test_enabling_worker_clears_the_stale_preset(self, tmp_data_dir):
         """Leaving a contradictory ml_only behind is a trap for whoever reads
         config.json next, even though the explicit key already wins."""
@@ -2616,6 +2659,124 @@ def _worker_env_for(overrides: dict) -> dict:
         with pytest.raises(RuntimeError):
             m.cmd_start(argparse.Namespace(force=True))
     return captured
+
+
+class TestWorkerFreeWatchDoesNotStrandTheInstall:
+    """Two ways the worker-free loop could quietly ruin an install.
+
+    Both come from the same change: that loop used to be reachable only via the
+    `ml_only` preset, and is now reachable by any full install running
+    `component worker off`. Things it could assume before, it cannot assume now.
+    """
+
+    def _loop(self, m, configs):
+        """Run _watch_without_worker over a scripted sequence of configs."""
+        return patch.multiple(
+            m,
+            load_config=MagicMock(side_effect=configs),
+            read_pid=MagicMock(return_value=999),
+            reconcile_dashboard=MagicMock(),
+            reconcile_components=MagicMock(),
+            cap_service_logs=MagicMock(),
+            _start_without_worker=MagicMock(),
+        )
+
+    def test_does_not_hand_over_to_a_worker_that_cannot_start(self, tmp_data_dir):
+        """Handing over would crash-loop launchd forever.
+
+        `component worker on` refuses without a worker config, but the README
+        documents these as plain keys in config.json, so a hand-edited or
+        restored file reaches the watcher without passing that check. Switching
+        anyway makes cmd_start raise out of cmd_watch, main() exits 1, launchd
+        relaunches into the same crash, and the ML engine and dashboard are
+        left running unsupervised for good.
+        """
+        import immich_accelerator.__main__ as m
+
+        ml_only = {"ml_only": True, "ml_port": 3003, "worker": True}
+        with self._loop(m, [ml_only, KeyboardInterrupt()]), patch.object(
+            m, "_upgraded_on_disk", return_value=False
+        ), patch("signal.signal"), patch("time.sleep"), patch.object(m, "log") as log:
+            assert m._watch_without_worker(ml_only) is None, "must not switch"
+
+        said = " ".join(str(c) for c in log.error.call_args_list)
+        assert "server_dir" in said, "should name what is missing"
+
+    def test_hands_over_when_the_config_really_describes_a_worker(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        full: dict = {k: "x" for k in m._WORKER_CONFIG_KEYS}
+        full["worker"] = True
+        with self._loop(m, [full]), patch.object(
+            m, "_upgraded_on_disk", return_value=False
+        ), patch("signal.signal"), patch("time.sleep"), patch.object(m, "log"):
+            assert m._watch_without_worker(full) == m._SWITCH
+
+    def test_applies_a_brew_upgrade(self, tmp_data_dir):
+        """Without this, `component worker off` silently opts an install out of
+        every future upgrade: brew writes the new code and the KeepAlive'd
+        watcher keeps running the old one forever. That is #79 again, reached
+        from a documented command."""
+        import immich_accelerator.__main__ as m
+
+        off = {"worker": False, "ml_port": 3003}
+        with self._loop(m, [off]), patch.object(
+            m, "_upgraded_on_disk", return_value=True
+        ) as upgraded, patch("signal.signal"), patch("time.sleep"), patch.object(
+            m, "log"
+        ):
+            assert m._watch_without_worker(off) is None
+            upgraded.assert_called_once()
+
+    def test_both_watch_loops_share_one_upgrade_check(self):
+        """Derived, not hand-listed: whichever loop someone adds next, the
+        check is a named function and its absence is visible here."""
+        import inspect
+
+        import immich_accelerator.__main__ as m
+
+        for loop in (m._watch_worker, m._watch_without_worker):
+            assert "_upgraded_on_disk" in inspect.getsource(loop), loop.__name__
+
+
+class TestStartWithoutWorkerStopsTheWorker:
+    """`start` on a worker-off install must not leave one running.
+
+    _kill_stale_processes deliberately spares anything named in a pidfile, so a
+    live tracked worker walks straight through it. Left alone it keeps pulling
+    jobs while status, the menu bar and the dashboard all report it off, and
+    the user points a second machine at the same queues.
+    """
+
+    CFG = {"worker": False, "ml": False, "dashboard": True, "ml_port": 3003}
+
+    def test_a_running_worker_is_stopped(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_kill_stale_processes"), patch.object(
+            m, "read_pid", side_effect=lambda n: 4242 if n == "worker" else None
+        ), patch.object(m, "kill_pid") as kill, patch.object(
+            m, "start_dashboard"
+        ), patch.object(
+            m, "log"
+        ):
+            m._start_without_worker(dict(self.CFG), argparse.Namespace(force=False))
+
+        assert "worker" in [c.args[0] for c in kill.call_args_list]
+
+    def test_nothing_is_killed_when_no_worker_is_running(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_kill_stale_processes"), patch.object(
+            m, "read_pid", return_value=None
+        ), patch.object(m, "kill_pid") as kill, patch.object(
+            m, "start_dashboard"
+        ), patch.object(
+            m, "log"
+        ):
+            m._start_without_worker(dict(self.CFG), argparse.Namespace(force=False))
+
+        assert "worker" not in [c.args[0] for c in kill.call_args_list]
 
 
 class TestWatchDispatch:
@@ -2806,6 +2967,26 @@ class TestStartIsSerialized:
             m.cmd_start(argparse.Namespace(force=False))
         assert held, "cmd_start must take the start lock itself"
 
+    def test_the_lock_lands_in_the_temp_dir_not_the_real_home(self, tmp_data_dir):
+        """The fixture must isolate the lock, not just the config and pids.
+
+        Releases are validated on the same Mac that runs production
+        (CLAUDE.md: the Mini is the release gate). An unpatched LOCK_FILE means
+        a test taking a real flock contends with the live watcher for the
+        production start lock: the test hangs on the 180s timeout, or the
+        watcher's worker restart stalls for the length of the suite and Immich
+        sits with no worker while the tests pass green. Same trap as read_pid's
+        global process scan, where a throwaway HOME looked isolating and was
+        not.
+        """
+        import immich_accelerator.__main__ as m
+
+        assert m.LOCK_FILE == tmp_data_dir["lock_file"]
+        with m._start_lock(timeout=1.0):
+            pass
+        assert Path.home() not in m.LOCK_FILE.parents, "points at the real install"
+        assert tmp_data_dir["lock_file"].exists(), "the lock was taken elsewhere"
+
     def test_lock_is_not_taken_again_by_callers(self):
         """Re-entrancy would deadlock: flock is per-file-descriptor but the
         wait loop is not re-entrant, so a caller holding it while cmd_start
@@ -2876,14 +3057,32 @@ class TestSetupReestablishesComponents:
     made re-running setup on an ml-only box silently keep worker: false, which
     breaks the documented ml-only-to-full upgrade path."""
 
-    def test_component_keys_are_not_preserved_wholesale(self):
+    def test_worker_is_the_only_component_key_setup_may_reset(self):
         from immich_accelerator.__main__ import _PRESERVED_CONFIG_KEYS
 
+        # Re-running a full setup on an ml-only box is how you turn the worker
+        # back on, so this one key is deliberately not carried across.
         assert "worker" not in _PRESERVED_CONFIG_KEYS
-        assert "ml" not in _PRESERVED_CONFIG_KEYS
-        # The dashboard is a pure preference with no setup-path meaning, so it
-        # is the one that should survive.
+        # The other two are pure preferences that no full setup path writes,
+        # so leaving them out did not mean "setup decides", it meant "setup
+        # silently discards". Dropping "ml" started a local engine behind the
+        # back of anyone who had offloaded ML to another machine, downloaded
+        # gigabytes of models, and repointed the worker at localhost.
         assert "dashboard" in _PRESERVED_CONFIG_KEYS
+        assert "ml" in _PRESERVED_CONFIG_KEYS
+
+    def test_ml_off_survives_a_setup_rerun(self, tmp_data_dir):
+        """The offloaded-ML path end to end, through the real _finalize_config."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"ml": False, "ml_url": "http://10.0.0.9:3003", "api_key": "k"})
+        fresh = {"version": "3.0.2", "server_dir": "/srv", "node": "/node"}
+        with patch.object(m, "log"):
+            m._finalize_config(fresh)
+
+        saved = m.load_config()
+        assert saved["ml"] is False, "setup re-enabled an engine the user turned off"
+        assert saved["ml_url"] == "http://10.0.0.9:3003"
 
 
 class TestWorkerConfigGate:
