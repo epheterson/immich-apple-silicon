@@ -1001,9 +1001,9 @@ class TestStartMlOnly:
     def test_cmd_start_dispatches_to_ml_only_and_skips_worker_path(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
 
-        with patch.object(
-            m, "load_config", return_value=dict(self.CFG)
-        ), patch.object(m, "_start_without_worker") as start_no_worker, patch.object(
+        with patch.object(m, "load_config", return_value=dict(self.CFG)), patch.object(
+            m, "_start_without_worker"
+        ) as start_no_worker, patch.object(
             m, "find_docker"
         ) as find_docker, patch.object(
             m, "_preflight_env_health"
@@ -1079,11 +1079,9 @@ class TestWatchMlOnly:
     def test_cmd_watch_dispatches_to_ml_only_and_skips_worker_path(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
 
-        with patch.object(
-            m, "load_config", return_value=dict(self.CFG)
-        ), patch.object(m, "_watch_without_worker") as watch_no_worker, patch.object(
-            m, "cmd_start"
-        ) as cmd_start:
+        with patch.object(m, "load_config", return_value=dict(self.CFG)), patch.object(
+            m, "_watch_without_worker"
+        ) as watch_no_worker, patch.object(m, "cmd_start") as cmd_start:
             m.cmd_watch(argparse.Namespace())
             watch_no_worker.assert_called_once()
             cmd_start.assert_not_called()
@@ -1131,11 +1129,9 @@ class TestWatchMlOnly:
 
         # First read_pid call is the pre-loop check (live -> no initial start).
         # Second is inside the loop body (crashed -> triggers a restart).
-        with patch.object(
-            m, "read_pid", side_effect=[4321, None]
-        ), patch.object(m, "reconcile_dashboard"), patch.object(
-            m, "load_config", return_value=dict(self.CFG)
-        ), patch.object(
+        with patch.object(m, "read_pid", side_effect=[4321, None]), patch.object(
+            m, "reconcile_dashboard"
+        ), patch.object(m, "load_config", return_value=dict(self.CFG)), patch.object(
             m, "cap_service_logs"
         ), patch.object(
             m, "_find_ml_dir", return_value=None
@@ -1179,9 +1175,9 @@ class TestSetupMlOnly:
     def test_writes_minimal_config_with_no_worker_fields(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
 
-        with patch.object(
-            m, "_find_ml_dir", return_value=Path("/ml")
-        ), patch.object(m, "_finalize_config") as finalize:
+        with patch.object(m, "_find_ml_dir", return_value=Path("/ml")), patch.object(
+            m, "_finalize_config"
+        ) as finalize:
             m._setup_ml_only(argparse.Namespace())
             finalize.assert_called_once()
             written = finalize.call_args[0][0]
@@ -2355,3 +2351,300 @@ class TestIntEnv:
 
         monkeypatch.setenv("IAA_TEST_INT", "10k")
         assert _int_env("IAA_TEST_INT", 10) == 10
+
+
+class TestComponentEnabled:
+    """_component_enabled: the precedence rules every other path depends on."""
+
+    def test_absent_means_enabled(self):
+        from immich_accelerator.__main__ import COMPONENTS, _component_enabled
+
+        for name in COMPONENTS:
+            assert _component_enabled(name, {}) is True
+
+    def test_v180_dashboard_key_still_honored(self):
+        """The one component key that actually shipped must keep working."""
+        from immich_accelerator.__main__ import _component_enabled
+
+        cfg = {"dashboard": False}
+        assert _component_enabled("dashboard", cfg) is False
+        assert _component_enabled("worker", cfg) is True
+        assert _component_enabled("ml", cfg) is True
+
+    def test_ml_only_preset_disables_only_the_worker(self):
+        from immich_accelerator.__main__ import _component_enabled
+
+        cfg = {"ml_only": True}
+        assert _component_enabled("worker", cfg) is False
+        assert _component_enabled("ml", cfg) is True
+        assert _component_enabled("dashboard", cfg) is True
+
+    def test_explicit_key_beats_the_preset(self):
+        """Otherwise a box set up with --ml-only could never be switched back
+        without hand-editing config.json."""
+        from immich_accelerator.__main__ import _component_enabled
+
+        assert _component_enabled("worker", {"ml_only": True, "worker": True}) is True
+
+    def test_worker_on_ml_off_is_expressible(self):
+        """The capability this release adds: Mac does thumbs, another box does ML."""
+        from immich_accelerator.__main__ import _component_enabled
+
+        cfg = {"ml": False}
+        assert _component_enabled("worker", cfg) is True
+        assert _component_enabled("ml", cfg) is False
+
+    def test_unreadable_config_defaults_to_enabled(self, tmp_data_dir):
+        """A broken config must not silently turn the accelerator off."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "load_config", side_effect=OSError("boom")):
+            assert m._component_enabled("worker") is True
+
+
+class TestComponentToggle:
+    """cmd_component / _set_component: flipping a key and applying it now."""
+
+    def test_off_writes_key_and_stops_it(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        saved = {}
+        with patch.object(m, "load_config", return_value={"ml": True}), patch.object(
+            m, "save_config", side_effect=lambda c: saved.update(c)
+        ), patch.object(m, "reconcile_ml") as reconcile:
+            m._set_component("ml", False)
+        assert saved["ml"] is False
+        reconcile.assert_called_once()
+
+    def test_enabling_worker_clears_the_stale_preset(self, tmp_data_dir):
+        """Leaving a contradictory ml_only behind is a trap for whoever reads
+        config.json next, even though the explicit key already wins."""
+        import immich_accelerator.__main__ as m
+
+        saved = {}
+        with patch.object(
+            m, "load_config", return_value={"ml_only": True, "worker": False}
+        ), patch.object(
+            m, "save_config", side_effect=lambda c: saved.update(c)
+        ), patch.object(
+            m, "cmd_start"
+        ):
+            m._set_component("worker", True)
+        assert saved["worker"] is True
+        assert "ml_only" not in saved
+
+    def test_unknown_component_is_rejected(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_set_component") as setter:
+            m.cmd_component(argparse.Namespace(name="thumbnails", state="off"))
+            setter.assert_not_called()
+
+    def test_listing_does_not_write_config(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "load_config", return_value={}), patch.object(
+            m, "read_pid", return_value=None
+        ), patch.object(m, "save_config") as save:
+            m.cmd_component(argparse.Namespace(name=None, state=None))
+            save.assert_not_called()
+
+
+class TestWorkerWithoutML:
+    """Worker on, ML off. New in 1.9.0, and the env var is the subtle part."""
+
+    def test_ml_url_omitted_so_immich_own_setting_governs(self, tmp_data_dir):
+        """Pointing the worker at a dead localhost port would fail every ML job;
+        setting nothing lets Immich's configured ML URL apply."""
+        env = _worker_env_for({"ml": False})
+        assert "IMMICH_MACHINE_LEARNING_URL" not in env
+
+    def test_ml_url_config_key_is_forwarded_when_set(self, tmp_data_dir):
+        env = _worker_env_for({"ml": False, "ml_url": "http://gpubox:3003"})
+        assert env["IMMICH_MACHINE_LEARNING_URL"] == "http://gpubox:3003"
+
+    def test_localhost_used_when_ml_is_on(self, tmp_data_dir):
+        env = _worker_env_for({})
+        assert env["IMMICH_MACHINE_LEARNING_URL"] == "http://localhost:3003"
+
+
+def _worker_env_for(overrides: dict) -> dict:
+    """Run cmd_start far enough to capture the worker environment it builds.
+
+    cmd_start is the most load-bearing function in the codebase, so this drives
+    the real thing rather than reimplementing its env assembly.
+    """
+    import immich_accelerator.__main__ as m
+
+    config = {
+        "db_hostname": "localhost",
+        "db_port": "5432",
+        "db_username": "postgres",
+        "db_password": "pw",
+        "db_name": "immich",
+        "redis_hostname": "localhost",
+        "redis_port": "6379",
+        "ml_port": 3003,
+        "version": "3.0.1",
+        "server_dir": "/srv",
+        "node": "/usr/bin/node",
+        "ml_dir": "/ml",
+    }
+    config.update(overrides)
+    captured = {}
+
+    def capture(name, cmd, env, cwd):
+        captured.update(env)
+        raise RuntimeError("stop here, the env is what we came for")
+
+    with patch.object(m, "load_config", return_value=config), patch.object(
+        m, "save_config"
+    ), patch.object(m, "_kill_stale_processes"), patch.object(
+        m, "find_docker", side_effect=RuntimeError("no docker")
+    ), patch.object(
+        m, "read_pid", return_value=None
+    ), patch.object(
+        m, "find_node", return_value="/usr/bin/node"
+    ), patch.object(
+        m, "_check_node_engines_compat", return_value=(True, "")
+    ), patch.object(
+        m, "_verify_sharp_loads", return_value=(True, "")
+    ), patch.object(
+        m, "_build_link_ok", return_value=True
+    ), patch.object(
+        m, "_preflight_env_health", return_value=True
+    ), patch.object(
+        m, "ensure_media_ready", return_value=True
+    ), patch.object(
+        m, "_find_ml_dir", return_value=None
+    ), patch.object(
+        m, "_start_ml_preferred", return_value=(0, None, False)
+    ), patch.object(
+        m, "kill_pid"
+    ), patch.object(
+        m, "start_service", side_effect=capture
+    ):
+        with pytest.raises(RuntimeError):
+            m.cmd_start(argparse.Namespace(force=True))
+    return captured
+
+
+class TestWatchDispatch:
+    """cmd_watch picks a loop by the worker component, and each loop hands back
+    when that key flips, so a toggle takes effect on a running watcher instead
+    of at the next restart."""
+
+    def test_dispatches_to_worker_loop_by_default(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "load_config", return_value={}), patch.object(
+            m, "_watch_worker", return_value=None
+        ) as worker, patch.object(m, "_watch_without_worker") as no_worker:
+            m.cmd_watch(None)
+            worker.assert_called_once()
+            no_worker.assert_not_called()
+
+    def test_dispatches_to_worker_free_loop_when_worker_off(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "load_config", return_value={"worker": False}
+        ), patch.object(m, "_watch_worker") as worker, patch.object(
+            m, "_watch_without_worker", return_value=None
+        ) as no_worker:
+            m.cmd_watch(None)
+            no_worker.assert_called_once()
+            worker.assert_not_called()
+
+    def test_switch_hands_over_to_the_other_loop(self, tmp_data_dir):
+        """The worker loop returning _SWITCH must re-dispatch, not exit."""
+        import immich_accelerator.__main__ as m
+
+        configs = [{}, {"worker": False}]
+        with patch.object(
+            m, "load_config", side_effect=lambda: configs.pop(0)
+        ), patch.object(
+            m, "_watch_worker", return_value=m._SWITCH
+        ) as worker, patch.object(
+            m, "_watch_without_worker", return_value=None
+        ) as no_worker:
+            m.cmd_watch(None)
+            worker.assert_called_once()
+            no_worker.assert_called_once()
+
+    def test_worker_loop_stops_the_worker_when_disabled_mid_flight(self, tmp_data_dir):
+        """Otherwise the crash-check would fight the toggle and restart it."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "load_config", side_effect=[{}, {"worker": False}]
+        ), patch.object(m, "read_pid", return_value=1234), patch.object(
+            m, "reconcile_components"
+        ), patch.object(
+            m, "kill_pid"
+        ) as kill, patch.object(
+            m, "cmd_start"
+        ), patch.object(
+            m, "cap_service_logs"
+        ), patch(
+            "signal.signal"
+        ), patch(
+            "time.sleep", return_value=None
+        ), patch.object(
+            m, "WORKER_VERSION_FILE", Path("/nonexistent/worker-version")
+        ):
+            assert m._watch_worker({}) == m._SWITCH
+            kill.assert_called_once_with("worker")
+
+    def test_worker_free_loop_hands_back_when_worker_enabled(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "load_config", return_value={"worker": True}
+        ), patch.object(m, "read_pid", return_value=4321), patch.object(
+            m, "reconcile_dashboard"
+        ), patch.object(
+            m, "reconcile_components"
+        ), patch.object(
+            m, "cap_service_logs"
+        ), patch(
+            "signal.signal"
+        ), patch(
+            "time.sleep", return_value=None
+        ):
+            assert m._watch_without_worker({"worker": False}) == m._SWITCH
+
+
+class TestReconcileML:
+    """reconcile_ml: the ML half of the one-enforcement-point rule."""
+
+    def test_stops_ml_when_disabled(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=999), patch.object(
+            m, "kill_pid"
+        ) as kill, patch.object(m, "_start_ml_service") as start:
+            m.reconcile_ml({"ml": False})
+            kill.assert_called_once_with("ml")
+            start.assert_not_called()
+
+    def test_does_not_start_ml_when_disabled_and_already_down(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=None), patch.object(
+            m, "kill_pid"
+        ) as kill, patch.object(m, "_start_ml_service") as start:
+            m.reconcile_ml({"ml": False})
+            kill.assert_not_called()
+            start.assert_not_called()
+
+    def test_restarts_ml_when_enabled_and_down(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=None), patch.object(
+            m, "_find_ml_dir", return_value=None
+        ), patch.object(
+            m, "_start_ml_service", return_value=(77, "native Swift")
+        ) as start:
+            m.reconcile_ml({})
+            start.assert_called_once()

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.9.0 - 2026-08-06
+
+### Added
+- **Turn the worker, ML, or dashboard off independently.** 1.8.0 made the dashboard optional; that is now one rule instead of a special case. `immich-accelerator component ml off` leaves the Mac doing thumbnails, video and metadata while an existing box keeps doing ML, which was not possible before. `component worker off` is the reverse, an ML-only compute node. `component` with no arguments lists what's on. Changes apply immediately, including to a running service, and the menu bar app's Settings window has the same three switches. Every existing install keeps all three on.
+- **`setup --ml-only`: run a spare Mac as a network ML node.** No worker, no Docker, no Postgres, no Redis, no library mount, just the ML engine reachable at this Mac's IP for another Immich instance's Remote Machine Learning URL. Contributed by [@lesurJ](https://github.com/lesurJ) ([#119](https://github.com/epheterson/immich-apple-silicon/pull/119)).
+- **`IMMICH_ACCEL_ML_THREADS` caps ML CPU use.** The ONNX models in the CLIP zoo now use every core (see below), which is right on an idle Mac and less obviously right while the worker is transcoding on the same machine. Set it to a number to cap ML without touching the worker; unset keeps the default.
+
+### Changed
+- **CLIP models in the model zoo are roughly twice as fast.** onnxruntime was pinned to a single thread, set when the engine only ran face recognition and never revisited when the model zoo landed in 1.7.0. Measured on an M4: ViT-B-16 347ms to 181ms, ViT-B-16-SigLIP 357ms to 163ms, with byte-identical embeddings, so existing search indexes are unaffected. Found and fixed by [@lesurJ](https://github.com/lesurJ) ([#118](https://github.com/epheterson/immich-apple-silicon/pull/118)).
+- **Menu bar: a component you turn off disappears rather than showing red.** The status icon also stops judging components you turned off, so an ML-only Mac no longer sits amber forever for missing a worker it was told not to run.
+- **`status` distinguishes "disabled" from "stopped".**
+
 ## 1.8.0 - 2026-08-05
 
 ### Added
