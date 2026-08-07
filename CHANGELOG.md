@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.9.0 - 2026-08-06
+## 1.9.0 - 2026-08-07
 
 ### Added
 - **Turn the worker, ML, or dashboard off independently.** 1.8.0 made the dashboard optional; that is now one rule instead of a special case. `immich-accelerator component ml off` leaves the Mac doing thumbnails, video and metadata while an existing box keeps doing ML, which was not possible before. `component worker off` is the reverse, an ML-only compute node. `component` with no arguments lists what's on. Changes apply immediately, including to a running service, and the menu bar app's Settings window has the same three switches. Every existing install keeps all three on.
@@ -20,6 +20,8 @@
 ### Fixed
 - **The dashboard reported 100% complete while assets were still unprocessed.** Whenever Immich's queues were empty, every progress bar jumped to 100% and the remainder was labelled "skipped", on the assumption that anything left after a drained queue must be unprocessable. That is true for a handful of corrupt files and badly wrong for a library that simply has not been queued yet: a 174,000-asset library with 106,000 assets awaiting embeddings showed four full bars and reported the work done. Percentages are now always done over total, and the remainder is reported as "not queued", which is what it is. This is also why the dashboard and the menu bar used to disagree.
 - **Menu bar: the panel no longer resizes while you are reading it.** The progress rows came from a call with a 2 second timeout, and any slower reply blanked all five rows until the next poll, so the panel shrank and regrew every few seconds on a large library. A slow reply now keeps the last known values, and which rows exist is decided when you open the panel rather than changing under the pointer.
+- **Menu bar: no more querying your Immich database in the background.** Fetching per-queue progress runs a full aggregate over the asset table, measured at about 1.5 seconds on a 174,000-asset library. It was running every 15 seconds for as long as the app was open, to compute rows nobody was looking at. It now runs only while the panel is open, so the app costs an idle Mac nothing.
+- **The Settings window always opens fully on screen**, and the checklist no longer prints the app and background-service versions as two rows when they are the same number.
 
 ## 1.8.0 - 2026-08-05
 
