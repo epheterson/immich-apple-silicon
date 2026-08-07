@@ -78,11 +78,20 @@ struct Snapshot: Equatable {
         var wanted = 0, healthy = 0
         if workerEnabled { wanted += 1; if workerUp { healthy += 1 } }
         if mlEnabled { wanted += 1; if mlHealthy { healthy += 1 } }
-        if wanted == 0 { return .stopped }   // nothing that processes is enabled
+
+        // Nothing that processes photos is enabled. Note this is NOT the same
+        // as "every component is off": a dashboard-only install lands here too,
+        // and .stopped is still the honest answer, because from the point of
+        // view of getting work done nothing is running. The Dashboard row
+        // reports its own state separately.
+        if wanted == 0 { return .stopped }
+
         if healthy == wanted { return .running }
+        // Something is enabled and not healthy. Distinguish "not started yet"
+        // from "started and broken", counting the dashboard as a sign of life
+        // even though it does not count toward health.
         let anyAlive = workerUp || mlUp || dashboardUp
-        if !anyAlive { return .stopped }
-        return .degraded
+        return anyAlive ? .degraded : .stopped
     }
 }
 

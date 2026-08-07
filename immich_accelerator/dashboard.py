@@ -173,11 +173,16 @@ def _query_db(sql: str, config: dict) -> str:
 def _reload_config(config: dict) -> dict:
     """Re-read config.json, falling back to the caller's copy.
 
-    create_app closes over the dict read once at process start, so without this
-    a component toggled while the dashboard is running would never reach it: the
-    page would keep drawing a service that was switched off minutes ago. Cheap
-    enough at the cache TTL, and a partially-written file just means we use the
-    previous copy for one cycle.
+    create_app captures the config once at process start, so a component toggled
+    while the dashboard is running would otherwise never reach it and the page
+    would keep drawing a service switched off minutes ago.
+
+    Called from the request handlers rather than from get_status, so get_status
+    stays a pure function of the config it is handed: making it silently prefer
+    a file over its own argument would change the contract for every caller and
+    every test, and would behave differently on a machine that happens to have a
+    real install. A partially-written file just means one cycle with the
+    previous copy.
     """
     try:
         with open(CONFIG_FILE) as f:
@@ -193,8 +198,6 @@ def get_status(config: dict) -> dict:
     now = time.monotonic()
     if now - _cache_ts < _CACHE_TTL and _cache:
         return _cache
-
-    config = _reload_config(config)
 
     # Service health
     import urllib.request as _urlreq
@@ -460,21 +463,26 @@ def create_app(config: dict):
 
     app = FastAPI(title="Immich Accelerator Dashboard")
 
+    # The captured config is the fallback; every request re-reads the file, so a
+    # component toggle or an added api_key takes effect without a restart.
+    # Both handlers do it: a reload in only one of them is the same bug with a
+    # smaller blast radius.
     @app.get("/", response_class=HTMLResponse)
     async def index():
         return _load_html()
 
     @app.get("/api/status")
     async def api_status():
-        return JSONResponse(get_status(config))
+        return JSONResponse(get_status(_reload_config(config)))
 
     @app.post("/api/requeue")
     async def api_requeue():
         """Trigger 'Run All Missing' for thumbnail, CLIP, faces, and OCR queues."""
         import urllib.request, urllib.error
 
-        api_key = config.get("api_key", "")
-        immich_url = config.get("immich_url", "http://localhost:2283")
+        live = _reload_config(config)
+        api_key = live.get("api_key", "")
+        immich_url = live.get("immich_url", "http://localhost:2283")
         if not api_key:
             return JSONResponse({"error": "No API key configured"}, status_code=400)
 

@@ -788,24 +788,27 @@ class TestDashboardToggle:
         # Alive until it is killed, gone afterwards. A constant pid would mean
         # "we killed it and it is still running", which the toggle is now
         # supposed to report as a failure.
-        alive = {"pid": 4321}
         with patch(
-            "immich_accelerator.__main__.read_pid",
-            side_effect=lambda name: alive["pid"],
-        ), patch(
-            "immich_accelerator.__main__.kill_pid",
-            side_effect=lambda name: alive.update(pid=None),
-        ) as kill:
+            "immich_accelerator.__main__.read_pid", return_value=4321
+        ), patch("immich_accelerator.__main__.kill_pid") as kill, patch(
+            "immich_accelerator.__main__._pid_on_port", return_value=None
+        ):
             cmd_dashboard(args)
             kill.assert_called_once_with("dashboard")
         assert load_config().get("dashboard") is False
 
     def test_cmd_dashboard_off_reports_failure_when_it_survives(self, saved_config):
         """The whole point of the exit code: the menu bar reads it, so a stop
-        that did not stop must not look like success."""
+        that did not stop must not look like success. Verified against the port,
+        because kill_pid unlinks the pid file whether or not the process died,
+        so a pid-file check could never see a survivor."""
         args = argparse.Namespace(state="off", port=8420)
         with patch("immich_accelerator.__main__.read_pid", return_value=4321), patch(
             "immich_accelerator.__main__.kill_pid"
+        ), patch(
+            "immich_accelerator.__main__._pid_on_port", return_value=4321
+        ), patch(
+            "immich_accelerator.__main__._process_is_our_dashboard", return_value=True
         ), pytest.raises(SystemExit) as e:
             cmd_dashboard(args)
         assert e.value.code == 1
@@ -822,12 +825,17 @@ class TestDashboardToggle:
         `off` only honored the pidfile, the dashboard would keep serving while
         the UI reported it disabled."""
         args = argparse.Namespace(state="off", port=8420)
+        # The port frees once the process is signalled, as it would in reality.
+        # A mock that holds the port forever would be asserting that SIGTERM
+        # does not work.
+        holder = {"pid": 5150}
         with patch("immich_accelerator.__main__.read_pid", return_value=None), patch(
-            "immich_accelerator.__main__._pid_on_port", return_value=5150
+            "immich_accelerator.__main__._pid_on_port",
+            side_effect=lambda port: holder["pid"],
         ), patch(
             "immich_accelerator.__main__._process_is_our_dashboard", return_value=True
         ), patch(
-            "os.kill"
+            "os.kill", side_effect=lambda pid, sig: holder.update(pid=None)
         ) as kill:
             cmd_dashboard(args)
             kill.assert_called_once()
@@ -2428,9 +2436,14 @@ class TestComponentToggle:
     WORKER_CFG = {
         "server_dir": "/srv",
         "version": "3.0.1",
+        "node": "/usr/bin/node",
         "db_hostname": "localhost",
+        "db_port": "5432",
         "db_username": "postgres",
         "db_name": "immich",
+        "redis_hostname": "localhost",
+        "redis_port": "6379",
+        "ml_port": 3003,
     }
 
     def test_off_writes_key_and_stops_it(self, tmp_data_dir):
@@ -2772,3 +2785,136 @@ class TestDashboardComponentAwareness:
         assert "worker" not in worker_off
         assert "docker" not in worker_off
         assert "ml" in worker_off
+
+
+class TestStartIsSerialized:
+    """The lock lives inside cmd_start, not at its call sites.
+
+    There are seven call sites and the two that were locked were the two
+    somebody remembered. A toggle and the watcher can both decide to start the
+    worker inside the same 30s window, and two concurrent starts race over the
+    pid files, the /build link and the sharp rebuild."""
+
+    def test_every_cmd_start_is_covered(self):
+        import immich_accelerator.__main__ as m
+
+        held = []
+        with patch.object(m, "_start_lock") as lock, patch.object(m, "_cmd_start"):
+            lock.side_effect = lambda *a, **k: held.append(1) or _NullCtx()
+            m.cmd_start(argparse.Namespace(force=False))
+        assert held, "cmd_start must take the start lock itself"
+
+    def test_lock_is_not_taken_again_by_callers(self):
+        """Re-entrancy would deadlock: flock is per-file-descriptor but the
+        wait loop is not re-entrant, so a caller holding it while cmd_start
+        takes it again would block until the timeout."""
+        import inspect
+
+        import immich_accelerator.__main__ as m
+
+        for fn in (m._set_component, m._restart_worker):
+            assert "_start_lock" not in inspect.getsource(fn), (
+                f"{fn.__name__} must not take the lock; cmd_start does"
+            )
+
+
+class _NullCtx:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *a):
+        return False
+
+
+class TestRestartWorkerDelegatesToTheWatcher:
+    """Stopping is safe; starting has ten failure paths. When a supervisor is
+    running, only stop, and let it do the start it already knows how to do."""
+
+    def test_supervised_restart_only_stops(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=999), patch.object(
+            m, "kill_pid"
+        ) as kill, patch.object(m, "_watcher_running", return_value=True), patch.object(
+            m, "cmd_start"
+        ) as start:
+            assert m._restart_worker("for a test") is True
+            kill.assert_called_once_with("worker")
+            start.assert_not_called()
+
+    def test_unsupervised_restart_starts_and_reports_failure(self, tmp_data_dir):
+        """With nothing to converge for us, we must start it AND admit it if
+        the worker does not come back, rather than leaving a box with no
+        processing while claiming success."""
+        import immich_accelerator.__main__ as m
+
+        pids = iter([999, None, None])
+        with patch.object(m, "read_pid", side_effect=lambda n: next(pids)), patch.object(
+            m, "kill_pid"
+        ), patch.object(m, "_watcher_running", return_value=False), patch.object(
+            m, "cmd_start"
+        ) as start:
+            assert m._restart_worker("for a test") is False
+            start.assert_called_once()
+
+    def test_nothing_to_restart_is_success(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=None), patch.object(
+            m, "kill_pid"
+        ) as kill:
+            assert m._restart_worker("for a test") is True
+            kill.assert_not_called()
+
+
+class TestSetupReestablishesComponents:
+    """A full setup means you want a worker. Preserving component keys wholesale
+    made re-running setup on an ml-only box silently keep worker: false, which
+    breaks the documented ml-only-to-full upgrade path."""
+
+    def test_component_keys_are_not_preserved_wholesale(self):
+        from immich_accelerator.__main__ import _PRESERVED_CONFIG_KEYS
+
+        assert "worker" not in _PRESERVED_CONFIG_KEYS
+        assert "ml" not in _PRESERVED_CONFIG_KEYS
+        # The dashboard is a pure preference with no setup-path meaning, so it
+        # is the one that should survive.
+        assert "dashboard" in _PRESERVED_CONFIG_KEYS
+
+
+class TestWorkerConfigGate:
+    """One authoritative list of what cmd_start needs, checked up front, raising
+    RuntimeError (which main() catches) rather than KeyError (which it does
+    not, and which crash-loops the launchd watcher)."""
+
+    def test_ml_only_config_is_rejected_by_name(self):
+        import immich_accelerator.__main__ as m
+
+        with pytest.raises(RuntimeError) as e:
+            m._require_worker_config({"ml_only": True, "ml_port": 3003})
+        assert "server_dir" in str(e.value)
+        assert "setup" in str(e.value)
+
+    def test_a_complete_config_passes(self):
+        import immich_accelerator.__main__ as m
+
+        cfg = {k: "x" for k in m._WORKER_CONFIG_KEYS}
+        m._require_worker_config(cfg)  # must not raise
+
+    def test_gate_covers_every_key_cmd_start_dereferences(self):
+        """The previous version was a hand-maintained duplicate that had already
+        drifted four keys behind cmd_start."""
+        import inspect
+        import re
+
+        import immich_accelerator.__main__ as m
+
+        src = inspect.getsource(m._cmd_start)
+        # A hard read is config["x"] used as a value. Two things are not hard
+        # reads and must not be flagged: an assignment (config["x"] = ...,
+        # which creates the key), and a read the function already guards with
+        # its own config.get("x") truthiness check.
+        reads = set(re.findall(r'config\["([a-z_]+)"\](?!\s*=[^=])', src))
+        guarded = set(re.findall(r'config\.get\("([a-z_]+)"', src))
+        missing = reads - guarded - set(m._WORKER_CONFIG_KEYS)
+        assert not missing, f"cmd_start dereferences ungated keys: {sorted(missing)}"

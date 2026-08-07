@@ -44,14 +44,16 @@ struct SettingsView: View {
         config = StatusModel.readConfig()
         savedEngine = (config["ml_engine"] as? String) ?? "native"
         engine = savedEngine
-        // Seed the switches without treating it as a user action: assigning
-        // here fires .onChange, so an install that already has a component off
-        // would shell out to turn it off merely because the window opened.
-        applyingComponent = "seeding"
+        // Plain assignment. Seeding cannot be mistaken for a user action here
+        // because the toggles act through an explicit Binding whose setter is
+        // the action (see componentToggle), not through .onChange watching
+        // @State. A flag-guarded .onChange looked equivalent and was not:
+        // SwiftUI coalesces the set-and-clear of the guard into one update
+        // pass, so onChange saw it already cleared and fired anyway. On an
+        // ML-off install, merely opening this window restarted the worker.
         workerOn = StatusModel.componentEnabled("worker", config)
         mlOn = StatusModel.componentEnabled("ml", config)
         dashboardOn = StatusModel.componentEnabled("dashboard", config)
-        applyingComponent = nil
     }
 
     // MARK: - sections
@@ -152,30 +154,36 @@ struct SettingsView: View {
     private func componentToggle(
         _ name: String, _ binding: Binding<Bool>, _ title: String, _ caption: String
     ) -> some View {
-        VStack(alignment: .leading, spacing: Metrics.xs) {
+        // The switch reads @State but writes through here, so only a real
+        // interaction can trigger the CLI. Seeding assigns to the @State
+        // directly and is structurally incapable of firing this.
+        let action = Binding<Bool>(
+            get: { binding.wrappedValue },
+            set: { on in
+                guard applyingComponent == nil else { return }
+                binding.wrappedValue = on           // optimistic, reverted below
+                applyingComponent = name
+                Task {
+                    let result = await Actions.setComponent(name, on)
+                    await model.refresh()
+                    // Never leave a switch claiming something the accelerator
+                    // did not do: put it back and say why.
+                    if !result.ok {
+                        componentError = result.message
+                        binding.wrappedValue = !on  // no re-entry: setter unused
+                    } else {
+                        componentError = nil
+                        config = StatusModel.readConfig()
+                    }
+                    applyingComponent = nil
+                }
+            })
+
+        return VStack(alignment: .leading, spacing: Metrics.xs) {
             HStack(spacing: Metrics.md) {
-                Toggle(isOn: binding) { Text(title) }
+                Toggle(isOn: action) { Text(title) }
                     .toggleStyle(.switch)
                     .disabled(applyingComponent != nil)
-                    .onChange(of: binding.wrappedValue) { _, on in
-                        // Ignore the assignment load() makes when seeding state.
-                        guard applyingComponent == nil else { return }
-                        applyingComponent = name
-                        Task {
-                            let result = await Actions.setComponent(name, on)
-                            await model.refresh()
-                            // Never leave a switch claiming something the
-                            // accelerator did not do: put it back and say why.
-                            if !result.ok {
-                                componentError = result.message
-                                binding.wrappedValue = !on
-                            } else {
-                                componentError = nil
-                                config = StatusModel.readConfig()
-                            }
-                            applyingComponent = nil
-                        }
-                    }
                 // Turning the worker on runs a full start (extract, verify
                 // sharp, preflight) and can take minutes. A row that just went
                 // dead with no explanation reads as a hang.
