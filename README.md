@@ -99,6 +99,7 @@ Every command is prefixed with `immich-accelerator` (e.g. `immich-accelerator se
 | `setup` | Auto-detect local Docker, extract server, configure |
 | `setup --url URL` | Set up from a remote Immich instance |
 | `setup --manual` | Create a config template for manual editing |
+| `setup --ml-only` | Set up this Mac as an [ML-only network compute node](#running-as-an-ml-only-network-node) |
 | `start` | Run worker + ML once in the foreground (testing only; use the [service](#running-as-a-service-recommended) for auto-restart/update/log-rotation) |
 | `stop` | Stop native services |
 | `status` | Show what's running |
@@ -218,6 +219,55 @@ The native engine is the default and is health-checked at startup. If its bundle
 Then restart the accelerator (`brew services restart epheterson/immich-accelerator/immich-accelerator`, or `immich-accelerator stop` then `start`). Set it back to `"native"` (or remove the key) and restart to return to native. Confirm which engine is live with `immich-accelerator ml-test` and check `ml.log`.
 
 The Python engine is a managed fork of [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) by [@sebastianfredette](https://github.com/sebastianfredette), included as a git submodule; upstream changes are reviewed before merging, and contributions are made via [upstream PRs](https://github.com/sebastianfredette/immich-ml-metal/pulls).
+
+## Running as an ML-only network node
+
+Dedicate a spare Apple Silicon Mac to ML compute only — no worker, no Docker, no
+Postgres, no Redis, no library mount — and point another Immich instance's stock
+**Administration → Machine Learning Settings → Remote Machine Learning URL** at it:
+
+```text
+http://<this-mac-ip>:3003
+```
+
+This turns the Mac into pure ML compute for an Immich instance (or several) running
+anywhere else on the network, without the shared-filesystem/path-alignment rules that
+[split deployment](#split-deployment-nas--mac-or-any-two-hosts) requires — because
+unlike the worker, the ML service never touches the library on disk, only the image
+bytes and text sent to it over HTTP.
+
+### Setup
+
+```bash
+immich-accelerator setup --ml-only
+```
+
+Finds (or offers to build) the Python venv fallback engine, writes a minimal config
+(`"ml_only": true`), and offers to start now and install as a launch-at-login service —
+same as a full install, minus every Docker/worker/database step.
+
+### What's different from a full install
+
+- `start` / `watch` / `brew services start` bring up only the ML engine (native Swift by
+  default, Python venv fallback) and the [dashboard](#dashboard) — no worker, no
+  `/build` link, no Immich version tracking, no database connectivity checks.
+- `status`, `stop`, `logs ml`, and `ml-test` all work exactly as in a full install.
+- The dashboard's processing-progress bars aren't meaningful here — there's no single
+  "owning" Immich library, since this node can serve any number of Immich instances —
+  so it shows ML health and Apple Silicon hardware utilization only.
+- Changing the CLIP/face model is still controlled entirely from each consuming
+  Immich instance's own admin settings, same as any other deployment — see
+  [ML service](#ml-service) above.
+
+### Security note
+
+The ML service binds `0.0.0.0:3003` (LAN-accessible) and, like Immich's own Docker ML
+service, has **no authentication** — anything that can reach the port can submit
+inference requests. This is the same trust model as Immich's stock `machine-learning`
+container; ml-only mode just makes it reachable from other hosts instead of only
+`localhost`. If you're on an untrusted network, put it behind a firewall or VPN and
+don't expose port 3003 to the internet — same guidance as the [dashboard's security
+note](#security) below.
 
 ## Running as a service (recommended)
 

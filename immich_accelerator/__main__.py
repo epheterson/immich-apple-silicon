@@ -2519,8 +2519,11 @@ def _finalize_config(config: dict) -> None:
 
     save_config(config)
 
-    # Ensure /build firmlink for plugin path compatibility (Immich 2.7+)
-    _ensure_build_link()
+    # Ensure /build firmlink for plugin path compatibility (Immich 2.7+).
+    # Skip in ml-only mode: no worker, no Immich server files on this box —
+    # nothing needs /build to resolve.
+    if not config.get("ml_only"):
+        _ensure_build_link()
 
     # Auto-start services
     log.info("")
@@ -2567,7 +2570,12 @@ def _finalize_config(config: dict) -> None:
             subprocess.run(
                 ["launchctl", "load", str(plist_dst)], capture_output=True, timeout=10
             )
-            log.info("  Installed (auto-starts worker, ML, and dashboard on login)")
+            log.info(
+                "  Installed (auto-starts %s on login)",
+                "ML and dashboard"
+                if config.get("ml_only")
+                else "worker, ML, and dashboard",
+            )
 
     log.info("")
     log.info("Immich Accelerator is running.")
@@ -3681,9 +3689,46 @@ def _setup_manual(_args):
     log.info("  python -m immich_accelerator start")
 
 
+def _setup_ml_only(args) -> None:
+    """Set up this Mac as an ML-only network compute node: just the ML engine
+    (native Swift by default, Python venv fallback), reachable at this Mac's
+    IP on ml_port. No Docker, no Postgres, no Redis, no worker, no library
+    mount. Point another Immich instance's Administration -> Machine Learning
+    Settings -> Remote Machine Learning URL at this Mac.
+    """
+    log.info("Setting up ML-only mode (network ML compute node)...")
+    log.info("  This Mac will run only the ML engine — no worker, no Docker, no DB.")
+
+    ml_dir = _find_ml_dir()
+    if ml_dir:
+        log.info("  Python venv fallback: %s", ml_dir)
+    else:
+        log.warning(
+            "  Python ML source/venv not found — the venv fallback engine "
+            "won't be available."
+        )
+        log.warning(
+            "  The native Swift engine (if installed via Homebrew) still "
+            "works on its own."
+        )
+
+    config = {
+        "ml_only": True,
+        "ml_dir": str(ml_dir) if ml_dir else None,
+        "ml_port": 3003,
+    }
+    _finalize_config(config)
+
+    log.info("")
+    log.info("Point other Immich instances' Remote Machine Learning URL at:")
+    log.info("  http://<this-mac-ip>:%d", config["ml_port"])
+
+
 def cmd_setup(args):
-    """Set up the accelerator. Dispatches to local, remote, or manual mode."""
-    if args.manual:
+    """Set up the accelerator. Dispatches to local, remote, manual, or ml-only mode."""
+    if args.ml_only:
+        _setup_ml_only(args)
+    elif args.manual:
         _setup_manual(args)
     elif args.import_server and not args.url:
         # Standalone import: load existing config and import server files
@@ -4109,8 +4154,59 @@ def _kill_stale_processes():
         time.sleep(1)
 
 
+def _start_ml_only(config: dict, args) -> None:
+    """cmd_start's ml-only counterpart: bring up just the ML engine (and the
+    dashboard) as a network-reachable compute node. No Docker, no DB/Redis,
+    no worker, no /build link — none of that is relevant when this Mac's
+    only job is to answer /predict for some other Immich instance's "Remote
+    Machine Learning URL". Uses _start_ml_service (blocks on the health
+    check) rather than cmd_start's split preferred/verify dance: unlike the
+    worker path, there is no worker startup here to avoid delaying.
+    """
+    _kill_stale_processes()
+
+    ml_pid = read_pid("ml")
+    if ml_pid:
+        if not args.force:
+            log.info("Already running (PID %d). Use --force to restart.", ml_pid)
+            return
+        cmd_stop(None)
+
+    # Re-resolve ml_dir every start — config["ml_dir"] is a cache that goes
+    # stale when brew upgrade deletes the old Cellar directory (#29).
+    resolved_ml = _find_ml_dir()
+    if resolved_ml and str(resolved_ml) != config.get("ml_dir"):
+        log.info(
+            "ML path changed (%s -> %s) — updating config.",
+            config.get("ml_dir") or "(unset)",
+            resolved_ml,
+        )
+        config["ml_dir"] = str(resolved_ml)
+        save_config(config)
+
+    ml_pid, ml_engine = _start_ml_service(config)
+    if not ml_pid:
+        log.warning("ML service will not start (no native bundle, no venv).")
+        log.warning(
+            "  If you installed via Homebrew, try: brew reinstall immich-accelerator"
+        )
+        return
+    log.info("  ML service ready (PID %d, %s)", ml_pid, ml_engine)
+
+    # Bring up the dashboard too, so `start` is a complete bring-up.
+    start_dashboard()
+
+    log.info("")
+    log.info("Immich Accelerator running (ML-only)")
+    log.info("  ML log: %s/ml.log", LOG_DIR)
+
+
 def cmd_start(args):
     config = load_config()
+
+    if config.get("ml_only"):
+        _start_ml_only(config, args)
+        return
 
     # Kill any stale processes before starting
     _kill_stale_processes()
@@ -4632,11 +4728,71 @@ FD_RESTART_THRESHOLD = _int_env("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000)
 FD_RESTART_COOLDOWN = _int_env("IMMICH_ACCEL_FD_RESTART_COOLDOWN", 300)
 
 
+def _watch_ml_only(config: dict) -> None:
+    """cmd_watch's ml-only counterpart: monitor and restart only the ML
+    service (and dashboard), forever. No fd-leak watchdog (that leak is
+    worker-only, #89) and no Docker/Immich-API polling (there is no local
+    server_dir to re-extract in ml-only mode).
+    """
+    log.info("Watching ML-only service (Ctrl+C to stop)...")
+
+    # `brew services stop`/`restart` send SIGTERM to this watcher, but ml/
+    # dashboard run detached (own session) and would survive — trap the
+    # signal and stop them before exiting, matching cmd_watch's behavior.
+    def _graceful_stop(signum, _frame):
+        log.info("Received signal %d, stopping services...", signum)
+        try:
+            stop_all_fast()
+        finally:
+            sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _graceful_stop)
+    signal.signal(signal.SIGINT, _graceful_stop)
+
+    if not read_pid("ml"):
+        log.info("Service not running, starting...")
+        _start_ml_only(config, argparse.Namespace(force=True))
+    else:
+        reconcile_dashboard()
+
+    while True:
+        try:
+            time.sleep(30)
+            config = load_config()  # reload each cycle (setup may have changed it)
+
+            # Keep service logs bounded, same as the worker path.
+            cap_service_logs()
+
+            reconcile_dashboard()
+
+            # Check ML — re-resolve ml_dir each cycle (brew upgrade can
+            # invalidate it), same as cmd_watch's worker-path check.
+            if not read_pid("ml"):
+                log.warning("ML service not running — attempting restart...")
+                resolved_ml = _find_ml_dir()
+                if resolved_ml and str(resolved_ml) != config.get("ml_dir"):
+                    config["ml_dir"] = str(resolved_ml)
+                    save_config(config)
+                pid, engine = _start_ml_service(config)
+                if pid:
+                    log.info("  ML restarted (PID %d, %s)", pid, engine)
+                else:
+                    log.error("  ML restart failed")
+        except KeyboardInterrupt:
+            log.info("Watch stopped")
+            return
+
+
 def cmd_watch(_args):
     """Monitor services and restart on crash. Detects Docker updates.
 
     Suitable for launchd KeepAlive — runs forever, checking every 30s.
     """
+    config = load_config()
+    if config.get("ml_only"):
+        _watch_ml_only(config)
+        return
+
     log.info("Watching services (Ctrl+C to stop)...")
 
     if FD_RESTART_THRESHOLD > 0 and _LIBPROC is None:
@@ -5230,6 +5386,11 @@ def main():
         "--import-server",
         metavar="DIR",
         help="Import server from extracted directory or tarball",
+    )
+    setup_p.add_argument(
+        "--ml-only",
+        action="store_true",
+        help="Set up this Mac as an ML-only network compute node (no worker, no DB)",
     )
     start_p = sub.add_parser("start", help="Start native worker + ML")
     start_p.add_argument("--force", action="store_true", help="Restart if running")
