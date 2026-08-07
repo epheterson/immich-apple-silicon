@@ -520,7 +520,12 @@ class TestRegressionGuards:
             env={"NODE_OPTIONS": node_options, "PATH": "/usr/bin:/bin"},
             capture_output=True,
             text=True,
-            timeout=10,
+            # Generous, because this asserts nothing about speed. The question
+            # is whether node parses a quoted --require path containing a
+            # space, and a cold node start on a loaded CI runner blew a 10s
+            # budget and failed the build for a reason unrelated to what is
+            # under test.
+            timeout=60,
         )
         if result.returncode != 0:
             pytest.fail(
@@ -1066,7 +1071,8 @@ class TestKillStaleProcessesPattern:
             ),
             (
                 1002,
-                "/Users/someone/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main",
+                "/Users/someone/.immich-accelerator/ml/venv/bin/python3.11 "
+                "-m src.main",
             ),
         ]
         killed = self._run(rows)
@@ -1135,7 +1141,8 @@ class TestKillStaleProcessesPattern:
             ),
             (
                 4002,
-                "/Users/someone/.immich-accelerator/ml/venv/bin/python3.11 " "-m src.main",
+                "/Users/someone/.immich-accelerator/ml/venv/bin/python3.11 "
+                "-m src.main",
             ),
             # Harness + noise — all must survive
             (4101, "tart run --no-graphics immich-test-run-20260415-011735"),
@@ -1256,8 +1263,10 @@ class TestNodeVersionPreflight:
         the generated formula and corrupts it (a bug that reached #106 before CI
         caught it). Keep the heredoc body free of both."""
         script = (REPO_ROOT / "scripts" / "render-formula.sh").read_text()
-        body = script[script.index("cat >"):]
-        assert "`" not in body, "no backticks in the formula heredoc (command substitution)"
+        body = script[script.index("cat >") :]
+        assert (
+            "`" not in body
+        ), "no backticks in the formula heredoc (command substitution)"
         assert "$(" not in body, "no $( ) in the formula heredoc (command substitution)"
 
     def test_find_node_prefers_node_22_keg(self):
@@ -1489,7 +1498,9 @@ class TestHeicDecodeShim:
         )
         assert result.returncode == 0, f"driver failed: {result.stderr}"
         assert "WRAPPED:true" in result.stdout.splitlines()
-        types = [ln for ln in result.stdout.splitlines() if ln.startswith("INPUT_TYPE:")]
+        types = [
+            ln for ln in result.stdout.splitlines() if ln.startswith("INPUT_TYPE:")
+        ]
         assert types == ["INPUT_TYPE:buffer", "INPUT_TYPE:string"], result.stdout
 
     def test_prefers_vips_over_sips(self, tmp_path):
@@ -1509,7 +1520,10 @@ class TestHeicDecodeShim:
         result = self._run(
             tmp_path,
             node,
-            {"IMMICH_ACCELERATOR_VIPS": str(vips), "IMMICH_ACCELERATOR_SIPS": str(sips)},
+            {
+                "IMMICH_ACCELERATOR_VIPS": str(vips),
+                "IMMICH_ACCELERATOR_SIPS": str(sips),
+            },
             [str(heic)],
         )
         assert result.returncode == 0, f"driver failed: {result.stderr}"
@@ -1534,7 +1548,10 @@ class TestHeicDecodeShim:
         result = self._run(
             tmp_path,
             node,
-            {"IMMICH_ACCELERATOR_VIPS": str(vips), "IMMICH_ACCELERATOR_SIPS": str(sips)},
+            {
+                "IMMICH_ACCELERATOR_VIPS": str(vips),
+                "IMMICH_ACCELERATOR_SIPS": str(sips),
+            },
             [str(heic)],
         )
         assert result.returncode == 0, f"driver failed: {result.stderr}"
@@ -1564,7 +1581,9 @@ class TestHeicDecodeShim:
             [str(cr2), str(nef), str(plain_tif)],
         )
         assert result.returncode == 0, f"driver failed: {result.stderr}"
-        types = [ln for ln in result.stdout.splitlines() if ln.startswith("INPUT_TYPE:")]
+        types = [
+            ln for ln in result.stdout.splitlines() if ln.startswith("INPUT_TYPE:")
+        ]
         assert types == [
             "INPUT_TYPE:buffer",
             "INPUT_TYPE:buffer",
@@ -1581,28 +1600,37 @@ class TestHeicDecodeShim:
         self._fake_sharp(tmp_path)
         marker = tmp_path / "vipshome_seen"
         vips = tmp_path / "vips_stub.sh"
-        self._stub(vips, 'echo "[${VIPSHOME-UNSET}]" > ' + str(marker) + '\n' + self._TIFF)
+        self._stub(
+            vips, 'echo "[${VIPSHOME-UNSET}]" > ' + str(marker) + "\n" + self._TIFF
+        )
         heic = tmp_path / "photo.heic"
         heic.write_bytes(self._HEIC_BYTES)
 
         bogus = tmp_path / "does-not-exist"
         r = self._run(
-            tmp_path, node,
+            tmp_path,
+            node,
             {"IMMICH_ACCELERATOR_VIPS": str(vips), "VIPSHOME": str(bogus)},
             [str(heic)],
         )
         assert r.returncode == 0, r.stderr
-        assert marker.read_text().strip() == "[UNSET]", "nonexistent VIPSHOME must be stripped"
+        assert (
+            marker.read_text().strip() == "[UNSET]"
+        ), "nonexistent VIPSHOME must be stripped"
 
         real = tmp_path / "real-vipshome"
         real.mkdir()
         r2 = self._run(
-            tmp_path, node,
+            tmp_path,
+            node,
             {"IMMICH_ACCELERATOR_VIPS": str(vips), "VIPSHOME": str(real)},
             [str(heic)],
         )
         assert r2.returncode == 0, r2.stderr
-        assert marker.read_text().strip() == "[" + str(real) + "]", "existing VIPSHOME must be preserved"
+        assert (
+            marker.read_text().strip() == "[" + str(real) + "]"
+        ), "existing VIPSHOME must be preserved"
+
 
 class TestPgKeepaliveShim:
     """The pg keepalive shim sets keepAlive on Immich's Postgres connections so
