@@ -994,7 +994,7 @@ class TestStartMlService:
 
 
 class TestStartMlOnly:
-    """_start_ml_only, and cmd_start's dispatch to it."""
+    """_start_without_worker, and cmd_start's dispatch to it."""
 
     CFG = {"ml_only": True, "ml_dir": "/ml", "ml_port": 3003}
 
@@ -1003,7 +1003,7 @@ class TestStartMlOnly:
 
         with patch.object(
             m, "load_config", return_value=dict(self.CFG)
-        ), patch.object(m, "_start_ml_only") as start_ml_only, patch.object(
+        ), patch.object(m, "_start_without_worker") as start_no_worker, patch.object(
             m, "find_docker"
         ) as find_docker, patch.object(
             m, "_preflight_env_health"
@@ -1011,7 +1011,7 @@ class TestStartMlOnly:
             m, "ensure_media_ready"
         ) as media_ready:
             m.cmd_start(argparse.Namespace(force=False))
-            start_ml_only.assert_called_once()
+            start_no_worker.assert_called_once()
             find_docker.assert_not_called()
             preflight.assert_not_called()
             media_ready.assert_not_called()
@@ -1024,7 +1024,7 @@ class TestStartMlOnly:
         ), patch.object(m, "cmd_stop") as stop, patch.object(
             m, "_start_ml_service"
         ) as start_ml:
-            m._start_ml_only(dict(self.CFG), argparse.Namespace(force=False))
+            m._start_without_worker(dict(self.CFG), argparse.Namespace(force=False))
             start_ml.assert_not_called()
             stop.assert_not_called()
 
@@ -1040,7 +1040,7 @@ class TestStartMlOnly:
         ), patch.object(
             m, "start_dashboard"
         ) as start_dash:
-            m._start_ml_only(dict(self.CFG), argparse.Namespace(force=True))
+            m._start_without_worker(dict(self.CFG), argparse.Namespace(force=True))
             stop.assert_called_once_with(None)
             start_dash.assert_called_once()
 
@@ -1054,7 +1054,7 @@ class TestStartMlOnly:
         ), patch.object(
             m, "start_dashboard"
         ) as start_dash:
-            m._start_ml_only(dict(self.CFG), argparse.Namespace(force=False))
+            m._start_without_worker(dict(self.CFG), argparse.Namespace(force=False))
             start_dash.assert_called_once()
 
     def test_no_engine_available_does_not_start_dashboard(self, tmp_data_dir):
@@ -1067,12 +1067,12 @@ class TestStartMlOnly:
         ), patch.object(
             m, "start_dashboard"
         ) as start_dash:
-            m._start_ml_only(dict(self.CFG), argparse.Namespace(force=False))
+            m._start_without_worker(dict(self.CFG), argparse.Namespace(force=False))
             start_dash.assert_not_called()
 
 
 class TestWatchMlOnly:
-    """_watch_ml_only, and cmd_watch's dispatch to it."""
+    """_watch_without_worker, and cmd_watch's dispatch to it."""
 
     CFG = {"ml_only": True, "ml_dir": "/ml", "ml_port": 3003}
 
@@ -1081,11 +1081,11 @@ class TestWatchMlOnly:
 
         with patch.object(
             m, "load_config", return_value=dict(self.CFG)
-        ), patch.object(m, "_watch_ml_only") as watch_ml_only, patch.object(
+        ), patch.object(m, "_watch_without_worker") as watch_no_worker, patch.object(
             m, "cmd_start"
         ) as cmd_start:
             m.cmd_watch(argparse.Namespace())
-            watch_ml_only.assert_called_once()
+            watch_no_worker.assert_called_once()
             cmd_start.assert_not_called()
 
     def test_skips_worker_only_checks_in_loop(self, tmp_data_dir):
@@ -1108,7 +1108,7 @@ class TestWatchMlOnly:
         ), patch(
             "time.sleep", side_effect=KeyboardInterrupt
         ):
-            m._watch_ml_only(dict(self.CFG))
+            m._watch_without_worker(dict(self.CFG))
             cmd_start.assert_not_called()
             fd_total.assert_not_called()
             find_docker.assert_not_called()
@@ -1118,13 +1118,13 @@ class TestWatchMlOnly:
 
         with patch.object(m, "read_pid", return_value=None), patch.object(
             m, "reconcile_dashboard"
-        ), patch.object(m, "_start_ml_only") as start_ml_only, patch(
+        ), patch.object(m, "_start_without_worker") as start_no_worker, patch(
             "signal.signal"
         ), patch(
             "time.sleep", side_effect=KeyboardInterrupt
         ):
-            m._watch_ml_only(dict(self.CFG))
-            start_ml_only.assert_called_once()
+            m._watch_without_worker(dict(self.CFG))
+            start_no_worker.assert_called_once()
 
     def test_restarts_ml_on_crash_inside_loop(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
@@ -1142,14 +1142,14 @@ class TestWatchMlOnly:
         ), patch.object(
             m, "_start_ml_service", return_value=(555, "native Swift")
         ) as start_ml, patch.object(
-            m, "_start_ml_only"
-        ) as start_ml_only, patch(
+            m, "_start_without_worker"
+        ) as start_no_worker, patch(
             "signal.signal"
         ), patch(
             "time.sleep", side_effect=[None, KeyboardInterrupt]
         ):
-            m._watch_ml_only(dict(self.CFG))
-            start_ml_only.assert_not_called()  # already running at the pre-loop check
+            m._watch_without_worker(dict(self.CFG))
+            start_no_worker.assert_not_called()  # already running at the pre-loop check
             start_ml.assert_called_once()  # in-loop restart after it "crashed"
 
 

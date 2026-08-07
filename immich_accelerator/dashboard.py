@@ -33,6 +33,20 @@ _CACHE_TTL = 3  # seconds
 _static_hw: dict | None = None
 
 
+def _worker_enabled(config: dict) -> bool:
+    """Whether the microservices worker component is on, which is what decides
+    whether there is a local library and database to report on at all.
+
+    Deliberately a small duplicate of __main__._component_enabled rather than an
+    import: the dashboard is spawned as `python -m immich_accelerator dashboard`,
+    so __main__ is the running module, and importing it from here would load a
+    second copy of it with its own state. Keep the two in sync.
+    """
+    if "worker" in config:
+        return bool(config["worker"])
+    return not config.get("ml_only")
+
+
 def _get_accelerator_version() -> str:
     """Get accelerator version from the VERSION file or fall back."""
     try:
@@ -188,30 +202,34 @@ def get_status(config: dict) -> dict:
     #   live = asset, deletedAt IS NULL, visibility != hidden
     #   awp  = live + has an asset_job_status row + has a Preview file
     #
-    # Skipped entirely in ml-only mode: there's no local Postgres to query
-    # (by design — this box has no worker, no library, no DB), so every
-    # uncached poll would otherwise spawn a doomed psql/docker-exec call and
-    # log a misleading "cannot connect to Postgres" line. Progress bars stay
-    # at 0/0, which is accurate — this node isn't "the" library.
-    counts_raw = "" if config.get("ml_only") else _query_db(
-        "WITH live AS ("
-        "  SELECT id, type, thumbhash FROM asset"
-        "  WHERE \"deletedAt\" IS NULL AND visibility != 'hidden'), "
-        "awp AS ("
-        '  SELECT a.id, js."facesRecognizedAt" FROM asset a'
-        '  JOIN asset_job_status js ON js."assetId" = a.id'
-        "  WHERE a.\"deletedAt\" IS NULL AND a.visibility != 'hidden'"
-        "    AND EXISTS (SELECT 1 FROM asset_file f"
-        "               WHERE f.\"assetId\" = a.id AND f.type = 'preview')) "
-        "SELECT (SELECT COUNT(*) FROM live), "
-        "(SELECT COUNT(*) FROM awp), "
-        "(SELECT COUNT(*) FROM live WHERE type = 'VIDEO'), "
-        "(SELECT COUNT(*) FROM live WHERE thumbhash IS NOT NULL), "
-        '(SELECT COUNT(*) FROM awp WHERE EXISTS (SELECT 1 FROM smart_search s WHERE s."assetId" = awp.id)), '
-        '(SELECT COUNT(*) FROM awp WHERE "facesRecognizedAt" IS NOT NULL), '
-        '(SELECT COUNT(*) FROM live l WHERE EXISTS (SELECT 1 FROM asset_job_status js WHERE js."assetId" = l.id AND js."ocrAt" IS NOT NULL)), '
-        "(SELECT COUNT(*) FROM live l WHERE l.type = 'VIDEO' AND EXISTS (SELECT 1 FROM asset_file f WHERE f.\"assetId\" = l.id AND f.type = 'encoded_video'))",
-        config,
+    # Skipped entirely when the worker component is off: there's no local
+    # Postgres to query (by design — that box has no worker, no library, no DB),
+    # so every uncached poll would otherwise spawn a doomed psql/docker-exec
+    # call and log a misleading "cannot connect to Postgres" line. Progress bars
+    # stay at 0/0, which is accurate — this node isn't "the" library.
+    counts_raw = (
+        ""
+        if not _worker_enabled(config)
+        else _query_db(
+            "WITH live AS ("
+            "  SELECT id, type, thumbhash FROM asset"
+            "  WHERE \"deletedAt\" IS NULL AND visibility != 'hidden'), "
+            "awp AS ("
+            '  SELECT a.id, js."facesRecognizedAt" FROM asset a'
+            '  JOIN asset_job_status js ON js."assetId" = a.id'
+            "  WHERE a.\"deletedAt\" IS NULL AND a.visibility != 'hidden'"
+            "    AND EXISTS (SELECT 1 FROM asset_file f"
+            "               WHERE f.\"assetId\" = a.id AND f.type = 'preview')) "
+            "SELECT (SELECT COUNT(*) FROM live), "
+            "(SELECT COUNT(*) FROM awp), "
+            "(SELECT COUNT(*) FROM live WHERE type = 'VIDEO'), "
+            "(SELECT COUNT(*) FROM live WHERE thumbhash IS NOT NULL), "
+            '(SELECT COUNT(*) FROM awp WHERE EXISTS (SELECT 1 FROM smart_search s WHERE s."assetId" = awp.id)), '
+            '(SELECT COUNT(*) FROM awp WHERE "facesRecognizedAt" IS NOT NULL), '
+            '(SELECT COUNT(*) FROM live l WHERE EXISTS (SELECT 1 FROM asset_job_status js WHERE js."assetId" = l.id AND js."ocrAt" IS NOT NULL)), '
+            "(SELECT COUNT(*) FROM live l WHERE l.type = 'VIDEO' AND EXISTS (SELECT 1 FROM asset_file f WHERE f.\"assetId\" = l.id AND f.type = 'encoded_video'))",
+            config,
+        )
     )
 
     # total_assets: thumbnails/OCR denominator; total_previews: CLIP/faces.
