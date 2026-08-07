@@ -33,6 +33,11 @@ struct AcceleratorBarMain {
     /// over ssh on a headless session. Both matter here, because the Mac this
     /// is validated on refuses screen capture and the release Mini has no GUI
     /// session at all, which is why UI changes kept shipping unlooked-at.
+    ///
+    /// Known limit: over ssh there is no window server to composite vibrancy,
+    /// so material-backed views (the sidebar) come out blank and the title bar
+    /// may lay out differently. Trust a headless render for *content* and a
+    /// render on a real display for *layout*.
     @MainActor
     private static func renderSettings(pane: String, to path: String) {
         setenv("ACCEL_SETTINGS_TAB", pane, 1)
@@ -43,7 +48,17 @@ struct AcceleratorBarMain {
         let window = NSWindow(contentViewController: host)
         window.styleMask = [.titled, .closable]
         window.title = "Immich Accelerator Settings"
-        window.orderFrontRegardless()
+        // Parked far off-screen and never ordered front. This used to call
+        // orderFrontRegardless, which put a real window on whatever display
+        // the machine had; on the Mini that meant watching windows blink in
+        // and out, half off the bottom of the screen, every time this ran.
+        // Dropping orderFrontRegardless alone was not enough: the window still
+        // materialized at a negative origin (measured at 959,-216 on the
+        // Mini's 1920x1050 display). cacheDisplay needs the window laid out,
+        // not visible, so put it somewhere it cannot be seen and leave it
+        // there.
+        window.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+        window.layoutIfNeeded()
 
         // Let layout, the status poll and any async row content settle. A
         // single spin renders an empty split view.
@@ -52,7 +67,12 @@ struct AcceleratorBarMain {
             RunLoop.main.run(until: Date().addingTimeInterval(0.05))
         }
 
-        guard let view = window.contentView,
+        // The theme frame (contentView's superview), not the content view, so
+        // the capture includes the title bar. Without it this tool could not
+        // answer questions about the window title, which is one of the things
+        // it exists to check.
+        guard let content = window.contentView,
+              let view = content.superview ?? content as NSView?,
               let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)
         else { print("render failed: no view"); return }
         view.cacheDisplay(in: view.bounds, to: rep)

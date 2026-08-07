@@ -103,8 +103,12 @@ struct SettingsView: View {
             .toolbar(removing: .sidebarToggle)
         } detail: {
             detail
-                .navigationTitle(pane?.title ?? "Settings")
         }
+        // On the split view, not on the detail. Applied to the detail it
+        // becomes that column's inline toolbar title and sits left-aligned
+        // above the content; applied here it is the window's title, which
+        // macOS centers, which is where a window title belongs.
+        .navigationTitle(pane?.title ?? "Settings")
         // Fixed, so switching panes doesn't resize the window under the pointer.
         .frame(width: Metrics.settingsWidth, height: Metrics.settingsHeight)
         .onAppear(perform: load)
@@ -165,9 +169,16 @@ struct SettingsView: View {
             }
 
             Section("Software Update") {
-                LabeledContent("Menu bar app", value: "v\(appVersion)")
-                LabeledContent("Core", value: model.snap.version.isEmpty
-                               ? "unknown" : "v\(model.snap.version)")
+                LabeledContent("Version", value: "v\(appVersion)")
+                // Only when it disagrees. The background service follows this
+                // app automatically (AppDelegate.syncCoreVersion), so in normal
+                // operation these are the same number, and printing it twice
+                // under two internal names ("Menu bar app", "Core") was two
+                // rows saying one thing. The split is only information when
+                // they have actually drifted, and then it matters a lot.
+                if let drifted = driftedCoreVersion {
+                    LabeledContent("Background service", value: drifted)
+                }
                 Button("Check for Updates…") { UpdaterModel.shared.checkForUpdates() }
             }
 
@@ -421,6 +432,15 @@ struct SettingsView: View {
 
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+    }
+
+    /// The installed core's version, but only when it is worth mentioning:
+    /// different from this app's, or unreadable. nil means "in lockstep, say
+    /// nothing".
+    private var driftedCoreVersion: String? {
+        let core = model.snap.version
+        if core.isEmpty { return "unknown" }
+        return core == appVersion ? nil : "v\(core)"
     }
 
     private func str(_ key: String) -> String {
