@@ -26,7 +26,7 @@ struct SettingsView: View {
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: Metrics.xl) {
             mlSection
             componentsSection
             configSection
@@ -35,8 +35,8 @@ struct SettingsView: View {
             Divider()
             footer
         }
-        .padding(20)
-        .frame(width: 460)
+        .padding(Metrics.xxl)
+        .frame(width: Metrics.settingsWidth)
         .onAppear(perform: load)
     }
 
@@ -58,15 +58,22 @@ struct SettingsView: View {
 
     private var configSection: some View {
         GroupBox {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: Metrics.rowPadV) {
                 ForEach(Diagnostics.checks(config: config, snap: model.snap)) { c in
-                    HStack(spacing: 8) {
-                        Image(systemName: c.iconName).foregroundStyle(c.tint).frame(width: 16)
+                    HStack(alignment: .firstTextBaseline, spacing: Metrics.md) {
+                        Image(systemName: c.iconName)
+                            .symbolRenderingMode(.hierarchical)
+                            .foregroundStyle(c.tint)
+                            .frame(width: Metrics.iconColumn, alignment: .center)
                         Text(c.label).foregroundStyle(.secondary)
-                            .frame(width: 90, alignment: .leading)
+                            .frame(width: 96, alignment: .leading)
                         Text(c.detail).textSelection(.enabled)
                             .foregroundStyle(c.level == .fail ? .primary : .secondary)
-                        Spacer()
+                            // Long paths belong on two lines, not truncated to
+                            // uselessness: this list exists to be read and
+                            // pasted into an issue.
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
                     }
                     .font(.callout)
                 }
@@ -82,13 +89,13 @@ struct SettingsView: View {
                     .help("Copies versions, this checklist, and recent log lines. No API key.")
                 }
             }
-            .padding(4)
+            .padding(Metrics.sm)
         } label: { Label("Configuration", systemImage: "checklist") }
     }
 
     private var mlSection: some View {
         GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: Metrics.lg) {
                 Picker("Engine", selection: $engine) {
                     Text("Native (Swift)").tag("native")
                     Text("Python (venv)").tag("python")
@@ -115,7 +122,7 @@ struct SettingsView: View {
                     }
                 }
             }
-            .padding(4)
+            .padding(Metrics.sm)
         } label: { Label("Machine Learning", systemImage: "brain.fill") }
     }
 
@@ -124,7 +131,7 @@ struct SettingsView: View {
     // so which of those happen is Immich's job scheduler, not ours.
     private var componentsSection: some View {
         GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: Metrics.lg) {
                 componentToggle("worker", $workerOn, "Worker",
                                 "Thumbnails, video transcoding, metadata")
                 componentToggle("ml", $mlOn, "Machine Learning",
@@ -132,18 +139,21 @@ struct SettingsView: View {
                 componentToggle("dashboard", $dashboardOn, "Web dashboard",
                                 dashboardStatus)
                 if let componentError {
-                    Text(componentError).font(.caption).foregroundStyle(.red)
+                    Label(componentError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.rowDetail)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .padding(4)
+            .padding(Metrics.sm)
         } label: { Label("Components", systemImage: "square.stack.3d.up") }
     }
 
     private func componentToggle(
         _ name: String, _ binding: Binding<Bool>, _ title: String, _ caption: String
     ) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: Metrics.xs) {
+            HStack(spacing: Metrics.md) {
                 Toggle(isOn: binding) { Text(title) }
                     .toggleStyle(.switch)
                     .disabled(applyingComponent != nil)
@@ -172,10 +182,10 @@ struct SettingsView: View {
                 if applyingComponent == name {
                     ProgressView().controlSize(.small)
                     Text(binding.wrappedValue ? "Starting…" : "Stopping…")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.rowDetail).foregroundStyle(.secondary)
                 }
             }
-            Text(caption).font(.caption).foregroundStyle(.secondary)
+            Text(caption).font(.rowDetail).foregroundStyle(.secondary)
         }
     }
 

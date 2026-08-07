@@ -9,32 +9,39 @@ struct MenuView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            Divider().padding(.horizontal, 12)
+            InsetDivider()
             statusRows
-            Divider().padding(.horizontal, 12)
+            InsetDivider()
             actions
-            Divider().padding(.horizontal, 12)
+            InsetDivider()
             footer
         }
-        .frame(width: 300)
+        .frame(width: Metrics.panelWidth)
         .onAppear { model.startPolling(interval: 3) }
         .onDisappear { model.startPolling(interval: 15) }
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: Metrics.md) {
             Image(systemName: "bolt.fill")
-                .foregroundStyle(model.snap.overall == .running ? .yellow : .secondary)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(model.snap.overall == .running ? Color.accentColor : .secondary)
                 .font(.title3)
-            VStack(alignment: .leading, spacing: 1) {
+                .frame(width: Metrics.iconColumn, alignment: .center)
+            VStack(alignment: .leading, spacing: Metrics.xs) {
                 Text("Immich Accelerator").font(.headline)
-                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                Text(subtitle).font(.rowDetail).foregroundStyle(.secondary)
             }
-            Spacer()
-            StatusDot(state: model.snap.overall).scaleEffect(1.25)
+            Spacer(minLength: Metrics.md)
+            // One state signal, not two. The bolt tints with health already;
+            // a dot beside it repeated the same fact in a second vocabulary.
+            Text(model.snap.overall.label)
+                .font(.badge)
+                .foregroundStyle(model.snap.overall == .running ? .secondary : .primary)
+            StatusDot(state: model.snap.overall)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
+        .panelGutter()
+        .padding(.vertical, Metrics.lg)
     }
 
     private var subtitle: String {
@@ -49,7 +56,7 @@ struct MenuView: View {
     // permanent red row for something switched off deliberately trains people
     // to ignore the colors.
     private var statusRows: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: Metrics.xs) {
             if model.snap.workerEnabled {
                 StatusRow(
                     icon: "gearshape.2.fill", name: "Worker",
@@ -75,11 +82,12 @@ struct MenuView: View {
                 Text("Every component is switched off.")
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 6).padding(.vertical, 4)
+                    .padding(.horizontal, Metrics.rowPadV)
+                    .padding(.vertical, Metrics.sm)
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.horizontal, Metrics.md)
+        .padding(.vertical, Metrics.sm)
     }
 
     private var mlDetail: String {
@@ -113,8 +121,8 @@ struct MenuView: View {
     }
 
     private var actions: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 6) {
+        VStack(spacing: Metrics.md) {
+            HStack(spacing: Metrics.md) {
                 if model.snap.overall == .stopped {
                     ActionButton(title: "Start", icon: "play.fill", prominent: true) {
                         await Actions.startService(); await model.refresh()
@@ -129,7 +137,7 @@ struct MenuView: View {
                 }
             }
             if let result = model.lastMLTest {
-                HStack(spacing: 5) {
+                HStack(spacing: Metrics.sm) {
                     Image(systemName: result.contains("OK") || result.contains("passed")
                           ? "checkmark.circle.fill" : "xmark.circle.fill")
                         .foregroundStyle(result.contains("OK") || result.contains("passed")
@@ -137,16 +145,16 @@ struct MenuView: View {
                     Text(result).font(.caption)
                     Spacer()
                 }
-                .padding(.horizontal, 4)
+                .padding(.horizontal, Metrics.xs)
                 .transition(.opacity)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .panelGutter()
+        .padding(.vertical, Metrics.md)
     }
 
     private var footer: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 0) {
             LinkRow(icon: "photo.on.rectangle.angled", title: "Open Immich") {
                 Actions.openImmich(model.snap.openImmichURL)
             }
@@ -161,7 +169,7 @@ struct MenuView: View {
             LinkRow(icon: "doc.text.magnifyingglass", title: "Open Logs") {
                 Actions.openLogs()
             }
-            Divider().padding(.vertical, 4).padding(.horizontal, 4)
+            Divider().padding(.vertical, Metrics.sm).padding(.horizontal, Metrics.sm)
             if Paths.isConfigured {
                 LinkRow(icon: "slider.horizontal.3", title: "Settings…") {
                     WindowManager.shared.showSettings(model: model)
@@ -174,14 +182,11 @@ struct MenuView: View {
             LinkRow(icon: "arrow.down.circle", title: "Check for Updates…") {
                 UpdaterModel.shared.checkForUpdates()
             }
-            Divider().padding(.vertical, 4).padding(.horizontal, 4)
+            Divider().padding(.vertical, Metrics.sm).padding(.horizontal, Metrics.sm)
             // Full-width settings row so it lines up with the link rows above
             // instead of a narrow checkbox centering itself in the panel.
-            HStack(spacing: 10) {
-                Image(systemName: "arrow.up.forward.app")
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 20)
+            HStack(spacing: Metrics.md) {
+                RowIcon(systemName: "arrow.up.forward.app")
                 Text("Launch at Login").font(.callout)
                 Spacer()
                 Toggle("", isOn: $launchAtLogin)
@@ -189,13 +194,13 @@ struct MenuView: View {
                     .toggleStyle(.switch)
                     .controlSize(.mini)
             }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
+            .padding(.horizontal, Metrics.md)
+            .padding(.vertical, Metrics.rowPadV)
             .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
             LinkRow(icon: "power", title: "Quit") { NSApp.terminate(nil) }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 8)
+        .padding(.horizontal, Metrics.md)
+        .padding(.vertical, Metrics.md)
     }
 }
 
@@ -211,7 +216,7 @@ struct StatusDot: View {
         }
     }
     var body: some View {
-        Circle().fill(color).frame(width: 9, height: 9)
+        Circle().fill(color).frame(width: Metrics.dot, height: Metrics.dot)
             .shadow(color: color.opacity(0.5), radius: 3)
     }
 }
@@ -225,29 +230,38 @@ struct StatusRow: View {
     var badgeTint: Color = .green
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: icon)
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(ok ? Color.accentColor : .secondary)
-                .frame(width: 20)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 6) {
-                    Text(name).font(.callout).fontWeight(.medium)
+        HStack(spacing: Metrics.md) {
+            RowIcon(systemName: icon, active: ok)
+            VStack(alignment: .leading, spacing: Metrics.xs) {
+                HStack(spacing: Metrics.sm) {
+                    Text(name).font(.rowTitle)
                     if let badge {
-                        Text(badge)
-                            .font(.system(size: 9, weight: .semibold, design: .rounded))
-                            .padding(.horizontal, 5).padding(.vertical, 1.5)
-                            .background(badgeTint.opacity(0.18), in: Capsule())
-                            .foregroundStyle(badgeTint)
+                        BadgeLabel(text: badge, tint: badgeTint)
                     }
                 }
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+                Text(detail).font(.rowDetail).foregroundStyle(.secondary)
             }
-            Spacer()
+            Spacer(minLength: Metrics.md)
             StatusDot(state: ok ? .running : .stopped)
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 5)
+        .padding(.horizontal, Metrics.rowPadV)
+        .padding(.vertical, Metrics.rowPadV)
+    }
+}
+
+/// The small capsule beside a row title (NATIVE / PYTHON). Its own type so the
+/// shape, tint opacity and padding are stated once.
+struct BadgeLabel: View {
+    let text: String
+    var tint: Color = .green
+
+    var body: some View {
+        Text(text)
+            .font(.badge)
+            .padding(.horizontal, Metrics.sm)
+            .padding(.vertical, 1)
+            .background(tint.opacity(0.18), in: Capsule())
+            .foregroundStyle(tint)
     }
 }
 
@@ -278,24 +292,31 @@ struct LinkRow: View {
     let title: String
     let action: () -> Void
 
+    @State private var hovering = false
+
     var body: some View {
         Button {
             action()
             // Clicking a link dismisses the panel like a normal menu item.
             WindowManager.shared.dismissMenuBarPanel()
         } label: {
-            HStack(spacing: 10) {
-                Image(systemName: icon)
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 20)
+            HStack(spacing: Metrics.md) {
+                RowIcon(systemName: icon, active: hovering)
                 Text(title).font(.callout)
-                Spacer()
+                Spacer(minLength: 0)
             }
+            .padding(.horizontal, Metrics.rowPadV)
+            .padding(.vertical, Metrics.sm)
             .contentShape(Rectangle())
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
+            // A row that highlights under the pointer is what makes this read
+            // as a menu rather than a list of labels. Without it the panel is
+            // the one part of the app that does not respond to the cursor.
+            .background(
+                RoundedRectangle(cornerRadius: Metrics.rowRadius, style: .continuous)
+                    .fill(Color.primary.opacity(hovering ? 0.08 : 0))
+            )
         }
         .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }

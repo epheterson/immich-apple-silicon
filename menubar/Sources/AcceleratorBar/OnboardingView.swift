@@ -19,7 +19,7 @@ struct OnboardingView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: Metrics.xl) {
             header
             Divider()
             switch phase {
@@ -28,16 +28,16 @@ struct OnboardingView: View {
             case .ready: ready
             }
         }
-        .padding(22)
-        .frame(width: 460)
+        .padding(Metrics.xxl)
+        .frame(width: Metrics.settingsWidth)
     }
 
     private var header: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: Metrics.lg) {
             Image(systemName: "bolt.fill")
-                .font(.system(size: 30))
+                .font(.largeTitle)
                 .foregroundStyle(.yellow)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: Metrics.xs) {
                 Text("Immich Accelerator").font(.title2).bold()
                 Text("Run Immich's ML and video work natively on Apple Silicon")
                     .font(.callout).foregroundStyle(.secondary)
@@ -48,12 +48,12 @@ struct OnboardingView: View {
     // MARK: - phases
 
     private var notInstalled: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: Metrics.lg) {
             Label("The accelerator isn't installed yet", systemImage: "shippingbox")
                 .font(.headline)
             Text("Install it with Homebrew, then come back and re-check.")
                 .foregroundStyle(.secondary)
-            HStack(spacing: 8) {
+            HStack(spacing: Metrics.md) {
                 Text(Actions.installCommand)
                     .font(.system(.footnote, design: .monospaced))
                     .textSelection(.enabled)
@@ -73,7 +73,7 @@ struct OnboardingView: View {
     }
 
     private var notConfigured: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: Metrics.lg) {
             Label("Installed. Let's connect it to Immich", systemImage: "gearshape")
                 .font(.headline)
             Text("Setup asks a few questions (your Immich, database, media) and "
@@ -92,7 +92,7 @@ struct OnboardingView: View {
     }
 
     private var ready: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: Metrics.lg) {
             Label("You're all set", systemImage: "checkmark.seal.fill")
                 .font(.headline)
                 .foregroundStyle(.green)
@@ -133,7 +133,7 @@ struct OnboardingView: View {
     }
 
     private func infoLine(_ label: String, _ value: String) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: Metrics.md) {
             Text(label).foregroundStyle(.secondary).frame(width: 70, alignment: .leading)
             Text(value).textSelection(.enabled)
         }
