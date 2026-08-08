@@ -3978,6 +3978,11 @@ def _venv_ml_spec(config: dict, env: dict):
     ml_dir = Path(config.get("ml_dir", ""))
     ml_python = ml_dir / "venv" / "bin" / "python3"
     if ml_python.exists():
+        # stdout is block-buffered once it's not a tty (always true — we redirect
+        # it into ml.log), which is where uvicorn's access log and any print()
+        # output live. Without this, `logs ml` sits blank and then dumps a stale
+        # chunk instead of streaming in real time.
+        env = dict(env, PYTHONUNBUFFERED="1")
         return [str(ml_python), "-m", "src.main"], str(ml_dir), env
     return None
 

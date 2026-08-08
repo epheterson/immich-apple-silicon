@@ -1,6 +1,12 @@
 import Foundation
 import MLX
 
+// stdout is fully block-buffered by libc once it isn't a tty (always true here —
+// launchd/immich-accelerator redirect it to a log file), so `immich-accelerator
+// logs ml` would sit blank for a while and then dump a stale chunk. Line-buffer
+// it so every print() shows up in the log as soon as it happens.
+setvbuf(stdout, nil, _IOLBF, 0)
+
 // Native Swift ML service prototype: CLIP (mlx-swift) + OCR + face-detect (Vision).
 // Proves the whole ML compute layer can be native — no Python, no venv, no torch.
 
