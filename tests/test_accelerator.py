@@ -730,32 +730,15 @@ class TestCLIParsing:
         assert exc.value.code == 1
 
     def _build_parser(self):
-        """Build the same parser as main() for testing."""
-        parser = argparse.ArgumentParser(prog="immich-accelerator")
-        parser.add_argument("--version", action="version", version="test")
-        sub = parser.add_subparsers(dest="command")
+        """The real parser, not a copy of it.
 
-        setup_p = sub.add_parser("setup")
-        setup_p.add_argument("--url")
-        setup_p.add_argument("--api-key")
-        setup_p.add_argument("--manual", action="store_true")
-        setup_p.add_argument("--import-server", metavar="DIR")
-        setup_p.add_argument("--ml-only", action="store_true")
-        start_p = sub.add_parser("start")
-        start_p.add_argument("--force", action="store_true")
-        sub.add_parser("stop")
-        sub.add_parser("status")
-        logs_p = sub.add_parser("logs")
-        logs_p.add_argument(
-            "service", nargs="?", choices=["worker", "ml"], default="worker"
-        )
-        sub.add_parser("update")
-        sub.add_parser("watch")
-        dash_p = sub.add_parser("dashboard")
-        dash_p.add_argument("state", nargs="?", choices=["on", "off"])
-        dash_p.add_argument("--port", type=int, default=8420)
-        sub.add_parser("uninstall")
-        return parser
+        This used to hand-rebuild the whole CLI, which meant a flag added to
+        __main__ and not here produced tests asserting the behaviour of a CLI
+        nobody ships. build_parser() exists so there is one definition.
+        """
+        import immich_accelerator.__main__ as m
+
+        return m.build_parser()
 
 
 # ---------------------------------------------------------------------------
@@ -3060,6 +3043,158 @@ class TestRestartWorkerDelegatesToTheWatcher:
         ) as kill:
             assert m._restart_worker("for a test") is True
             kill.assert_not_called()
+
+
+class TestConfirm:
+    """_confirm: the one place setup decides whether to ask.
+
+    This exists so the menu-bar app can run setup itself instead of handing the
+    user to Terminal and losing every signal about what happened.
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_flag(self):
+        import immich_accelerator.__main__ as m
+
+        m.ASSUME_YES = False
+        yield
+        m.ASSUME_YES = False
+
+    def test_asks_when_interactive(self):
+        import immich_accelerator.__main__ as m
+
+        with patch("builtins.input", return_value="y") as ask:
+            assert m._confirm("go? [Y/n] ") is True
+            ask.assert_called_once()
+
+    def test_empty_answer_takes_the_default(self):
+        import immich_accelerator.__main__ as m
+
+        with patch("builtins.input", return_value=""):
+            assert m._confirm("go? [Y/n] ", default=True) is True
+            assert m._confirm("go? [y/N] ", default=False) is False
+
+    def test_explicit_no_beats_the_default(self):
+        import immich_accelerator.__main__ as m
+
+        with patch("builtins.input", return_value="n"):
+            assert m._confirm("go? [Y/n] ", default=True) is False
+
+    def test_assume_yes_does_not_read_stdin(self):
+        import immich_accelerator.__main__ as m
+
+        m.ASSUME_YES = True
+        with patch("builtins.input", side_effect=AssertionError("must not ask")):
+            assert m._confirm("go? [Y/n] ", default=True) is True
+            assert m._confirm("go? [y/N] ", default=False) is False
+
+    def test_non_interactive_without_yes_refuses(self):
+        """The asymmetry, and it is deliberate.
+
+        Every one of these prompts already answered "no" on EOFError, and that
+        stays: a piped setup silently answering "yes, install a launch agent"
+        would be a nasty surprise. Refusing to act is the safe direction when
+        nobody is there to read the question. --yes is how you opt in.
+        """
+        import immich_accelerator.__main__ as m
+
+        with patch("builtins.input", side_effect=EOFError):
+            assert m._confirm("go? [Y/n] ", default=True) is False
+
+
+class TestSetupYesFlag:
+    """`setup --yes` is what makes an in-app setup possible at all."""
+
+    @pytest.fixture(autouse=True)
+    def reset_flag(self):
+        import immich_accelerator.__main__ as m
+
+        m.ASSUME_YES = False
+        yield
+        m.ASSUME_YES = False
+
+    def test_flag_parses_and_arms_the_module(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        args = m.build_parser().parse_args(["setup", "--ml-only", "--yes"])
+        assert args.yes is True
+        with patch.object(m, "_setup_ml_only") as setup:
+            m.cmd_setup(args)
+            setup.assert_called_once()
+        assert m.ASSUME_YES is True
+
+    def test_absent_flag_leaves_prompts_alone(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        args = m.build_parser().parse_args(["setup", "--ml-only"])
+        assert args.yes is False
+        with patch.object(m, "_setup_ml_only"):
+            m.cmd_setup(args)
+        assert m.ASSUME_YES is False
+
+    def test_ml_only_with_yes_starts_without_asking(self, tmp_data_dir):
+        """End to end through the real _finalize_config: the whole point is
+        that nothing blocks on stdin and the services actually come up."""
+        import immich_accelerator.__main__ as m
+
+        args = m.build_parser().parse_args(["setup", "--ml-only", "--yes"])
+        with patch.object(m, "_find_ml_dir", return_value=None), patch.object(
+            m, "cmd_start"
+        ) as start, patch.object(m, "log"), patch(
+            "builtins.input", side_effect=AssertionError("setup --yes must not ask")
+        ):
+            m.cmd_setup(args)
+
+        start.assert_called_once()
+        saved = m.load_config()
+        assert saved["worker"] is False
+        assert saved["ml"] is True
+
+    def test_yes_does_not_install_a_launch_agent_in_the_real_home(
+        self, tmp_data_dir, monkeypatch
+    ):
+        """The bug this flag caused, pinned.
+
+        Running the suite installed a live KeepAlive'd launch agent into the
+        developer's real ~/Library/LaunchAgents and left it crash-looping
+        every 10 seconds. The path was computed inline from Path.home(), so
+        the fixture never saw it; `input()` raising EOFError under pytest was
+        the only thing that had been preventing it, and --yes removed that.
+        """
+        import immich_accelerator.__main__ as m
+
+        real_home_agents = Path.home() / "Library" / "LaunchAgents"
+        before = (
+            set(real_home_agents.glob("com.immich.*"))
+            if real_home_agents.exists()
+            else set()
+        )
+
+        # Force the branch that installs it: a non-brew layout with the
+        # template present and no plist yet.
+        src = tmp_data_dir["data_dir"] / "launchd"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "com.immich.accelerator.plist").write_text("<plist/>")
+
+        args = m.build_parser().parse_args(["setup", "--ml-only", "--yes"])
+        with patch.object(m, "_find_ml_dir", return_value=None), patch.object(
+            m, "cmd_start"
+        ), patch.object(m, "log"), patch("subprocess.run"):
+            m.cmd_setup(args)
+
+        after = (
+            set(real_home_agents.glob("com.immich.*"))
+            if real_home_agents.exists()
+            else set()
+        )
+        assert after == before, f"setup wrote into the real home: {after - before}"
+
+    def test_the_fixture_isolates_the_launch_agents_dir(self, tmp_data_dir):
+        """Derived, so the next path someone computes inline is caught here."""
+        import immich_accelerator.__main__ as m
+
+        assert m.LAUNCH_AGENTS_DIR == tmp_data_dir["launch_agents"]
+        assert Path.home() not in m.LAUNCH_AGENTS_DIR.parents
 
 
 class TestSetupReestablishesComponents:

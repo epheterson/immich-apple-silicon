@@ -24,6 +24,13 @@ def tmp_data_dir(tmp_path):
     timeout, or the watcher's worker restart stalls for the length of the
     suite and Immich sits with no worker while the tests pass.
 
+    LAUNCH_AGENTS_DIR is the same trap with worse consequences. `setup --yes`
+    under pytest installed a live, KeepAlive'd launch agent into the real
+    ~/Library/LaunchAgents and left it crash-looping every 10 seconds. That
+    hole predates --yes: the prompt used to raise EOFError under pytest and
+    default to no, so nothing was written and nobody noticed. Adding a flag
+    that answers yes turned a dormant isolation gap into a live one.
+
     Same class of trap as read_pid's global process scan: the fixture looks
     isolating and is not.
     """
@@ -35,6 +42,8 @@ def tmp_data_dir(tmp_path):
     log_dir.mkdir()
     config_file = data_dir / "config.json"
     lock_file = data_dir / "start.lock"
+    launch_agents = tmp_path / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True)
 
     with patch.multiple(
         "immich_accelerator.__main__",
@@ -43,6 +52,7 @@ def tmp_data_dir(tmp_path):
         PID_DIR=pid_dir,
         LOG_DIR=log_dir,
         LOCK_FILE=lock_file,
+        LAUNCH_AGENTS_DIR=launch_agents,
     ):
         yield {
             "data_dir": data_dir,
@@ -50,6 +60,7 @@ def tmp_data_dir(tmp_path):
             "pid_dir": pid_dir,
             "log_dir": log_dir,
             "lock_file": lock_file,
+            "launch_agents": launch_agents,
         }
 
 
