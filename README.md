@@ -107,6 +107,7 @@ Every command is prefixed with `immich-accelerator` (e.g. `immich-accelerator se
 | `update` | Update to match a new Immich version |
 | `watch` | Monitor + auto-restart/update + log rotation (what the service runs) |
 | `dashboard` | Web UI at http://localhost:8420 |
+| `component [name] [on\|off]` | Turn the [worker, ML, or dashboard](#choosing-what-runs) on or off (no args lists them) |
 | `ml-test` | Diagnose the ML service (health + CLIP + OCR round-trip) |
 | `uninstall` | Remove services, data, and launchd config |
 
@@ -183,6 +184,10 @@ In the Immich admin UI (Administration → Jobs), tune the per-queue concurrency
 
 Higher isn't always better. Oversubscribing the CPU causes thrashing and actually reduces throughput.
 
+The ONNX models in the CLIP zoo (anything that isn't the default MLX model) let onnxruntime use every core, which is right on a Mac doing nothing else and less obviously right while the worker is transcoding on the same machine. `IMMICH_ACCEL_ML_THREADS` caps it without touching the worker; unset means "use every core", which stays the default.
+
+The cap is close to free, because the parallelism saturates early. On an M4 with ViT-B-16, capping to 2 measured 179ms against 175ms uncapped, for 8 fewer threads competing with the worker. Try it if search feels like it's making the rest of the machine sluggish.
+
 ## Split deployment (NAS + Mac, or any two hosts)
 
 Run the Immich Docker stack (API, Postgres, Redis) on one host and the native accelerator (worker + ML) on another. The one rule: **both machines must see the same files at the same absolute paths via a shared filesystem.** Setup detects a path mismatch and refuses to save a broken config.
@@ -220,7 +225,31 @@ Then restart the accelerator (`brew services restart epheterson/immich-accelerat
 
 The Python engine is a managed fork of [immich-ml-metal](https://github.com/sebastianfredette/immich-ml-metal) by [@sebastianfredette](https://github.com/sebastianfredette), included as a git submodule; upstream changes are reviewed before merging, and contributions are made via [upstream PRs](https://github.com/sebastianfredette/immich-ml-metal/pulls).
 
+## Choosing what runs
+
+The accelerator is three separate processes, and each one can be turned off independently:
+
+| Component | What it does | Turn it off when |
+|-----------|--------------|------------------|
+| `worker` | Thumbnails, video transcoding, metadata, RAW/HEIC decode | Another machine already runs the worker and you only want this Mac for ML |
+| `ml` | Smart search (CLIP), face detection, OCR | Another machine already does ML and you want this Mac for thumbnails and VideoToolbox |
+| `dashboard` | The web UI on port 8420 | You use the menu bar app, or you don't want a port open |
+
+```bash
+immich-accelerator component              # list what's on
+immich-accelerator component ml off       # this Mac does thumbnails and video, not ML
+immich-accelerator component worker off   # this Mac does ML only
+```
+
+Changes apply immediately, including to a running service, and they persist as plain keys in `~/.immich-accelerator/config.json`. The menu bar app's Settings window has the same three switches, and a component you turn off disappears from the menu rather than showing as a red failure.
+
+**Turning `ml` off hands ML to another machine, so tell it where.** The accelerator normally points the worker at its own engine on `localhost`. With `ml` off it stops setting that, and whatever you configured in Immich under **Administration → Machine Learning Settings** applies instead. Immich's default there is `immich-machine-learning:3003`, a Docker-internal hostname a worker running natively on macOS cannot resolve, so if you never changed it every ML job will fail. Either set that URL in Immich to a reachable engine, or set `"ml_url"` in `config.json` to name it here. Toggling `ml` restarts the worker, because that URL is fixed when the worker starts.
+
+**This goes as far as the process boundaries and no further.** Video, thumbnails, metadata and RAW decode all happen inside the single Immich microservices worker, so "video but not thumbnails" isn't something the accelerator can offer. That split is Immich's job scheduler: use **Administration → Jobs** to pause individual queues, and see [performance tuning](#performance-tuning) for concurrency.
+
 ## Running as an ML-only network node
+
+This is the `worker off, ml on` case above, with a setup flag (`--ml-only`) that skips every Docker and database step.
 
 Dedicate a spare Apple Silicon Mac to ML compute only — no worker, no Docker, no
 Postgres, no Redis, no library mount — and point another Immich instance's stock
@@ -243,8 +272,11 @@ immich-accelerator setup --ml-only
 ```
 
 Finds (or offers to build) the Python venv fallback engine, writes a minimal config
-(`"ml_only": true`), and offers to start now and install as a launch-at-login service —
-same as a full install, minus every Docker/worker/database step.
+(`"worker": false`), and offers to start now and install as a launch-at-login service —
+same as a full install, minus every Docker/worker/database step. To turn this
+node into a full install later, re-run `immich-accelerator setup`: the worker
+needs the Docker, database and library details that ML-only setup never collects,
+so `component worker on` cannot conjure them and will tell you so.
 
 ### What's different from a full install
 

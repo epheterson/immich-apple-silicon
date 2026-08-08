@@ -268,7 +268,7 @@ class TestGetStatus:
             assert "done" in p
             assert "total" in p
             assert "pct" in p
-            assert "skipped" in p
+            assert "unqueued" in p
 
     def test_progress_calculations(self, sample_config):
         import immich_accelerator.dashboard as d
@@ -301,6 +301,132 @@ class TestGetStatus:
         assert status["progress"]["faces"]["pct"] == 100.0
         for key in ("thumbnails", "clip", "faces", "ocr"):
             assert status["progress"][key]["pct"] <= 100.0
+
+    # -- idle is not finished ------------------------------------------------
+    #
+    # get_status used to return pct=100 for every stage whenever Immich's
+    # queues were drained, labelling the remainder "skipped" on the theory that
+    # anything still undone after an idle queue must be unprocessable. On a
+    # real 174k-asset library with 106k assets awaiting embeddings that drew
+    # four full bars and reported the work complete, and it was also why the
+    # menu bar (which compares done to total) and the web dashboard disagreed.
+
+    @staticmethod
+    def _jobs_response(active: int = 0, waiting: int = 0):
+        """A stand-in for Immich's /api/jobs with every queue in one state."""
+        body = json.dumps(
+            {
+                name: {"jobCounts": {"active": active, "waiting": waiting}}
+                for name in (
+                    "thumbnailGeneration",
+                    "smartSearch",
+                    "faceDetection",
+                    "ocr",
+                    "videoConversion",
+                )
+            }
+        ).encode()
+        resp = MagicMock()
+        resp.read.return_value = body
+        resp.__enter__ = lambda s: resp
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def _status_with_idle_queues(self, config, counts):
+        import immich_accelerator.dashboard as d
+
+        d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
+        with patch("urllib.request.urlopen", return_value=self._jobs_response()), patch(
+            "immich_accelerator.dashboard._query_db", return_value=counts
+        ), patch("immich_accelerator.dashboard._run", return_value=""):
+            return get_status(config)
+
+    def test_idle_queues_do_not_report_complete(self, sample_config):
+        # fields: total_assets|total_previews|total_videos|thumbs|clip|faces|ocr|video
+        # Eric's library in miniature: thumbnails nearly done, ML far behind.
+        status = self._status_with_idle_queues(
+            sample_config, "175234|173932|7664|173932|67712|67712|67712|4703"
+        )
+        clip = status["progress"]["clip"]
+        assert clip["pct"] == 38.9, "an idle queue is not a finished one"
+        assert clip["unqueued"] == 106220
+        # Video went through the same special case and gets the same treatment.
+        assert status["progress"]["video"]["pct"] == 61.4
+        assert status["progress"]["video"]["unqueued"] == 2961
+
+    def test_unqueued_is_zero_when_the_jobs_api_is_unreachable(self, sample_config):
+        """Unreachable is not idle: with no answer we cannot claim anything."""
+        import immich_accelerator.dashboard as d
+
+        d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
+        with patch("urllib.request.urlopen", side_effect=OSError), patch(
+            "immich_accelerator.dashboard._query_db",
+            return_value="100|100|10|100|40|40|40|5",
+        ), patch("immich_accelerator.dashboard._run", return_value=""):
+            status = get_status(sample_config)
+
+        assert status["progress"]["clip"]["pct"] == 40.0
+        assert status["progress"]["clip"]["unqueued"] == 0
+
+    def test_unqueued_is_zero_while_work_is_scheduled(self, sample_config):
+        """Waiting jobs are queued by definition, so nothing is unqueued."""
+        import immich_accelerator.dashboard as d
+
+        d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
+        with patch(
+            "urllib.request.urlopen", return_value=self._jobs_response(waiting=60)
+        ), patch(
+            "immich_accelerator.dashboard._query_db",
+            return_value="100|100|10|100|40|40|40|5",
+        ), patch(
+            "immich_accelerator.dashboard._run", return_value=""
+        ):
+            status = get_status(sample_config)
+
+        assert status["progress"]["clip"]["pct"] == 40.0
+        assert status["progress"]["clip"]["unqueued"] == 0
+
+    def test_unqueued_is_judged_per_queue_not_globally(self, sample_config):
+        """One busy queue must not blank the hint on all the others.
+
+        Gating on "is ANY queue busy" meant a video transcode backlog, or the
+        first seconds after Re-queue Missing, hid "106,220 not queued" from the
+        CLIP bar precisely while someone was watching it, then flashed it back
+        when the last queue drained.
+        """
+        import immich_accelerator.dashboard as d
+
+        busy_video = json.dumps(
+            {
+                "videoConversion": {"jobCounts": {"active": 3, "waiting": 40}},
+                "thumbnailGeneration": {"jobCounts": {"active": 0, "waiting": 0}},
+                "smartSearch": {"jobCounts": {"active": 0, "waiting": 0}},
+                "faceDetection": {"jobCounts": {"active": 0, "waiting": 0}},
+                "ocr": {"jobCounts": {"active": 0, "waiting": 0}},
+            }
+        ).encode()
+        resp = MagicMock()
+        resp.read.return_value = busy_video
+        resp.__enter__ = lambda s: resp
+        resp.__exit__ = MagicMock(return_value=False)
+
+        d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
+        with patch("urllib.request.urlopen", return_value=resp), patch(
+            "immich_accelerator.dashboard._query_db",
+            return_value="100|100|10|100|40|40|40|5",
+        ), patch("immich_accelerator.dashboard._run", return_value=""):
+            status = get_status(sample_config)
+
+        assert status["progress"]["clip"]["unqueued"] == 60, "idle queue lost its hint"
+        assert status["progress"]["video"]["unqueued"] == 0, "this one really is busy"
+
+    def test_unqueued_never_negative_on_count_skew(self, sample_config):
+        """done > total (assets removed mid-scan) must not report -10 unqueued."""
+        status = self._status_with_idle_queues(
+            sample_config, "200|100|10|150|110|110|150|5"
+        )
+        assert status["progress"]["clip"]["unqueued"] == 0
+        assert status["progress"]["clip"]["pct"] == 100.0
 
     def test_caching(self, sample_config):
         import immich_accelerator.dashboard as d

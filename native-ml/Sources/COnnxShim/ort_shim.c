@@ -13,6 +13,23 @@ typedef struct {
     char *out_name;
 } OrtHandle;
 
+// Intra-op thread count for every session we create. 0 means "let onnxruntime
+// decide", which is hardware_concurrency and the right default.
+//
+// IMMICH_ACCEL_ML_THREADS exists because that default is only obviously right
+// on a box doing nothing else. On a full install the worker is transcoding and
+// generating thumbnails at the same time, and ML taking every core makes the
+// whole machine feel worse for a gain nobody asked for. Setting it to e.g. 4
+// caps ML without touching the worker. Unset, or any junk value, keeps 0.
+static int ort_intra_op_threads(void) {
+    const char *raw = getenv("IMMICH_ACCEL_ML_THREADS");
+    if (!raw || !*raw) return 0;
+    char *end = NULL;
+    long n = strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || n < 0 || n > 1024) return 0;
+    return (int)n;
+}
+
 void *ort_load(const char *model_path) {
     if (!g) g = OrtGetApiBase()->GetApi(ORT_API_VERSION);
     OrtHandle *h = calloc(1, sizeof(OrtHandle));
@@ -27,7 +44,7 @@ void *ort_load(const char *model_path) {
     // bottleneck (measured ~14x slower than the mlx default-model path on
     // the same machine, and slower than the Python venv fallback's MPS
     // path for the same model).
-    g->SetIntraOpNumThreads(h->opts, 0);
+    g->SetIntraOpNumThreads(h->opts, ort_intra_op_threads());
     g->SetSessionGraphOptimizationLevel(h->opts, ORT_ENABLE_ALL);
     if (g->CreateSession(h->env, model_path, h->opts, &h->session)) goto fail;
     OrtAllocator *alloc;

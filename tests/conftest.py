@@ -1,4 +1,5 @@
 """Shared fixtures for immich-accelerator tests."""
+
 from __future__ import annotations
 
 import json
@@ -11,7 +12,21 @@ import pytest
 
 @pytest.fixture
 def tmp_data_dir(tmp_path):
-    """Override DATA_DIR / CONFIG_FILE / PID_DIR / LOG_DIR to use a temp directory."""
+    """Point every module-level path at a temp directory.
+
+    Every one of these is bound at import time off the real home, so anything
+    left unpatched here is a path from the test straight into the user's
+    production install. LOCK_FILE is the one that bites hardest: cmd_start
+    takes a real flock on it, the release process runs pytest on the same Mac
+    that runs production (CLAUDE.md: the Mini is the release gate), and tests
+    that drive the real cmd_start would otherwise contend with the live
+    watcher for the production start lock. Either the test hangs on the 180s
+    timeout, or the watcher's worker restart stalls for the length of the
+    suite and Immich sits with no worker while the tests pass.
+
+    Same class of trap as read_pid's global process scan: the fixture looks
+    isolating and is not.
+    """
     data_dir = tmp_path / ".immich-accelerator"
     data_dir.mkdir()
     pid_dir = data_dir / "pids"
@@ -19,6 +34,7 @@ def tmp_data_dir(tmp_path):
     log_dir = data_dir / "logs"
     log_dir.mkdir()
     config_file = data_dir / "config.json"
+    lock_file = data_dir / "start.lock"
 
     with patch.multiple(
         "immich_accelerator.__main__",
@@ -26,12 +42,14 @@ def tmp_data_dir(tmp_path):
         CONFIG_FILE=config_file,
         PID_DIR=pid_dir,
         LOG_DIR=log_dir,
+        LOCK_FILE=lock_file,
     ):
         yield {
             "data_dir": data_dir,
             "config_file": config_file,
             "pid_dir": pid_dir,
             "log_dir": log_dir,
+            "lock_file": lock_file,
         }
 
 

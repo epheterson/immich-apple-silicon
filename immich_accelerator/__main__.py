@@ -10,7 +10,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
+import fcntl
 import json
 import logging
 import os
@@ -40,6 +42,8 @@ log = logging.getLogger("accelerator")
 DATA_DIR = Path.home() / ".immich-accelerator"
 CONFIG_FILE = DATA_DIR / "config.json"
 PID_DIR = DATA_DIR / "pids"
+# Advisory lock so a component toggle and the watcher cannot both run cmd_start.
+LOCK_FILE = DATA_DIR / "start.lock"
 LOG_DIR = DATA_DIR / "logs"
 
 # Records the package version the running worker was started with, so the watch
@@ -1653,6 +1657,10 @@ def save_config(config: dict) -> None:
     tmp = CONFIG_FILE.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(config, f, indent=2)
+        # POSIX text files end in a newline. Without it every editor and diff
+        # tool reports "\ No newline at end of file" on a file people are
+        # expected to open and read.
+        f.write("\n")
     os.chmod(tmp, 0o600)
     tmp.rename(CONFIG_FILE)
 
@@ -2216,14 +2224,47 @@ def _dashboard_port() -> int:
         return 8420
 
 
+# The three separable processes. Each can be turned off independently, and each
+# is a real process boundary — which is exactly where this stops. Video,
+# thumbnails and RAW decode all happen inside the single microservices worker,
+# so "video but not thumbnails" is Immich's job scheduler, not ours.
+COMPONENTS = ("worker", "ml", "dashboard")
+
+# How to say each one in a sentence. str.capitalize() turns "ml" into "Ml".
+COMPONENT_LABELS = {
+    "worker": "Worker",
+    "ml": "ML service",
+    "dashboard": "Dashboard",
+}
+
+
+def _component_enabled(name: str, config: dict | None = None) -> bool:
+    """Whether a component should be running. Defaults True.
+
+    Absent means enabled, because every config written before these keys existed
+    has none of them, and an upgrade must not silently turn anything off.
+
+    An explicit component key beats the legacy "ml_only" preset. That order
+    matters: without it, a user who ran `setup --ml-only` once could never turn
+    the worker back on without hand-editing config.json.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except (RuntimeError, ValueError, OSError):
+            return True
+    if name in config:
+        return bool(config[name])
+    if config.get("ml_only"):  # preset: worker off, everything else on
+        return name != "worker"
+    return True
+
+
 def _dashboard_enabled() -> bool:
-    """Whether the web dashboard is enabled. Defaults True (back-compat: a config
-    written before this option existed has no key). Set "dashboard": false in
-    config.json (or `immich-accelerator dashboard off`) to run headless."""
-    try:
-        return bool(load_config().get("dashboard", True))
-    except (RuntimeError, ValueError, OSError):
-        return True
+    """Whether the web dashboard is enabled. Set "dashboard": false in
+    config.json (or `immich-accelerator component dashboard off`) to run
+    headless."""
+    return _component_enabled("dashboard")
 
 
 def _process_is_our_dashboard(pid: int) -> bool:
@@ -2272,27 +2313,48 @@ def stop_dashboard() -> bool:
     return False
 
 
-def reconcile_dashboard() -> None:
+def reconcile_dashboard() -> bool:
     """Make the running state match the "dashboard" config key.
 
     One enforcement point, called from the watch loop as well as the toggle, so
     editing config.json (the documented way to turn it off) actually takes
-    effect on a running install instead of only at the next start."""
+    effect on a running install instead of only at the next start.
+
+    Returns whether the running state now matches the config."""
     if _dashboard_enabled():
-        start_dashboard()
-    elif read_pid("dashboard") or _pid_on_port(_dashboard_port()):
+        return start_dashboard()
+    if read_pid("dashboard") or _pid_on_port(_dashboard_port()):
         stop_dashboard()
+    # "Off" means nothing of OURS is serving. Ask the port, not the pid file:
+    # kill_pid unlinks the pid file unconditionally, so read_pid can never see a
+    # survivor and this check would always report success.
+    #
+    # SIGTERM is asynchronous, so give it a moment before calling it a failure.
+    # Reporting "it did not stop" for a process that is one scheduler tick from
+    # exiting would be its own kind of lie.
+    deadline = time.monotonic() + 3.0
+    while True:
+        survivor = _pid_on_port(_dashboard_port())
+        if not (survivor and _process_is_our_dashboard(survivor)):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
 
 
-def start_dashboard() -> None:
+def start_dashboard() -> bool:
     """Start the dashboard in the background if it isn't already running.
     Idempotent — used by both `start` and `watch` so either brings the
-    dashboard up (#81). No-op when the dashboard is disabled in config."""
+    dashboard up (#81). No-op when the dashboard is disabled in config.
+
+    Returns whether the dashboard is (or was already) ours and running. False
+    means we could not start it and said why, which is what lets a toggle report
+    failure instead of claiming a success the user cannot see."""
     if not _dashboard_enabled():
         log.debug("Dashboard disabled in config; not starting.")
-        return
+        return False
     if read_pid("dashboard"):
-        return  # already tracked + alive (also guards a just-spawned one)
+        return True  # already tracked + alive (also guards a just-spawned one)
     port = _dashboard_port()
     # Untracked but already serving (an orphan from a prior run whose pid file
     # was lost) — adopt its pid so a later stop can reach it. Only if it's
@@ -2303,7 +2365,7 @@ def start_dashboard() -> None:
         if _process_is_our_dashboard(orphan):
             write_pid("dashboard", orphan)
             log.info("Adopted running dashboard (PID %d)", orphan)
-            return
+            return True
         log.warning(
             "Dashboard port %d is held by another process (PID %d), not the "
             'accelerator. Set "dashboard_port" in %s to a free port to run the '
@@ -2312,7 +2374,7 @@ def start_dashboard() -> None:
             orphan,
             CONFIG_FILE,
         )
-        return
+        return False
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     dash_log = open(LOG_DIR / "dashboard.log", "a")
     try:
@@ -2334,6 +2396,7 @@ def start_dashboard() -> None:
         dash_log.close()
     write_pid("dashboard", proc.pid)
     log.info("Dashboard started: http://localhost:%d", port)
+    return True
 
 
 # --- Commands ---
@@ -2500,13 +2563,34 @@ def _validate_connectivity(config: dict) -> bool:
     return ok
 
 
+# User choices that setup must not silently undo. Setup rebuilds config.json
+# from scratch from what it detects, so anything the user set by hand or by
+# toggle has to be carried across explicitly or it is lost on the next re-run.
+#
+# "ml" belongs here for the same reason "dashboard" does. Neither full setup
+# path writes it, so leaving it out did not mean "setup decides", it meant
+# "setup silently discards". Someone who offloaded ML to another machine
+# (`component ml off` plus an "ml_url") and then re-ran setup, which is the
+# documented repair step and what _require_worker_config's own error text
+# tells them to do, would get a local engine started behind their back,
+# several GB of models downloaded, and the worker repointed from the remote
+# node back at localhost.
+#
+# "worker" is the one component key still not preserved, and that is
+# deliberate: each setup path states whether it establishes a worker, so
+# re-running a full `setup` on an ml-only box is how you turn the worker back
+# on. `setup --ml-only` writes "worker": false itself.
+_PRESERVED_CONFIG_KEYS = ("api_key", "ml_url", "dashboard_port", "dashboard", "ml")
+
+
 def _finalize_config(config: dict) -> None:
-    """Preserve existing api_key, save config, print next steps."""
+    """Carry over the user's own settings, save config, print next steps."""
     try:
         existing = load_config()
-        if existing.get("api_key") and "api_key" not in config:
-            config["api_key"] = existing["api_key"]
-    except RuntimeError:
+        for key in _PRESERVED_CONFIG_KEYS:
+            if key in existing and key not in config:
+                config[key] = existing[key]
+    except (RuntimeError, ValueError, OSError):
         pass
 
     if "api_key" not in config:
@@ -2520,9 +2604,9 @@ def _finalize_config(config: dict) -> None:
     save_config(config)
 
     # Ensure /build firmlink for plugin path compatibility (Immich 2.7+).
-    # Skip in ml-only mode: no worker, no Immich server files on this box —
-    # nothing needs /build to resolve.
-    if not config.get("ml_only"):
+    # Skip it when the worker is off: no worker, no Immich server files on this
+    # box, so nothing needs /build to resolve.
+    if _component_enabled("worker", config):
         _ensure_build_link()
 
     # Auto-start services
@@ -2570,11 +2654,10 @@ def _finalize_config(config: dict) -> None:
             subprocess.run(
                 ["launchctl", "load", str(plist_dst)], capture_output=True, timeout=10
             )
+            enabled = [c for c in COMPONENTS if _component_enabled(c, config)]
             log.info(
                 "  Installed (auto-starts %s on login)",
-                "ML and dashboard"
-                if config.get("ml_only")
-                else "worker, ML, and dashboard",
+                ", ".join(enabled) if enabled else "nothing, every component is off",
             )
 
     log.info("")
@@ -3712,8 +3795,13 @@ def _setup_ml_only(args) -> None:
             "works on its own."
         )
 
+    # "worker": false is the real switch; "ml_only" is kept alongside it as the
+    # documented preset name so the flag and the config key still line up for
+    # anyone reading either one.
     config = {
         "ml_only": True,
+        "worker": False,
+        "ml": True,
         "ml_dir": str(ml_dir) if ml_dir else None,
         "ml_port": 3003,
     }
@@ -3990,6 +4078,43 @@ def _start_ml_service(config: dict):
     return pid, engine
 
 
+def reconcile_ml(config: dict) -> None:
+    """Make the running state match the "ml" config key, the ML counterpart to
+    reconcile_dashboard. Re-resolves ml_dir first, because brew upgrade deletes
+    the old Cellar path out from under the cached value (#29)."""
+    if not _component_enabled("ml", config):
+        if read_pid("ml"):
+            log.info("ML disabled in config, stopping it.")
+            kill_pid("ml")
+        return
+    if read_pid("ml"):
+        return
+    resolved_ml = _find_ml_dir()
+    if resolved_ml and str(resolved_ml) != config.get("ml_dir"):
+        config["ml_dir"] = str(resolved_ml)
+        save_config(config)
+    log.warning("ML service not running, attempting restart...")
+    pid, engine = _start_ml_service(config)
+    if pid:
+        log.info("  ML restarted (PID %d, %s)", pid, engine)
+    else:
+        log.error("  ML restart failed")
+
+
+def reconcile_components(config: dict) -> None:
+    """Make the running state match the config for every component the caller
+    is responsible for, except the worker.
+
+    The worker is deliberately excluded: its health check is entangled with the
+    fd-leak watchdog and the Docker version poll, so it stays inline in the
+    watch loops. Everything else is a simple "should it be up" question and
+    belongs in one enforcement point, so that editing config.json (the
+    documented way to turn a component off) takes effect on a running install
+    rather than only at the next start."""
+    reconcile_dashboard()
+    reconcile_ml(config)
+
+
 def _find_ml_dir() -> Path | None:
     """Find the immich-ml-metal service directory. Sets up venv if needed.
 
@@ -4073,6 +4198,50 @@ _STALE_WORKER_RE = _WORKER_CMD_RE  # same pattern, used by _kill_stale_processes
 _STALE_ML_RE = re.compile(r"(?:^|/)python[\d.]*\b.*\s-m\s+src\.main(?:\s|$)")
 
 
+@contextlib.contextmanager
+def _start_lock(timeout: float = 180.0):
+    """Serialize cmd_start across processes.
+
+    A component toggle runs cmd_start in the CLI process while the watcher, which
+    reloads config every 30s, can see the same flip and run its own. Two
+    concurrent starts race over the pid files, the /build link and the sharp
+    rebuild. flock is advisory and process-scoped, which is exactly the scope
+    needed: the loser waits for the winner rather than duplicating the work.
+
+    Never fails the caller. A lock we cannot take is not a reason to refuse to
+    start; it degrades to today's behavior.
+    """
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fh = None
+    try:
+        fh = open(LOCK_FILE, "w")
+    except OSError as e:
+        log.debug("Could not open the start lock (%s); proceeding unlocked.", e)
+        yield
+        return
+    deadline = time.monotonic() + timeout
+    locked = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    log.warning("Another start is still running; proceeding anyway.")
+                    break
+                time.sleep(0.5)
+        yield
+    finally:
+        if locked:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fh.close()
+
+
 def _kill_stale_processes():
     """Kill any lingering immich worker or ML processes not tracked by PID files.
 
@@ -4154,8 +4323,8 @@ def _kill_stale_processes():
         time.sleep(1)
 
 
-def _start_ml_only(config: dict, args) -> None:
-    """cmd_start's ml-only counterpart: bring up just the ML engine (and the
+def _start_without_worker(config: dict, args) -> None:
+    """cmd_start's worker-free counterpart: bring up the ML engine (and the
     dashboard) as a network-reachable compute node. No Docker, no DB/Redis,
     no worker, no /build link — none of that is relevant when this Mac's
     only job is to answer /predict for some other Immich instance's "Remote
@@ -4164,6 +4333,36 @@ def _start_ml_only(config: dict, args) -> None:
     worker path, there is no worker startup here to avoid delaying.
     """
     _kill_stale_processes()
+
+    # Stop a worker that is still running despite being switched off.
+    # _kill_stale_processes deliberately spares anything listed in a pidfile,
+    # so a live tracked worker walks straight through it. This path used to be
+    # ml-only-preset-only, where a worker could not exist; now that any full
+    # install can reach it, skipping this leaves the worker pulling jobs while
+    # `status`, the menu bar and the dashboard all report it off. Two workers
+    # competing over one queue with nothing in any UI admitting the second one
+    # exists is a worse failure than the one the toggle was meant to fix.
+    if read_pid("worker"):
+        log.info("Worker disabled in config, stopping it.")
+        kill_pid("worker")
+
+    if not _component_enabled("ml", config):
+        # Stop a leftover engine first. The worker path does this too; without it
+        # here, an ml-only box that turns ML off keeps serving /predict from a
+        # process nothing believes is running.
+        if read_pid("ml"):
+            log.info("ML disabled in config, stopping it.")
+            kill_pid("ml")
+        # worker off + ml off. The dashboard alone is a legal, if odd, config
+        # (watching a library some other machine processes), so honor it rather
+        # than refusing. Nothing at all is a mistake worth naming.
+        if not _component_enabled("dashboard", config):
+            log.error("Every component is disabled, so there is nothing to start.")
+            log.error("  Re-enable one: immich-accelerator component worker on")
+            return
+        log.info("Worker and ML are both disabled; starting the dashboard only.")
+        start_dashboard()
+        return
 
     ml_pid = read_pid("ml")
     if ml_pid:
@@ -4201,12 +4400,57 @@ def _start_ml_only(config: dict, args) -> None:
     log.info("  ML log: %s/ml.log", LOG_DIR)
 
 
+# Keys cmd_start dereferences directly on the worker path. Checked in one place,
+# at the top, so a config that cannot support a worker produces a named error
+# instead of a KeyError from 200 lines in. KeyError is not a RuntimeError, so an
+# escaping one takes down the launchd watcher, which KeepAlive then relaunches
+# into the same crash: that is why this is an explicit gate and not a try block.
+_WORKER_CONFIG_KEYS = (
+    "server_dir",
+    "version",
+    "node",
+    "db_hostname",
+    "db_port",
+    "db_username",
+    "db_name",
+    "redis_hostname",
+    "redis_port",
+    "ml_port",
+)
+
+
+def _require_worker_config(config: dict) -> None:
+    missing = [k for k in _WORKER_CONFIG_KEYS if not config.get(k)]
+    if missing:
+        raise RuntimeError(
+            "This install has no worker configuration (missing: "
+            + ", ".join(missing)
+            + "). It was set up as an ML-only node, so there is nothing to "
+            "start. Run: immich-accelerator setup"
+        )
+
+
 def cmd_start(args):
+    """Bring up the components this install has enabled.
+
+    Serialized against every other start: a component toggle and the watcher can
+    both decide to start the worker within the same 30s window, and two
+    concurrent starts race over the pid files, the /build link and the sharp
+    rebuild. The lock lives here rather than at the call sites because there are
+    seven of them and the two that mattered were the two nobody remembered.
+    """
+    with _start_lock():
+        _cmd_start(args)
+
+
+def _cmd_start(args):
     config = load_config()
 
-    if config.get("ml_only"):
-        _start_ml_only(config, args)
+    if not _component_enabled("worker", config):
+        _start_without_worker(config, args)
         return
+    _require_worker_config(config)
+    ml_enabled = _component_enabled("ml", config)
 
     # Kill any stale processes before starting
     _kill_stale_processes()
@@ -4354,10 +4598,37 @@ def cmd_start(args):
             "DB_DATABASE_NAME": config["db_name"],
             "REDIS_HOSTNAME": config["redis_hostname"],
             "REDIS_PORT": config["redis_port"],
-            "IMMICH_MACHINE_LEARNING_URL": f"http://localhost:{config['ml_port']}",
             "PATH": str(Path(node).parent) + ":" + os.environ.get("PATH", ""),
         }
     )
+
+    # Point the worker at an ML engine. Normally that's our own on localhost.
+    #
+    # With ML off it has to be someone else's, and the env var must be actively
+    # removed rather than merely not set: worker_env starts as a copy of our own
+    # environment, so an inherited IMMICH_MACHINE_LEARNING_URL would otherwise
+    # survive and silently point the worker at a port with nothing behind it.
+    #
+    # Deferring to Immich's own setting is only safe if the admin actually set
+    # one. Immich's default is the Docker-internal hostname
+    # `immich-machine-learning:3003`, which a worker running natively on macOS
+    # cannot resolve, so every ML job would fail with ENOTFOUND and retry
+    # forever. Say so loudly instead of pretending this is configured.
+    if ml_enabled:
+        worker_env["IMMICH_MACHINE_LEARNING_URL"] = (
+            f"http://localhost:{config['ml_port']}"
+        )
+    elif config.get("ml_url"):
+        worker_env["IMMICH_MACHINE_LEARNING_URL"] = config["ml_url"]
+        log.info("ML is off here; the worker will use %s", config["ml_url"])
+    else:
+        worker_env.pop("IMMICH_MACHINE_LEARNING_URL", None)
+        log.warning('ML is off here and no "ml_url" is set in %s.', CONFIG_FILE)
+        log.warning("  Immich's own Machine Learning URL now governs. If it is")
+        log.warning("  still the default (immich-machine-learning:3003), this")
+        log.warning("  worker cannot resolve it and every ML job will fail.")
+        log.warning('  Set "ml_url" to a reachable engine, or turn ML back on:')
+        log.warning("    immich-accelerator component ml on")
 
     # Forward Redis credentials only when set — an empty password makes
     # ioredis send AUTH to a password-less Redis, which errors (issue #56).
@@ -4517,7 +4788,15 @@ def cmd_start(args):
     ml_native_pending = False
     ml_engine = None
     ml_pid = read_pid("ml")
-    if not ml_pid and config.get("ml_dir"):
+    if not ml_enabled:
+        # Worker on, ML off: this Mac does thumbnails and VideoToolbox while
+        # some other machine answers /predict. Stop a leftover ML process so
+        # the config is the truth, then leave it alone.
+        if ml_pid:
+            log.info("ML disabled in config, stopping it (PID %d).", ml_pid)
+            kill_pid("ml")
+            ml_pid = None
+    elif not ml_pid and config.get("ml_dir"):
         ml_pid, ml_engine, ml_native_pending = _start_ml_preferred(config)
         if ml_pid:
             ml_started_here = True
@@ -4566,9 +4845,10 @@ def cmd_start(args):
     _prune_old_server_versions(Path(server_dir).name)
 
     log.info("")
-    log.info("Immich Accelerator running")
+    log.info("Immich Accelerator running%s", "" if ml_enabled else " (worker only)")
     log.info("  Worker log: %s/worker.log", LOG_DIR)
-    log.info("  ML log:     %s/ml.log", LOG_DIR)
+    if ml_enabled:
+        log.info("  ML log:     %s/ml.log", LOG_DIR)
 
 
 def stop_all_fast() -> None:
@@ -4639,18 +4919,24 @@ def cmd_stop(_args):
 def cmd_status(_args):
     worker_pid = read_pid("worker")
     ml_pid = read_pid("ml")
+    config = load_config() if CONFIG_FILE.exists() else {}
 
     if not worker_pid and not ml_pid:
-        log.info("Not running")
+        # "Disabled" and "stopped" are different facts, and a user who turned a
+        # component off should never be told their install is broken.
+        off = [c for c in COMPONENTS if not _component_enabled(c, config)]
+        log.info("Not running%s", f" ({', '.join(off)} disabled)" if off else "")
         return
 
-    log.info(
-        "Worker:     %s", f"running (PID {worker_pid})" if worker_pid else "stopped"
-    )
-    log.info("ML service: %s", f"running (PID {ml_pid})" if ml_pid else "stopped")
+    def state(name: str, pid: int | None) -> str:
+        if not _component_enabled(name, config):
+            return "disabled"
+        return f"running (PID {pid})" if pid else "stopped"
 
-    if CONFIG_FILE.exists():
-        config = load_config()
+    log.info("Worker:     %s", state("worker", worker_pid))
+    log.info("ML service: %s", state("ml", ml_pid))
+
+    if config:
         log.info("Version:    %s", config.get("version", "?"))
         if config.get("ffmpeg_path"):
             log.info("FFmpeg:     %s (VideoToolbox)", config["ffmpeg_path"])
@@ -4728,11 +5014,41 @@ FD_RESTART_THRESHOLD = _int_env("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000)
 FD_RESTART_COOLDOWN = _int_env("IMMICH_ACCEL_FD_RESTART_COOLDOWN", 300)
 
 
-def _watch_ml_only(config: dict) -> None:
-    """cmd_watch's ml-only counterpart: monitor and restart only the ML
+def _upgraded_on_disk() -> bool:
+    """Did a `brew upgrade` land while we were running? If so, stop the now
+    stale services and say yes; the caller returns and launchd KeepAlive
+    relaunches watch with the new code.
+
+    Both watch loops need this. It lived inline in the worker loop only, which
+    meant that turning the worker off (now an ordinary supported choice, not
+    just the ml-only preset) silently opted that install out of ever applying
+    an upgrade: brew would write the new code and the KeepAlive'd watcher would
+    keep executing the old one forever. That is #79 all over again, reachable
+    from a documented command.
+
+    No-op on non-Homebrew installs, where the opt symlink is absent and
+    _installed_version falls back to __version__.
+    """
+    installed = _installed_version()  # read once (the symlink can change)
+    if installed == __version__:
+        return False
+    log.info(
+        "Accelerator upgraded on disk (%s -> %s) — relaunching.",
+        __version__,
+        installed,
+    )
+    cmd_stop(argparse.Namespace())
+    return True
+
+
+def _watch_without_worker(config: dict) -> str | None:
+    """cmd_watch's worker-free counterpart: monitor and restart only the ML
     service (and dashboard), forever. No fd-leak watchdog (that leak is
     worker-only, #89) and no Docker/Immich-API polling (there is no local
-    server_dir to re-extract in ml-only mode).
+    server_dir to re-extract when this box runs no worker).
+
+    Returns _SWITCH if the worker was re-enabled mid-flight, so cmd_watch can
+    hand over to the worker loop without this function knowing about it.
     """
     log.info("Watching ML-only service (Ctrl+C to stop)...")
 
@@ -4751,48 +5067,89 @@ def _watch_ml_only(config: dict) -> None:
 
     if not read_pid("ml"):
         log.info("Service not running, starting...")
-        _start_ml_only(config, argparse.Namespace(force=True))
+        _start_without_worker(config, argparse.Namespace(force=True))
     else:
         reconcile_dashboard()
+
+    # Say "the worker is on but cannot start" once, not every 30s forever.
+    _warned_unstartable_worker = False
 
     while True:
         try:
             time.sleep(30)
             config = load_config()  # reload each cycle (setup may have changed it)
 
+            # The worker can be switched back on while this loop runs. Hand
+            # back to cmd_watch rather than sitting here ignoring it, but only
+            # if a worker could actually start.
+            #
+            # `component worker on` refuses when the config has no worker
+            # section, but these are documented as plain keys in config.json,
+            # and a hand-edited or restored file reaches here without ever
+            # passing that check. Handing over anyway means cmd_start raises
+            # RuntimeError out of cmd_watch, main() exits 1, launchd relaunches
+            # into the same crash, and the node loops forever with its ML
+            # engine and dashboard unsupervised. Staying put keeps the engine
+            # serving and names what is missing.
+            if _component_enabled("worker", config):
+                try:
+                    _require_worker_config(config)
+                except RuntimeError as e:
+                    if not _warned_unstartable_worker:
+                        log.error("%s", e)
+                        log.error("  Staying on ML only; the engine keeps running.")
+                        _warned_unstartable_worker = True
+                else:
+                    log.info("Worker enabled in config, switching to full watch.")
+                    return _SWITCH
+            else:
+                _warned_unstartable_worker = False
+
+            # Same as the worker loop: a `brew upgrade` must take effect here
+            # too. Without this an install with the worker switched off never
+            # applies an upgrade at all.
+            if _upgraded_on_disk():
+                return None
+
             # Keep service logs bounded, same as the worker path.
             cap_service_logs()
 
-            reconcile_dashboard()
-
-            # Check ML — re-resolve ml_dir each cycle (brew upgrade can
-            # invalidate it), same as cmd_watch's worker-path check.
-            if not read_pid("ml"):
-                log.warning("ML service not running — attempting restart...")
-                resolved_ml = _find_ml_dir()
-                if resolved_ml and str(resolved_ml) != config.get("ml_dir"):
-                    config["ml_dir"] = str(resolved_ml)
-                    save_config(config)
-                pid, engine = _start_ml_service(config)
-                if pid:
-                    log.info("  ML restarted (PID %d, %s)", pid, engine)
-                else:
-                    log.error("  ML restart failed")
+            # Match ML and the dashboard to config. Reloaded above each cycle,
+            # so a toggle takes effect on a running install.
+            reconcile_components(config)
         except KeyboardInterrupt:
             log.info("Watch stopped")
-            return
+            return None
 
 
 def cmd_watch(_args):
     """Monitor services and restart on crash. Detects Docker updates.
 
     Suitable for launchd KeepAlive — runs forever, checking every 30s.
-    """
-    config = load_config()
-    if config.get("ml_only"):
-        _watch_ml_only(config)
-        return
 
+    A thin dispatcher over two loops, because the worker changes what watching
+    even means: with a worker there is an fd-leak watchdog, a Docker version
+    poll and a server re-extract; without one there is none of that. Each loop
+    hands back here when the "worker" component is toggled, so switching it
+    takes effect on a running watcher instead of at the next restart.
+    """
+    while True:
+        config = load_config()
+        if _component_enabled("worker", config):
+            outcome = _watch_worker(config)
+        else:
+            outcome = _watch_without_worker(config)
+        if outcome != _SWITCH:
+            return
+
+
+# Returned by a watch loop that wants cmd_watch to re-dispatch to the other one.
+_SWITCH = "switch"
+
+
+def _watch_worker(config: dict) -> str | None:
+    """cmd_watch's worker loop. Returns _SWITCH if the worker was disabled
+    mid-flight, so cmd_watch can hand over to the worker-free loop."""
     log.info("Watching services (Ctrl+C to stop)...")
 
     if FD_RESTART_THRESHOLD > 0 and _LIBPROC is None:
@@ -4836,12 +5193,15 @@ def cmd_watch(_args):
 
     # First ensure everything is running. cmd_start brings up worker, ML, AND
     # the dashboard, so only start the dashboard separately when the worker/ML
-    # were already up (avoids a double-start race on the dashboard).
-    if not read_pid("worker") or not read_pid("ml"):
+    # were already up (avoids a double-start race on the dashboard). A missing
+    # ML pid only counts when ML is enabled: otherwise every watcher restart
+    # would read "ML is down" and bounce a perfectly healthy worker.
+    ml_missing = _component_enabled("ml", config) and not read_pid("ml")
+    if not read_pid("worker") or ml_missing:
         log.info("Services not running, starting...")
         cmd_start(argparse.Namespace(force=True))
     else:
-        reconcile_dashboard()
+        reconcile_components(config)
 
     # Warn if auto-update won't work for remote setups
     _watch_config = load_config()
@@ -4862,46 +5222,28 @@ def cmd_watch(_args):
             config = load_config()  # reload each cycle (setup may have changed it)
             worker_handled = False  # set by the fd watchdog to skip crash-check
 
-            # Auto-apply a `brew upgrade`: if the version installed on disk no
-            # longer matches the code we're running, stop the (now-stale)
-            # services and exit so launchd KeepAlive relaunches watch with the
-            # new code, which then starts a fresh worker. Makes `brew upgrade`
-            # take effect on its own; no manual restart needed. No-op on
-            # non-Homebrew installs (opt symlink absent → _installed_version
-            # falls back to __version__).
-            installed = _installed_version()  # read once (symlink can change)
-            if installed != __version__:
-                log.info(
-                    "Accelerator upgraded on disk (%s -> %s) — relaunching.",
-                    __version__,
-                    installed,
-                )
-                cmd_stop(argparse.Namespace())
+            # The worker can be switched off while this loop runs. Stop it and
+            # hand back to cmd_watch, which re-dispatches to the worker-free
+            # loop; otherwise the crash-check below would fight the toggle and
+            # restart it every cycle.
+            if not _component_enabled("worker", config):
+                log.info("Worker disabled in config, switching to ML-only watch.")
+                if read_pid("worker"):
+                    kill_pid("worker")
+                return _SWITCH
+
+            if _upgraded_on_disk():
                 return  # launchd KeepAlive relaunches with the new code
 
             # Keep service logs bounded — the worker can spew stack traces for
             # unsupported files; left unmanaged a log grew to 10GB.
             cap_service_logs()
 
-            # Match the dashboard to the "dashboard" config key. config is
+            # Match ML and the dashboard to their config keys. config is
             # reloaded above each cycle, so editing config.json (the documented
-            # way to turn it off) takes effect on a running install, and a
-            # crashed dashboard is restarted while it is enabled.
-            reconcile_dashboard()
-
-            # Check ML — re-resolve ml_dir each cycle (same stale-
-            # path fix as cmd_start; brew upgrade can invalidate it).
-            if not read_pid("ml"):
-                log.warning("ML service not running — attempting restart...")
-                resolved_ml = _find_ml_dir()
-                if resolved_ml and str(resolved_ml) != config.get("ml_dir"):
-                    config["ml_dir"] = str(resolved_ml)
-                    save_config(config)
-                pid, engine = _start_ml_service(config)
-                if pid:
-                    log.info("  ML restarted (PID %d, %s)", pid, engine)
-                else:
-                    log.error("  ML restart failed")
+            # way to turn one off) takes effect on a running install, and a
+            # crashed one is restarted while it is enabled.
+            reconcile_components(config)
 
             # fd-leak safety net (#89): restart the worker before a runaway
             # open-file-descriptor count (an upstream Immich leak on some media)
@@ -5038,24 +5380,178 @@ def cmd_watch(_args):
             return
 
 
+def _watcher_running() -> bool:
+    """Is a `watch` loop supervising the services?
+
+    This is what makes stopping something safe. The watcher restarts a missing
+    worker every 30s using the same path it uses for a crash, which is far
+    better tested than anything a toggle could do inline, and it retries. When
+    one is running, "stop it and let the supervisor bring it back" is the whole
+    implementation of a restart.
+    """
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", "immich_accelerator.*watch"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    pids = [int(p) for p in out.stdout.split() if p.isdigit()]
+    return any(p != os.getpid() for p in pids)
+
+
+def _restart_worker(reason: str) -> bool:
+    """Restart the worker so it picks up a changed environment.
+
+    The worker's ML URL is fixed when it spawns, so a change to it is only real
+    after a restart. Stopping is always safe; starting is the part with ten
+    failure paths. So when a supervisor is running we only stop, and let it do
+    the start it already knows how to do. Unsupervised, we have to do both, and
+    then we have to be honest that we might not get it back.
+    """
+    if not read_pid("worker"):
+        return True  # nothing to restart
+    log.info("Restarting the worker %s...", reason)
+    kill_pid("worker")
+    if _watcher_running():
+        log.info("  The service watcher will bring it back within 30s.")
+        return True
+    cmd_start(argparse.Namespace(force=False))
+    if not read_pid("worker"):
+        log.error(
+            "  The worker did not come back. Start it with: " "immich-accelerator start"
+        )
+        return False
+    return True
+
+
+def _set_component(name: str, on: bool) -> bool:
+    """Record that a component should be on or off, and converge toward it.
+
+    config.json is the intent and the single source of truth; this function's
+    job is to make the running state agree with it. It deliberately does the
+    cheap, safe half of that inline (stopping anything, starting ML or the
+    dashboard) and delegates the expensive half (starting a worker) to the
+    watcher when one is running, because cmd_start reports most of its ten
+    failure modes by logging and returning, and a toggle is a bad place to
+    discover that.
+
+    Returns whether the component is now in, or is reliably converging toward,
+    the requested state.
+    """
+    config = load_config()
+
+    # Turning the worker on needs a config that describes one. An ml-only box
+    # has never had one; say so before writing an intent we cannot honor.
+    if name == "worker" and on:
+        try:
+            _require_worker_config(config)
+        except RuntimeError as e:
+            log.error("%s", e)
+            return False
+
+    config[name] = on
+    # An explicit key beats the preset, but leaving a contradictory "ml_only"
+    # behind is a trap for whoever reads the file next.
+    if name == "worker" and on and config.pop("ml_only", None):
+        log.info("Cleared the ml_only preset (the worker component is now on).")
+    save_config(config)
+
+    ok = True
+    if name == "dashboard":
+        # reconcile_dashboard reports what it actually did; re-reading the pid
+        # here instead would race a just-spawned process.
+        ok = bool(reconcile_dashboard())
+    elif name == "ml":
+        reconcile_ml(config)
+        ok = bool(read_pid("ml")) == on
+        # The worker's ML URL is baked in at spawn, so without this a live
+        # worker keeps talking to an engine we just killed, failing every CLIP,
+        # face and OCR job, or ignoring one we just started.
+        ok = _restart_worker("to pick up the new ML setting") and ok
+    elif name == "worker":
+        if not on:
+            if read_pid("worker"):
+                kill_pid("worker")
+        elif _watcher_running():
+            log.info("The service watcher will start the worker within 30s.")
+        else:
+            cmd_start(argparse.Namespace(force=False))
+            # cmd_start signals most failures by logging and returning, so
+            # whether a worker actually came up is the only usable signal.
+            ok = bool(read_pid("worker"))
+            if not ok:
+                log.error("The worker did not start. See the errors above.")
+
+    # Only on success. The menu bar shows the CLI's last output line as the
+    # reason a toggle failed, and this sentence logged unconditionally, so
+    # every failure banner in Settings read "Worker enabled. ML service and
+    # Dashboard unaffected." while the real cause (Docker down, sharp broken,
+    # media mount missing) scrolled past above it. Announcing success on the
+    # way out of a failure is wrong on its own terms, too.
+    if ok:
+        others = " and ".join(COMPONENT_LABELS[c] for c in COMPONENTS if c != name)
+        log.info(
+            "%s %s. %s unaffected.",
+            COMPONENT_LABELS[name],
+            "enabled" if on else "disabled",
+            others,
+        )
+    if not any(_component_enabled(c, config) for c in COMPONENTS):
+        log.warning("Every component is now off, so nothing will run.")
+    return ok
+
+
+def cmd_component(args):
+    """Turn a component on or off, or list what's enabled.
+
+    The three components are the accelerator's three separable processes. This
+    only goes as far as those process boundaries: video, thumbnails and RAW
+    decode all run inside the single microservices worker, so which of those
+    happen is Immich's job scheduler, not ours."""
+    name = getattr(args, "name", None)
+    state = getattr(args, "state", None)
+
+    if not name:
+        config = load_config()
+        for component in COMPONENTS:
+            enabled = _component_enabled(component, config)
+            running = bool(read_pid(component))
+            if not enabled:
+                detail = "disabled"
+            else:
+                detail = "running" if running else "enabled, not running"
+            log.info("  %-10s %s", component, detail)
+        return
+
+    if name not in COMPONENTS:
+        log.error(
+            "Unknown component '%s'. Choose one of: %s", name, ", ".join(COMPONENTS)
+        )
+        sys.exit(2)
+    if state not in ("on", "off"):
+        log.info("%s: %s", name, "on" if _component_enabled(name) else "off")
+        return
+    # Exit non-zero when the component did not reach the requested state. The
+    # menu bar reads the exit code, and cmd_start reports most of its failures
+    # by logging and returning, so without this a failed toggle renders as
+    # success in the UI.
+    if not _set_component(name, state == "on"):
+        sys.exit(1)
+
+
 def cmd_dashboard(args):
     """Run the web dashboard, or toggle it on/off.
 
-    `dashboard on|off` flips the "dashboard" config key so `start`/`watch` do (or
-    don't) bring the dashboard up, and starts/stops it now to match. With no
-    state it runs the dashboard server in the foreground (what start_dashboard
-    spawns in the background)."""
+    `dashboard on|off` is kept as an alias for `component dashboard on|off`,
+    which is what it became in 1.9.0. With no state it runs the dashboard server
+    in the foreground (what start_dashboard spawns in the background)."""
     state = getattr(args, "state", None)
     if state in ("on", "off"):
-        config = load_config()
-        config["dashboard"] = state == "on"
-        save_config(config)
-        if state == "on":
-            start_dashboard()
-            log.info("Dashboard enabled.")
-        else:
-            stop_dashboard()
-            log.info("Dashboard disabled. Worker and ML are unaffected.")
+        if not _set_component("dashboard", state == "on"):
+            sys.exit(1)
         return
 
     config = load_config()
@@ -5410,6 +5906,13 @@ def main():
         help="Enable or disable the dashboard (omit to run it in the foreground)",
     )
     dash_p.add_argument("--port", type=int, default=8420, help="Dashboard port")
+    comp_p = sub.add_parser(
+        "component", help="Turn worker / ml / dashboard on or off (omit args to list)"
+    )
+    comp_p.add_argument("name", nargs="?", choices=list(COMPONENTS), help="Component")
+    comp_p.add_argument(
+        "state", nargs="?", choices=["on", "off"], help="Enable or disable it"
+    )
     sub.add_parser(
         "ml-test",
         help="Diagnose the ML service (health + CLIP + OCR round-trip)",
@@ -5431,6 +5934,7 @@ def main():
             "update": cmd_update,
             "watch": cmd_watch,
             "dashboard": cmd_dashboard,
+            "component": cmd_component,
             "ml-test": cmd_ml_test,
             "uninstall": cmd_uninstall,
         }[args.command](args)

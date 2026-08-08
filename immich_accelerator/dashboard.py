@@ -25,12 +25,45 @@ from pathlib import Path
 
 log = logging.getLogger("dashboard")
 
+CONFIG_FILE = Path.home() / ".immich-accelerator" / "config.json"
+
 # Cache to avoid hammering the DB on every request
 _cache: dict = {}
 _cache_ts: float = 0
 _CACHE_TTL = 3  # seconds
 
 _static_hw: dict | None = None
+
+
+def _component_on(config: dict, name: str) -> bool:
+    """Whether a component ("worker", "ml", "dashboard") is switched on.
+
+    Deliberately a small duplicate of __main__._component_enabled rather than an
+    import: the dashboard is spawned as `python -m immich_accelerator dashboard`,
+    so __main__ is the running module, and importing it from here would load a
+    second copy of it with its own state. Keep the two in sync.
+    """
+    if name in config:
+        return bool(config[name])
+    if config.get("ml_only"):  # legacy preset: worker off, everything else on
+        return name != "worker"
+    return True
+
+
+def _worker_enabled(config: dict) -> bool:
+    """Whether the worker component is switched on."""
+    return _component_on(config, "worker")
+
+
+def _has_database(config: dict) -> bool:
+    """Whether this install has an Immich database to report on.
+
+    A config shape question, not a component question. `setup --ml-only` writes
+    no db fields at all; every other setup path writes db_hostname. Keeping this
+    separate from the worker switch matters, because a full install with the
+    worker merely turned off still owns its library and its progress bars must
+    keep working."""
+    return bool(config.get("db_hostname"))
 
 
 def _get_accelerator_version() -> str:
@@ -137,6 +170,27 @@ def _query_db(sql: str, config: dict) -> str:
     return ""
 
 
+def _reload_config(config: dict) -> dict:
+    """Re-read config.json, falling back to the caller's copy.
+
+    create_app captures the config once at process start, so a component toggled
+    while the dashboard is running would otherwise never reach it and the page
+    would keep drawing a service switched off minutes ago.
+
+    Called from the request handlers rather than from get_status, so get_status
+    stays a pure function of the config it is handed: making it silently prefer
+    a file over its own argument would change the contract for every caller and
+    every test, and would behave differently on a machine that happens to have a
+    real install. A partially-written file just means one cycle with the
+    previous copy.
+    """
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return config
+
+
 def get_status(config: dict) -> dict:
     """Get full accelerator status. Cached for _CACHE_TTL seconds."""
     global _cache, _cache_ts
@@ -188,30 +242,37 @@ def get_status(config: dict) -> dict:
     #   live = asset, deletedAt IS NULL, visibility != hidden
     #   awp  = live + has an asset_job_status row + has a Preview file
     #
-    # Skipped entirely in ml-only mode: there's no local Postgres to query
-    # (by design — this box has no worker, no library, no DB), so every
-    # uncached poll would otherwise spawn a doomed psql/docker-exec call and
-    # log a misleading "cannot connect to Postgres" line. Progress bars stay
-    # at 0/0, which is accurate — this node isn't "the" library.
-    counts_raw = "" if config.get("ml_only") else _query_db(
-        "WITH live AS ("
-        "  SELECT id, type, thumbhash FROM asset"
-        "  WHERE \"deletedAt\" IS NULL AND visibility != 'hidden'), "
-        "awp AS ("
-        '  SELECT a.id, js."facesRecognizedAt" FROM asset a'
-        '  JOIN asset_job_status js ON js."assetId" = a.id'
-        "  WHERE a.\"deletedAt\" IS NULL AND a.visibility != 'hidden'"
-        "    AND EXISTS (SELECT 1 FROM asset_file f"
-        "               WHERE f.\"assetId\" = a.id AND f.type = 'preview')) "
-        "SELECT (SELECT COUNT(*) FROM live), "
-        "(SELECT COUNT(*) FROM awp), "
-        "(SELECT COUNT(*) FROM live WHERE type = 'VIDEO'), "
-        "(SELECT COUNT(*) FROM live WHERE thumbhash IS NOT NULL), "
-        '(SELECT COUNT(*) FROM awp WHERE EXISTS (SELECT 1 FROM smart_search s WHERE s."assetId" = awp.id)), '
-        '(SELECT COUNT(*) FROM awp WHERE "facesRecognizedAt" IS NOT NULL), '
-        '(SELECT COUNT(*) FROM live l WHERE EXISTS (SELECT 1 FROM asset_job_status js WHERE js."assetId" = l.id AND js."ocrAt" IS NOT NULL)), '
-        "(SELECT COUNT(*) FROM live l WHERE l.type = 'VIDEO' AND EXISTS (SELECT 1 FROM asset_file f WHERE f.\"assetId\" = l.id AND f.type = 'encoded_video'))",
-        config,
+    # Skipped only when this box has no database to ask, which is a statement
+    # about config shape, not about the worker switch. A node set up by
+    # `setup --ml-only` has no db credentials at all, and querying would spawn a
+    # doomed psql/docker-exec call every uncached poll and log a misleading
+    # "cannot connect to Postgres". But a full install with the worker merely
+    # switched off still owns its library, so its progress bars must keep
+    # working: gating those on the worker would zero them out for the exact
+    # user watching to see whether turning the worker off was a good idea.
+    counts_raw = (
+        ""
+        if not _has_database(config)
+        else _query_db(
+            "WITH live AS ("
+            "  SELECT id, type, thumbhash FROM asset"
+            "  WHERE \"deletedAt\" IS NULL AND visibility != 'hidden'), "
+            "awp AS ("
+            '  SELECT a.id, js."facesRecognizedAt" FROM asset a'
+            '  JOIN asset_job_status js ON js."assetId" = a.id'
+            "  WHERE a.\"deletedAt\" IS NULL AND a.visibility != 'hidden'"
+            "    AND EXISTS (SELECT 1 FROM asset_file f"
+            "               WHERE f.\"assetId\" = a.id AND f.type = 'preview')) "
+            "SELECT (SELECT COUNT(*) FROM live), "
+            "(SELECT COUNT(*) FROM awp), "
+            "(SELECT COUNT(*) FROM live WHERE type = 'VIDEO'), "
+            "(SELECT COUNT(*) FROM live WHERE thumbhash IS NOT NULL), "
+            '(SELECT COUNT(*) FROM awp WHERE EXISTS (SELECT 1 FROM smart_search s WHERE s."assetId" = awp.id)), '
+            '(SELECT COUNT(*) FROM awp WHERE "facesRecognizedAt" IS NOT NULL), '
+            '(SELECT COUNT(*) FROM live l WHERE EXISTS (SELECT 1 FROM asset_job_status js WHERE js."assetId" = l.id AND js."ocrAt" IS NOT NULL)), '
+            "(SELECT COUNT(*) FROM live l WHERE l.type = 'VIDEO' AND EXISTS (SELECT 1 FROM asset_file f WHERE f.\"assetId\" = l.id AND f.type = 'encoded_video'))",
+            config,
+        )
     )
 
     # total_assets: thumbnails/OCR denominator; total_previews: CLIP/faces.
@@ -309,57 +370,81 @@ def get_status(config: dict) -> dict:
     # Versions
     version = config.get("version", "?")
 
-    # When all queues are confirmed idle (API responded, nothing active),
-    # unprocessable assets are "skipped." Only apply when we actually got
-    # queue data — empty queue_status means API unreachable, not "idle."
+    # Whether we actually reached the jobs API this cycle. An empty
+    # queue_status means unreachable, not idle, and the two must never be
+    # confused: one is "nothing is scheduled", the other is "we have no idea".
     queues_known = bool(queue_status)
-    any_active = queues_known and any(queue_status.values())
 
-    def prog(done, tot):
-        if queues_known and not any_active and done < tot:
-            return {"done": done, "total": tot, "pct": 100.0, "skipped": tot - done}
-        # Clamp to 100: done can briefly exceed tot from count skew between the
-        # asset-total and per-stage-done queries (assets added/removed mid-scan),
-        # and a completion percentage can't exceed 100% (#68).
+    def prog(queue, done, tot):
+        """One stage's completion, reported honestly.
+
+        This used to return a flat 100% whenever Immich's queues were idle and
+        call the remainder "skipped", on the theory that anything still undone
+        after a drained queue must be unprocessable. That theory holds for a
+        handful of corrupt files and collapses for a library that simply has
+        not been queued yet: on a 174k-asset library with 106k assets missing
+        embeddings it drew four full bars and reported everything complete.
+
+        Idle is not finished. The percentage is now always done/total, and the
+        nuance moves to "unqueued", which is literally true in both cases:
+        that work exists, nothing is running it, and nothing will until
+        someone queues it (the dashboard's Re-queue Missing button, or
+        Immich's own Jobs page).
+
+        "unqueued" is judged per queue, not globally. Asking "is ANY queue
+        busy" would blank the hint on every bar the moment one unrelated queue
+        picked up work, so a video transcode backlog, or the first seconds
+        after Re-queue Missing, would hide "106,220 not queued" from the CLIP
+        bar precisely while someone was watching it, then flash it back when
+        the last queue drained. queue_status already answers this per queue.
+        """
         return {
             "done": done,
             "total": tot,
+            # Clamp to 100: done can briefly exceed tot from count skew between
+            # the asset-total and per-stage-done queries (assets added/removed
+            # mid-scan), and a completion percentage can't exceed 100% (#68).
             "pct": min(round(done / max(tot, 1) * 100, 1), 100.0),
-            "skipped": 0,
+            "unqueued": (
+                max(tot - done, 0)
+                if (queues_known and not queue_status.get(queue, False))
+                else 0
+            ),
         }
 
-    # Video transcode: use queue state for pct when active, 100% when idle + transcoded
-    vid_active = queue_status.get("video", False)
-    if vid_active and total_videos > 0:
-        vid_pct = min(round(encoded_videos / total_videos * 100, 1), 100.0)
-    elif encoded_videos > 0:
-        vid_pct = 100.0
-    else:
-        vid_pct = 0
+    # A component the user switched off is omitted, not drawn dead. Same rule as
+    # the menu bar: "off because I said so" must not render as a red dot, or the
+    # dots stop meaning anything. The page renders whatever keys arrive, so
+    # leaving one out is the whole fix.
+    services = {}
+    if _worker_enabled(config):
+        services["worker"] = {
+            "alive": worker_alive,
+            "name": "Microservices Worker",
+            "rss_mb": worker_rss_mb,
+        }
+    if _component_on(config, "ml"):
+        services["ml"] = {"alive": ml_alive, "name": "ML Service"}
+    if _has_database(config):
+        # Derived from the asset count, so it only means anything where there is
+        # a library to count. Tied to the database, not to the worker switch: an
+        # install with the worker off still has both.
+        services["docker"] = {"alive": total_assets > 0, "name": "Docker (API)"}
 
     status = {
-        "services": {
-            "worker": {
-                "alive": worker_alive,
-                "name": "Microservices Worker",
-                "rss_mb": worker_rss_mb,
-            },
-            "ml": {"alive": ml_alive, "name": "ML Service"},
-            "docker": {"alive": total_assets > 0, "name": "Docker (API)"},
-        },
+        "services": services,
         "progress": {
             # Each bar uses Immich's own denominator: thumbnails/OCR over all
             # live assets, CLIP/faces over assets-with-previews.
-            "thumbnails": prog(thumbs, total_assets),
-            "clip": prog(clip, total_previews),
-            "faces": prog(faces, total_previews),
-            "ocr": prog(ocr, total_assets),
-            "video": {
-                "done": encoded_videos,
-                "total": total_videos,
-                "pct": vid_pct,
-                "skipped": 0,
-            },
+            "thumbnails": prog("thumbnails", thumbs, total_assets),
+            "clip": prog("clip", clip, total_previews),
+            "faces": prog("faces", faces, total_previews),
+            "ocr": prog("ocr", ocr, total_assets),
+            # Video went through the same "idle means done" special case and
+            # gets the same honest treatment. Videos Immich's transcode policy
+            # never selects show up as unqueued, which is exactly what they
+            # are: no encoded copy, and nothing scheduled to make one.
+            "video": prog("video", encoded_videos, total_videos),
         },
         "system": {
             "load_1m": load_1m,
@@ -391,21 +476,26 @@ def create_app(config: dict):
 
     app = FastAPI(title="Immich Accelerator Dashboard")
 
+    # The captured config is the fallback; every request re-reads the file, so a
+    # component toggle or an added api_key takes effect without a restart.
+    # Both handlers do it: a reload in only one of them is the same bug with a
+    # smaller blast radius.
     @app.get("/", response_class=HTMLResponse)
     async def index():
         return _load_html()
 
     @app.get("/api/status")
     async def api_status():
-        return JSONResponse(get_status(config))
+        return JSONResponse(get_status(_reload_config(config)))
 
     @app.post("/api/requeue")
     async def api_requeue():
         """Trigger 'Run All Missing' for thumbnail, CLIP, faces, and OCR queues."""
         import urllib.request, urllib.error
 
-        api_key = config.get("api_key", "")
-        immich_url = config.get("immich_url", "http://localhost:2283")
+        live = _reload_config(config)
+        api_key = live.get("api_key", "")
+        immich_url = live.get("immich_url", "http://localhost:2283")
         if not api_key:
             return JSONResponse({"error": "No API key configured"}, status_code=400)
 

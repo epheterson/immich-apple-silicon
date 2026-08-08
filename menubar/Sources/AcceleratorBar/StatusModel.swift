@@ -26,6 +26,22 @@ enum MLEngine: Equatable, Sendable {
     }
 }
 
+/// One Immich processing queue's completion, as the dashboard reports it.
+struct QueueProgress: Equatable, Identifiable {
+    let key: String
+    let label: String
+    let done: Int
+    let total: Int
+
+    var id: String { key }
+    var fraction: Double { total > 0 ? min(Double(done) / Double(total), 1) : 0 }
+    var complete: Bool { total > 0 && done >= total }
+    /// Clamped: done can briefly exceed total because the asset-total and
+    /// per-stage-done counts are taken by separate queries and the library can
+    /// change between them. "-3 remaining" is not a thing to show anyone.
+    var remaining: Int { max(total - done, 0) }
+}
+
 struct Snapshot: Equatable {
     var workerUp = false
     var mlUp = false          // process alive
@@ -39,7 +55,12 @@ struct Snapshot: Equatable {
     var jobsActive = 0       // jobs the worker is running right now
     var jobsWaiting = 0      // jobs queued behind them
     var dashboardPort = 8420 // where the accelerator dashboard is served
-    var dashboardEnabled = true // config "dashboard" (default on); off => hide the row
+    // Which components the user has turned on. A disabled component is hidden
+    // entirely rather than shown red: "off because I said so" and "off because
+    // it broke" are different facts and must not look the same.
+    var workerEnabled = true
+    var mlEnabled = true
+    var dashboardEnabled = true
     var immichReachable = false // Immich answered on immich_url
     // Set while the ML service is fetching a model (the largest are several GB
     // and take minutes, during which Immich's jobs fail and retry).
@@ -50,6 +71,13 @@ struct Snapshot: Equatable {
     // is up). Distinguishing that from false matters: a stopped worker must not
     // make a perfectly good key look rejected.
     var apiKeyValid: Bool?
+    /// Per-queue completion, populated only when the dashboard is serving.
+    ///
+    /// The dashboard is an enrichment here, never a dependency: 1.8.0 made the
+    /// menu bar work with the dashboard switched off, and reading this from it
+    /// must not quietly undo that. Empty means "we could not ask", and the
+    /// panel falls back to the aggregate it computes from Immich directly.
+    var queues: [QueueProgress] = []
 
     // What "Open Immich" should launch: the public domain the user set in
     // Immich when present, otherwise the local URL the accelerator connects to.
@@ -60,10 +88,33 @@ struct Snapshot: Equatable {
     // The worker is actively chewing through jobs (drives the amber icon).
     var processing: Bool { jobsActive > 0 }
 
+    // Health is judged only against the components that actually process
+    // photos, and only those the user turned on. Judging a disabled component
+    // would leave an ML-only box amber forever for missing a worker it was told
+    // not to run, which is the fastest way to teach someone to ignore the icon.
+    //
+    // The dashboard is deliberately excluded even when enabled: it is a way to
+    // look at the work, not a way to do it. A wedged dashboard (or an OrbStack
+    // process squatting port 8420) must not make a perfectly healthy install
+    // report degraded. The Dashboard row still shows its own real state.
     var overall: ServiceState {
-        if workerUp && mlHealthy { return .running }
-        if !workerUp && !mlUp && !dashboardUp { return .stopped }
-        return .degraded
+        var wanted = 0, healthy = 0
+        if workerEnabled { wanted += 1; if workerUp { healthy += 1 } }
+        if mlEnabled { wanted += 1; if mlHealthy { healthy += 1 } }
+
+        // Nothing that processes photos is enabled. Note this is NOT the same
+        // as "every component is off": a dashboard-only install lands here too,
+        // and .stopped is still the honest answer, because from the point of
+        // view of getting work done nothing is running. The Dashboard row
+        // reports its own state separately.
+        if wanted == 0 { return .stopped }
+
+        if healthy == wanted { return .running }
+        // Something is enabled and not healthy. Distinguish "not started yet"
+        // from "started and broken", counting the dashboard as a sign of life
+        // even though it does not count toward health.
+        let anyAlive = workerUp || mlUp || dashboardUp
+        return anyAlive ? .degraded : .stopped
     }
 }
 
@@ -78,6 +129,8 @@ struct ProcessProbe: Sendable {
     var immichVersion = ""
     var immichURL = ""
     var dashboardPort = 8420
+    var workerEnabled = true
+    var mlEnabled = true
     var dashboardEnabled = true
     var mlPort = 3003
     var apiKey = ""
@@ -112,6 +165,27 @@ final class StatusModel: ObservableObject {
     @Published var busy = false
 
     private var timer: Timer?
+    /// How many refreshes are awaiting their probes. The timer skips a tick
+    /// while any is in flight rather than stacking a pass on top of a slow one:
+    /// the probes have timeouts up to 6s and the panel polls every 3s, so
+    /// without this a wedged endpoint would let ticks pile up.
+    ///
+    /// A count, not a flag. Six call sites refresh directly (the panel,
+    /// Settings, onboarding, and startPolling's immediate kick), none of which
+    /// consult this, so a single bool would be cleared by whichever overlapping
+    /// pass returned first and the timer would start stacking again.
+    private var inFlight = 0
+    /// Ordering for those overlapping passes: each refresh takes a ticket, and
+    /// a pass whose ticket is older than what has already been published drops
+    /// its result. Without this a slow refresh could land a snapshot captured
+    /// seconds earlier on top of a fresh one, which is exactly what happens
+    /// right after a toggle, when an action-driven refresh races the poller.
+    private var refreshTicket = 0
+    private var publishedTicket = 0
+    /// Set while the panel is open. Gates the one probe expensive enough that
+    /// polling it in the background is a real cost to the user's Immich
+    /// server, not just to us.
+    var wantsQueueDetail = false
 
     init() {
         // Background cadence from launch so the menu-bar icon is accurate before
@@ -126,7 +200,10 @@ final class StatusModel: ObservableObject {
         // event-tracking mode, and a .default-mode timer stops firing, so the
         // panel would freeze on whatever it showed when it opened.
         let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.refresh() }
+            Task { @MainActor in
+                guard let self, self.inFlight == 0 else { return }
+                await self.refresh()
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
@@ -136,6 +213,10 @@ final class StatusModel: ObservableObject {
     func stopPolling() { timer?.invalidate(); timer = nil }
 
     func refresh() async {
+        inFlight += 1
+        refreshTicket += 1
+        let ticket = refreshTicket
+        defer { inFlight -= 1 }
         // The pidfile/ps/config probes fork subprocesses and touch the disk;
         // run them off the main actor so a poll never hitches the UI thread.
         let p = await Task.detached(priority: .utility) { Self.probeProcesses() }.value
@@ -149,15 +230,32 @@ final class StatusModel: ObservableObject {
         s.immichVersion = p.immichVersion
         s.immichURL = p.immichURL
         s.dashboardPort = p.dashboardPort
+        s.workerEnabled = p.workerEnabled
+        s.mlEnabled = p.mlEnabled
         s.dashboardEnabled = p.dashboardEnabled
 
         // The three network probes are independent (each has its own timeout),
         // so run them concurrently: a slow/unreachable service costs the max
         // latency, not the sum.
         async let domain = Self.externalDomain(base: p.immichURL)
-        async let healthy = Self.ping(port: p.mlPort)
+        async let healthy = p.mlEnabled ? Self.ping(port: p.mlPort) : false
         async let jobs = Self.jobCounts(base: p.immichURL, apiKey: p.apiKey)
         async let reachable = Self.serverReachable(base: p.immichURL)
+        // Only while the panel is open. /api/status is the most expensive
+        // thing this app can ask for: a full aggregate over Immich's asset
+        // table through a spawned psql (measured ~1.4s cold on a 174k-asset
+        // library) plus a jobs API call, behind a cache shorter than our
+        // background poll, so every background poll would miss. Merely having
+        // the menu bar running would put a seconds-long query on the user's
+        // Immich database every 15 seconds forever, to compute rows nobody is
+        // looking at.
+        //
+        // Closed: nil, meaning "did not ask", so the last values survive and
+        // are on screen the instant the panel opens. No dashboard: [], because
+        // "nowhere to ask" really is no queue data, and keeping rows from
+        // before it was switched off would show numbers nothing refreshes.
+        async let queues: [QueueProgress]? = !p.dashboardUp ? []
+            : (wantsQueueDetail ? Self.queueProgress(port: p.dashboardPort) : nil)
         async let fetching = p.mlUp ? Self.downloadProgress(port: p.mlPort) : nil
         s.externalDomain = await domain
         s.mlHealthy = await healthy
@@ -171,8 +269,25 @@ final class StatusModel: ObservableObject {
         s.jobsWaiting = counts.waiting
         s.immichReachable = await reachable
         s.apiKeyValid = counts.authed
+        // nil means the dashboard did not answer in time. Keep what we last
+        // knew: a slow poll is not news, and dropping the rows for one cycle
+        // resizes the panel under the user's pointer.
+        s.queues = (await queues) ?? snap.queues
 
+        // A pass that started later has already published: its snapshot is
+        // newer than ours by construction, so leave it alone.
+        guard ticket > publishedTicket else { return }
+        publishedTicket = ticket
         snap = s
+    }
+
+    // Whether a component is switched on. Mirrors __main__._component_enabled:
+    // absent means enabled, and an explicit key beats the legacy "ml_only"
+    // preset so a box can be switched back without hand-editing config.json.
+    nonisolated static func componentEnabled(_ name: String, _ config: [String: Any]) -> Bool {
+        if let explicit = config[name] as? Bool { return explicit }
+        if (config["ml_only"] as? Bool) == true { return name != "worker" }
+        return true
     }
 
     // Blocking pidfile/ps/config probes, gathered off the main actor. Confirms
@@ -195,10 +310,52 @@ final class StatusModel: ObservableObject {
         p.immichVersion = config["version"] as? String ?? ""
         p.immichURL = config["immich_url"] as? String ?? ""
         p.dashboardPort = (config["dashboard_port"] as? Int) ?? 8420
-        p.dashboardEnabled = (config["dashboard"] as? Bool) ?? true
+        p.workerEnabled = componentEnabled("worker", config)
+        p.mlEnabled = componentEnabled("ml", config)
+        p.dashboardEnabled = componentEnabled("dashboard", config)
         p.mlPort = (config["ml_port"] as? Int) ?? 3003
         p.apiKey = (p.workerUp ? config["api_key"] as? String : nil) ?? ""
         return p
+    }
+
+    /// Per-queue completion from the accelerator's own dashboard API.
+    ///
+    /// We already compute this server-side for the web dashboard and have never
+    /// read it here, so the panel showed one aggregate number while the data
+    /// for five real progress bars sat one HTTP call away.
+    ///
+    /// Returns nil when we could not ask, which is not the same as "no queues"
+    /// and must not be rendered as one. This endpoint runs real SQL against
+    /// Immich's database behind a 5s cache: on a 174k-asset library it answers
+    /// in ~20ms warm and ~1.4s cold, so a 3s poll pays the cold cost about
+    /// every other time and a load spike pushes it past any tight timeout.
+    /// Treating that as "no data" blanked the rows, and the panel visibly
+    /// shrank and regrew every few seconds. The caller keeps the last good
+    /// answer instead (see refresh).
+    nonisolated static func queueProgress(port: Int) async -> [QueueProgress]? {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/status")
+        else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 6
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let progress = root["progress"] as? [String: Any]
+        else { return nil }
+
+        // Fixed order and our own labels: the API keys are storage names, and
+        // the order they serialize in is not a thing to show a person.
+        let order = [
+            ("thumbnails", "Thumbnails"), ("clip", "Search"),
+            ("faces", "Faces"), ("ocr", "Text"), ("video", "Video"),
+        ]
+        return order.compactMap { key, label in
+            guard let e = progress[key] as? [String: Any],
+                  let total = (e["total"] as? NSNumber)?.intValue, total > 0,
+                  let done = (e["done"] as? NSNumber)?.intValue
+            else { return nil }
+            return QueueProgress(key: key, label: label, done: done, total: total)
+        }
     }
 
     // Sum active/waiting across all of Immich's job queues so the menu bar can

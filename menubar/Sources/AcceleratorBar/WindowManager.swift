@@ -47,6 +47,7 @@ final class WindowManager: NSObject {
     private func present<V: View>(_ existing: NSWindow?, title: String, view: V) -> NSWindow {
         NSApp.setActivationPolicy(.regular)  // let the window come to the front
         let window = existing ?? make(title: title, view: view)
+        Self.placeOnScreen(window)
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
@@ -58,11 +59,45 @@ final class WindowManager: NSObject {
         window.title = title
         window.styleMask = [.titled, .closable]
         window.isReleasedWhenClosed = false  // reuse across opens
-        window.center()
         NotificationCenter.default.addObserver(
             self, selector: #selector(windowWillClose(_:)),
             name: NSWindow.willCloseNotification, object: window)
         return window
+    }
+
+    /// Put the window fully on a screen, every time it is shown.
+    ///
+    /// `center()` at construction was not enough, twice over. It ran before
+    /// SwiftUI had applied the content's `.frame`, so it centered a window
+    /// that was about to grow, leaving it hanging off the edge; and because
+    /// these windows are reused (`isReleasedWhenClosed = false`), a bad frame
+    /// persisted for the life of the app. Widening Settings from 460 to 700
+    /// made both visible on the Mini.
+    ///
+    /// So: force layout first, then only move the window when it is actually
+    /// off-screen. A window the user has dragged somewhere deliberate stays
+    /// where they put it.
+    static func placeOnScreen(_ window: NSWindow) {
+        window.layoutIfNeeded()  // let the hosting controller apply its size
+
+        guard let screen = window.screen ?? NSScreen.main else { return }
+        let visible = screen.visibleFrame
+        var frame = window.frame
+
+        // A window larger than the screen can never be fully on it; shrink to
+        // fit before deciding where to put it.
+        frame.size.width = min(frame.width, visible.width)
+        frame.size.height = min(frame.height, visible.height)
+
+        if !visible.contains(frame) {
+            // Re-center rather than nudging the nearest edge in: a frame that
+            // ended up half off-screen is not a position worth preserving.
+            frame.origin = CGPoint(x: visible.midX - frame.width / 2,
+                                   y: visible.midY - frame.height / 2)
+        }
+        if frame != window.frame {
+            window.setFrame(frame, display: false)
+        }
     }
 
     @objc private func windowWillClose(_ note: Notification) {
