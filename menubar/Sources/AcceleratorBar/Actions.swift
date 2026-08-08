@@ -41,6 +41,127 @@ enum Actions {
         }
     }
 
+    /// Run a command and deliver its output line by line as it arrives.
+    ///
+    /// `run` above buffers to completion, which is fine for a status probe and
+    /// useless for setup: extracting the server and building the venv take
+    /// minutes, and a wizard that shows nothing for minutes is indistinguishable
+    /// from one that has hung. Returns the exit status once the process ends.
+    @discardableResult
+    static func stream(
+        _ tool: String, _ args: [String],
+        onLine: @escaping @Sendable (String) -> Void
+    ) async -> Int32 {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global().async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: tool)
+                p.arguments = args
+                // No TTY here, so setup's prompts would read EOF and answer no.
+                // Callers pass --yes; this just makes sure nothing waits on a
+                // human who cannot answer.
+                p.standardInput = FileHandle.nullDevice
+                let out = Pipe()
+                p.standardOutput = out
+                p.standardError = out
+                do { try p.run() } catch {
+                    onLine("failed to launch: \(error)")
+                    cont.resume(returning: -1)
+                    return
+                }
+                var pending = ""
+                let handle = out.fileHandleForReading
+                while true {
+                    let chunk = handle.availableData
+                    if chunk.isEmpty { break }
+                    pending += String(data: chunk, encoding: .utf8) ?? ""
+                    while let nl = pending.firstIndex(of: "\n") {
+                        let line = String(pending[pending.startIndex..<nl])
+                        pending = String(pending[pending.index(after: nl)...])
+                        if !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                            onLine(line)
+                        }
+                    }
+                }
+                if !pending.trimmingCharacters(in: .whitespaces).isEmpty { onLine(pending) }
+                p.waitUntilExit()
+                cont.resume(returning: p.terminationStatus)
+            }
+        }
+    }
+
+    /// Install the formula, the way the README tells people to.
+    ///
+    /// `brew trust` matters and is easy to miss: Homebrew 5.1.15+ silently
+    /// skips untrusted third-party taps during `brew upgrade`, so without it
+    /// the install works and then never updates again.
+    static func installFormula(onLine: @escaping @Sendable (String) -> Void) async -> Bool {
+        onLine("Installing the accelerator with Homebrew. This takes a few minutes.")
+        let code = await stream(brew, ["install", service], onLine: onLine)
+        if code != 0 { return false }
+        onLine("Trusting the tap so future upgrades reach you...")
+        await stream(brew, ["trust", "epheterson/immich-accelerator"], onLine: onLine)
+        return Paths.isInstalled
+    }
+
+    /// Run setup non-interactively and stream it. `--yes` is what makes this
+    /// possible at all; without it every prompt reads EOF and answers no,
+    /// including "start now?".
+    static func runSetup(
+        url: String, apiKey: String, mlOnly: Bool,
+        onLine: @escaping @Sendable (String) -> Void
+    ) async -> Bool {
+        var args = ["setup", "--yes"]
+        if mlOnly {
+            args.append("--ml-only")
+        } else {
+            if !url.isEmpty { args += ["--url", url] }
+            if !apiKey.isEmpty { args += ["--api-key", apiKey] }
+        }
+        let code = await stream(cli, args, onLine: onLine)
+        return code == 0
+    }
+
+    // MARK: - config backup
+
+    /// Copy config.json somewhere the user chooses. The API key lives in this
+    /// file, so the picker (rather than a fixed path) is deliberate: the user
+    /// decides where a secret lands.
+    static func backupConfig(to url: URL) throws {
+        try FileManager.default.copyItem(at: Paths.configFile, to: url)
+    }
+
+    /// Replace config.json from a backup, after checking it parses and looks
+    /// like ours. Restoring garbage would leave the accelerator unable to
+    /// start with no clue why.
+    static func restoreConfig(from url: URL) throws {
+        let data = try Data(contentsOf: url)
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw ConfigError.notJSON }
+        // Any real config has at least one of these. A stricter check would
+        // reject the legitimate ml-only shape, which has almost nothing in it.
+        let known = ["ml_port", "immich_url", "server_dir", "ml_only", "worker", "ml"]
+        guard known.contains(where: { obj[$0] != nil }) else { throw ConfigError.notOurs }
+        try FileManager.default.createDirectory(
+            at: Paths.dataDir, withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: Paths.configFile.path) {
+            try FileManager.default.removeItem(at: Paths.configFile)
+        }
+        try FileManager.default.copyItem(at: url, to: Paths.configFile)
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: Paths.configFile.path)
+    }
+
+    enum ConfigError: LocalizedError {
+        case notJSON, notOurs
+        var errorDescription: String? {
+            switch self {
+            case .notJSON: return "That file isn't JSON."
+            case .notOurs: return "That JSON isn't an accelerator config."
+            }
+        }
+    }
+
     static func startService() async { await run(brew, ["services", "start", service]) }
     static func stopService() async { await run(brew, ["services", "stop", service]) }
     static func restartService() async { await run(brew, ["services", "restart", service]) }

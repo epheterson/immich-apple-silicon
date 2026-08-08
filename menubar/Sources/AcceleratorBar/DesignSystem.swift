@@ -33,6 +33,12 @@ enum Metrics {
     /// of checks, and scrolling a list is not a defect.
     static let settingsWidth: CGFloat = 700
     static let settingsHeight: CGFloat = 480
+    /// The setup wizard. Wider than Settings because its steps carry
+    /// explanatory prose and a live log pane, and taller so the log does not
+    /// squeeze the buttons off the bottom.
+    static let wizardWidth: CGFloat = 620
+    static let wizardHeight: CGFloat = 560
+
     /// Wide enough for "Machine Learning" beside its glyph. At 190 it
     /// truncated to "Machine Le...", which is the sort of thing that only
     /// shows up when you render the window and look at it.

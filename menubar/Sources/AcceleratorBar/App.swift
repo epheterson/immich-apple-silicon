@@ -44,7 +44,12 @@ struct AcceleratorBarMain {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
-        let host = NSHostingController(rootView: SettingsView(model: .shared))
+        // "wizard" renders the setup flow instead of Settings, so the first-run
+        // experience can be looked at on the release machine too. It is the
+        // screen most users see exactly once and we see least often.
+        let host: NSViewController = pane == "wizard"
+            ? NSHostingController(rootView: SetupWizard(model: .shared))
+            : NSHostingController(rootView: SettingsView(model: .shared))
         let window = NSWindow(contentViewController: host)
         window.styleMask = [.titled, .closable]
         window.title = "Immich Accelerator Settings"
