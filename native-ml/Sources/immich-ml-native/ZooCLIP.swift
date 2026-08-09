@@ -394,7 +394,16 @@ final class ZooCLIP {
                     }
                     continue
                 }
-                do { _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp) } catch {
+                do {
+                    // replaceItemAt requires an atomic rename and throws
+                    // EXDEV ("Cross-device link") instead of falling back
+                    // when dst's volume differs from tmp's (any cache
+                    // directory on an external or secondary disk, not just
+                    // a theoretical case — verified on-device); moveItem
+                    // handles that cross-volume case correctly.
+                    try? FileManager.default.removeItem(at: dst)
+                    try FileManager.default.moveItem(at: tmp, to: dst)
+                } catch {
                     throw PredictError(status: "500 Internal Server Error",
                                        message: "model \(name): cannot store \(f) (\(error))")
                 }

@@ -30,8 +30,11 @@ if CommandLine.arguments.contains("zootest") {
                    "A DOG, running!  on the beach?", "immich native swift"]
     let imagePath = ProcessInfo.processInfo.environment["ZOOTEST_IMAGE"] ?? "/tmp/face_test.jpg"
     let imageTag = (imagePath as NSString).lastPathComponent
-    for name in ["ViT-B-16-SigLIP__webli", "ViT-B-16-SigLIP2__webli",
-                 "ViT-L-16-SigLIP2-256__webli", "ViT-SO400M-16-SigLIP2-384__webli"] {
+    let defaultModels = ["ViT-B-16-SigLIP__webli", "ViT-B-16-SigLIP2__webli",
+                          "ViT-L-16-SigLIP2-256__webli", "ViT-SO400M-16-SigLIP2-384__webli"]
+    let models = ProcessInfo.processInfo.environment["ZOOTEST_MODELS"]
+        .map { $0.split(separator: ",").map(String.init) } ?? defaultModels
+    for name in models {
         do {
             let zoo = try ZooCLIP(name: name)
             guard let cg = loadCGImage(imagePath) else { fatalError("no image at \(imagePath)") }

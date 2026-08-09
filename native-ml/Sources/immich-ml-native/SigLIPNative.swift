@@ -220,7 +220,7 @@ final class SigLIPNative {
             }
             x = ln(x, "text_model.final_layer_norm")
             let pooled = x[seq - 1].reshaped([1, tower.hidden])
-            var emb = lin(pooled, "text_model.head").reshaped([tower.hidden])
+            var emb = lin(pooled, "text_model.head").reshaped([cfg.textProjection])
             emb = emb / sqrt((emb * emb).sum())
             eval(emb)
             return emb.asArray(Float.self)
@@ -287,19 +287,33 @@ final class SigLIPNative {
         let sem = DispatchSemaphore(value: 0)
         var total: Int?
         var acceptsRanges = false
+        var ok = false
         session.dataTask(with: req) { _, resp, _ in
             if let http = resp as? HTTPURLResponse {
+                // HF's origin unconditionally advertises Accept-Ranges: bytes
+                // even on a 404 (verified on-device against a sharded
+                // checkpoint with no single model.safetensors) — the error
+                // page's own small body would otherwise be mistaken for a
+                // tiny real file. Status must be checked explicitly.
+                ok = http.statusCode == 200
                 total = Int(http.value(forHTTPHeaderField: "Content-Length") ?? "")
                 acceptsRanges = http.value(forHTTPHeaderField: "Accept-Ranges") == "bytes"
             }
             sem.signal()
         }.resume()
         sem.wait()
-        return acceptsRanges ? total : nil
+        return (ok && acceptsRanges) ? total : nil
     }
 
     private static func downloadRanged(session: URLSession, url: URL, dst: URL, total: Int, name: String) throws {
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        // Same directory as dst, not FileManager's system temp dir: when the
+        // cache lives on a different volume than /var/folders (an external
+        // or secondary disk — not just theoretical, hit this on-device),
+        // FileManager.moveItem below still succeeds (it falls back to a
+        // copy across volumes, verified), but writing here directly avoids
+        // that fallback doing a redundant full-file copy on top of the
+        // chunk writes this function already did.
+        let tmp = dst.deletingLastPathComponent().appendingPathComponent(".tmp-\(UUID().uuidString)")
         guard FileManager.default.createFile(atPath: tmp.path, contents: nil) else {
             throw PredictError(status: "500 Internal Server Error", message: "\(name): cannot create temp file")
         }
@@ -429,6 +443,16 @@ struct SigLIPConfig {
     let vision: Tower
     let visionPatch: Int
     let text: Tower
+    // text_model.head projects from text.hidden to this width. Equal to
+    // text.hidden for every model currently in this registry, but not a safe
+    // assumption in general: the giant-opt scale's text tower runs at
+    // so400m's width (1152) internally and projects up to 1536 to match its
+    // own larger vision tower's output (see the deferred-models note below)
+    // — caught by cross-checking every field against each model's actual
+    // config.json rather than assuming vision/text symmetry. Kept as an
+    // explicit field, not inferred, so giant-opt support is a registry
+    // addition later rather than another architecture change.
+    let textProjection: Int
 }
 
 enum SigLIPRegistry {
@@ -437,12 +461,12 @@ enum SigLIPRegistry {
             hfRepo: "google/siglip-base-patch16-224",
             vision: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072),
             visionPatch: 16,
-            text: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072)),
+            text: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072), textProjection: 768),
         "ViT-B-16-SigLIP2__webli": SigLIPConfig(
             hfRepo: "google/siglip2-base-patch16-224",
             vision: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072),
             visionPatch: 16,
-            text: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072)),
+            text: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072), textProjection: 768),
         // Visual embeddings here measure ~0.99 cosine against Immich's ONNX
         // export (vs. 0.999+ for every other model in this registry); textual
         // is unaffected (1.0000). Investigated 2026-08-09 and not treated as
@@ -474,12 +498,123 @@ enum SigLIPRegistry {
             hfRepo: "google/siglip2-large-patch16-256",
             vision: .init(hidden: 1024, layers: 24, heads: 16, intermediate: 4096),
             visionPatch: 16,
-            text: .init(hidden: 1024, layers: 24, heads: 16, intermediate: 4096)),
+            text: .init(hidden: 1024, layers: 24, heads: 16, intermediate: 4096), textProjection: 1024),
         "ViT-SO400M-16-SigLIP2-384__webli": SigLIPConfig(
             hfRepo: "google/siglip2-so400m-patch16-384",
             vision: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304),
             visionPatch: 16,
-            text: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304)),
+            text: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304), textProjection: 1152),
+
+        // --- added for full-catalog coverage (all verified against each
+        // model's own https://huggingface.co/<hfRepo>/config.json) ---
+
+        // patch14 at 384 does not divide evenly (384/14 = 27.43): the conv
+        // is a "valid" 27x27 patch grid with ~6px trimmed off the bottom-
+        // right, which is why Immich names this variant "-378" (27*14) even
+        // though the checkpoint's own HF config says image_size=384. The
+        // resize target actually used comes from this model's own
+        // preprocess_cfg.json (ZooCLIP.pre.size, already fetched generically)
+        // rather than the HF vision_config here — they disagree, and
+        // preprocess_cfg.json is the one Immich's own ONNX export was built
+        // against.
+        "ViT-SO400M-14-SigLIP2-378__webli": SigLIPConfig(
+            hfRepo: "google/siglip2-so400m-patch14-384",
+            vision: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304),
+            visionPatch: 14,
+            text: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304), textProjection: 1152),
+        "ViT-SO400M-16-SigLIP2-512__webli": SigLIPConfig(
+            hfRepo: "google/siglip2-so400m-patch16-512",
+            vision: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304),
+            visionPatch: 16,
+            text: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304), textProjection: 1152),
+        "ViT-L-16-SigLIP2-512__webli": SigLIPConfig(
+            hfRepo: "google/siglip2-large-patch16-512",
+            vision: .init(hidden: 1024, layers: 24, heads: 16, intermediate: 4096),
+            visionPatch: 16,
+            text: .init(hidden: 1024, layers: 24, heads: 16, intermediate: 4096), textProjection: 1024),
+        "ViT-SO400M-16-SigLIP2-256__webli": SigLIPConfig(
+            hfRepo: "google/siglip2-so400m-patch16-256",
+            vision: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304),
+            visionPatch: 16,
+            text: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304), textProjection: 1152),
+        // No resolution suffix in Immich's name = the checkpoint's default
+        // (224 for patch14, matching this repo's name).
+        "ViT-SO400M-14-SigLIP2__webli": SigLIPConfig(
+            hfRepo: "google/siglip2-so400m-patch14-224",
+            vision: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304),
+            visionPatch: 14,
+            text: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304), textProjection: 1152),
+        "ViT-L-16-SigLIP2-384__webli": SigLIPConfig(
+            hfRepo: "google/siglip2-large-patch16-384",
+            vision: .init(hidden: 1024, layers: 24, heads: 16, intermediate: 4096),
+            visionPatch: 16,
+            text: .init(hidden: 1024, layers: 24, heads: 16, intermediate: 4096), textProjection: 1024),
+        "ViT-B-32-SigLIP2-256__webli": SigLIPConfig(
+            hfRepo: "google/siglip2-base-patch32-256",
+            vision: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072),
+            visionPatch: 32,
+            text: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072), textProjection: 768),
+
+        // SigLIP v1 (no "2" — smaller 32k sentencepiece vocab instead of
+        // SigLIP2's 256k, handled transparently by ZooCLIP's existing
+        // generic tokenizer loading; nothing here depends on vocab size).
+        "ViT-SO400M-14-SigLIP-384__webli": SigLIPConfig(
+            hfRepo: "google/siglip-so400m-patch14-384",
+            vision: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304),
+            visionPatch: 14,
+            text: .init(hidden: 1152, layers: 27, heads: 16, intermediate: 4304), textProjection: 1152),
+        "ViT-L-16-SigLIP-384__webli": SigLIPConfig(
+            hfRepo: "google/siglip-large-patch16-384",
+            vision: .init(hidden: 1024, layers: 24, heads: 16, intermediate: 4096),
+            visionPatch: 16,
+            text: .init(hidden: 1024, layers: 24, heads: 16, intermediate: 4096), textProjection: 1024),
+        "ViT-L-16-SigLIP-256__webli": SigLIPConfig(
+            hfRepo: "google/siglip-large-patch16-256",
+            vision: .init(hidden: 1024, layers: 24, heads: 16, intermediate: 4096),
+            visionPatch: 16,
+            text: .init(hidden: 1024, layers: 24, heads: 16, intermediate: 4096), textProjection: 1024),
+        "ViT-B-16-SigLIP-512__webli": SigLIPConfig(
+            hfRepo: "google/siglip-base-patch16-512",
+            vision: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072),
+            visionPatch: 16,
+            text: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072), textProjection: 768),
+        "ViT-B-16-SigLIP-384__webli": SigLIPConfig(
+            hfRepo: "google/siglip-base-patch16-384",
+            vision: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072),
+            visionPatch: 16,
+            text: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072), textProjection: 768),
+        "ViT-B-16-SigLIP-256__webli": SigLIPConfig(
+            hfRepo: "google/siglip-base-patch16-256",
+            vision: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072),
+            visionPatch: 16,
+            text: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072), textProjection: 768),
+
+        // Deliberately NOT here (deferred, not overlooked):
+        //  - ViT-B-16-SigLIP-i18n-256__webli: Immich's name implies base
+        //    scale, but the only "i18n" checkpoint google publishes is
+        //    SO400M-scale (google/siglip-so400m-patch16-256-i18n) — the
+        //    name doesn't map mechanically like the rest of this table, and
+        //    guessing which repo (if any) actually backs this Immich model
+        //    risks silently loading the wrong weights. Needs the real repo
+        //    tracked down before it can be added.
+        //  - nllb-clip-{base,large}-siglip__{v1,mrl}: SigLIP vision tower
+        //    (already covered by the configs above once the right repo is
+        //    confirmed) but paired with an NLLB text tower, a different
+        //    architecture family this file doesn't implement. Vision-only
+        //    reuse is a separate, smaller follow-up; full support needs an
+        //    NLLB port, out of scope here.
+        //  - ViT-gopt-16-SigLIP2-{256,384}__webli: google/siglip2-giant-opt-*
+        //    ships as two sharded files (model-0000{1,2}-of-00002.safetensors
+        //    + an index) rather than the single model.safetensors every
+        //    other entry here has — ensureWeights doesn't handle that yet.
+        //    Also the single biggest model in Immich's whole catalog (~7GB
+        //    fp32 per resolution) for a scale that Immich's own docs already
+        //    mark not Pareto-optimal against so400m-384 on English recall
+        //    (so400m-384 scores *higher* recall at roughly a third the
+        //    memory) — lowest value-per-effort entry in the catalog, so
+        //    deferred rather than built now. Multi-shard loading (concatenate
+        //    each shard's MLX.loadArrays() result) is the actual gap if this
+        //    gets picked up later.
     ]
 
     static func config(for name: String) -> SigLIPConfig? { models[name] }
