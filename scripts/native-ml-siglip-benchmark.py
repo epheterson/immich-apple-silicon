@@ -30,6 +30,15 @@ Forcing ONNX on a large model triggers ZooCLIP's normal external-data fetch
 `.external-data-checked` marker) on first run; expect that to take a while
 for SO400M-scale models the first time.
 
+Test image resolution matters and is not a footnote: the CPU-side bicubic
+resize inside embedVisual (Resize.bicubic, scales with *source* image
+resolution, runs before the GPU forward pass) is a real chunk of latency that
+a small test image hides almost entirely — measured 246ms vs 552ms for the
+same model (ViT-SO400M-16-SigLIP2-384) on a 512x512 test image vs a
+realistic ~4032x3024 one. --image auto-generates a realistic-resolution
+synthetic JPEG if none exists; don't benchmark with a tiny image and report
+the number as representative.
+
 USAGE
 -----
   python3 scripts/native-ml-siglip-benchmark.py
@@ -105,34 +114,59 @@ def ensure_metallib(binary: str, native_ml_dir: str) -> None:
     shutil.copy2(candidates[0], dst)
 
 
+def ensure_bench_image(path: str) -> str:
+    """Generate a synthetic ~4032x3024 (12MP, real-iPhone-photo scale) JPEG if
+    none exists. The resize inside embedVisual/embedTextual (Resize.bicubic,
+    CPU-side, scales with *source* resolution before the GPU forward pass) is
+    a big chunk of real-world latency that a small test image hides entirely
+    — measured 246ms vs 552ms for the same model on a 512x512 test image vs a
+    realistic one. Content is irrelevant (random noise), only the resolution
+    matters for a latency benchmark."""
+    if os.path.isfile(path):
+        return path
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError:
+        raise RuntimeError(
+            f"{path} does not exist and PIL/numpy aren't available to generate it. "
+            "Install them (e.g. via the ml/venv) or pass --image with a real photo."
+        )
+    print(f"[bench] generating {path} (synthetic 4032x3024, real-photo-scale) ...", flush=True)
+    arr = (np.random.rand(3024, 4032, 3) * 255).astype("uint8")
+    Image.fromarray(arr).save(path, quality=90)
+    return path
+
+
 def run_bench(binary: str, models: list, clip_dir: str, iters: int, warmup: int,
-              force_onnx: bool, timeout: int) -> dict:
-    env = {
-        **os.environ,
-        "ML_CLIP_DIR": clip_dir,
-        "BENCH_MODELS": ",".join(models),
-        "BENCH_ITERS": str(iters),
-        "BENCH_WARMUP": str(warmup),
-    }
+              force_onnx: bool, timeout: int, image: str) -> dict:
+    """One fresh process per model, not a single process switching between
+    them via BENCH_MODELS — measured cross-model interference otherwise
+    (loading model B right after model A in the same process inflated both
+    B's visual *and* its unrelated textual timing well above an isolated
+    run: 96ms vs a stable 35-54ms across repeats). A fresh process per model
+    costs more wall-clock time but each number is then only about that model."""
+    env_base = {**os.environ, "ML_CLIP_DIR": clip_dir, "BENCH_ITERS": str(iters),
+                "BENCH_WARMUP": str(warmup), "BENCH_IMAGE": image}
     if force_onnx:
-        env["ZOOCLIP_FORCE_ONNX"] = "1"
+        env_base["ZOOCLIP_FORCE_ONNX"] = "1"
     label = "onnxruntime" if force_onnx else "native mlx-swift"
-    print(f"[bench] running {len(models)} model(s) via {label} ...", flush=True)
-    proc = subprocess.run([binary, "benchtest"], env=env, capture_output=True, text=True, timeout=timeout)
+    print(f"[bench] running {len(models)} model(s) via {label} (one process each) ...", flush=True)
     results = {}
-    for line in proc.stdout.splitlines():
-        print(f"[bench]   {line}")
+    for name in models:
+        env = {**env_base, "BENCH_MODELS": name}
+        proc = subprocess.run([binary, "benchtest"], env=env, capture_output=True, text=True, timeout=timeout)
+        line = next((l for l in proc.stdout.splitlines() if l.startswith("BENCH")), "")
+        print(f"[bench]   {line or '(no BENCH line)'}")
         m = BENCH_RE.match(line.strip())
         if m:
-            results[m["name"]] = {"visual_ms": float(m["visual"]), "textual_ms": float(m["textual"])}
-        elif line.strip().startswith("BENCH") and "FAILED" in line:
-            name = line.split()[1]
+            results[name] = {"visual_ms": float(m["visual"]), "textual_ms": float(m["textual"])}
+        else:
             print(f"[bench] FAIL — {name} errored under {label}: {line.strip()}")
+            if proc.stderr.strip():
+                print(f"[bench]   stderr tail: {proc.stderr.strip()[-1000:]}")
     missing = set(models) - set(results)
     if missing:
-        print(f"[bench] FAIL — no result for {sorted(missing)} under {label}")
-        if proc.stderr.strip():
-            print(f"[bench]   stderr tail: {proc.stderr.strip()[-1000:]}")
         raise RuntimeError(f"missing benchmark results: {sorted(missing)}")
     return results
 
@@ -168,6 +202,10 @@ def main() -> int:
                           "download multi-GB external-data weights on first use")
     ap.add_argument("--markdown", action="store_true", help="also print a markdown table")
     ap.add_argument("--json-out", help="write full results as JSON to this path")
+    ap.add_argument("--image", default="/tmp/native-ml-bench.jpg",
+                     help="test image; auto-generated at realistic (4032x3024) resolution if missing. "
+                          "A small image understates real-world latency — the CPU-side resize inside "
+                          "embedVisual scales with source resolution.")
     args = ap.parse_args()
 
     models = ALL_MODELS if args.models == "all" else [m.strip() for m in args.models.split(",") if m.strip()]
@@ -180,12 +218,13 @@ def main() -> int:
         print(f"[bench] FAIL — clip dir not found: {args.clip_dir}")
         return 1
     ensure_metallib(binary, args.native_ml_dir)
+    image = ensure_bench_image(args.image)
 
     try:
         native = run_bench(binary, models, args.clip_dir, args.iterations, args.warmup,
-                            force_onnx=False, timeout=args.timeout)
+                            force_onnx=False, timeout=args.timeout, image=image)
         onnx = run_bench(binary, models, args.clip_dir, args.iterations, args.warmup,
-                          force_onnx=True, timeout=args.timeout)
+                          force_onnx=True, timeout=args.timeout, image=image)
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         print(f"[bench] FAIL — {e}")
         return 1
