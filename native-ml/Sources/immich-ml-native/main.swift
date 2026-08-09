@@ -97,6 +97,16 @@ if CommandLine.arguments.contains("facetest") {
     exit(0)
 }
 
+// --- Debug: dump Resize.bicubic's raw output for pixel-level comparison against PIL ---
+if CommandLine.arguments.contains("resizetest") {
+    guard let cg = loadCGImage("/tmp/face_test.jpg") else { fatalError("no image") }
+    let (rgb, w, h) = rgbBuffer(cg)
+    let resized = Resize.bicubic(rgb, w: w, h: h, outW: 384, outH: 384)
+    try! Data(resized).write(to: URL(fileURLWithPath: "/tmp/swift_resized_384.raw"))
+    print("wrote \(resized.count) bytes")
+    exit(0)
+}
+
 let MODEL = ProcessInfo.processInfo.environment["ML_CLIP_DIR"] ?? "/tmp/mlx032test/clipmodel"
 let ARCFACE = ProcessInfo.processInfo.environment["ML_ARCFACE"]
     ?? (NSHomeDirectory() + "/.insightface/models/buffalo_l/w600k_r50.onnx")
