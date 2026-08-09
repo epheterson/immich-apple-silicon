@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Real-model concurrent preflight gate for native-ml (immich-ml-native).
+
+WHY THIS EXISTS
+---------------
+scripts/ml-preflight.py gates the Python `ml` submodule service against real
+concurrent /predict load — it boots STUB_MODE=false and fires concurrent CLIP
+calls because synthetic proxies (image_encoder loops, STUB_MODE tests) missed
+a real mlx crash that only reproduced under the actual FastAPI service (#103).
+That gate explicitly does not, and cannot, cover native-ml: a separate Swift
+binary with its own MLX runtime, its own HTTP server (Server.swift, via
+Network.framework), and its own model-residency/switching logic
+(Models.zoo(for:), an NSCondition-guarded single-resident-model cache). None
+of that machinery is exercised by `zootest` (a single-threaded CLI harness) or
+by any unit test — only by the real server under real concurrent requests,
+exactly the class of bug the Python gate exists to catch on the other service.
+
+This gate boots the ACTUAL release binary (`swift build -c release`, the same
+build produced for shipping — see native-ml/scripts/build_bundle.sh) with the
+real HTTP server, and fires concurrent /predict calls (both clip.visual and
+clip.textual) at it for a sample of real registry models, using weights
+already on disk (no stub, no mock). A crash presents as the process dying
+(SIGABRT/SIGSEGV/SIGILL/Swift fatal error) — detected via child exit plus an
+abort signature in stderr, the same technique as ml-preflight.py.
+
+USAGE
+-----
+  python3 scripts/native-ml-preflight.py
+  python3 scripts/native-ml-preflight.py --models all
+  python3 scripts/native-ml-preflight.py --binary native-ml/.build/release/immich-ml-native
+
+Exit 0 = the server survived real concurrent CLIP inference across the tested
+         models (safe to ship this native-ml / mlx-swift change).
+Exit 1 = the server crashed or misbehaved (do NOT ship this change).
+"""
+
+import argparse
+import base64
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+# Same minimal valid baseline JPEG as ml-preflight.py, so this gate has no
+# PIL/numpy dependency — content is irrelevant, it just needs to decode.
+_TINY_JPEG_B64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAoHBwgHBgoICAgLCgoLDhgQDg0NDh0VFhEYIx8lJCIfIiEmKzcvJik0KSEiMEExNDk7Pj4+JS5ESUM8SDc9Pjv/2wBDAQoLCw4NDhwQEBw7KCIoOzs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozv/wAARCABAAEADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDFooorzzuCiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAP/9k="
+
+# One model per architecture family/scale actually in SigLIPRegistry (see
+# SigLIPNative.swift), spanning the axes most likely to expose a real
+# concurrency bug: smallest vs largest tower, v1 vs v2, and the mlx
+# fast-path default CLIP model (a different code path entirely — CLIPEncoder,
+# not ZooCLIP/SigLIPNative — that's always resident and must keep working
+# while zoo models load/switch around it). Not the full 17: that's what
+# --models all is for (run before an actual native-ml/mlx-swift release).
+DEFAULT_MODELS = [
+    "ViT-B-32__openai",
+    "ViT-B-16-SigLIP-256__webli",
+    "ViT-SO400M-16-SigLIP2-384__webli",
+    "ViT-L-16-SigLIP2-512__webli",
+]
+
+# Keep in sync with SigLIPRegistry.models in SigLIPNative.swift.
+ALL_SIGLIP_MODELS = [
+    "ViT-B-16-SigLIP__webli",
+    "ViT-B-16-SigLIP2__webli",
+    "ViT-L-16-SigLIP2-256__webli",
+    "ViT-SO400M-16-SigLIP2-384__webli",
+    "ViT-SO400M-14-SigLIP2-378__webli",
+    "ViT-SO400M-16-SigLIP2-512__webli",
+    "ViT-L-16-SigLIP2-512__webli",
+    "ViT-SO400M-16-SigLIP2-256__webli",
+    "ViT-SO400M-14-SigLIP2__webli",
+    "ViT-L-16-SigLIP2-384__webli",
+    "ViT-B-32-SigLIP2-256__webli",
+    "ViT-SO400M-14-SigLIP-384__webli",
+    "ViT-L-16-SigLIP-384__webli",
+    "ViT-L-16-SigLIP-256__webli",
+    "ViT-B-16-SigLIP-512__webli",
+    "ViT-B-16-SigLIP-384__webli",
+    "ViT-B-16-SigLIP-256__webli",
+]
+ALL_MODELS = ["ViT-B-32__openai"] + ALL_SIGLIP_MODELS
+
+ABORT_SIGNATURES = (
+    "Stream(",
+    "libc++abi",
+    "uncaught exception",
+    "Fatal error",
+    "Illegal instruction",
+    "Precondition failed",
+    "Segmentation fault",
+    "EXC_BAD_INSTRUCTION",
+    "EXC_BAD_ACCESS",
+)
+
+
+def tiny_jpeg() -> bytes:
+    return base64.b64decode(_TINY_JPEG_B64)
+
+
+def predict(base: str, model_name: str, kind: str, image: bytes, text: str, timeout: int = 60) -> str:
+    """One real /predict call (visual or textual) for a specific zoo model,
+    matching Immich's own multipart wire format (see Server.swift/Predict.swift)."""
+    boundary = "----native-ml-preflight"
+    entries = {"clip": {kind: {"modelName": model_name}}}
+    parts = [
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="entries"\r\n\r\n',
+        json.dumps(entries).encode() + b"\r\n",
+    ]
+    if kind == "visual":
+        parts += [
+            f"--{boundary}\r\n".encode(),
+            b'Content-Disposition: form-data; name="image"; filename="t.jpg"\r\n'
+            b"Content-Type: image/jpeg\r\n\r\n",
+            image,
+            b"\r\n",
+        ]
+    else:
+        parts += [
+            f"--{boundary}\r\n".encode(),
+            b'Content-Disposition: form-data; name="text"\r\n\r\n',
+            text.encode() + b"\r\n",
+        ]
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        f"{base}/predict",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        result = json.loads(r.read())
+    raw = result.get("clip")
+    emb = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(emb, list) or len(emb) < 8:
+        raise RuntimeError(f"bad embedding for {model_name}/{kind}: {emb!r}"[:200])
+    return f"{model_name}/{kind} dim={len(emb)}"
+
+
+def wait_healthy(base: str, proc: subprocess.Popen, timeout: int) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"service exited during startup (rc={proc.returncode})")
+        try:
+            with urllib.request.urlopen(f"{base}/health", timeout=5) as r:
+                health = json.loads(r.read())
+                # "healthy" needs arcface loaded too; this gate only cares
+                # about clip, so accept "degraded" as long as clip itself is ok.
+                if health.get("checks", {}).get("clip") == "ok":
+                    return
+        except Exception:
+            pass
+        time.sleep(2)
+    raise RuntimeError("service did not become healthy in time")
+
+
+def build_release(native_ml_dir: str) -> str:
+    print(f"[preflight] swift build -c release in {native_ml_dir} ...", flush=True)
+    subprocess.run(["swift", "build", "-c", "release"], cwd=native_ml_dir, check=True)
+    return os.path.join(native_ml_dir, ".build", "release", "immich-ml-native")
+
+
+def ensure_metallib(binary: str, native_ml_dir: str) -> None:
+    """mlx.metallib must sit beside the binary at runtime (see
+    native-ml/scripts/build_bundle.sh, which does the same copy for a real
+    release bundle) — swift build does not place it there itself. Search the
+    usual spots; on a dev machine the debug build often already has one from
+    an earlier `swift build` and it's config-independent (same compiled Metal
+    shaders regardless of Swift optimization level), so reuse it."""
+    dst = os.path.join(os.path.dirname(os.path.abspath(binary)), "mlx.metallib")
+    if os.path.isfile(dst):
+        return
+    candidates = subprocess.run(
+        ["find", "/opt/homebrew", native_ml_dir, "-name", "mlx.metallib"],
+        capture_output=True, text=True,
+    ).stdout.splitlines()
+    candidates = [c for c in candidates if os.path.abspath(c) != dst]
+    if not candidates:
+        raise RuntimeError(
+            "mlx.metallib not found anywhere (checked /opt/homebrew and the native-ml checkout); "
+            "build the debug target at least once, or set it up per native-ml/scripts/build_bundle.sh"
+        )
+    print(f"[preflight] copying {candidates[0]} -> {dst}", flush=True)
+    import shutil
+    shutil.copy2(candidates[0], dst)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--native-ml-dir",
+        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "native-ml"),
+        help="native-ml checkout (has Package.swift)",
+    )
+    ap.add_argument("--binary", help="pre-built binary path; skips swift build -c release")
+    ap.add_argument("--clip-dir", default=os.path.expanduser("~/.cache/immich-ml-native/clip"))
+    ap.add_argument("--arcface", default=None, help="omit to let the binary use its own default search")
+    ap.add_argument("--port", type=int, default=3998)
+    ap.add_argument("--concurrency", type=int, default=4)
+    ap.add_argument("--requests", type=int, default=16, help="concurrent requests per model, split visual/textual")
+    ap.add_argument(
+        "--models",
+        default=",".join(DEFAULT_MODELS),
+        help="comma-separated model names, or 'all' for the full registry (slow: first-load per model)",
+    )
+    ap.add_argument("--startup-timeout", type=int, default=120)
+    ap.add_argument("--warmup-timeout", type=int, default=240,
+                     help="per-request timeout for the cold model-switch load, not the stress batch")
+    args = ap.parse_args()
+
+    models = ALL_MODELS if args.models == "all" else [m.strip() for m in args.models.split(",") if m.strip()]
+
+    binary = args.binary or build_release(args.native_ml_dir)
+    if not os.path.isfile(binary):
+        print(f"[preflight] FAIL — binary not found: {binary}")
+        return 1
+    if not os.path.isdir(args.clip_dir):
+        print(f"[preflight] FAIL — clip dir not found: {args.clip_dir} "
+              f"(run native-ml/scripts/install_native.sh first)")
+        return 1
+    ensure_metallib(binary, args.native_ml_dir)
+
+    base = f"http://127.0.0.1:{args.port}"
+    env = {**os.environ, "ML_CLIP_DIR": args.clip_dir}
+    if args.arcface:
+        env["ML_ARCFACE"] = args.arcface
+
+    err = open(os.path.join("/tmp", f"native-ml-preflight-{args.port}.err"), "w+b")
+    print(f"[preflight] booting real native-ml service on {base} (release build) ...", flush=True)
+    proc = subprocess.Popen([binary, "serve", str(args.port)], env=env, stdout=err, stderr=subprocess.STDOUT)
+
+    def stderr_tail() -> str:
+        err.flush()
+        err.seek(0)
+        return err.read().decode(errors="replace")[-2000:]
+
+    def died_with_abort(prefix: str) -> bool:
+        if proc.poll() is None:
+            return False
+        tail = stderr_tail()
+        abort = next((ln for ln in tail.splitlines() if any(sig in ln for sig in ABORT_SIGNATURES)), "")
+        print(f"[preflight] FAIL — service DIED {prefix} (rc={proc.returncode})")
+        if abort:
+            print(f"[preflight]   abort: {abort.strip()}")
+        elif tail.strip():
+            print(f"[preflight]   stderr tail: {tail.strip()[-500:]}")
+        return True
+
+    try:
+        wait_healthy(base, proc, args.startup_timeout)
+        image = tiny_jpeg()
+        text = "a photo of a cat"
+
+        for i, name in enumerate(models, 1):
+            print(f"[preflight] [{i}/{len(models)}] {name}: warming up (model load/switch) ...", flush=True)
+            try:
+                # Cold load: evicts whatever's resident and reads a fresh
+                # multi-GB safetensors file off disk (Models.zoo(for:), see
+                # Models.swift) — measured minutes, not seconds, for the
+                # largest towers back-to-back, so this needs real headroom.
+                # Once resident, inference itself is fast — see the tighter
+                # per-request timeout on the concurrent batch below.
+                predict(base, name, "visual", image, text, timeout=args.warmup_timeout)
+                predict(base, name, "textual", image, text, timeout=args.warmup_timeout)
+            except Exception as e:
+                if died_with_abort(f"loading {name}"):
+                    return 1
+                print(f"[preflight] FAIL — {name} warmup errored: {e!r}")
+                return 1
+
+            print(
+                f"[preflight] [{i}/{len(models)}] {name}: firing {args.requests} concurrent "
+                f"predict calls (concurrency={args.concurrency}) ...",
+                flush=True,
+            )
+            errors = []
+            with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+                futs = [
+                    ex.submit(predict, base, name, "visual" if j % 2 == 0 else "textual", image, text)
+                    for j in range(args.requests)
+                ]
+                for f in futs:
+                    try:
+                        f.result()
+                    except Exception as e:
+                        errors.append(repr(e))
+
+            if died_with_abort(f"under concurrent load on {name}"):
+                return 1
+            if errors:
+                print(f"[preflight] FAIL — {name}: {len(errors)}/{args.requests} predict calls errored")
+                for e in errors[:3]:
+                    print(f"[preflight]   {e}")
+                return 1
+            print(f"[preflight] [{i}/{len(models)}] {name}: OK ({args.requests} concurrent calls, no crash)")
+
+        print(
+            f"[preflight] PASS — {len(models)} model(s), {args.requests} concurrent real predict "
+            f"calls each, service alive throughout, no abort"
+        )
+        return 0
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        err.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
