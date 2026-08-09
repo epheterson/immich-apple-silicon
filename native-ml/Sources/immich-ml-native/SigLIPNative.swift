@@ -179,8 +179,14 @@ final class SigLIPNative {
     // detection) must keep running on whatever the global default is.
     // Concurrency: this service has no gpu_lock equivalent to the Python
     // fork's (README's documented MLX-vs-Vision-framework Metal crash
-    // mitigation) — see scripts/ml-preflight.py, which every model added to
-    // SigLIPRegistry must pass before shipping.
+    // mitigation) — a pre-existing gap, not introduced here (the default mlx
+    // ViT-B-32 path has shared this exposure with Vision-framework OCR/face
+    // detection since 1.6.0). scripts/native-ml-preflight.py exercises
+    // concurrent /predict load on real models and every SigLIPRegistry
+    // addition should pass it before shipping, but it drives clip.visual/
+    // textual only — it does not yet fire concurrent facial-recognition/ocr
+    // alongside clip, so it cannot by itself rule out this specific crash
+    // mode. A real gpu_lock is the actual fix, out of scope for this file.
     func embedVisual(_ cg: CGImage, targetSize: Int, mean: [Float], std: [Float]) -> [Float] {
         Stream.withNewDefaultStream(device: Device(.gpu)) {
             let tower = cfg.vision
