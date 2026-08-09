@@ -72,6 +72,14 @@ final class ZooCLIP {
         dir = Self.zooDir.appendingPathComponent(name)
         try Self.ensureFiles(name: name, dir: dir)
 
+        // Benchmark-only escape hatch (scripts/native-ml-siglip-benchmark.py):
+        // run a SigLIPRegistry model through the onnxruntime branch anyway, so
+        // the "before native" baseline is measured with the exact same
+        // preprocessing/session code this file used to run for every SigLIP
+        // model, not a separately-written comparison harness. Never set in
+        // production; unset behaves exactly as before.
+        let forceONNX = ProcessInfo.processInfo.environment["ZOOCLIP_FORCE_ONNX"] == "1"
+
         // Large models keep their weights in external data files beside
         // model.onnx (#116). Resolve those once per model; the marker keeps a
         // later model switch from re-querying the API for an already-complete
@@ -88,7 +96,7 @@ final class ZooCLIP {
         // straight from the model's HF owner, see SigLIPNative), not this
         // model's ONNX weights — skip fetching several GB of external data
         // that would go unused.
-        if SigLIPRegistry.config(for: name) == nil, !FileManager.default.fileExists(atPath: marker.path) {
+        if (SigLIPRegistry.config(for: name) == nil || forceONNX), !FileManager.default.fileExists(atPath: marker.path) {
             if let external = Self.externalDataFiles(name: name) {
                 if !external.isEmpty {
                     print("[native-ml] \(name): fetching \(external.count) external data files")
@@ -156,7 +164,7 @@ final class ZooCLIP {
                                message: "model \(name): tokenizer unsupported (\(String(describing: loadError)))")
         }
 
-        if let sig = SigLIPRegistry.config(for: name) {
+        if let sig = SigLIPRegistry.config(for: name), !forceONNX {
             native = try SigLIPNative(config: sig, weightsPath: SigLIPNative.ensureWeights(hfRepo: sig.hfRepo, name: name))
             visualSession = nil
             textualSession = nil

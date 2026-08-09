@@ -56,6 +56,54 @@ if CommandLine.arguments.contains("zootest") {
     exit(0)
 }
 
+// --- Latency benchmark: raw embedVisual/embedTextual compute time, no HTTP ---
+// Used by scripts/native-ml-siglip-benchmark.py to compare the native mlx-swift
+// path against the onnxruntime path it replaced. Run this binary twice — once
+// normally (native) and once with ZOOCLIP_FORCE_ONNX=1 (see ZooCLIP.swift) — so
+// both numbers come from the exact same harness and preprocessing code, only
+// the inference backend differs.
+if CommandLine.arguments.contains("benchtest") {
+    let iters = Int(ProcessInfo.processInfo.environment["BENCH_ITERS"] ?? "") ?? 10
+    let warmup = Int(ProcessInfo.processInfo.environment["BENCH_WARMUP"] ?? "") ?? 3
+    let imagePath = ProcessInfo.processInfo.environment["BENCH_IMAGE"] ?? "/tmp/face_test.jpg"
+    let phrase = "a photo of a cat"
+    let defaultModels = ["ViT-B-16-SigLIP__webli", "ViT-B-16-SigLIP2__webli",
+                          "ViT-L-16-SigLIP2-256__webli", "ViT-SO400M-16-SigLIP2-384__webli"]
+    let models = ProcessInfo.processInfo.environment["BENCH_MODELS"]
+        .map { $0.split(separator: ",").map(String.init) } ?? defaultModels
+
+    func timeMs(_ n: Int, _ body: () throws -> Void) rethrows -> [Double] {
+        var samples: [Double] = []
+        samples.reserveCapacity(n)
+        for _ in 0..<n {
+            let start = DispatchTime.now()
+            try body()
+            let end = DispatchTime.now()
+            samples.append(Double(end.uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
+        }
+        return samples
+    }
+    func median(_ xs: [Double]) -> Double {
+        let s = xs.sorted()
+        return s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
+    }
+
+    for name in models {
+        do {
+            let zoo = try ZooCLIP(name: name)
+            guard let cg = loadCGImage(imagePath) else { fatalError("no image at \(imagePath)") }
+            _ = try timeMs(warmup) { _ = try zoo.embedVisual(cg) }
+            let visual = try timeMs(iters) { _ = try zoo.embedVisual(cg) }
+            _ = try timeMs(warmup) { _ = try zoo.embedTextual(phrase) }
+            let textual = try timeMs(iters) { _ = try zoo.embedTextual(phrase) }
+            print("BENCH \(name) visual_ms=\(median(visual)) textual_ms=\(median(textual)) n=\(iters)")
+        } catch {
+            print("BENCH \(name) FAILED \(error)")
+        }
+    }
+    exit(0)
+}
+
 // --- Face-align parity harness: align /tmp/face_test.jpg with Python's landmarks ---
 if CommandLine.arguments.contains("aligntest") {
     guard let cg = loadCGImage("/tmp/face_test.jpg") else { fatalError("no face image") }
