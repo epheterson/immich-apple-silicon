@@ -28,13 +28,16 @@ if CommandLine.arguments.contains("texttest") {
 if CommandLine.arguments.contains("zootest") {
     let phrases = ["a photo of a cat", "sunset over the mountains", "OCR Test 123",
                    "A DOG, running!  on the beach?", "immich native swift"]
-    for name in ["ViT-B-16__openai", "ViT-B-16-SigLIP__webli"] {
+    let imagePath = ProcessInfo.processInfo.environment["ZOOTEST_IMAGE"] ?? "/tmp/face_test.jpg"
+    let imageTag = (imagePath as NSString).lastPathComponent
+    for name in ["ViT-B-16-SigLIP__webli", "ViT-B-16-SigLIP2__webli",
+                 "ViT-L-16-SigLIP2-256__webli", "ViT-SO400M-16-SigLIP2-384__webli"] {
         do {
             let zoo = try ZooCLIP(name: name)
-            guard let cg = loadCGImage("/tmp/face_test.jpg") else { fatalError("no image") }
+            guard let cg = loadCGImage(imagePath) else { fatalError("no image at \(imagePath)") }
             let ve = try zoo.embedVisual(cg)
             ve.withUnsafeBytes {
-                try? Data($0).write(to: URL(fileURLWithPath: "/tmp/zoo_swift_\(name)_visual.f32"))
+                try? Data($0).write(to: URL(fileURLWithPath: "/tmp/zoo_swift_\(name)_\(imageTag)_visual.f32"))
             }
             var tout = Data()
             for p in phrases {
@@ -101,8 +104,9 @@ if CommandLine.arguments.contains("facetest") {
 if CommandLine.arguments.contains("resizetest") {
     guard let cg = loadCGImage("/tmp/face_test.jpg") else { fatalError("no image") }
     let (rgb, w, h) = rgbBuffer(cg)
-    let resized = Resize.bicubic(rgb, w: w, h: h, outW: 384, outH: 384)
-    try! Data(resized).write(to: URL(fileURLWithPath: "/tmp/swift_resized_384.raw"))
+    let size = CommandLine.arguments.last.flatMap { Int($0) } ?? 384
+    let resized = Resize.bicubic(rgb, w: w, h: h, outW: size, outH: size)
+    try! Data(resized).write(to: URL(fileURLWithPath: "/tmp/swift_resized_\(size).raw"))
     print("wrote \(resized.count) bytes")
     exit(0)
 }

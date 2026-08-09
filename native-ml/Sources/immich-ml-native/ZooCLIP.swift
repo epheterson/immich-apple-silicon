@@ -44,11 +44,11 @@ final class ZooCLIP {
     // Sessions load eagerly in init: after init the instance is immutable, so
     // concurrent requests never mutate shared state (a lazy-cache inout here
     // trips Swift's exclusivity enforcement under the concurrent server).
-    // Both nil exactly when `native` is set (see init): SigLIP2SO400M.modelName
-    // routes through native mlx-swift instead of onnxruntime.
+    // Both nil exactly when `native` is set (see init): any name in
+    // SigLIPRegistry routes through native mlx-swift instead of onnxruntime.
     private let visualSession: ORTSession?
     private let textualSession: ORTSession?
-    private let native: SigLIP2SO400M?
+    private let native: SigLIPNative?
 
     static let zooDir = NATIVE_CACHE_DIR.appendingPathComponent("zoo")
 
@@ -84,10 +84,11 @@ final class ZooCLIP {
         // load would skip the fetch and fail on the missing weights with no way
         // back short of deleting a hidden file.
         let marker = dir.appendingPathComponent(".external-data-checked")
-        // Native mlx-swift path uses its own (much smaller, already-fp16)
-        // safetensors checkpoint, not this model's ONNX weights — skip
-        // fetching several GB of external data that would go unused.
-        if name != SigLIP2SO400M.modelName, !FileManager.default.fileExists(atPath: marker.path) {
+        // Native mlx-swift path uses its own safetensors checkpoint (fetched
+        // straight from the model's HF owner, see SigLIPNative), not this
+        // model's ONNX weights — skip fetching several GB of external data
+        // that would go unused.
+        if SigLIPRegistry.config(for: name) == nil, !FileManager.default.fileExists(atPath: marker.path) {
             if let external = Self.externalDataFiles(name: name) {
                 if !external.isEmpty {
                     print("[native-ml] \(name): fetching \(external.count) external data files")
@@ -155,8 +156,8 @@ final class ZooCLIP {
                                message: "model \(name): tokenizer unsupported (\(String(describing: loadError)))")
         }
 
-        if name == SigLIP2SO400M.modelName {
-            native = try SigLIP2SO400M(weightsPath: SigLIP2SO400M.ensureWeights())
+        if let sig = SigLIPRegistry.config(for: name) {
+            native = try SigLIPNative(config: sig, weightsPath: SigLIPNative.ensureWeights(hfRepo: sig.hfRepo, name: name))
             visualSession = nil
             textualSession = nil
         } else {
@@ -178,7 +179,9 @@ final class ZooCLIP {
     // MARK: - inference
 
     func embedVisual(_ cg: CGImage) throws -> [Float] {
-        if let native { return native.embedVisual(cg) }
+        if let native {
+            return native.embedVisual(cg, targetSize: pre.size.first, mean: pre.mean, std: pre.std)
+        }
         guard let session = visualSession else {
             throw PredictError(status: "500 Internal Server Error", message: "no visual backend (\(name))")
         }
