@@ -16,6 +16,21 @@ final class ZooCLIP {
         let size: SizeValue
         let mean: [Float]
         let std: [Float]
+        let resizeMode: String
+
+        enum CodingKeys: String, CodingKey {
+            case size, mean, std
+            case resizeMode = "resize_mode"
+        }
+
+        init(from d: Swift.Decoder) throws {
+            let c = try d.container(keyedBy: CodingKeys.self)
+            size = try c.decode(SizeValue.self, forKey: .size)
+            mean = try c.decode([Float].self, forKey: .mean)
+            std = try c.decode([Float].self, forKey: .std)
+            // open_clip's own default (transform.py) when the key is absent.
+            resizeMode = try c.decodeIfPresent(String.self, forKey: .resizeMode) ?? "shortest"
+        }
 
         enum SizeValue: Decodable {
             case int(Int), list([Int])
@@ -168,24 +183,50 @@ final class ZooCLIP {
         let session = visualSession
         let size = pre.size.first
         let (rgb, w, h) = rgbBuffer(cg)
-        // Exact immich_ml resize_pil: short side -> size, long side int() truncated.
-        let newW: Int, newH: Int
-        if w < h {
-            newW = size
-            newH = Int(Double(h) / Double(w) * Double(size))
-        } else {
-            newW = Int(Double(w) / Double(h) * Double(size))
-            newH = size
+        // open_clip transform.py has three resize_mode values; Immich's zoo
+        // only ever uses two of them (checked all 54 immich-app/* repos):
+        // "shortest" (32 models — the CLIP-family default) and "squash" (22
+        // — the whole SigLIP/SigLIP2 family plus a few others). No shipped
+        // model uses "longest", so it's not implemented — fail loudly rather
+        // than silently mis-resize if that ever changes.
+        let resized: [UInt8]
+        switch pre.resizeMode {
+        case "squash":
+            // Resize(image_size): stretch straight to size x size, no crop.
+            resized = (w == size && h == size) ? rgb : Resize.bicubic(rgb, w: w, h: h, outW: size, outH: size)
+        case "shortest":
+            // Exact immich_ml resize_pil: short side -> size, long side int() truncated.
+            let newW: Int, newH: Int
+            if w < h {
+                newW = size
+                newH = Int(Double(h) / Double(w) * Double(size))
+            } else {
+                newW = Int(Double(w) / Double(h) * Double(size))
+                newH = size
+            }
+            let stretched = (newW == w && newH == h) ? rgb : Resize.bicubic(rgb, w: w, h: h, outW: newW, outH: newH)
+            // Exact immich_ml crop_pil: int() centers.
+            let left = Int(Double(newW) / 2 - Double(size) / 2)
+            let upper = Int(Double(newH) / 2 - Double(size) / 2)
+            var cropped = [UInt8](repeating: 0, count: size * size * 3)
+            for yy in 0..<size {
+                for xx in 0..<size {
+                    let srcBase = ((upper + yy) * newW + (left + xx)) * 3
+                    let dstBase = (yy * size + xx) * 3
+                    for c in 0..<3 { cropped[dstBase + c] = stretched[srcBase + c] }
+                }
+            }
+            resized = cropped
+        default:
+            throw PredictError(status: "422 Unprocessable Entity",
+                               message: "model \(name): unsupported resize_mode '\(pre.resizeMode)'")
         }
-        let resized = (newW == w && newH == h) ? rgb : Resize.bicubic(rgb, w: w, h: h, outW: newW, outH: newH)
-        // Exact immich_ml crop_pil: int() centers.
-        let left = Int(Double(newW) / 2 - Double(size) / 2)
-        let upper = Int(Double(newH) / 2 - Double(size) / 2)
+
         var x = [Float](repeating: 0, count: 3 * size * size)
         for c in 0..<3 {
             for yy in 0..<size {
                 for xx in 0..<size {
-                    let px = Float(resized[((upper + yy) * newW + (left + xx)) * 3 + c]) / 255.0
+                    let px = Float(resized[(yy * size + xx) * 3 + c]) / 255.0
                     x[c * size * size + yy * size + xx] = (px - pre.mean[c]) / pre.std[c]
                 }
             }
