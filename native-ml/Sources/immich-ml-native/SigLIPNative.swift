@@ -172,37 +172,39 @@ final class SigLIPNative {
         return MLXArray(flat, [grid * grid, dim])
     }
 
-    // Scoped to a GPU stream for just this call (Stream.withNewDefaultStream
+    // Scoped to the GPU device for just this call (Device.withDefaultDevice
     // sets a @TaskLocal, not the process-wide default) — every model in this
     // family is dramatically slower on CPU (SO400M measured ~28x), but the
     // rest of the service (default mlx CLIP path, Vision-framework OCR/face
     // detection) must keep running on whatever the global default is.
-    // Concurrency: this service has no gpu_lock equivalent to the Python
-    // fork's (README's documented MLX-vs-Vision-framework Metal crash
-    // mitigation) — a pre-existing gap, not introduced here (the default mlx
-    // ViT-B-32 path has shared this exposure with Vision-framework OCR/face
-    // detection since 1.6.0). scripts/native-ml-preflight.py exercises
-    // concurrent /predict load on real models and every SigLIPRegistry
-    // addition should pass it before shipping, but it drives clip.visual/
-    // textual only — it does not yet fire concurrent facial-recognition/ocr
-    // alongside clip, so it cannot by itself rule out this specific crash
-    // mode. A real gpu_lock is the actual fix, out of scope for this file.
+    // Device.gpu / its .defaultStream are pre-existing cached singletons
+    // (see mlx-swift's Device.swift), so this allocates nothing — earlier
+    // this used Stream.withNewDefaultStream(device:), which constructs a
+    // brand-new Metal command queue (mlx_stream_new_device) on every single
+    // call. Under sustained sequential load that churn is a real suspect for
+    // a production Metal OOM crash ("Command buffer execution failed:
+    // Insufficient Memory") after hundreds of consecutive predict calls;
+    // reusing the cached stream removes the churn entirely.
+    // Concurrency: guarded by metalLock (GPULock.swift), the Swift-side
+    // equivalent of the Python fork's gpu_lock — see that file for why.
     func embedVisual(_ cg: CGImage, targetSize: Int, mean: [Float], std: [Float]) -> [Float] {
-        Stream.withNewDefaultStream(device: Device(.gpu)) {
-            let tower = cfg.vision
-            let wPatch = w("vision_model.embeddings.patch_embedding.weight")
-                .reshaped([tower.hidden, 3 * cfg.visionPatch * cfg.visionPatch])
-            var x = matmul(patches(cg, targetSize: targetSize, mean: mean, std: std), wPatch.transposed())
-            x = x + w("vision_model.embeddings.patch_embedding.bias")
-            x = x + w("vision_model.embeddings.position_embedding.weight")
-            for l in 0 ..< tower.layers {
-                x = block(x, "vision_model.encoder.layers.\(l)", tower)
+        withMetalLock {
+            Device.withDefaultDevice(.gpu) {
+                let tower = cfg.vision
+                let wPatch = w("vision_model.embeddings.patch_embedding.weight")
+                    .reshaped([tower.hidden, 3 * cfg.visionPatch * cfg.visionPatch])
+                var x = matmul(patches(cg, targetSize: targetSize, mean: mean, std: std), wPatch.transposed())
+                x = x + w("vision_model.embeddings.patch_embedding.bias")
+                x = x + w("vision_model.embeddings.position_embedding.weight")
+                for l in 0 ..< tower.layers {
+                    x = block(x, "vision_model.encoder.layers.\(l)", tower)
+                }
+                x = ln(x, "vision_model.post_layernorm")
+                var emb = mapHead(x).reshaped([tower.hidden])
+                emb = emb / sqrt((emb * emb).sum())
+                eval(emb)
+                return emb.asArray(Float.self)
             }
-            x = ln(x, "vision_model.post_layernorm")
-            var emb = mapHead(x).reshaped([tower.hidden])
-            emb = emb / sqrt((emb * emb).sum())
-            eval(emb)
-            return emb.asArray(Float.self)
         }
     }
 
@@ -214,22 +216,24 @@ final class SigLIPNative {
     // let the last position see the whole real sequence regardless of
     // trailing padding ("sticky EOS" convention).
     func embedTextual(_ ids: [Int]) -> [Float] {
-        Stream.withNewDefaultStream(device: Device(.gpu)) {
-            let tower = cfg.text
-            let seq = ids.count
-            let tokEmb = w("text_model.embeddings.token_embedding.weight")
-            let posEmb = w("text_model.embeddings.position_embedding.weight")
-            let idsArr = MLXArray(ids.map { Int32($0) })
-            var x = take(tokEmb, idsArr, axis: 0) + posEmb[0 ..< seq]
-            for l in 0 ..< tower.layers {
-                x = block(x, "text_model.encoder.layers.\(l)", tower)
+        withMetalLock {
+            Device.withDefaultDevice(.gpu) {
+                let tower = cfg.text
+                let seq = ids.count
+                let tokEmb = w("text_model.embeddings.token_embedding.weight")
+                let posEmb = w("text_model.embeddings.position_embedding.weight")
+                let idsArr = MLXArray(ids.map { Int32($0) })
+                var x = take(tokEmb, idsArr, axis: 0) + posEmb[0 ..< seq]
+                for l in 0 ..< tower.layers {
+                    x = block(x, "text_model.encoder.layers.\(l)", tower)
+                }
+                x = ln(x, "text_model.final_layer_norm")
+                let pooled = x[seq - 1].reshaped([1, tower.hidden])
+                var emb = lin(pooled, "text_model.head").reshaped([cfg.textProjection])
+                emb = emb / sqrt((emb * emb).sum())
+                eval(emb)
+                return emb.asArray(Float.self)
             }
-            x = ln(x, "text_model.final_layer_norm")
-            let pooled = x[seq - 1].reshaped([1, tower.hidden])
-            var emb = lin(pooled, "text_model.head").reshaped([cfg.textProjection])
-            emb = emb / sqrt((emb * emb).sum())
-            eval(emb)
-            return emb.asArray(Float.self)
         }
     }
 

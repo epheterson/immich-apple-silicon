@@ -102,17 +102,16 @@ def tiny_jpeg() -> bytes:
     return base64.b64decode(_TINY_JPEG_B64)
 
 
-def predict(base: str, model_name: str, kind: str, image: bytes, text: str, timeout: int = 60) -> str:
-    """One real /predict call (visual or textual) for a specific zoo model,
-    matching Immich's own multipart wire format (see Server.swift/Predict.swift)."""
+def predict_raw(base: str, entries: dict, image: bytes | None, text: str | None, timeout: int = 60) -> dict:
+    """One real /predict call for an arbitrary entries dict, matching Immich's
+    own multipart wire format (see Server.swift/Predict.swift)."""
     boundary = "----native-ml-preflight"
-    entries = {"clip": {kind: {"modelName": model_name}}}
     parts = [
         f"--{boundary}\r\n".encode(),
         b'Content-Disposition: form-data; name="entries"\r\n\r\n',
         json.dumps(entries).encode() + b"\r\n",
     ]
-    if kind == "visual":
+    if image is not None:
         parts += [
             f"--{boundary}\r\n".encode(),
             b'Content-Disposition: form-data; name="image"; filename="t.jpg"\r\n'
@@ -120,7 +119,7 @@ def predict(base: str, model_name: str, kind: str, image: bytes, text: str, time
             image,
             b"\r\n",
         ]
-    else:
+    if text is not None:
         parts += [
             f"--{boundary}\r\n".encode(),
             b'Content-Disposition: form-data; name="text"\r\n\r\n',
@@ -138,12 +137,34 @@ def predict(base: str, model_name: str, kind: str, image: bytes, text: str, time
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        result = json.loads(r.read())
+        return json.loads(r.read())
+
+
+def predict(base: str, model_name: str, kind: str, image: bytes, text: str, timeout: int = 60) -> str:
+    """One real /predict call (visual or textual) for a specific zoo model."""
+    result = predict_raw(
+        base, {"clip": {kind: {"modelName": model_name}}},
+        image if kind == "visual" else None, text if kind != "visual" else None, timeout,
+    )
     raw = result.get("clip")
     emb = json.loads(raw) if isinstance(raw, str) else raw
     if not isinstance(emb, list) or len(emb) < 8:
         raise RuntimeError(f"bad embedding for {model_name}/{kind}: {emb!r}"[:200])
     return f"{model_name}/{kind} dim={len(emb)}"
+
+
+def predict_face(base: str, image: bytes, timeout: int = 60) -> str:
+    """One real /predict call for facial-recognition — Vision framework, Metal-backed
+    on its own command queue, run concurrently with clip below to reproduce the
+    MLX-vs-Vision-framework Metal race (see GPULock.swift)."""
+    predict_raw(base, {"facial-recognition": {"detection": {"options": {"minScore": 0.5}}}}, image, None, timeout)
+    return "facial-recognition ok"
+
+
+def predict_ocr(base: str, image: bytes, timeout: int = 60) -> str:
+    """One real /predict call for ocr — also Vision framework / Metal-backed."""
+    predict_raw(base, {"ocr": {"detection": {"options": {"minScore": 0.0}}}}, image, None, timeout)
+    return "ocr ok"
 
 
 def wait_healthy(base: str, proc: subprocess.Popen, timeout: int) -> None:
@@ -208,6 +229,14 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=3998)
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--requests", type=int, default=16, help="concurrent requests per model, split visual/textual")
+    ap.add_argument(
+        "--mixed-image", default="/tmp/native-ml-bench.jpg",
+        help="realistic-resolution image for the mixed clip+vision stage (see "
+             "scripts/native-ml-siglip-benchmark.py's ensure_bench_image) — a tiny image resolves "
+             "clip.visual in a few ms and closes the Metal collision window almost instantly, "
+             "hiding the crash this stage exists to catch. Falls back to the tiny synthetic JPEG "
+             "if the file doesn't exist.",
+    )
     ap.add_argument(
         "--models",
         default=",".join(DEFAULT_MODELS),
@@ -303,6 +332,54 @@ def main() -> int:
                     print(f"[preflight]   {e}")
                 return 1
             print(f"[preflight] [{i}/{len(models)}] {name}: OK ({args.requests} concurrent calls, no crash)")
+
+        # Mixed-load stage: fires clip.visual concurrently with
+        # facial-recognition and ocr — the actual crash-reproducing shape.
+        # Server.swift's concurrent connection queue mixes MLX (clip) with
+        # Vision-framework work (faces/ocr) across simultaneous requests;
+        # the per-model loop above only ever exercises clip against clip,
+        # so it can pass while this combination still crashes (see
+        # GPULock.swift). Reuses whichever model is already resident from
+        # the loop above — no extra cold-load cost.
+        mixed_model = models[-1]
+        mixed_image = image
+        if os.path.isfile(args.mixed_image):
+            with open(args.mixed_image, "rb") as f:
+                mixed_image = f.read()
+        else:
+            print(f"[preflight] warning: {args.mixed_image} not found, using tiny test image "
+                  f"(closes the collision window almost instantly — see --mixed-image help)")
+        print(
+            f"[preflight] mixed load: {mixed_model} clip.visual concurrent with "
+            f"facial-recognition + ocr ({args.requests} calls, concurrency={args.concurrency}, "
+            f"image={len(mixed_image)} bytes) ...",
+            flush=True,
+        )
+        errors = []
+        with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+            futs = []
+            for j in range(args.requests):
+                m = j % 3
+                if m == 0:
+                    futs.append(ex.submit(predict, base, mixed_model, "visual", mixed_image, text))
+                elif m == 1:
+                    futs.append(ex.submit(predict_face, base, mixed_image))
+                else:
+                    futs.append(ex.submit(predict_ocr, base, mixed_image))
+            for f in futs:
+                try:
+                    f.result()
+                except Exception as e:
+                    errors.append(repr(e))
+
+        if died_with_abort("under mixed clip+vision concurrent load"):
+            return 1
+        if errors:
+            print(f"[preflight] FAIL — mixed load: {len(errors)}/{args.requests} calls errored")
+            for e in errors[:3]:
+                print(f"[preflight]   {e}")
+            return 1
+        print(f"[preflight] mixed load: OK ({args.requests} concurrent calls, no crash)")
 
         print(
             f"[preflight] PASS — {len(models)} model(s), {args.requests} concurrent real predict "

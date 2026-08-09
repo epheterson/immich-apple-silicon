@@ -41,39 +41,42 @@ final class CLIPText {
         return lin(o, w("\(p).out_proj.weight"), w("\(p).out_proj.bias"))
     }
 
+    // Concurrency: guarded by metalLock (GPULock.swift) — see that file.
     func encode(_ text: String) -> [Float] {
-        var ids = tok.encode(text)
-        if ids.count > Self.CTX { ids = Array(ids.prefix(Self.CTX - 1)) + [CLIPTokenizer.EOT] }
-        let seq = ids.count
-        let eotPos = seq - 1   // EOT (49407, the max id) is always last
+        withMetalLock {
+            var ids = tok.encode(text)
+            if ids.count > Self.CTX { ids = Array(ids.prefix(Self.CTX - 1)) + [CLIPTokenizer.EOT] }
+            let seq = ids.count
+            let eotPos = seq - 1   // EOT (49407, the max id) is always last
 
-        let tokEmb = w("text_model.embeddings.token_embedding.weight")    // [49408, 512]
-        let posEmb = w("text_model.embeddings.position_embedding.weight")  // [77, 512]
-        let idsArr = MLXArray(ids.map { Int32($0) })
-        let posIdx = MLXArray((0..<seq).map { Int32($0) })
-        var x = take(tokEmb, idsArr, axis: 0) + take(posEmb, posIdx, axis: 0)
+            let tokEmb = w("text_model.embeddings.token_embedding.weight")    // [49408, 512]
+            let posEmb = w("text_model.embeddings.position_embedding.weight")  // [77, 512]
+            let idsArr = MLXArray(ids.map { Int32($0) })
+            let posIdx = MLXArray((0..<seq).map { Int32($0) })
+            var x = take(tokEmb, idsArr, axis: 0) + take(posEmb, posIdx, axis: 0)
 
-        // causal mask [seq, seq]: 0 on/below diagonal, large-negative above
-        var maskFlat = [Float](repeating: 0, count: seq * seq)
-        for i in 0..<seq { for j in (i + 1)..<seq { maskFlat[i * seq + j] = -1e9 } }
-        let causal = MLXArray(maskFlat, [seq, seq])
+            // causal mask [seq, seq]: 0 on/below diagonal, large-negative above
+            var maskFlat = [Float](repeating: 0, count: seq * seq)
+            for i in 0..<seq { for j in (i + 1)..<seq { maskFlat[i * seq + j] = -1e9 } }
+            let causal = MLXArray(maskFlat, [seq, seq])
 
-        for l in 0..<Self.LAYERS {
-            let p = "text_model.encoder.layers.\(l)"
-            var r = x
-            x = r + attn(ln(x, w("\(p).layer_norm1.weight"), w("\(p).layer_norm1.bias")), "\(p).self_attn", causal)
-            r = x
-            var h = ln(x, w("\(p).layer_norm2.weight"), w("\(p).layer_norm2.bias"))
-            h = lin(h, w("\(p).mlp.fc1.weight"), w("\(p).mlp.fc1.bias"))
-            h = h * sigmoid(1.702 * h)   // quick_gelu
-            h = lin(h, w("\(p).mlp.fc2.weight"), w("\(p).mlp.fc2.bias"))
-            x = r + h
+            for l in 0..<Self.LAYERS {
+                let p = "text_model.encoder.layers.\(l)"
+                var r = x
+                x = r + attn(ln(x, w("\(p).layer_norm1.weight"), w("\(p).layer_norm1.bias")), "\(p).self_attn", causal)
+                r = x
+                var h = ln(x, w("\(p).layer_norm2.weight"), w("\(p).layer_norm2.bias"))
+                h = lin(h, w("\(p).mlp.fc1.weight"), w("\(p).mlp.fc1.bias"))
+                h = h * sigmoid(1.702 * h)   // quick_gelu
+                h = lin(h, w("\(p).mlp.fc2.weight"), w("\(p).mlp.fc2.bias"))
+                x = r + h
+            }
+            x = ln(x, w("text_model.final_layer_norm.weight"), w("text_model.final_layer_norm.bias"))
+            let pooled = x[eotPos].reshaped([1, Self.H])
+            let emb = matmul(pooled, w("text_projection.weight").transposed()).reshaped([Self.H])
+            let e = emb / sqrt((emb * emb).sum())
+            eval(e)
+            return e.asArray(Float.self)
         }
-        x = ln(x, w("text_model.final_layer_norm.weight"), w("text_model.final_layer_norm.bias"))
-        let pooled = x[eotPos].reshaped([1, Self.H])
-        let emb = matmul(pooled, w("text_projection.weight").transposed()).reshaped([Self.H])
-        let e = emb / sqrt((emb * emb).sum())
-        eval(e)
-        return e.asArray(Float.self)
     }
 }
