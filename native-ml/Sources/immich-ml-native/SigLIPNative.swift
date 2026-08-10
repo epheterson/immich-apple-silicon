@@ -613,6 +613,16 @@ enum SigLIPRegistry {
             vision: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072),
             visionPatch: 16,
             text: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072), textProjection: 768),
+        // RE-MEASURED 2026-08-10, after the CPU-preprocessing rewrite and the
+        // move to bf16 compute: this model no longer stands out. Against
+        // Immich's own ONNX export on three real library preview images it
+        // measures 0.99932, 0.99953 and 0.99979 visual, 0.99983 textual — in
+        // line with every other model here. Whatever produced the number below
+        // did not survive those two commits, so the note is kept for the
+        // investigation rather than as a live caveat. Re-check on real
+        // previews, not synthetic images, if it ever resurfaces: a noise image
+        // is not a proxy for a photo here.
+        //
         // Visual embeddings here measure ~0.99 cosine against Immich's ONNX
         // export (vs. 0.999+ for every other model in this registry); textual
         // is unaffected (1.0000). Investigated 2026-08-09 and not treated as
