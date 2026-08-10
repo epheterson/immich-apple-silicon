@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The settings window: a sidebar and a grouped `Form`, which is what a macOS
@@ -80,6 +81,8 @@ struct SettingsView: View {
     @State private var applyingComponent: String?
     @State private var componentError: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
+    @State private var configNote: String?
+    @State private var configFailed = false
 
     var body: some View {
         NavigationSplitView {
@@ -197,9 +200,64 @@ struct SettingsView: View {
                         Button("Open Logs") { Actions.openLogs() }
                     }
                 }
+                LabeledContent("Configuration") {
+                    HStack(spacing: Metrics.md) {
+                        Button("Back Up…") { backupConfig() }
+                            .disabled(!Paths.isConfigured)
+                        Button("Restore…") { restoreConfig() }
+                    }
+                }
+                LabeledContent("Setup") {
+                    Button("Run Setup Again…") {
+                        WindowManager.shared.showOnboarding(model: model)
+                    }
+                }
+            } footer: {
+                if let configNote {
+                    Text(configNote).font(.rowDetail)
+                        .foregroundStyle(configFailed ? .red : .secondary)
+                } else {
+                    // The API key lives in this file, which is why the backup
+                    // goes wherever the user points it rather than to a fixed
+                    // path they might not think about.
+                    Text("The backup includes your API key. Keep it somewhere you would keep a password.")
+                        .font(.rowDetail).foregroundStyle(.secondary)
+                }
             }
         }
         .formStyle(.grouped)
+    }
+
+    private func backupConfig() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "immich-accelerator-config.json"
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try Actions.backupConfig(to: url)
+            configFailed = false
+            configNote = "Backed up to \(url.lastPathComponent)."
+        } catch {
+            configFailed = true
+            configNote = "Could not back up: \(error.localizedDescription)"
+        }
+    }
+
+    private func restoreConfig() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try Actions.restoreConfig(from: url)
+            config = StatusModel.readConfig()
+            load()
+            configFailed = false
+            configNote = "Restored. Restart the accelerator for it to take effect."
+        } catch {
+            configFailed = true
+            configNote = "Could not restore: \(error.localizedDescription)"
+        }
     }
 
     private var immichSummary: String {

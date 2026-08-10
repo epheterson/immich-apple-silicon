@@ -46,6 +46,16 @@ PID_DIR = DATA_DIR / "pids"
 LOCK_FILE = DATA_DIR / "start.lock"
 LOG_DIR = DATA_DIR / "logs"
 
+# Where setup would install the launch agent. A module-level constant for the
+# same reason as the paths above: anything computed inline from Path.home() is
+# invisible to the test fixture, and therefore reaches the developer's real
+# machine. This one did: `setup --yes` under pytest installed a live,
+# KeepAlive'd launch agent into the real ~/Library/LaunchAgents and left it
+# crash-looping every 10 seconds. Before --yes existed the prompt raised
+# EOFError under pytest and the answer defaulted to no, so the hole was there
+# all along and merely dormant.
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+
 # Records the package version the running worker was started with, so the watch
 # loop can tell when a `brew upgrade` left the worker on stale code.
 WORKER_VERSION_FILE = PID_DIR / "worker.version"
@@ -111,6 +121,41 @@ def _build_link_ok() -> bool:
         return target.exists() and target.resolve() == build_data.resolve()
     except OSError:
         return False
+
+
+# Set by `setup --yes`. Module-level rather than threaded through a dozen
+# call sites, because it is a property of how the process was invoked, not of
+# any one question.
+ASSUME_YES = False
+
+
+def _confirm(prompt: str, default: bool = True) -> bool:
+    """Ask a yes/no question, or take the default without asking.
+
+    Three cases, and they really are different:
+
+    - ``--yes``: take the default and say so. This is what lets the menu-bar
+      app run setup itself instead of handing the user to Terminal.
+    - stdin is not a terminal and ``--yes`` was not passed: answer no. Every
+      one of these prompts already fell back to no on EOFError, and that is
+      worth keeping, because a piped setup silently answering "yes, install a
+      launch agent" would be a nasty surprise.
+    - otherwise: ask.
+
+    Note the asymmetry: absent ``--yes``, a non-interactive run answers *no*
+    even to a ``[Y/n]`` question whose default is yes. Refusing to act is the
+    safe direction when nobody is there to read the question.
+    """
+    if ASSUME_YES:
+        log.info("%s%s", prompt, "yes" if default else "no")
+        return default
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        return False
+    if not answer:
+        return default
+    return answer == "y"
 
 
 def _synthetic_build_entry(build_data: Path) -> str:
@@ -275,11 +320,7 @@ def _ensure_build_link():
     log.info("This uses macOS synthetic links (requires sudo once).")
     log.info("")
 
-    try:
-        answer = input("Create /build link? [Y/n] ").strip().lower()
-    except EOFError:
-        return False
-    if answer and answer != "y":
+    if not _confirm("Create /build link? [Y/n] "):
         return False
 
     # Write our file in /etc/synthetic.d/ (avoids touching shared synthetic.conf).
@@ -2626,11 +2667,7 @@ def _finalize_config(config: dict) -> None:
 
     # Auto-start services
     log.info("")
-    try:
-        answer = input("  Start Immich Accelerator now? [Y/n] ").strip().lower()
-    except EOFError:
-        answer = "n"
-    if not answer or answer == "y":
+    if _confirm("  Start Immich Accelerator now? [Y/n] "):
         cmd_start(argparse.Namespace(force=True))
 
     # Offer to install launchd service (watch mode — manages worker, ML, and dashboard).
@@ -2643,7 +2680,7 @@ def _finalize_config(config: dict) -> None:
         Path(__file__).parent.parent / "launchd" / "com.immich.accelerator.plist"
     )
     plist_dst = (
-        Path.home() / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
+        LAUNCH_AGENTS_DIR / "com.immich.accelerator.plist"
     )
 
     if is_brew_install:
@@ -2651,15 +2688,7 @@ def _finalize_config(config: dict) -> None:
         log.info("Installed via Homebrew. To auto-start on login:")
         log.info("  brew services start immich-accelerator")
     elif plist_src.exists() and not plist_dst.exists():
-        try:
-            answer = (
-                input("  Install as system service (auto-starts on login)? [Y/n] ")
-                .strip()
-                .lower()
-            )
-        except EOFError:
-            answer = "n"
-        if not answer or answer == "y":
+        if _confirm("  Install as system service (auto-starts on login)? [Y/n] "):
             content = plist_src.read_text()
             repo_dir = str(Path(__file__).parent.parent.resolve())
             content = content.replace("/path/to/immich-apple-silicon", repo_dir)
@@ -3829,6 +3858,11 @@ def _setup_ml_only(args) -> None:
 
 def cmd_setup(args):
     """Set up the accelerator. Dispatches to local, remote, manual, or ml-only mode."""
+    # Set before anything can prompt. getattr, because other entry points build
+    # a Namespace by hand and should not have to know about this flag.
+    global ASSUME_YES
+    ASSUME_YES = bool(getattr(args, "yes", False))
+
     if args.ml_only:
         _setup_ml_only(args)
     elif args.manual:
@@ -4242,11 +4276,7 @@ def _find_ml_dir() -> Path | None:
         log.warning("  Install with: brew install python@3.11")
         return None
 
-    try:
-        answer = input("  Set up ML service venv? [Y/n] ").strip().lower()
-    except EOFError:
-        return None
-    if answer and answer != "y":
+    if not _confirm("  Set up ML service venv? [Y/n] "):
         return None
 
     log.info("  Creating venv with %s...", python)
@@ -5855,7 +5885,7 @@ def cmd_ml_test(_args):
 
 def cmd_uninstall(_args):
     """Remove services, data, and launchd config."""
-    plist = Path.home() / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
+    plist = LAUNCH_AGENTS_DIR / "com.immich.accelerator.plist"
     is_brew_install = "/Cellar/immich-accelerator/" in str(Path(__file__).resolve())
     ml_venv = Path(__file__).parent.parent / "ml" / "venv"
 
@@ -5938,13 +5968,13 @@ def cmd_uninstall(_args):
     log.info("  docker compose up -d")
 
 
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-5s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI, as one function so tests can use the real thing.
 
+    This lived inline in main(), and the test suite kept a hand-written copy of
+    it to parse against. A duplicated parser drifts silently: a flag added here
+    and not there is a test asserting the behaviour of a CLI nobody ships.
+    """
     parser = argparse.ArgumentParser(
         prog="immich-accelerator",
         description="Immich Accelerator — native macOS microservices worker",
@@ -5971,6 +6001,12 @@ def main():
         "--ml-only",
         action="store_true",
         help="Set up this Mac as an ML-only network compute node (no worker, no DB)",
+    )
+    setup_p.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Take the default answer to every yes/no prompt (for scripts and the menu-bar app)",
     )
     start_p = sub.add_parser("start", help="Start native worker + ML")
     start_p.add_argument("--force", action="store_true", help="Restart if running")
@@ -6003,6 +6039,17 @@ def main():
     )
     sub.add_parser("uninstall", help="Remove services, data, and launchd config")
 
+    return parser
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-5s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = build_parser()
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
