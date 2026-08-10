@@ -19,6 +19,8 @@
 ### Changed
 - **CI compiles the native ML engine on every pull request.** It never did: the Swift half of the project was only built at release time, so a change could pass every check and still not compile.
 
+## 1.9.0 - 2026-08-07
+
 ### Added
 - **Turn the worker, ML, or dashboard off independently.** 1.8.0 made the dashboard optional; that is now one rule instead of a special case. `immich-accelerator component ml off` leaves the Mac doing thumbnails, video and metadata while an existing box keeps doing ML, which was not possible before. `component worker off` is the reverse, an ML-only compute node. `component` with no arguments lists what's on. Changes apply immediately, including to a running service, and the menu bar app's Settings window has the same three switches. Every existing install keeps all three on.
   - Toggling ML restarts the worker. The ML URL is fixed in the worker's environment when it starts, so without a restart the worker would keep talking to an engine that is no longer there.
