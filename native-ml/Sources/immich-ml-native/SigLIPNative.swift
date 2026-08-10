@@ -315,6 +315,7 @@ final class SigLIPNative {
             return dst.path
         }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        sweepPartials(dir: dir, name: name)
         let url = URL(string: "https://huggingface.co/\(hfRepo)/resolve/main/model.safetensors")!
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 60
@@ -341,6 +342,27 @@ final class SigLIPNative {
         }
         try downloadWhole(session: session, url: url, dst: dst, name: name)
         return dst.path
+    }
+
+    // Delete leftover .tmp-<uuid> files from an interrupted fetch.
+    //
+    // downloadRanged preallocates the whole file (truncate to Content-Length)
+    // before writing a byte, so an interrupted 4.5GB fetch leaves something
+    // that reports its full size on disk and is named differently every time
+    // — nothing would ever have reclaimed it, and each retry added another.
+    // Only safe here, before a fetch starts, because a completed download is
+    // already renamed to model.safetensors and a concurrent one cannot exist:
+    // Models.zoo(for:) holds a single-resident-model lock across this call.
+    private static func sweepPartials(dir: URL, name: String) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
+        for entry in entries where entry.hasPrefix(".tmp-") {
+            let stale = dir.appendingPathComponent(entry)
+            let bytes = ((try? stale.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
+                .totalFileAllocatedSize) ?? 0) ?? 0
+            try? fm.removeItem(at: stale)
+            print("[native-ml] \(name): discarded interrupted download (\(bytes / 1024 / 1024)MB)")
+        }
     }
 
     private static func contentLength(session: URLSession, url: URL) -> Int? {
@@ -389,10 +411,17 @@ final class SigLIPNative {
         let ranges = (0..<chunks).map { i in (i * chunkSize, min((i + 1) * chunkSize, total) - 1) }
             .filter { $0.0 <= $0.1 }
         print("[native-ml] fetching \(name) (\(total / 1024 / 1024)MB, \(ranges.count)x parallel)")
+        // Multi-gigabyte and minutes long, so it goes on the same /health field
+        // the ONNX fetch uses. Without this the menu bar showed nothing at all
+        // during the single longest wait the service has, while Immich's jobs
+        // failed and retried in the background and the app looked idle.
+        ZooCLIP.setProgress(.init(model: name, done: 0, total: ranges.count))
+        defer { ZooCLIP.setProgress(nil) }
 
         let group = DispatchGroup()
         let errorLock = NSLock()
         var firstError: Error?
+        var completed = 0
         for (start, end) in ranges {
             group.enter()
             fetchRange(session: session, url: url, start: start, end: end) { data, err in
@@ -406,6 +435,8 @@ final class SigLIPNative {
                 do {
                     try handle.seek(toOffset: UInt64(start))
                     try handle.write(contentsOf: data)
+                    completed += 1
+                    ZooCLIP.setProgress(.init(model: name, done: completed, total: ranges.count))
                 } catch {
                     errorLock.lock(); if firstError == nil { firstError = error }; errorLock.unlock()
                 }
@@ -447,6 +478,11 @@ final class SigLIPNative {
     // Single-connection fallback: used when the server doesn't advertise
     // Content-Length/Accept-Ranges, or if the ranged path fails outright.
     private static func downloadWhole(session: URLSession, url: URL, dst: URL, name: String) throws {
+        // One opaque transfer, so there is no chunk count to report against;
+        // 0-of-1 still tells the menu bar which model is being fetched, which
+        // is the part that keeps a long wait from looking like a hang.
+        ZooCLIP.setProgress(.init(model: name, done: 0, total: 1))
+        defer { ZooCLIP.setProgress(nil) }
         var lastError = ""
         for attempt in 1...3 {
             let sem = DispatchSemaphore(value: 0)

@@ -377,7 +377,10 @@ final class ZooCLIP {
         return _progress
     }
 
-    private static func setProgress(_ p: FetchProgress?) {
+    // Not private: SigLIPNative reports its own multi-GB safetensors fetch
+    // through the same field, so /health (and the menu bar reading it) covers
+    // every download the service can be waiting on, not just the ONNX ones.
+    static func setProgress(_ p: FetchProgress?) {
         progressLock.lock(); _progress = p; progressLock.unlock()
     }
 
