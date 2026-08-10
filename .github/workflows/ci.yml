@@ -23,6 +23,42 @@ jobs:
           pip install pytest
           pytest -v -m "not slow"
 
+  native-ml-build:
+    # Compile the native ML engine on every pull request that touches it.
+    #
+    # Nothing did this before: native-bundle.yml only runs on a tag, so the
+    # Swift half of the project reached main with four green checks, none of
+    # which had built it. 1,595 lines of it landed that way in one PR. A
+    # Package.resolved that doesn't resolve, or a source file that doesn't
+    # compile, would have been found at release time with the tag already cut.
+    #
+    # macos-15 for the same reason native-bundle.yml pins it: it ships the
+    # Swift version where mlx-swift resolves to the validated 0.31.6 rather
+    # than silently falling back to 0.29.x. Do not "upgrade" this runner.
+    #
+    # Build only — the release bundle (metallib, relinked onnxruntime) stays in
+    # native-bundle.yml, and anything needing real inference needs real Apple
+    # Silicon with models on disk, which is scripts/native-ml-preflight.py on a
+    # real Mac, not a runner.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: onnxruntime headers
+        run: brew install onnxruntime
+      # mlx-swift compiles its C++ core from source, which is most of this
+      # job's runtime. Keyed on Package.resolved so a dependency change busts
+      # it and an ordinary source change does not.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            native-ml/.build
+            ~/.cache/org.swift.swiftpm
+          key: native-ml-${{ runner.os }}-${{ hashFiles('native-ml/Package.resolved') }}
+          restore-keys: native-ml-${{ runner.os }}-
+      - name: swift build -c release
+        working-directory: native-ml
+        run: swift build -c release
+
   fresh-install-macos:
     # Runs on a clean macOS Apple Silicon runner — no global pip
     # packages, no leftover venvs. Catches the "works on my machine"
@@ -159,7 +195,8 @@ jobs:
 
   auto-tag:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [lint, fresh-install-macos, fresh-install-docker, formula-check]
+    needs:
+      [lint, native-ml-build, fresh-install-macos, fresh-install-docker, formula-check]
     runs-on: ubuntu-latest
     permissions:
       contents: write
