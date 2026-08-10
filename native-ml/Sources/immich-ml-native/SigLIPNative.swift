@@ -179,7 +179,13 @@ final class SigLIPNative {
     // and was measured as a real chunk of latency alongside Resize.bicubic — see
     // that file's doc comment. Same output as the previous bounds-checked
     // sequential version, just faster on the M4's 10 cores.
-    private func patches(_ cg: CGImage, targetSize: Int, mean: [Float], std: [Float]) -> MLXArray {
+    // Returns the raw normalized patch buffer and its shape, NOT an MLXArray.
+    // Building the array here would put MLX allocation and a lazy astype node
+    // outside withMetalLock, on up to Server.swift's maxConcurrent threads at
+    // once, which is the invariant GPULock.swift exists to hold. Only the
+    // pixel work belongs outside the lock; the caller makes the array inside.
+    private func patches(_ cg: CGImage, targetSize: Int, mean: [Float], std: [Float])
+        -> (flat: [Float], rows: Int, cols: Int) {
         let patch = cfg.visionPatch
         let grid = targetSize / patch
         let (full, iw, ih) = rgbBuffer(cg)
@@ -208,7 +214,7 @@ final class SigLIPNative {
                 }
             }
         }
-        return MLXArray(flat, [grid * grid, dim]).asType(Self.computeDType)
+        return (flat, grid * grid, dim)
     }
 
     // Scoped to the GPU device for just this call (Device.withDefaultDevice
@@ -231,9 +237,11 @@ final class SigLIPNative {
         // withMetalLock so up to Server.swift's maxConcurrent requests can prep
         // their patch tensors in parallel; only the GPU submission below needs
         // to be serialized against other Metal work (see GPULock.swift).
-        let patchInput = patches(cg, targetSize: targetSize, mean: mean, std: std)
+        let prepped = patches(cg, targetSize: targetSize, mean: mean, std: std)
         return withMetalLock {
             Device.withDefaultDevice(.gpu) {
+                let patchInput = MLXArray(prepped.flat, [prepped.rows, prepped.cols])
+                    .asType(Self.computeDType)
                 let tower = cfg.vision
                 let wPatch = w("vision_model.embeddings.patch_embedding.weight")
                     .reshaped([tower.hidden, 3 * cfg.visionPatch * cfg.visionPatch])
@@ -431,12 +439,13 @@ final class SigLIPNative {
             // took the full single-stream time while the label claimed
             // otherwise.
             DispatchQueue.global().async {
-                fetchRange(session: session, url: url, start: start, end: end) { data, err in
+                fetchRange(session: session, url: url, start: start, end: end) { chunkFile, err in
                     defer { group.leave() }
-                    guard let data else {
+                    guard let chunkFile else {
                         errorLock.lock(); if firstError == nil { firstError = err }; errorLock.unlock()
                         return
                     }
+                    defer { try? FileManager.default.removeItem(at: chunkFile) }
                     // A 206 is not a promise that the bytes are the ones asked
                     // for. Unchecked, a short or shifted chunk left the
                     // preallocated file's zeros in place, still counted as
@@ -445,13 +454,14 @@ final class SigLIPNative {
                     // either fails to load on every start or loads and writes
                     // garbage embeddings into Immich's search index.
                     let expected = end - start + 1
-                    guard data.count == expected else {
+                    let got = ((try? chunkFile.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) ?? 0
+                    guard got == expected else {
                         errorLock.lock()
                         if firstError == nil {
                             firstError = PredictError(
                                 status: "500 Internal Server Error",
                                 message: "\(name): range \(start)-\(end) returned "
-                                    + "\(data.count) bytes, expected \(expected)")
+                                    + "\(got) bytes, expected \(expected)")
                         }
                         errorLock.unlock()
                         return
@@ -459,8 +469,17 @@ final class SigLIPNative {
                     writeLock.lock()
                     defer { writeLock.unlock() }
                     do {
+                        // Streamed in blocks rather than read whole. Eight
+                        // concurrent chunks of a 4.5GB checkpoint held the
+                        // entire file in memory at once when each chunk was an
+                        // in-memory Data, on a machine also running the worker
+                        // and an Immich stack.
+                        let reader = try FileHandle(forReadingFrom: chunkFile)
+                        defer { try? reader.close() }
                         try handle.seek(toOffset: UInt64(start))
-                        try handle.write(contentsOf: data)
+                        while let block = try reader.read(upToCount: 8 << 20), !block.isEmpty {
+                            try handle.write(contentsOf: block)
+                        }
                         completed += 1
                         ZooCLIP.setProgress(.init(model: name, done: completed, total: ranges.count))
                     } catch {
@@ -482,19 +501,28 @@ final class SigLIPNative {
     // One range, 3 attempts with backoff — a single dropped chunk shouldn't
     // force re-fetching the other 7/8 of a multi-GB file.
     private static func fetchRange(
-        session: URLSession, url: URL, start: Int, end: Int, completion: @escaping (Data?, Error?) -> Void
+        session: URLSession, url: URL, start: Int, end: Int, completion: @escaping (URL?, Error?) -> Void
     ) {
         var req = URLRequest(url: url)
         req.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
         var lastError: Error?
         for attempt in 1...3 {
             let sem = DispatchSemaphore(value: 0)
-            var result: Data?
+            var result: URL?
             var ignoredRange = false
-            session.dataTask(with: req) { data, resp, err in
+            // downloadTask, not dataTask: the body lands in a file instead of
+            // in memory, so eight concurrent chunks cost eight file handles
+            // rather than the whole checkpoint in RAM.
+            session.downloadTask(with: req) { tmp, resp, err in
                 let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                if status == 206 {
-                    result = data
+                if status == 206, let tmp {
+                    // URLSession deletes its temp file when this handler
+                    // returns, so move it somewhere we own first.
+                    let hold = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("chunk-\(UUID().uuidString)")
+                    if (try? FileManager.default.moveItem(at: tmp, to: hold)) != nil {
+                        result = hold
+                    }
                 } else if status == 200 {
                     // The Range header was ignored and the whole file came
                     // back. contentLength() gates on the origin's
@@ -537,13 +565,16 @@ final class SigLIPNative {
             var result: URL?
             var status = 0
             var transportError: Error?
+            var expected = -1
             let task = session.downloadTask(with: url) { tmp, resp, err in
                 if let tmp {
                     let hold = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
                     try? FileManager.default.moveItem(at: tmp, to: hold)
                     result = hold
                 }
-                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let http = resp as? HTTPURLResponse
+                status = http?.statusCode ?? 0
+                expected = Int(http?.value(forHTTPHeaderField: "Content-Length") ?? "") ?? -1
                 transportError = err
                 sem.signal()
             }
@@ -552,6 +583,23 @@ final class SigLIPNative {
             sem.wait()
 
             if status == 200, let tmp = result {
+                // The ranged path checks every chunk against the range it asked
+                // for; this one had no check at all, and it is not a rare path
+                // (it is the fallback whenever ranges fail, including a proxy
+                // that strips the Range header). A connection that drops
+                // mid-body still yields a 200 with a short file, which would be
+                // moved into place and then satisfy the fileSize > 0 cache check
+                // on every subsequent start: a permanently broken model.
+                let got = ((try? tmp.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) ?? 0
+                if expected > 0 && got != expected {
+                    try? FileManager.default.removeItem(at: tmp)
+                    lastError = "short body: got \(got) bytes, expected \(expected)"
+                    if attempt < 3 {
+                        print("[native-ml] retrying \(name) weight fetch (\(lastError))")
+                        Thread.sleep(forTimeInterval: Double(attempt) * 2)
+                    }
+                    continue
+                }
                 try? FileManager.default.removeItem(at: dst)
                 try FileManager.default.moveItem(at: tmp, to: dst)
                 return

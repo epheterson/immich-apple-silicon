@@ -86,7 +86,15 @@ SUPPORTED_NODE_MAJORS = (22, 24)
 # native start loads weights before it serves, and a first-use model fetch is
 # gigabytes, so the grace has to clear the longest legitimate silence.
 ML_UNRESPONSIVE_GRACE = 300.0
-_ml_unresponsive_since: float | None = None
+# (pid, monotonic time it first went quiet). The PID is half the state, not
+# bookkeeping: a bare timestamp belongs to no particular process, so a service
+# replaced between two ticks inherits the dead one's elapsed silence and gets
+# killed seconds into its own cold start, on a stopwatch that was never about
+# it.
+_ml_unresponsive_since: tuple[int, float] | None = None
+# Latches the "someone else owns our port" warning so it is said once, not
+# every watch tick.
+_ml_foreign_listener_warned = False
 
 
 # --- Utility ---
@@ -4099,7 +4107,7 @@ def reconcile_ml(config: dict) -> None:
     """Make the running state match the "ml" config key, the ML counterpart to
     reconcile_dashboard. Re-resolves ml_dir first, because brew upgrade deletes
     the old Cellar path out from under the cached value (#29)."""
-    global _ml_unresponsive_since
+    global _ml_unresponsive_since, _ml_foreign_listener_warned
 
     if not _component_enabled("ml", config):
         if read_pid("ml"):
@@ -4125,10 +4133,15 @@ def reconcile_ml(config: dict) -> None:
             _ml_unresponsive_since = None
             return
         now = time.monotonic()
-        if _ml_unresponsive_since is None:
-            _ml_unresponsive_since = now
+        # A different PID is a different service, and it has been quiet for no
+        # time at all. Without this the timer is just a wall clock: a process
+        # replaced between two ticks (a manual `restart`, or a crash and
+        # relaunch inside one interval) is judged from its predecessor's
+        # silence and killed mid cold-start, then so is its replacement.
+        if _ml_unresponsive_since is None or _ml_unresponsive_since[0] != pid:
+            _ml_unresponsive_since = (pid, now)
             return
-        stuck = now - _ml_unresponsive_since
+        stuck = now - _ml_unresponsive_since[1]
         # Silence alone isn't enough to act on. A cold native start loads
         # weights before it binds, and a first-use model fetch runs for
         # minutes; restarting into either would kill the very work being
@@ -4141,6 +4154,24 @@ def reconcile_ml(config: dict) -> None:
         kill_pid("ml")
         _ml_unresponsive_since = None
         wedged = True
+    # Somebody is already serving our port, and it isn't us: we have no PID.
+    # Usually Docker's own immich-machine-learning container, sometimes an
+    # older instance. Starting another is pointless, because the native
+    # service now exits on a bind conflict rather than lingering, so the
+    # watcher would relaunch it every tick forever. Immich has a working ML
+    # endpoint either way, so say what is happening once and leave it alone.
+    if not wedged and _ml_ping(config):
+        if not _ml_foreign_listener_warned:
+            log.warning(
+                "Port %s is already served by something this accelerator did not "
+                "start (Docker's ML container?). Leaving it alone; stop that "
+                "service, or set a different ml_port, if this Mac should serve ML.",
+                config.get("ml_port", 3003),
+            )
+            _ml_foreign_listener_warned = True
+        return
+    _ml_foreign_listener_warned = False
+
     resolved_ml = _find_ml_dir()
     if resolved_ml and str(resolved_ml) != config.get("ml_dir"):
         config["ml_dir"] = str(resolved_ml)

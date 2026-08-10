@@ -49,6 +49,11 @@ from concurrent.futures import ThreadPoolExecutor
 # PIL/numpy dependency — content is irrelevant, it just needs to decode.
 _TINY_JPEG_B64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAoHBwgHBgoICAgLCgoLDhgQDg0NDh0VFhEYIx8lJCIfIiEmKzcvJik0KSEiMEExNDk7Pj4+JS5ESUM8SDc9Pjv/2wBDAQoLCw4NDhwQEBw7KCIoOzs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozv/wAARCABAAEADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDFooorzzuCiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAP/9k="
 
+# Models.defaultClip in the Swift service: the always-resident mlx CLIPEncoder
+# path, which is a different implementation from ZooCLIP/SigLIPNative and needs
+# covering in its own right, including in the mixed-load stage.
+DEFAULT_CLIP = "ViT-B-32__openai"
+
 # One model per architecture family/scale actually in SigLIPRegistry (see
 # SigLIPNative.swift), spanning the axes most likely to expose a real
 # concurrency bug: smallest vs largest tower, v1 vs v2, and the mlx
@@ -57,7 +62,7 @@ _TINY_JPEG_B64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAoHBwgHBgoICAgLCgoLDhgQDg0NDh
 # while zoo models load/switch around it). Not the full 17: that's what
 # --models all is for (run before an actual native-ml/mlx-swift release).
 DEFAULT_MODELS = [
-    "ViT-B-32__openai",
+    DEFAULT_CLIP,
     "ViT-B-16-SigLIP-256__webli",
     "ViT-SO400M-16-SigLIP2-384__webli",
     "ViT-L-16-SigLIP2-512__webli",
@@ -83,7 +88,7 @@ ALL_SIGLIP_MODELS = [
     "ViT-B-16-SigLIP-384__webli",
     "ViT-B-16-SigLIP-256__webli",
 ]
-ALL_MODELS = ["ViT-B-32__openai"] + ALL_SIGLIP_MODELS
+ALL_MODELS = [DEFAULT_CLIP] + ALL_SIGLIP_MODELS
 
 ABORT_SIGNATURES = (
     "Stream(",
@@ -202,6 +207,8 @@ def warm_up(
     text: str,
     proc: subprocess.Popen,
     quiet_timeout: int,
+    stall_timeout: int = 900,
+    hard_cap: int = 7200,
 ) -> None:
     """Cold-load a model, waiting out a first-use download instead of failing on it.
 
@@ -227,20 +234,43 @@ def warm_up(
     worker = threading.Thread(target=lambda: (call(), done.set()), daemon=True)
     worker.start()
 
-    deadline = time.time() + quiet_timeout
+    started = time.time()
+    deadline = started + quiet_timeout
     seen = None
     while not done.wait(5):
         if proc.poll() is not None:
             return  # died: the caller's died_with_abort reports the detail
+
+        # Nothing below may extend time without bound. The first version of
+        # this reset the deadline on the mere presence of a downloading block,
+        # so a transfer wedged at 3/8 chunks pushed the deadline out every five
+        # seconds forever while the worker thread sat on a 24-hour request
+        # timeout. A gate that hangs is worse than one that fails: the operator
+        # kills it and ships with no verdict from the check that exists to
+        # produce one.
+        if time.time() - started > hard_cap:
+            raise TimeoutError(
+                f"{name} did not finish loading within the {hard_cap}s hard cap"
+            )
+
         progress = downloading(base)
         if progress:
-            deadline = time.time() + quiet_timeout
             if progress != seen:
+                # Only observable movement buys more time, and only up to the
+                # stall timeout, which is generous because chunks of a
+                # multi-gigabyte checkpoint complete minutes apart.
                 seen = progress
+                deadline = time.time() + stall_timeout
                 print(
                     f"[preflight]   downloading {progress.get('model', name)}: "
                     f"{progress.get('files_done')}/{progress.get('files_total')}",
                     flush=True,
+                )
+            elif time.time() > deadline:
+                at = f"{progress.get('files_done')}/{progress.get('files_total')}"
+                raise TimeoutError(
+                    f"{name} download stalled: no progress for {stall_timeout}s "
+                    f"(stuck at {at})"
                 )
         elif time.time() > deadline:
             raise TimeoutError(
@@ -517,7 +547,15 @@ def main() -> int:
         # so it can pass while this combination still crashes (see
         # GPULock.swift). Reuses whichever model is already resident from
         # the loop above — no extra cold-load cost.
-        mixed_model = models[-1]
+        # Both engines, not just the resident one. CLIPEncoder (the default
+        # ViT-B-32 path) and SigLIPNative are separate implementations, and the
+        # commit that moved preprocessing outside withMetalLock changed both.
+        # Running only models[-1] exercised the zoo path and left the engine
+        # every stock install actually uses covered by nothing but clip against
+        # clip, which cannot reproduce this crash shape.
+        mixed_models = [models[-1]]
+        if DEFAULT_CLIP not in mixed_models:
+            mixed_models.append(DEFAULT_CLIP)
         mixed_image = image
         if os.path.isfile(args.mixed_image):
             with open(args.mixed_image, "rb") as f:
@@ -527,45 +565,50 @@ def main() -> int:
                 f"[preflight] warning: {args.mixed_image} not found, using tiny test image "
                 f"(closes the collision window almost instantly — see --mixed-image help)"
             )
-        print(
-            f"[preflight] mixed load: {mixed_model} clip.visual concurrent with "
-            f"facial-recognition + ocr ({args.requests} calls, concurrency={args.concurrency}, "
-            f"image={len(mixed_image)} bytes) ...",
-            flush=True,
-        )
-        errors = []
-        with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-            futs = []
-            for j in range(args.requests):
-                m = j % 3
-                if m == 0:
-                    futs.append(
-                        ex.submit(
-                            predict, base, mixed_model, "visual", mixed_image, text
-                        )
-                    )
-                elif m == 1:
-                    futs.append(ex.submit(predict_face, base, mixed_image))
-                else:
-                    futs.append(ex.submit(predict_ocr, base, mixed_image))
-            for f in futs:
-                try:
-                    f.result()
-                except Exception as e:
-                    errors.append(repr(e))
-
-        if died_with_abort("under mixed clip+vision concurrent load"):
-            return 1
-        if errors:
+        for mixed_model in mixed_models:
             print(
-                f"[preflight] FAIL — mixed load: {len(errors)}/{args.requests} calls errored"
+                f"[preflight] mixed load: {mixed_model} clip.visual concurrent with "
+                f"facial-recognition + ocr ({args.requests} calls, concurrency={args.concurrency}, "
+                f"image={len(mixed_image)} bytes) ...",
+                flush=True,
             )
-            for e in errors[:3]:
-                print(f"[preflight]   {e}")
-            return 1
-        print(
-            f"[preflight] mixed load: OK ({args.requests} concurrent calls, no crash)"
-        )
+            errors = []
+            with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+                futs = []
+                for j in range(args.requests):
+                    m = j % 3
+                    if m == 0:
+                        futs.append(
+                            ex.submit(
+                                predict, base, mixed_model, "visual", mixed_image, text
+                            )
+                        )
+                    elif m == 1:
+                        futs.append(ex.submit(predict_face, base, mixed_image))
+                    else:
+                        futs.append(ex.submit(predict_ocr, base, mixed_image))
+                for f in futs:
+                    try:
+                        f.result()
+                    except Exception as e:
+                        errors.append(repr(e))
+
+            if died_with_abort(
+                f"under mixed clip+vision concurrent load ({mixed_model})"
+            ):
+                return 1
+            if errors:
+                print(
+                    f"[preflight] FAIL — mixed load {mixed_model}: "
+                    f"{len(errors)}/{args.requests} calls errored"
+                )
+                for e in errors[:3]:
+                    print(f"[preflight]   {e}")
+                return 1
+            print(
+                f"[preflight] mixed load {mixed_model}: OK "
+                f"({args.requests} concurrent calls, no crash)"
+            )
 
         if args.skip_bind_check:
             print("[preflight] bind conflict: SKIPPED (--skip-bind-check)")

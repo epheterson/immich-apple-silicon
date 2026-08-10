@@ -3019,6 +3019,71 @@ class TestReconcileML:
 
             kill.assert_not_called()
 
+    def test_a_replaced_pid_starts_its_own_clock(self, tmp_data_dir):
+        """The stopwatch belongs to a process, not to the wall.
+
+        A bare timestamp is inherited by whatever PID happens to be there next,
+        so a service replaced between two ticks (a manual `restart`, or a crash
+        and relaunch inside one interval) gets judged from its predecessor's
+        silence and killed seconds into its own cold start.
+        """
+        import immich_accelerator.__main__ as m
+
+        clock = [1000.0]
+        pids = [999, 1001, 1001]
+        with patch.object(
+            m, "read_pid", side_effect=lambda *a: pids.pop(0)
+        ), patch.object(m, "_ml_ping", return_value=False), patch.object(
+            m.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(
+            m, "kill_pid"
+        ) as kill, patch.object(
+            m, "_start_ml_service", return_value=(1001, "native Swift")
+        ):
+            m.reconcile_ml({})  # 999 goes quiet at t=1000
+            clock[0] += m.ML_UNRESPONSIVE_GRACE + 1
+            m.reconcile_ml({})  # different PID: its own clock starts now
+            clock[0] += 10
+            m.reconcile_ml({})  # 1001 is 10s old, nowhere near the grace
+
+            kill.assert_not_called()
+
+    def test_a_foreign_listener_is_left_alone(self, tmp_data_dir):
+        """Docker's own ML container on port 3003, say.
+
+        The service now exits on a bind conflict instead of lingering, so
+        relaunching it into an occupied port would spawn and lose a process
+        every tick forever. If the port answers, Immich has ML either way.
+        """
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=None), patch.object(
+            m, "_ml_ping", return_value=True
+        ), patch.object(m, "_find_ml_dir", return_value=None), patch.object(
+            m, "_start_ml_service"
+        ) as start, patch.object(
+            m, "log"
+        ) as log:
+            m.reconcile_ml({})
+            m.reconcile_ml({})  # and again: the warning must not repeat
+
+            start.assert_not_called()
+        said = [str(c) for c in log.warning.call_args_list]
+        assert len(said) == 1, f"warned {len(said)} times, expected once"
+        assert "already served" in said[0]
+
+    def test_a_dead_port_still_restarts(self, tmp_data_dir):
+        """The foreign-listener check must not swallow the ordinary case."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=None), patch.object(
+            m, "_ml_ping", return_value=False
+        ), patch.object(m, "_find_ml_dir", return_value=None), patch.object(
+            m, "_start_ml_service", return_value=(77, "native Swift")
+        ) as start:
+            m.reconcile_ml({})
+            start.assert_called_once()
+
     def test_disabling_ml_clears_the_timer(self, tmp_data_dir):
         """A component turned off and back on starts from a clean slate rather
         than inheriting silence recorded before it was switched off."""
