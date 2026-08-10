@@ -4109,6 +4109,13 @@ def reconcile_ml(config: dict) -> None:
         return
     pid = read_pid("ml")
     wedged = False
+    if not pid:
+        # No process means no silence to hold against one. Leaving the timer
+        # set here was a restart loop waiting to happen: a service that went
+        # quiet and then died on its own left the clock running, so the
+        # replacement was judged from the dead instance's start and got killed
+        # on its first quiet tick, which for a cold start is every time.
+        _ml_unresponsive_since = None
     if pid:
         # A live PID is not a working service. The old check ended here, so a
         # process that was up but answering nothing kept its place forever and

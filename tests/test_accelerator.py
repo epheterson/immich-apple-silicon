@@ -2988,6 +2988,37 @@ class TestReconcileML:
 
             kill.assert_not_called()
 
+    def test_a_dead_process_does_not_bequeath_its_timer(self, tmp_data_dir):
+        """A service that went quiet and then died on its own left the clock
+        running, so its replacement was judged from the dead instance's start
+        and got killed on its first quiet tick. For a cold start that is every
+        time, which is a restart loop rather than a recovery."""
+        import immich_accelerator.__main__ as m
+
+        clock = [1000.0]
+        pids = [999, None, 1001]
+        with patch.object(
+            m, "read_pid", side_effect=lambda *a: pids.pop(0)
+        ), patch.object(m, "_ml_ping", return_value=False), patch.object(
+            m, "_find_ml_dir", return_value=None
+        ), patch.object(
+            m.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(
+            m, "kill_pid"
+        ) as kill, patch.object(
+            m, "_start_ml_service", return_value=(1001, "native Swift")
+        ):
+            m.reconcile_ml({})  # quiet at t=1000: timer starts
+            # The dead instance stays quiet past the grace window before it
+            # exits. That is the whole point: by the time the replacement
+            # starts, the stale clock already reads "long enough to kill".
+            clock[0] += m.ML_UNRESPONSIVE_GRACE + 1
+            m.reconcile_ml({})  # process gone: restarted, timer must clear
+            clock[0] += 10
+            m.reconcile_ml({})  # new process, still loading, seconds old
+
+            kill.assert_not_called()
+
     def test_disabling_ml_clears_the_timer(self, tmp_data_dir):
         """A component turned off and back on starts from a clean slate rather
         than inheriting silence recorded before it was switched off."""
