@@ -19,17 +19,36 @@ import MLXNN
 //   - single-level key nesting (vision_model.X / text_model.X), simpler than
 //     mlx-community's conversion which adds an extra vision_model.vision_model
 //     wrapper layer (an artifact of mlx-embeddings' own module hierarchy).
-//   - native fp32 (verified via safetensors header on so400m-patch16-384:
-//     4.54GB vs. mlx-community's 2.3GB fp16 conversion of the same weights).
-//     Larger download, but removes the fp16-text-tower upcast-to-fp32 gotcha
-//     the original SO400M-only port needed, and matches Immich's own
-//     benchmark reference precision (its docs: "testing was done at f32
-//     precision, the default in Immich").
+//   - native fp32 upstream (verified via safetensors header on
+//     so400m-patch16-384: 4.54GB vs. mlx-community's 2.3GB fp16 conversion of
+//     the same weights) — loaded here and downcast once to bfloat16
+//     (computeDType below). Apple GPU fp32 matmul throughput is roughly half
+//     of bf16, and bf16 keeps fp32's full exponent range (unlike fp16), so it
+//     doesn't reintroduce the fp16-text-tower upcast gotcha the original
+//     SO400M-only port needed. Immich's own accuracy reference ("testing was
+//     done at f32 precision") is about matching ONNX's *output*, which is
+//     what matters for nearest-neighbor search — not about every intermediate
+//     matmul needing to run at fp32. See ln()/embedVisual/embedTextual for
+//     where reductions are deliberately upcast back to fp32 despite that.
+//     Validated across all 17 registry models on a realistic 4032x3024 photo
+//     (scripts/native-ml-siglip-benchmark.py's synthetic image): worst-case
+//     cosine similarity against this same file's previous all-fp32 output is
+//     0.9996 visual / 0.9997 textual — well inside the ~0.99 already accepted
+//     for ViT-L-16-SigLIP2-256's fp32-vs-ONNX drift below. Latency: 7-21%
+//     faster on top of the CPU-preprocessing win (bigger models and the
+//     preprocessing-free textual path see the larger share, as expected from
+//     a change that's purely about matmul throughput/bandwidth).
 //   - PyTorch OIHW conv layout ([out,in,kH,kW]), not mlx-community's
 //     pre-transposed HWIO — init() transposes patch_embedding.weight once,
 //     matching mlx_embeddings' sanitize().
 final class SigLIPNative {
     static let EPS: Float = 1e-6
+    // bf16 (not fp16): same exponent range as fp32, so no overflow/underflow
+    // risk in exchange for the ~2x matmul throughput / bandwidth win on
+    // Apple GPU. Mantissa precision loss is real but the family already
+    // tolerates it — see the ViT-L-16-SigLIP2-256 registry comment below on
+    // ~0.99 cosine drift from ordinary fp32 non-associativity alone.
+    static let computeDType: DType = .bfloat16
 
     let cfg: SigLIPConfig
     let W: [String: MLXArray]
@@ -37,7 +56,7 @@ final class SigLIPNative {
     init(config: SigLIPConfig, weightsPath: String) throws {
         cfg = config
         var raw = try MLX.loadArrays(url: URL(fileURLWithPath: weightsPath))
-        raw = raw.mapValues { $0.dtype == .float32 ? $0 : $0.asType(.float32) }
+        raw = raw.mapValues { $0.dtype == Self.computeDType ? $0 : $0.asType(Self.computeDType) }
         // PyTorch OIHW [out,in,kH,kW] -> MLX-friendly HWIO [out,kH,kW,in].
         // patches() below flattens each patch in (row, col, channel) order,
         // which after this transpose is patch_embedding.weight's own
@@ -53,9 +72,17 @@ final class SigLIPNative {
         return v
     }
 
+    // Reduction (mean/variance over `hidden`, up to 1536 elements) upcast to
+    // fp32 regardless of x's dtype: layernorm stats are exactly the kind of
+    // wide low-magnitude-variance reduction bf16's 8-bit mantissa handles
+    // poorly, and this costs nothing next to the O(hidden^2) matmuls around
+    // it. Standard mixed-precision practice (e.g. PyTorch autocast keeps
+    // LayerNorm in fp32 under bf16/fp16 autocast too).
     private func ln(_ x: MLXArray, _ p: String) -> MLXArray {
-        (x - mean(x, axis: -1, keepDims: true)) * rsqrt(variance(x, axis: -1, keepDims: true) + Self.EPS)
-            * w("\(p).weight") + w("\(p).bias")
+        let x32 = x.dtype == .float32 ? x : x.asType(.float32)
+        let normed = (x32 - mean(x32, axis: -1, keepDims: true))
+            * rsqrt(variance(x32, axis: -1, keepDims: true) + Self.EPS)
+        return normed.asType(x.dtype) * w("\(p).weight") + w("\(p).bias")
     }
     private func lin(_ x: MLXArray, _ p: String) -> MLXArray {
         matmul(x, w("\(p).weight").transposed()) + w("\(p).bias")
@@ -181,7 +208,7 @@ final class SigLIPNative {
                 }
             }
         }
-        return MLXArray(flat, [grid * grid, dim])
+        return MLXArray(flat, [grid * grid, dim]).asType(Self.computeDType)
     }
 
     // Scoped to the GPU device for just this call (Device.withDefaultDevice
@@ -217,10 +244,16 @@ final class SigLIPNative {
                     x = block(x, "vision_model.encoder.layers.\(l)", tower)
                 }
                 x = ln(x, "vision_model.post_layernorm")
-                var emb = mapHead(x).reshaped([tower.hidden])
-                emb = emb / sqrt((emb * emb).sum())
-                eval(emb)
-                return emb.asArray(Float.self)
+                // L2-normalize in fp32 regardless of computeDType: this is the
+                // vector that actually gets compared by cosine similarity in
+                // search, and the sum-of-squares reduction has the same
+                // wide-reduction precision risk as ln() above — cheap to
+                // upcast for a single `hidden`-length vector.
+                let raw = mapHead(x).reshaped([tower.hidden])
+                let emb32 = raw.dtype == .float32 ? raw : raw.asType(.float32)
+                let normed = emb32 / sqrt((emb32 * emb32).sum())
+                eval(normed)
+                return normed.asArray(Float.self)
             }
         }
     }
@@ -246,10 +279,12 @@ final class SigLIPNative {
                 }
                 x = ln(x, "text_model.final_layer_norm")
                 let pooled = x[seq - 1].reshaped([1, tower.hidden])
-                var emb = lin(pooled, "text_model.head").reshaped([cfg.textProjection])
-                emb = emb / sqrt((emb * emb).sum())
-                eval(emb)
-                return emb.asArray(Float.self)
+                // fp32 L2-normalize — see the matching comment in embedVisual.
+                let raw = lin(pooled, "text_model.head").reshaped([cfg.textProjection])
+                let emb32 = raw.dtype == .float32 ? raw : raw.asType(.float32)
+                let normed = emb32 / sqrt((emb32 * emb32).sum())
+                eval(normed)
+                return normed.asArray(Float.self)
             }
         }
     }
