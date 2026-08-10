@@ -81,6 +81,13 @@ LOG_KEEP_TAIL_LINES = 2000  # lines of recent context preserved across a rotate
 # ships a prebuilt for the new node major.
 SUPPORTED_NODE_MAJORS = (22, 24)
 
+# How long the ML service may hold a live PID while answering nothing before
+# reconcile_ml stops believing it and restarts it. Generous on purpose: a cold
+# native start loads weights before it serves, and a first-use model fetch is
+# gigabytes, so the grace has to clear the longest legitimate silence.
+ML_UNRESPONSIVE_GRACE = 300.0
+_ml_unresponsive_since: float | None = None
+
 
 # --- Utility ---
 
@@ -3987,6 +3994,20 @@ def _venv_ml_spec(config: dict, env: dict):
     return None
 
 
+def _ml_ping(config: dict, timeout: float = 3.0) -> bool:
+    """One /ping probe. True only if the service answered."""
+    import urllib.request
+
+    port = int(config.get("ml_port", 3003))
+    try:
+        with urllib.request.urlopen(
+            f"http://localhost:{port}/ping", timeout=timeout
+        ) as r:
+            return r.read().strip() == b"pong"
+    except Exception:
+        return False
+
+
 def _ml_healthy(config: dict, pid: int | None = None, timeout: float = 90.0) -> bool:
     """Poll the ML service /ping until it answers or the timeout elapses.
 
@@ -3996,9 +4017,6 @@ def _ml_healthy(config: dict, pid: int | None = None, timeout: float = 90.0) -> 
     ``pid`` is given and the process dies, bail immediately so a genuinely
     broken native falls back to the venv fast instead of waiting out the timeout.
     """
-    import urllib.request
-
-    port = int(config.get("ml_port", 3003))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if pid is not None:
@@ -4006,14 +4024,8 @@ def _ml_healthy(config: dict, pid: int | None = None, timeout: float = 90.0) -> 
                 os.kill(pid, 0)
             except OSError:
                 return False  # process died, fall back now
-        try:
-            with urllib.request.urlopen(
-                f"http://localhost:{port}/ping", timeout=3
-            ) as r:
-                if r.read().strip() == b"pong":
-                    return True
-        except Exception:
-            pass
+        if _ml_ping(config):
+            return True
         time.sleep(1)
     return False
 
@@ -4087,18 +4099,47 @@ def reconcile_ml(config: dict) -> None:
     """Make the running state match the "ml" config key, the ML counterpart to
     reconcile_dashboard. Re-resolves ml_dir first, because brew upgrade deletes
     the old Cellar path out from under the cached value (#29)."""
+    global _ml_unresponsive_since
+
     if not _component_enabled("ml", config):
         if read_pid("ml"):
             log.info("ML disabled in config, stopping it.")
             kill_pid("ml")
+        _ml_unresponsive_since = None
         return
-    if read_pid("ml"):
-        return
+    pid = read_pid("ml")
+    wedged = False
+    if pid:
+        # A live PID is not a working service. The old check ended here, so a
+        # process that was up but answering nothing kept its place forever and
+        # nothing ever restarted it: that is how a Mac ran for days on an ML
+        # service the accelerator believed it was managing but wasn't.
+        if _ml_ping(config):
+            _ml_unresponsive_since = None
+            return
+        now = time.monotonic()
+        if _ml_unresponsive_since is None:
+            _ml_unresponsive_since = now
+            return
+        stuck = now - _ml_unresponsive_since
+        # Silence alone isn't enough to act on. A cold native start loads
+        # weights before it binds, and a first-use model fetch runs for
+        # minutes; restarting into either would kill the very work being
+        # waited on. Only sustained silence counts.
+        if stuck < ML_UNRESPONSIVE_GRACE:
+            return
+        log.warning(
+            "ML process %d has not answered for %ds, restarting it.", pid, int(stuck)
+        )
+        kill_pid("ml")
+        _ml_unresponsive_since = None
+        wedged = True
     resolved_ml = _find_ml_dir()
     if resolved_ml and str(resolved_ml) != config.get("ml_dir"):
         config["ml_dir"] = str(resolved_ml)
         save_config(config)
-    log.warning("ML service not running, attempting restart...")
+    if not wedged:
+        log.warning("ML service not running, attempting restart...")
     pid, engine = _start_ml_service(config)
     if pid:
         log.info("  ML restarted (PID %d, %s)", pid, engine)

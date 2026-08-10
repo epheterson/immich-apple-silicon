@@ -43,6 +43,10 @@ def tmp_data_dir(tmp_path):
         PID_DIR=pid_dir,
         LOG_DIR=log_dir,
         LOCK_FILE=lock_file,
+        # reconcile_ml's "has it been quiet too long" timer. Module state, so a
+        # test that leaves it set decides the outcome of the next one; patching
+        # it here means every test starts from "no silence recorded yet".
+        _ml_unresponsive_since=None,
     ):
         yield {
             "data_dir": data_dir,

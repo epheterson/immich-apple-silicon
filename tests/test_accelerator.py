@@ -2909,6 +2909,98 @@ class TestReconcileML:
             m.reconcile_ml({})
             start.assert_called_once()
 
+    def test_a_live_answering_process_is_left_alone(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=999), patch.object(
+            m, "_ml_ping", return_value=True
+        ), patch.object(m, "kill_pid") as kill, patch.object(
+            m, "_start_ml_service"
+        ) as start:
+            m.reconcile_ml({})
+            kill.assert_not_called()
+            start.assert_not_called()
+
+    def test_silence_is_not_acted_on_immediately(self, tmp_data_dir):
+        """A cold native start loads weights before it answers, and a first-use
+        model fetch runs for minutes. Restarting into either kills the work
+        being waited on, so one quiet pass must not be enough."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=999), patch.object(
+            m, "_ml_ping", return_value=False
+        ), patch.object(m, "kill_pid") as kill, patch.object(
+            m, "_start_ml_service"
+        ) as start:
+            m.reconcile_ml({})
+            m.reconcile_ml({})  # still inside the grace window
+            kill.assert_not_called()
+            start.assert_not_called()
+
+    def test_a_process_that_never_answers_is_restarted(self, tmp_data_dir):
+        """The regression that let a Mac run for days on an ML service the
+        accelerator thought it was managing: reconcile_ml returned as soon as
+        it saw a live PID, so a process that was up but serving nothing (a
+        native engine that lost the port race, say) kept its place forever.
+        """
+        import immich_accelerator.__main__ as m
+
+        clock = [1000.0]
+        with patch.object(m, "read_pid", return_value=999), patch.object(
+            m, "_ml_ping", return_value=False
+        ), patch.object(m, "_find_ml_dir", return_value=None), patch.object(
+            m.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(
+            m, "kill_pid"
+        ) as kill, patch.object(
+            m, "_start_ml_service", return_value=(77, "native Swift")
+        ) as start:
+            m.reconcile_ml({})  # first quiet pass: start the timer
+            kill.assert_not_called()
+            clock[0] += m.ML_UNRESPONSIVE_GRACE + 1
+            m.reconcile_ml({})
+
+            kill.assert_called_once_with("ml")
+            start.assert_called_once()
+
+    def test_answering_again_clears_the_timer(self, tmp_data_dir):
+        """Otherwise a service that goes quiet for a moment every few hours
+        eventually accumulates its way past the grace window and gets killed
+        while it is working perfectly well."""
+        import immich_accelerator.__main__ as m
+
+        clock = [1000.0]
+        answers = [False, True, False]
+        with patch.object(m, "read_pid", return_value=999), patch.object(
+            m, "_ml_ping", side_effect=lambda *a, **k: answers.pop(0)
+        ), patch.object(
+            m.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(
+            m, "kill_pid"
+        ) as kill, patch.object(
+            m, "_start_ml_service"
+        ):
+            m.reconcile_ml({})  # quiet: timer starts at t=1000
+            clock[0] += 10
+            m.reconcile_ml({})  # answered: timer must reset
+            clock[0] += m.ML_UNRESPONSIVE_GRACE - 1
+            m.reconcile_ml({})  # quiet again, but only just now
+
+            kill.assert_not_called()
+
+    def test_disabling_ml_clears_the_timer(self, tmp_data_dir):
+        """A component turned off and back on starts from a clean slate rather
+        than inheriting silence recorded before it was switched off."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "read_pid", return_value=999), patch.object(
+            m, "_ml_ping", return_value=False
+        ), patch.object(m, "kill_pid"), patch.object(m, "_start_ml_service"):
+            m.reconcile_ml({})
+            assert m._ml_unresponsive_since is not None
+            m.reconcile_ml({"ml": False})
+            assert m._ml_unresponsive_since is None
+
 
 class TestDashboardComponentAwareness:
     """The dashboard must agree with the CLI about what is switched on, and it
