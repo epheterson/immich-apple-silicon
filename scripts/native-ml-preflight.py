@@ -102,7 +102,9 @@ def tiny_jpeg() -> bytes:
     return base64.b64decode(_TINY_JPEG_B64)
 
 
-def predict_raw(base: str, entries: dict, image: bytes | None, text: str | None, timeout: int = 60) -> dict:
+def predict_raw(
+    base: str, entries: dict, image: bytes | None, text: str | None, timeout: int = 60
+) -> dict:
     """One real /predict call for an arbitrary entries dict, matching Immich's
     own multipart wire format (see Server.swift/Predict.swift)."""
     boundary = "----native-ml-preflight"
@@ -140,11 +142,16 @@ def predict_raw(base: str, entries: dict, image: bytes | None, text: str | None,
         return json.loads(r.read())
 
 
-def predict(base: str, model_name: str, kind: str, image: bytes, text: str, timeout: int = 60) -> str:
+def predict(
+    base: str, model_name: str, kind: str, image: bytes, text: str, timeout: int = 60
+) -> str:
     """One real /predict call (visual or textual) for a specific zoo model."""
     result = predict_raw(
-        base, {"clip": {kind: {"modelName": model_name}}},
-        image if kind == "visual" else None, text if kind != "visual" else None, timeout,
+        base,
+        {"clip": {kind: {"modelName": model_name}}},
+        image if kind == "visual" else None,
+        text if kind != "visual" else None,
+        timeout,
     )
     raw = result.get("clip")
     emb = json.loads(raw) if isinstance(raw, str) else raw
@@ -157,14 +164,122 @@ def predict_face(base: str, image: bytes, timeout: int = 60) -> str:
     """One real /predict call for facial-recognition — Vision framework, Metal-backed
     on its own command queue, run concurrently with clip below to reproduce the
     MLX-vs-Vision-framework Metal race (see GPULock.swift)."""
-    predict_raw(base, {"facial-recognition": {"detection": {"options": {"minScore": 0.5}}}}, image, None, timeout)
+    predict_raw(
+        base,
+        {"facial-recognition": {"detection": {"options": {"minScore": 0.5}}}},
+        image,
+        None,
+        timeout,
+    )
     return "facial-recognition ok"
 
 
 def predict_ocr(base: str, image: bytes, timeout: int = 60) -> str:
     """One real /predict call for ocr — also Vision framework / Metal-backed."""
-    predict_raw(base, {"ocr": {"detection": {"options": {"minScore": 0.0}}}}, image, None, timeout)
+    predict_raw(
+        base,
+        {"ocr": {"detection": {"options": {"minScore": 0.0}}}},
+        image,
+        None,
+        timeout,
+    )
     return "ocr ok"
+
+
+def downloading(base: str) -> dict | None:
+    """The /health "downloading" block, or None if nothing is being fetched."""
+    try:
+        with urllib.request.urlopen(f"{base}/health", timeout=5) as r:
+            return json.loads(r.read()).get("downloading")
+    except Exception:
+        return None
+
+
+def warm_up(
+    base: str,
+    name: str,
+    image: bytes,
+    text: str,
+    proc: subprocess.Popen,
+    quiet_timeout: int,
+) -> None:
+    """Cold-load a model, waiting out a first-use download instead of failing on it.
+
+    The naive version — a plain predict() with a fixed timeout — cannot pass on
+    a cold cache: the largest checkpoints are gigabytes and the fetch happens
+    inside this first request, so the gate timed out on a download that was
+    working perfectly and reported it as a failure. Time spent downloading is
+    therefore not counted; the timeout applies only to silence, so a crash or a
+    genuinely wedged load still fails, and a slow network never does.
+    """
+    import threading
+
+    outcome: dict = {}
+
+    def call() -> None:
+        try:
+            predict(base, name, "visual", image, text, timeout=24 * 3600)
+            predict(base, name, "textual", image, text, timeout=24 * 3600)
+        except Exception as e:  # surfaced on the main thread below
+            outcome["error"] = e
+
+    done = threading.Event()
+    worker = threading.Thread(target=lambda: (call(), done.set()), daemon=True)
+    worker.start()
+
+    deadline = time.time() + quiet_timeout
+    seen = None
+    while not done.wait(5):
+        if proc.poll() is not None:
+            return  # died: the caller's died_with_abort reports the detail
+        progress = downloading(base)
+        if progress:
+            deadline = time.time() + quiet_timeout
+            if progress != seen:
+                seen = progress
+                print(
+                    f"[preflight]   downloading {progress.get('model', name)}: "
+                    f"{progress.get('files_done')}/{progress.get('files_total')}",
+                    flush=True,
+                )
+        elif time.time() > deadline:
+            raise TimeoutError(
+                f"{name} did not load within {quiet_timeout}s and reported no download"
+            )
+    if "error" in outcome:
+        raise outcome["error"]
+
+
+def check_bind_conflict(
+    binary: str, port: int, env: dict, timeout: int = 120
+) -> str | None:
+    """Start a second service on an occupied port; it must exit, not linger.
+
+    NWListener reports a bind conflict asynchronously, so a server that does not
+    watch its listener state stays alive forever holding nothing. That shipped:
+    a release Mac accumulated six idle instances over four days while ml.pid
+    named one of them and the real listener was an older process, which made
+    `restart` a no-op. Nothing else in the suite covers it, because every other
+    stage is careful to use a free port. Returns None on success, else a reason.
+    """
+    second = subprocess.Popen(
+        [binary, "serve", str(port)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        rc = second.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        second.kill()
+        second.wait()
+        return (
+            f"a second service on the already-bound port {port} was still running after "
+            f"{timeout}s instead of exiting (this is the leaked-process bug)"
+        )
+    if rc == 0:
+        return f"a second service on port {port} exited 0, as though it had bound successfully"
+    return None
 
 
 def wait_healthy(base: str, proc: subprocess.Popen, timeout: int) -> None:
@@ -203,7 +318,8 @@ def ensure_metallib(binary: str, native_ml_dir: str) -> None:
         return
     candidates = subprocess.run(
         ["find", "/opt/homebrew", native_ml_dir, "-name", "mlx.metallib"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     ).stdout.splitlines()
     candidates = [c for c in candidates if os.path.abspath(c) != dst]
     if not candidates:
@@ -213,6 +329,7 @@ def ensure_metallib(binary: str, native_ml_dir: str) -> None:
         )
     print(f"[preflight] copying {candidates[0]} -> {dst}", flush=True)
     import shutil
+
     shutil.copy2(candidates[0], dst)
 
 
@@ -220,22 +337,38 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--native-ml-dir",
-        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "native-ml"),
+        default=os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "native-ml"
+        ),
         help="native-ml checkout (has Package.swift)",
     )
-    ap.add_argument("--binary", help="pre-built binary path; skips swift build -c release")
-    ap.add_argument("--clip-dir", default=os.path.expanduser("~/.cache/immich-ml-native/clip"))
-    ap.add_argument("--arcface", default=None, help="omit to let the binary use its own default search")
+    ap.add_argument(
+        "--binary", help="pre-built binary path; skips swift build -c release"
+    )
+    ap.add_argument(
+        "--clip-dir", default=os.path.expanduser("~/.cache/immich-ml-native/clip")
+    )
+    ap.add_argument(
+        "--arcface",
+        default=None,
+        help="omit to let the binary use its own default search",
+    )
     ap.add_argument("--port", type=int, default=3998)
     ap.add_argument("--concurrency", type=int, default=4)
-    ap.add_argument("--requests", type=int, default=16, help="concurrent requests per model, split visual/textual")
     ap.add_argument(
-        "--mixed-image", default="/tmp/native-ml-bench.jpg",
+        "--requests",
+        type=int,
+        default=16,
+        help="concurrent requests per model, split visual/textual",
+    )
+    ap.add_argument(
+        "--mixed-image",
+        default="/tmp/native-ml-bench.jpg",
         help="realistic-resolution image for the mixed clip+vision stage (see "
-             "scripts/native-ml-siglip-benchmark.py's ensure_bench_image) — a tiny image resolves "
-             "clip.visual in a few ms and closes the Metal collision window almost instantly, "
-             "hiding the crash this stage exists to catch. Falls back to the tiny synthetic JPEG "
-             "if the file doesn't exist.",
+        "scripts/native-ml-siglip-benchmark.py's ensure_bench_image) — a tiny image resolves "
+        "clip.visual in a few ms and closes the Metal collision window almost instantly, "
+        "hiding the crash this stage exists to catch. Falls back to the tiny synthetic JPEG "
+        "if the file doesn't exist.",
     )
     ap.add_argument(
         "--models",
@@ -243,19 +376,36 @@ def main() -> int:
         help="comma-separated model names, or 'all' for the full registry (slow: first-load per model)",
     )
     ap.add_argument("--startup-timeout", type=int, default=120)
-    ap.add_argument("--warmup-timeout", type=int, default=240,
-                     help="per-request timeout for the cold model-switch load, not the stress batch")
+    ap.add_argument(
+        "--warmup-timeout",
+        type=int,
+        default=240,
+        help="how long a cold model load may go quiet before it counts as wedged. "
+        "Time spent downloading does not count against it (see warm_up), so this "
+        "does not need to cover a multi-GB first fetch.",
+    )
+    ap.add_argument(
+        "--skip-bind-check",
+        action="store_true",
+        help="skip the second-instance-on-a-bound-port stage (costs one extra model load)",
+    )
     args = ap.parse_args()
 
-    models = ALL_MODELS if args.models == "all" else [m.strip() for m in args.models.split(",") if m.strip()]
+    models = (
+        ALL_MODELS
+        if args.models == "all"
+        else [m.strip() for m in args.models.split(",") if m.strip()]
+    )
 
     binary = args.binary or build_release(args.native_ml_dir)
     if not os.path.isfile(binary):
         print(f"[preflight] FAIL — binary not found: {binary}")
         return 1
     if not os.path.isdir(args.clip_dir):
-        print(f"[preflight] FAIL — clip dir not found: {args.clip_dir} "
-              f"(run native-ml/scripts/install_native.sh first)")
+        print(
+            f"[preflight] FAIL — clip dir not found: {args.clip_dir} "
+            f"(run native-ml/scripts/install_native.sh first)"
+        )
         return 1
     ensure_metallib(binary, args.native_ml_dir)
 
@@ -265,8 +415,13 @@ def main() -> int:
         env["ML_ARCFACE"] = args.arcface
 
     err = open(os.path.join("/tmp", f"native-ml-preflight-{args.port}.err"), "w+b")
-    print(f"[preflight] booting real native-ml service on {base} (release build) ...", flush=True)
-    proc = subprocess.Popen([binary, "serve", str(args.port)], env=env, stdout=err, stderr=subprocess.STDOUT)
+    print(
+        f"[preflight] booting real native-ml service on {base} (release build) ...",
+        flush=True,
+    )
+    proc = subprocess.Popen(
+        [binary, "serve", str(args.port)], env=env, stdout=err, stderr=subprocess.STDOUT
+    )
 
     def stderr_tail() -> str:
         err.flush()
@@ -277,7 +432,14 @@ def main() -> int:
         if proc.poll() is None:
             return False
         tail = stderr_tail()
-        abort = next((ln for ln in tail.splitlines() if any(sig in ln for sig in ABORT_SIGNATURES)), "")
+        abort = next(
+            (
+                ln
+                for ln in tail.splitlines()
+                if any(sig in ln for sig in ABORT_SIGNATURES)
+            ),
+            "",
+        )
         print(f"[preflight] FAIL — service DIED {prefix} (rc={proc.returncode})")
         if abort:
             print(f"[preflight]   abort: {abort.strip()}")
@@ -291,16 +453,19 @@ def main() -> int:
         text = "a photo of a cat"
 
         for i, name in enumerate(models, 1):
-            print(f"[preflight] [{i}/{len(models)}] {name}: warming up (model load/switch) ...", flush=True)
+            print(
+                f"[preflight] [{i}/{len(models)}] {name}: warming up (model load/switch) ...",
+                flush=True,
+            )
             try:
-                # Cold load: evicts whatever's resident and reads a fresh
-                # multi-GB safetensors file off disk (Models.zoo(for:), see
-                # Models.swift) — measured minutes, not seconds, for the
-                # largest towers back-to-back, so this needs real headroom.
-                # Once resident, inference itself is fast — see the tighter
-                # per-request timeout on the concurrent batch below.
-                predict(base, name, "visual", image, text, timeout=args.warmup_timeout)
-                predict(base, name, "textual", image, text, timeout=args.warmup_timeout)
+                # Cold load: evicts whatever's resident, fetches the checkpoint
+                # if this Mac has never run the model, and reads a multi-GB
+                # safetensors file off disk (Models.zoo(for:), see Models.swift)
+                # — measured minutes, not seconds, for the largest towers back
+                # to back. warm_up waits out the download part; once resident,
+                # inference itself is fast, hence the tighter per-request
+                # timeout on the concurrent batch below.
+                warm_up(base, name, image, text, proc, args.warmup_timeout)
             except Exception as e:
                 if died_with_abort(f"loading {name}"):
                     return 1
@@ -315,7 +480,14 @@ def main() -> int:
             errors = []
             with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
                 futs = [
-                    ex.submit(predict, base, name, "visual" if j % 2 == 0 else "textual", image, text)
+                    ex.submit(
+                        predict,
+                        base,
+                        name,
+                        "visual" if j % 2 == 0 else "textual",
+                        image,
+                        text,
+                    )
                     for j in range(args.requests)
                 ]
                 for f in futs:
@@ -327,11 +499,15 @@ def main() -> int:
             if died_with_abort(f"under concurrent load on {name}"):
                 return 1
             if errors:
-                print(f"[preflight] FAIL — {name}: {len(errors)}/{args.requests} predict calls errored")
+                print(
+                    f"[preflight] FAIL — {name}: {len(errors)}/{args.requests} predict calls errored"
+                )
                 for e in errors[:3]:
                     print(f"[preflight]   {e}")
                 return 1
-            print(f"[preflight] [{i}/{len(models)}] {name}: OK ({args.requests} concurrent calls, no crash)")
+            print(
+                f"[preflight] [{i}/{len(models)}] {name}: OK ({args.requests} concurrent calls, no crash)"
+            )
 
         # Mixed-load stage: fires clip.visual concurrently with
         # facial-recognition and ocr — the actual crash-reproducing shape.
@@ -347,8 +523,10 @@ def main() -> int:
             with open(args.mixed_image, "rb") as f:
                 mixed_image = f.read()
         else:
-            print(f"[preflight] warning: {args.mixed_image} not found, using tiny test image "
-                  f"(closes the collision window almost instantly — see --mixed-image help)")
+            print(
+                f"[preflight] warning: {args.mixed_image} not found, using tiny test image "
+                f"(closes the collision window almost instantly — see --mixed-image help)"
+            )
         print(
             f"[preflight] mixed load: {mixed_model} clip.visual concurrent with "
             f"facial-recognition + ocr ({args.requests} calls, concurrency={args.concurrency}, "
@@ -361,7 +539,11 @@ def main() -> int:
             for j in range(args.requests):
                 m = j % 3
                 if m == 0:
-                    futs.append(ex.submit(predict, base, mixed_model, "visual", mixed_image, text))
+                    futs.append(
+                        ex.submit(
+                            predict, base, mixed_model, "visual", mixed_image, text
+                        )
+                    )
                 elif m == 1:
                     futs.append(ex.submit(predict_face, base, mixed_image))
                 else:
@@ -375,11 +557,29 @@ def main() -> int:
         if died_with_abort("under mixed clip+vision concurrent load"):
             return 1
         if errors:
-            print(f"[preflight] FAIL — mixed load: {len(errors)}/{args.requests} calls errored")
+            print(
+                f"[preflight] FAIL — mixed load: {len(errors)}/{args.requests} calls errored"
+            )
             for e in errors[:3]:
                 print(f"[preflight]   {e}")
             return 1
-        print(f"[preflight] mixed load: OK ({args.requests} concurrent calls, no crash)")
+        print(
+            f"[preflight] mixed load: OK ({args.requests} concurrent calls, no crash)"
+        )
+
+        if args.skip_bind_check:
+            print("[preflight] bind conflict: SKIPPED (--skip-bind-check)")
+        else:
+            print(
+                f"[preflight] bind conflict: starting a second service on the "
+                f"already-bound port {args.port} (must exit, not linger) ...",
+                flush=True,
+            )
+            reason = check_bind_conflict(binary, args.port, env)
+            if reason:
+                print(f"[preflight] FAIL — {reason}")
+                return 1
+            print("[preflight] bind conflict: OK (second instance exited)")
 
         print(
             f"[preflight] PASS — {len(models)} model(s), {args.requests} concurrent real predict "
