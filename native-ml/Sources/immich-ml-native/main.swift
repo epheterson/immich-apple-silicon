@@ -28,13 +28,19 @@ if CommandLine.arguments.contains("texttest") {
 if CommandLine.arguments.contains("zootest") {
     let phrases = ["a photo of a cat", "sunset over the mountains", "OCR Test 123",
                    "A DOG, running!  on the beach?", "immich native swift"]
-    for name in ["ViT-B-16__openai", "ViT-B-16-SigLIP__webli"] {
+    let imagePath = ProcessInfo.processInfo.environment["ZOOTEST_IMAGE"] ?? "/tmp/face_test.jpg"
+    let imageTag = (imagePath as NSString).lastPathComponent
+    let defaultModels = ["ViT-B-16-SigLIP__webli", "ViT-B-16-SigLIP2__webli",
+                          "ViT-L-16-SigLIP2-256__webli", "ViT-SO400M-16-SigLIP2-384__webli"]
+    let models = ProcessInfo.processInfo.environment["ZOOTEST_MODELS"]
+        .map { $0.split(separator: ",").map(String.init) } ?? defaultModels
+    for name in models {
         do {
             let zoo = try ZooCLIP(name: name)
-            guard let cg = loadCGImage("/tmp/face_test.jpg") else { fatalError("no image") }
+            guard let cg = loadCGImage(imagePath) else { fatalError("no image at \(imagePath)") }
             let ve = try zoo.embedVisual(cg)
             ve.withUnsafeBytes {
-                try? Data($0).write(to: URL(fileURLWithPath: "/tmp/zoo_swift_\(name)_visual.f32"))
+                try? Data($0).write(to: URL(fileURLWithPath: "/tmp/zoo_swift_\(name)_\(imageTag)_visual.f32"))
             }
             var tout = Data()
             for p in phrases {
@@ -45,6 +51,54 @@ if CommandLine.arguments.contains("zootest") {
             print("\(name): visual dim=\(ve.count) first3=\(ve.prefix(3).map { String(format: "%.5f", $0) }); textual \(phrases.count) phrases dim=\(zoo.embedDim)")
         } catch {
             print("\(name): FAILED \(error)")
+        }
+    }
+    exit(0)
+}
+
+// --- Latency benchmark: raw embedVisual/embedTextual compute time, no HTTP ---
+// Used by scripts/native-ml-siglip-benchmark.py to compare the native mlx-swift
+// path against the onnxruntime path it replaced. Run this binary twice — once
+// normally (native) and once with ZOOCLIP_FORCE_ONNX=1 (see ZooCLIP.swift) — so
+// both numbers come from the exact same harness and preprocessing code, only
+// the inference backend differs.
+if CommandLine.arguments.contains("benchtest") {
+    let iters = Int(ProcessInfo.processInfo.environment["BENCH_ITERS"] ?? "") ?? 10
+    let warmup = Int(ProcessInfo.processInfo.environment["BENCH_WARMUP"] ?? "") ?? 3
+    let imagePath = ProcessInfo.processInfo.environment["BENCH_IMAGE"] ?? "/tmp/face_test.jpg"
+    let phrase = "a photo of a cat"
+    let defaultModels = ["ViT-B-16-SigLIP__webli", "ViT-B-16-SigLIP2__webli",
+                          "ViT-L-16-SigLIP2-256__webli", "ViT-SO400M-16-SigLIP2-384__webli"]
+    let models = ProcessInfo.processInfo.environment["BENCH_MODELS"]
+        .map { $0.split(separator: ",").map(String.init) } ?? defaultModels
+
+    func timeMs(_ n: Int, _ body: () throws -> Void) rethrows -> [Double] {
+        var samples: [Double] = []
+        samples.reserveCapacity(n)
+        for _ in 0..<n {
+            let start = DispatchTime.now()
+            try body()
+            let end = DispatchTime.now()
+            samples.append(Double(end.uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
+        }
+        return samples
+    }
+    func median(_ xs: [Double]) -> Double {
+        let s = xs.sorted()
+        return s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
+    }
+
+    for name in models {
+        do {
+            let zoo = try ZooCLIP(name: name)
+            guard let cg = loadCGImage(imagePath) else { fatalError("no image at \(imagePath)") }
+            _ = try timeMs(warmup) { _ = try zoo.embedVisual(cg) }
+            let visual = try timeMs(iters) { _ = try zoo.embedVisual(cg) }
+            _ = try timeMs(warmup) { _ = try zoo.embedTextual(phrase) }
+            let textual = try timeMs(iters) { _ = try zoo.embedTextual(phrase) }
+            print("BENCH \(name) visual_ms=\(median(visual)) textual_ms=\(median(textual)) n=\(iters)")
+        } catch {
+            print("BENCH \(name) FAILED \(error)")
         }
     }
     exit(0)
@@ -94,6 +148,17 @@ if CommandLine.arguments.contains("facetest") {
         e.withUnsafeBytes { try? Data($0).write(to: URL(fileURLWithPath: "/tmp/face_emb_swift.f32")) }
         print("wrote 512-d embedding; first5=\(e.prefix(5).map { String(format: "%.5f", $0) })")
     } else { print("no embedding produced") }
+    exit(0)
+}
+
+// --- Debug: dump Resize.bicubic's raw output for pixel-level comparison against PIL ---
+if CommandLine.arguments.contains("resizetest") {
+    guard let cg = loadCGImage("/tmp/face_test.jpg") else { fatalError("no image") }
+    let (rgb, w, h) = rgbBuffer(cg)
+    let size = CommandLine.arguments.last.flatMap { Int($0) } ?? 384
+    let resized = Resize.bicubic(rgb, w: w, h: h, outW: size, outH: size)
+    try! Data(resized).write(to: URL(fileURLWithPath: "/tmp/swift_resized_\(size).raw"))
+    print("wrote \(resized.count) bytes")
     exit(0)
 }
 

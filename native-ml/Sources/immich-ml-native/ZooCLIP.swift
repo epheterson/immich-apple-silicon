@@ -59,8 +59,11 @@ final class ZooCLIP {
     // Sessions load eagerly in init: after init the instance is immutable, so
     // concurrent requests never mutate shared state (a lazy-cache inout here
     // trips Swift's exclusivity enforcement under the concurrent server).
-    private let visualSession: ORTSession
-    private let textualSession: ORTSession
+    // Both nil exactly when `native` is set (see init): any name in
+    // SigLIPRegistry routes through native mlx-swift instead of onnxruntime.
+    private let visualSession: ORTSession?
+    private let textualSession: ORTSession?
+    private let native: SigLIPNative?
 
     static let zooDir = NATIVE_CACHE_DIR.appendingPathComponent("zoo")
 
@@ -84,6 +87,14 @@ final class ZooCLIP {
         dir = Self.zooDir.appendingPathComponent(name)
         try Self.ensureFiles(name: name, dir: dir)
 
+        // Benchmark-only escape hatch (scripts/native-ml-siglip-benchmark.py):
+        // run a SigLIPRegistry model through the onnxruntime branch anyway, so
+        // the "before native" baseline is measured with the exact same
+        // preprocessing/session code this file used to run for every SigLIP
+        // model, not a separately-written comparison harness. Never set in
+        // production; unset behaves exactly as before.
+        let forceONNX = ProcessInfo.processInfo.environment["ZOOCLIP_FORCE_ONNX"] == "1"
+
         // Large models keep their weights in external data files beside
         // model.onnx (#116). Resolve those once per model; the marker keeps a
         // later model switch from re-querying the API for an already-complete
@@ -96,7 +107,11 @@ final class ZooCLIP {
         // load would skip the fetch and fail on the missing weights with no way
         // back short of deleting a hidden file.
         let marker = dir.appendingPathComponent(".external-data-checked")
-        if !FileManager.default.fileExists(atPath: marker.path) {
+        // Native mlx-swift path uses its own safetensors checkpoint (fetched
+        // straight from the model's HF owner, see SigLIPNative), not this
+        // model's ONNX weights — skip fetching several GB of external data
+        // that would go unused.
+        if (SigLIPRegistry.config(for: name) == nil || forceONNX), !FileManager.default.fileExists(atPath: marker.path) {
             if let external = Self.externalDataFiles(name: name) {
                 if !external.isEmpty {
                     print("[native-ml] \(name): fetching \(external.count) external data files")
@@ -164,8 +179,15 @@ final class ZooCLIP {
                                message: "model \(name): tokenizer unsupported (\(String(describing: loadError)))")
         }
 
-        visualSession = try Self.loadSession(dir: dir, name: name, tower: "visual", dim: embedDim)
-        textualSession = try Self.loadSession(dir: dir, name: name, tower: "textual", dim: embedDim)
+        if let sig = SigLIPRegistry.config(for: name), !forceONNX {
+            native = try SigLIPNative(config: sig, weightsPath: SigLIPNative.ensureWeights(hfRepo: sig.hfRepo, name: name))
+            visualSession = nil
+            textualSession = nil
+        } else {
+            native = nil
+            visualSession = try Self.loadSession(dir: dir, name: name, tower: "visual", dim: embedDim)
+            textualSession = try Self.loadSession(dir: dir, name: name, tower: "textual", dim: embedDim)
+        }
     }
 
     private static func loadSession(dir: URL, name: String, tower: String, dim: Int) throws -> ORTSession {
@@ -180,7 +202,12 @@ final class ZooCLIP {
     // MARK: - inference
 
     func embedVisual(_ cg: CGImage) throws -> [Float] {
-        let session = visualSession
+        if let native {
+            return native.embedVisual(cg, targetSize: pre.size.first, mean: pre.mean, std: pre.std)
+        }
+        guard let session = visualSession else {
+            throw PredictError(status: "500 Internal Server Error", message: "no visual backend (\(name))")
+        }
         let size = pre.size.first
         let (rgb, w, h) = rgbBuffer(cg)
         // open_clip transform.py has three resize_mode values; Immich's zoo
@@ -238,7 +265,6 @@ final class ZooCLIP {
     }
 
     func embedTextual(_ text: String) throws -> [Float] {
-        let session = textualSession
         // Exact immich_ml clean_text (+ canonicalize for SigLIP-family).
         var t = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         if canonicalize {
@@ -254,6 +280,11 @@ final class ZooCLIP {
             ids = Array(ids.prefix(contextLength - 1)) + [eot]
         }
         while ids.count < contextLength { ids.append(padId) }
+
+        if let native { return native.embedTextual(ids) }
+        guard let session = textualSession else {
+            throw PredictError(status: "500 Internal Server Error", message: "no textual backend (\(name))")
+        }
 
         func intTensor(_ v: [Int], type: Int) -> ORTSession.Tensor {
             type == 2 ? .int64(v.map(Int64.init), shape: [1, Int64(contextLength)])
@@ -412,7 +443,16 @@ final class ZooCLIP {
                     }
                     continue
                 }
-                do { _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp) } catch {
+                do {
+                    // replaceItemAt requires an atomic rename and throws
+                    // EXDEV ("Cross-device link") instead of falling back
+                    // when dst's volume differs from tmp's (any cache
+                    // directory on an external or secondary disk, not just
+                    // a theoretical case — verified on-device); moveItem
+                    // handles that cross-volume case correctly.
+                    try? FileManager.default.removeItem(at: dst)
+                    try FileManager.default.moveItem(at: tmp, to: dst)
+                } catch {
                     throw PredictError(status: "500 Internal Server Error",
                                        message: "model \(name): cannot store \(f) (\(error))")
                 }
