@@ -23,6 +23,8 @@ final class CLIPEncoder {
     // CGImage -> normalized patch matrix [49, 3072]. Matches mlx_clip's
     // img_processor: PIL-style bicubic resize (short side -> 224) then center
     // crop 224, rescale /255, normalize. Resize filter parity matters for CLIP.
+    // Row-parallel + unsafe-pointer-backed, same rationale as SigLIPNative's
+    // patches() (see that file and Resize.swift).
     private func patches(_ cg: CGImage) -> MLXArray {
         let S = Self.IMG
         let (full, w, h) = rgbBuffer(cg)
@@ -31,18 +33,28 @@ final class CLIPEncoder {
         let newH = w <= h ? Int(Double(S) * Double(h) / Double(short)) : S
         let resized = (newW == w && newH == h) ? full : Resize.bicubic(full, w: w, h: h, outW: newW, outH: newH)
         let left = (newW - S) / 2, top = (newH - S) / 2   // center crop 224x224
-        func px(_ c: Int, _ y: Int, _ x: Int) -> Float {
-            (Float(resized[((top + y) * newW + (left + x)) * 3 + c]) / 255.0 - Self.MEAN[c]) / Self.STD[c]
-        }
         let nP = S / Self.PATCH, dim = 3 * Self.PATCH * Self.PATCH
         var flat = [Float](repeating: 0, count: nP * nP * dim)
-        for pi in 0..<nP { for pj in 0..<nP {
-            let p = pi * nP + pj
-            for c in 0..<3 { for i in 0..<Self.PATCH { for j in 0..<Self.PATCH {
-                flat[p * dim + c * Self.PATCH * Self.PATCH + i * Self.PATCH + j] =
-                    px(c, pi * Self.PATCH + i, pj * Self.PATCH + j)
-            }}}
-        }}
+        let mean = Self.MEAN, std = Self.STD, P = Self.PATCH
+        resized.withUnsafeBufferPointer { src in
+            flat.withUnsafeMutableBufferPointer { dst in
+                DispatchQueue.concurrentPerform(iterations: nP) { pi in
+                    for pj in 0..<nP {
+                        let p = pi * nP + pj
+                        for c in 0..<3 {
+                            for i in 0..<P {
+                                let y = top + pi * P + i
+                                for j in 0..<P {
+                                    let x = left + pj * P + j
+                                    let v = Float(src[(y * newW + x) * 3 + c]) / 255.0
+                                    dst[p * dim + c * P * P + i * P + j] = (v - mean[c]) / std[c]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return MLXArray(flat, [nP * nP, dim])
     }
 
@@ -63,11 +75,13 @@ final class CLIPEncoder {
         return lin(o, w("\(p).out_proj.weight"), w("\(p).out_proj.bias"))
     }
 
-    // Concurrency: guarded by metalLock (GPULock.swift) — see that file.
+    // Concurrency: guarded by metalLock (GPULock.swift) — see that file. CPU-only
+    // patch extraction runs before the lock, same rationale as SigLIPNative.embedVisual.
     func embed(_ cg: CGImage) -> [Float] {
-        withMetalLock {
+        let patchInput = patches(cg)
+        return withMetalLock {
             let wPatch = w("vision_model.embeddings.patch_embedding.weight").reshaped([Self.H, 3 * Self.PATCH * Self.PATCH])
-            var x = matmul(patches(cg), wPatch.transposed())
+            var x = matmul(patchInput, wPatch.transposed())
             x = concatenated([w("vision_model.embeddings.class_embedding").reshaped([1, Self.H]), x], axis: 0)
             x = x + w("vision_model.embeddings.position_embedding.weight")
             x = ln(x, w("vision_model.pre_layrnorm.weight"), w("vision_model.pre_layrnorm.bias"))

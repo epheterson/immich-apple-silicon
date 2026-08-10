@@ -147,6 +147,11 @@ final class SigLIPNative {
     // image_size=384, which is misleading for a patch14 grid (384/14 isn't
     // integer) — Immich's preprocess_cfg.json is the ground truth for the
     // resize target, the HF vision config is not.
+    // Row-parallel (per patch-grid row) and unsafe-pointer-backed: this scalar
+    // im2col loop runs on every call, sized by the *source* image's patch grid,
+    // and was measured as a real chunk of latency alongside Resize.bicubic — see
+    // that file's doc comment. Same output as the previous bounds-checked
+    // sequential version, just faster on the M4's 10 cores.
     private func patches(_ cg: CGImage, targetSize: Int, mean: [Float], std: [Float]) -> MLXArray {
         let patch = cfg.visionPatch
         let grid = targetSize / patch
@@ -155,15 +160,22 @@ final class SigLIPNative {
             ? full : Resize.bicubic(full, w: iw, h: ih, outW: targetSize, outH: targetSize)
         let dim = 3 * patch * patch
         var flat = [Float](repeating: 0, count: grid * grid * dim)
-        for pi in 0 ..< grid {
-            for pj in 0 ..< grid {
-                let p = pi * grid + pj
-                for i in 0 ..< patch {
-                    for j in 0 ..< patch {
-                        let py = pi * patch + i, px = pj * patch + j
-                        for c in 0 ..< 3 {
-                            let v = Float(resized[(py * targetSize + px) * 3 + c]) / 255.0
-                            flat[p * dim + i * patch * 3 + j * 3 + c] = (v - mean[c]) / std[c]
+        resized.withUnsafeBufferPointer { src in
+            flat.withUnsafeMutableBufferPointer { dst in
+                DispatchQueue.concurrentPerform(iterations: grid) { pi in
+                    for pj in 0 ..< grid {
+                        let p = pi * grid + pj
+                        for i in 0 ..< patch {
+                            let py = pi * patch + i
+                            for j in 0 ..< patch {
+                                let px = pj * patch + j
+                                let srcBase = (py * targetSize + px) * 3
+                                let dstBase = p * dim + i * patch * 3 + j * 3
+                                for c in 0 ..< 3 {
+                                    let v = Float(src[srcBase + c]) / 255.0
+                                    dst[dstBase + c] = (v - mean[c]) / std[c]
+                                }
+                            }
                         }
                     }
                 }
@@ -188,12 +200,17 @@ final class SigLIPNative {
     // Concurrency: guarded by metalLock (GPULock.swift), the Swift-side
     // equivalent of the Python fork's gpu_lock — see that file for why.
     func embedVisual(_ cg: CGImage, targetSize: Int, mean: [Float], std: [Float]) -> [Float] {
-        withMetalLock {
+        // CPU-only (image decode, bicubic resize, im2col) — deliberately outside
+        // withMetalLock so up to Server.swift's maxConcurrent requests can prep
+        // their patch tensors in parallel; only the GPU submission below needs
+        // to be serialized against other Metal work (see GPULock.swift).
+        let patchInput = patches(cg, targetSize: targetSize, mean: mean, std: std)
+        return withMetalLock {
             Device.withDefaultDevice(.gpu) {
                 let tower = cfg.vision
                 let wPatch = w("vision_model.embeddings.patch_embedding.weight")
                     .reshaped([tower.hidden, 3 * cfg.visionPatch * cfg.visionPatch])
-                var x = matmul(patches(cg, targetSize: targetSize, mean: mean, std: std), wPatch.transposed())
+                var x = matmul(patchInput, wPatch.transposed())
                 x = x + w("vision_model.embeddings.patch_embedding.bias")
                 x = x + w("vision_model.embeddings.position_embedding.weight")
                 for l in 0 ..< tower.layers {
