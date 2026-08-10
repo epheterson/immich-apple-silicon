@@ -510,11 +510,12 @@ def _ensure_homebrew() -> str | None:
     for p in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]:
         if os.path.isfile(p):
             return p
-    try:
-        answer = input("  Homebrew not found. Install it? [Y/n] ").strip().lower()
-    except EOFError:
-        return None
-    if answer and answer != "y":
+    # Routed through _confirm so `--yes` reaches it. It used to call input()
+    # directly, which under the wizard's /dev/null stdin raised EOFError and
+    # returned None: the flag documented as "take the default answer" was
+    # silently answering no to every dependency install, so a Mac missing Node
+    # failed setup where the Terminal flow would have offered to fix it.
+    if not _confirm("  Homebrew not found. Install it? [Y/n] "):
         return None
     log.info("  Installing Homebrew...")
     result = subprocess.run(
@@ -540,15 +541,9 @@ def _brew_install(package: str) -> bool:
     if not brew:
         return False
 
-    try:
-        answer = (
-            input(f"  {package} not found. Install with Homebrew? [Y/n] ")
-            .strip()
-            .lower()
-        )
-    except EOFError:
-        return False
-    if answer and answer != "y":
+    # Same reason as _ensure_homebrew: `--yes` only reaches prompts that go
+    # through _confirm, and this one gates every dependency setup installs.
+    if not _confirm(f"  {package} not found. Install with Homebrew? [Y/n] "):
         return False
 
     log.info("  Installing %s...", package)
@@ -2679,9 +2674,7 @@ def _finalize_config(config: dict) -> None:
     plist_src = (
         Path(__file__).parent.parent / "launchd" / "com.immich.accelerator.plist"
     )
-    plist_dst = (
-        LAUNCH_AGENTS_DIR / "com.immich.accelerator.plist"
-    )
+    plist_dst = LAUNCH_AGENTS_DIR / "com.immich.accelerator.plist"
 
     if is_brew_install:
         log.info("")
@@ -3611,6 +3604,20 @@ def _setup_remote(args):
     version = info["version"]
     log.info("Found Immich v%s", version)
 
+    # A remote Immich cannot be configured without its database and Redis
+    # details, and there is no safe default for them: guessing localhost and a
+    # blank password would write a config that looks complete and fails on the
+    # first job. So refuse clearly rather than raising EOFError from input()
+    # when nothing can answer, which is what the setup wizard's /dev/null stdin
+    # produced: a Python traceback in the app's log pane.
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "Setting up from a remote Immich needs database and Redis details, "
+            "which cannot be answered without a terminal. Run "
+            f"`immich-accelerator setup --url {url}` in Terminal to finish this, "
+            "or use `setup --ml-only` if this Mac should only run machine learning."
+        )
+
     # Interactive prompts for DB/Redis connection
     log.info("")
     log.info("Enter connection details for the Immich database and Redis.")
@@ -4217,6 +4224,51 @@ def reconcile_ml(config: dict) -> None:
         log.info("  ML restarted (PID %d, %s)", pid, engine)
     else:
         log.error("  ML restart failed")
+
+
+def cmd_detect(_args):
+    """Report what Immich this Mac can see, as JSON. Changes nothing.
+
+    Exists for the setup wizard, which needs to know whether Immich is running
+    here in Docker or somewhere else. The app used to answer that by assumption:
+    it always passed --url, which routed every user down the remote path and
+    made the local Docker flow unreachable from the GUI entirely. Detection
+    belongs next to the code that acts on it, so the two cannot drift.
+
+    Deliberately never raises for "nothing found": absence is an answer the
+    caller has to render, not an error. Only the JSON goes to stdout, so the
+    caller can parse it without filtering log lines.
+    """
+    out: dict = {
+        "configured": CONFIG_FILE.exists(),
+        "docker": None,
+        "local": None,
+    }
+    docker = None
+    try:
+        docker = find_docker()
+        out["docker"] = docker
+    except RuntimeError as e:
+        out["docker_error"] = str(e)
+
+    if docker:
+        try:
+            info = detect_immich(docker)
+            out["local"] = {
+                "container": info.get("container"),
+                "version": info.get("version"),
+                "media_location": info.get("media_location"),
+                "workers_include": info.get("workers_include"),
+                "ml_url": info.get("ml_url"),
+                # The API is published on the host by every compose we generate
+                # and by Immich's own; the wizard shows this for confirmation
+                # rather than treating it as gospel.
+                "url": "http://localhost:2283",
+            }
+        except RuntimeError as e:
+            out["local_error"] = str(e)
+
+    print(json.dumps(out, indent=2))
 
 
 def reconcile_components(config: dict) -> None:
@@ -6037,6 +6089,10 @@ def build_parser() -> argparse.ArgumentParser:
         "ml-test",
         help="Diagnose the ML service (health + CLIP + OCR round-trip)",
     )
+    sub.add_parser(
+        "detect",
+        help="Report what Immich this Mac can see, as JSON (used by the setup wizard)",
+    )
     sub.add_parser("uninstall", help="Remove services, data, and launchd config")
 
     return parser
@@ -6067,6 +6123,7 @@ def main():
             "dashboard": cmd_dashboard,
             "component": cmd_component,
             "ml-test": cmd_ml_test,
+            "detect": cmd_detect,
             "uninstall": cmd_uninstall,
         }[args.command](args)
     except RuntimeError as e:

@@ -2858,6 +2858,122 @@ class TestWatchDispatch:
             assert m._watch_without_worker({"worker": False}) == m._SWITCH
 
 
+class TestDetect:
+    """`detect` answers the wizard's topology question.
+
+    The wizard used to answer it by assumption, always passing --url, which
+    routed every user to the remote setup path and made the local Docker flow
+    unreachable from the app. Detection lives in the CLI so the thing that
+    decides and the thing that acts cannot drift apart.
+    """
+
+    def _run(self, m, capsys) -> dict:
+        m.cmd_detect(argparse.Namespace())
+        return json.loads(capsys.readouterr().out)
+
+    def test_reports_a_local_immich(self, tmp_data_dir, capsys):
+        import immich_accelerator.__main__ as m
+
+        found = {
+            "container": "immich_server",
+            "version": "3.0.2",
+            "media_location": "/nas/immich",
+            "workers_include": "api",
+            "ml_url": "http://host.docker.internal:3003",
+        }
+        with patch.object(
+            m, "find_docker", return_value="/usr/bin/docker"
+        ), patch.object(m, "detect_immich", return_value=found):
+            out = self._run(m, capsys)
+        assert out["local"]["version"] == "3.0.2"
+        assert out["local"]["media_location"] == "/nas/immich"
+        assert "local_error" not in out
+
+    def test_no_docker_is_an_answer_not_an_error(self, tmp_data_dir, capsys):
+        """A Mac with no Docker is the ML-only case, which is supported."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "find_docker", side_effect=RuntimeError("Docker not found")
+        ):
+            out = self._run(m, capsys)
+        assert out["docker"] is None
+        assert out["local"] is None
+        assert "Docker not found" in out["docker_error"]
+
+    def test_docker_without_immich_is_reported_distinctly(self, tmp_data_dir, capsys):
+        """Docker running but no Immich is a different fix from no Docker, so
+        the wizard has to be able to tell them apart."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "find_docker", return_value="/usr/bin/docker"
+        ), patch.object(
+            m, "detect_immich", side_effect=RuntimeError("No Immich server container")
+        ):
+            out = self._run(m, capsys)
+        assert out["docker"] == "/usr/bin/docker"
+        assert out["local"] is None
+        assert "No Immich server container" in out["local_error"]
+
+    def test_reports_whether_this_mac_is_already_configured(self, tmp_data_dir, capsys):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "find_docker", side_effect=RuntimeError("no docker")):
+            assert self._run(m, capsys)["configured"] is False
+            tmp_data_dir["config_file"].write_text("{}")
+            assert self._run(m, capsys)["configured"] is True
+
+    def test_output_is_only_json(self, tmp_data_dir, capsys):
+        """The wizard parses stdout, so a stray log line would break it."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "find_docker", return_value="/usr/bin/docker"
+        ), patch.object(m, "detect_immich", side_effect=RuntimeError("nope")):
+            m.cmd_detect(argparse.Namespace())
+        assert json.loads(capsys.readouterr().out)  # parses whole, no prefix
+
+
+class TestRemoteSetupWithoutATerminal:
+    """The wizard runs setup with stdin on /dev/null.
+
+    `_setup_remote` asks for Postgres and Redis details, and there is no safe
+    default: guessing localhost and a blank password writes a config that looks
+    complete and fails on the first job. It used to reach `input()` anyway and
+    raise EOFError, which surfaced as a Python traceback in the app's log pane.
+    """
+
+    def test_refuses_clearly_instead_of_raising_eoferror(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        args = argparse.Namespace(url="http://nas.local:2283", api_key="k")
+        with patch.object(
+            m, "_query_immich_api", return_value={"version": "3.0.2"}
+        ), patch.object(m.sys.stdin, "isatty", return_value=False):
+            with pytest.raises(RuntimeError) as e:
+                m._setup_remote(args)
+
+        said = str(e.value)
+        assert "terminal" in said.lower()
+        assert "--ml-only" in said, "must name the option that does work headlessly"
+
+    def test_a_terminal_still_prompts(self, tmp_data_dir):
+        """The guard must not break the ordinary Terminal flow."""
+        import immich_accelerator.__main__ as m
+
+        args = argparse.Namespace(url="http://nas.local:2283", api_key="k")
+        with patch.object(
+            m, "_query_immich_api", return_value={"version": "3.0.2"}
+        ), patch.object(m.sys.stdin, "isatty", return_value=True), patch(
+            "builtins.input", side_effect=EOFError
+        ):
+            # Reaching input() at all is the proof; EOFError here is the test
+            # harness, not the guard.
+            with pytest.raises(EOFError):
+                m._setup_remote(args)
+
+
 class TestReconcileML:
     """reconcile_ml: the ML half of the one-enforcement-point rule."""
 
