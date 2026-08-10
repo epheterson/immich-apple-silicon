@@ -424,21 +424,48 @@ final class SigLIPNative {
         var completed = 0
         for (start, end) in ranges {
             group.enter()
-            fetchRange(session: session, url: url, start: start, end: end) { data, err in
-                defer { group.leave() }
-                guard let data else {
-                    errorLock.lock(); if firstError == nil { firstError = err }; errorLock.unlock()
-                    return
-                }
-                writeLock.lock()
-                defer { writeLock.unlock() }
-                do {
-                    try handle.seek(toOffset: UInt64(start))
-                    try handle.write(contentsOf: data)
-                    completed += 1
-                    ZooCLIP.setProgress(.init(model: name, done: completed, total: ranges.count))
-                } catch {
-                    errorLock.lock(); if firstError == nil { firstError = error }; errorLock.unlock()
+            // Dispatched, not called inline. fetchRange blocks its caller until
+            // the transfer finishes, so running it in this loop made "8x
+            // parallel" strictly sequential: every group.leave() had already
+            // run by the time group.wait() was reached, and a 4.5GB checkpoint
+            // took the full single-stream time while the label claimed
+            // otherwise.
+            DispatchQueue.global().async {
+                fetchRange(session: session, url: url, start: start, end: end) { data, err in
+                    defer { group.leave() }
+                    guard let data else {
+                        errorLock.lock(); if firstError == nil { firstError = err }; errorLock.unlock()
+                        return
+                    }
+                    // A 206 is not a promise that the bytes are the ones asked
+                    // for. Unchecked, a short or shifted chunk left the
+                    // preallocated file's zeros in place, still counted as
+                    // completed, and got published as model.safetensors — which
+                    // then passes the size>0 cache check forever, so the model
+                    // either fails to load on every start or loads and writes
+                    // garbage embeddings into Immich's search index.
+                    let expected = end - start + 1
+                    guard data.count == expected else {
+                        errorLock.lock()
+                        if firstError == nil {
+                            firstError = PredictError(
+                                status: "500 Internal Server Error",
+                                message: "\(name): range \(start)-\(end) returned "
+                                    + "\(data.count) bytes, expected \(expected)")
+                        }
+                        errorLock.unlock()
+                        return
+                    }
+                    writeLock.lock()
+                    defer { writeLock.unlock() }
+                    do {
+                        try handle.seek(toOffset: UInt64(start))
+                        try handle.write(contentsOf: data)
+                        completed += 1
+                        ZooCLIP.setProgress(.init(model: name, done: completed, total: ranges.count))
+                    } catch {
+                        errorLock.lock(); if firstError == nil { firstError = error }; errorLock.unlock()
+                    }
                 }
             }
         }
@@ -463,12 +490,33 @@ final class SigLIPNative {
         for attempt in 1...3 {
             let sem = DispatchSemaphore(value: 0)
             var result: Data?
+            var ignoredRange = false
             session.dataTask(with: req) { data, resp, err in
-                if (resp as? HTTPURLResponse)?.statusCode == 206 { result = data } else { lastError = err }
+                let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if status == 206 {
+                    result = data
+                } else if status == 200 {
+                    // The Range header was ignored and the whole file came
+                    // back. contentLength() gates on the origin's
+                    // Accept-Ranges, which says nothing about what a proxy in
+                    // between does. Retrying cannot help and is ruinously
+                    // expensive: each of 8 chunks would pull the entire
+                    // multi-gigabyte file three times before the ranged path
+                    // gave up, so give up now and let the single-connection
+                    // fallback do it once.
+                    ignoredRange = true
+                } else {
+                    lastError = err
+                }
                 sem.signal()
             }.resume()
             sem.wait()
             if let result { completion(result, nil); return }
+            if ignoredRange {
+                completion(nil, PredictError(status: "500 Internal Server Error",
+                                             message: "server ignored Range (200), falling back"))
+                return
+            }
             if attempt < 3 { Thread.sleep(forTimeInterval: Double(attempt) * 2) }
         }
         completion(nil, lastError ?? PredictError(status: "500 Internal Server Error",

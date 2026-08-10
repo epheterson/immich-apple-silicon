@@ -85,7 +85,6 @@ final class ZooCLIP {
         }
         self.name = name
         dir = Self.zooDir.appendingPathComponent(name)
-        try Self.ensureFiles(name: name, dir: dir)
 
         // Benchmark-only escape hatch (scripts/native-ml-siglip-benchmark.py):
         // run a SigLIPRegistry model through the onnxruntime branch anyway, so
@@ -94,6 +93,16 @@ final class ZooCLIP {
         // model, not a separately-written comparison harness. Never set in
         // production; unset behaves exactly as before.
         let forceONNX = ProcessInfo.processInfo.environment["ZOOCLIP_FORCE_ONNX"] == "1"
+
+        // Decided before anything is fetched, because it decides what to fetch.
+        // This used to run after ensureFiles, so every native model downloaded
+        // both ONNX towers and then never opened them: on base and large SigLIP
+        // scales the weights live inside model.onnx itself, so first use pulled
+        // the towers and the fp32 safetensors, roughly double the bytes and
+        // double the permanent cache, with Immich's jobs timing out against a
+        // wait twice as long as it needed to be.
+        let useNative = SigLIPRegistry.config(for: name) != nil && !forceONNX
+        try Self.ensureFiles(name: name, dir: dir, needsONNX: !useNative)
 
         // Large models keep their weights in external data files beside
         // model.onnx (#116). Resolve those once per model; the marker keeps a
@@ -111,7 +120,7 @@ final class ZooCLIP {
         // straight from the model's HF owner, see SigLIPNative), not this
         // model's ONNX weights — skip fetching several GB of external data
         // that would go unused.
-        if (SigLIPRegistry.config(for: name) == nil || forceONNX), !FileManager.default.fileExists(atPath: marker.path) {
+        if !useNative, !FileManager.default.fileExists(atPath: marker.path) {
             if let external = Self.externalDataFiles(name: name) {
                 if !external.isEmpty {
                     print("[native-ml] \(name): fetching \(external.count) external data files")
@@ -179,7 +188,10 @@ final class ZooCLIP {
                                message: "model \(name): tokenizer unsupported (\(String(describing: loadError)))")
         }
 
-        if let sig = SigLIPRegistry.config(for: name), !forceONNX {
+        // Same condition as the fetch decision above, expressed through the
+        // same flag: if these two ever disagree, one of them downloads files
+        // the other never opens, or opens files that were never downloaded.
+        if useNative, let sig = SigLIPRegistry.config(for: name) {
             native = try SigLIPNative(config: sig, weightsPath: SigLIPNative.ensureWeights(hfRepo: sig.hfRepo, name: name))
             visualSession = nil
             textualSession = nil
@@ -384,11 +396,17 @@ final class ZooCLIP {
         progressLock.lock(); _progress = p; progressLock.unlock()
     }
 
-    static func ensureFiles(name: String, dir: URL, extra: [String] = []) throws {
-        let all = files + extra
+    // needsONNX: false fetches only the metadata the native mlx path uses
+    // (config, preprocess_cfg, tokenizer). The two model.onnx towers are the
+    // large half of this list and are dead weight for a model that will be
+    // served from its own safetensors checkpoint.
+    static func ensureFiles(name: String, dir: URL, extra: [String] = [],
+                            needsONNX: Bool = true) throws {
+        let base = needsONNX ? files : files.filter { !$0.hasSuffix("model.onnx") }
+        let all = base + extra
         // Only advertise a fetch worth reporting: the fixed handful is quick,
         // the external-data pass is the one measured in gigabytes.
-        let reportable = all.count > files.count
+        let reportable = all.count > base.count
         var completed = 0
         if reportable { setProgress(FetchProgress(model: name, done: 0, total: all.count)) }
         defer { if reportable { setProgress(nil) } }
