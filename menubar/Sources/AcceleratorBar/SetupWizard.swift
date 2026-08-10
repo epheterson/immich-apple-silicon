@@ -18,7 +18,18 @@ import SwiftUI
 @MainActor
 final class WizardModel: ObservableObject {
     enum Step: Int, CaseIterable {
-        case role, connect, install, run, verify
+        case role, where_, connect, install, run, verify
+    }
+
+    /// Where Immich itself runs. This is the question the wizard never asked,
+    /// and getting it wrong is not cosmetic: `cmd_setup` dispatches on whether
+    /// a URL was supplied, so always sending one routed every user to the
+    /// split-deployment path and made the local Docker flow — the primary
+    /// documented topology, the one that reads DB credentials straight out of
+    /// the container — unreachable from the app.
+    enum Location {
+        case here      // Docker on this Mac; the CLI detects everything
+        case remote    // another machine; needs URL + API key
     }
 
     enum Role: String {
@@ -48,6 +59,14 @@ final class WizardModel: ObservableObject {
 
     @Published var step: Step = .role
     @Published var role: Role = .everything
+    /// nil until we know, either because detection has not run or because it
+    /// could not answer (an older CLI with no `detect`, Docker unreachable).
+    /// Deliberately not defaulted: guessing wrong here is what routed everyone
+    /// down the remote path, so an unknown answer asks rather than assumes.
+    @Published var location: Location?
+    @Published var detecting = false
+    /// Whatever `immich-accelerator detect` last reported. nil = not asked yet.
+    @Published var detected: Detection?
     @Published var url = ""
     @Published var apiKey = ""
 
@@ -65,6 +84,15 @@ final class WizardModel: ObservableObject {
 
     init(model: StatusModel) {
         self.model = model
+        // Lets `render wizard:<step>` capture any screen, not just the first.
+        // Every step after the first is otherwise unreachable headlessly, which
+        // is how a dead-ended Install step and an unasked topology question
+        // both shipped unlooked-at. Dev/CI only; unset in every real launch.
+        if let want = ProcessInfo.processInfo.environment["ACCEL_WIZARD_STEP"],
+           let target = Step.allCases.first(where: { "\($0)" == want || "\($0)" == want + "_" }) {
+            step = target
+            if target == .connect { location = .remote }   // that step only exists for remote
+        }
     }
 
     /// The steps this run will actually visit. ML-only skips Connect entirely,
@@ -72,22 +100,50 @@ final class WizardModel: ObservableObject {
     /// it, so it needs no URL and no key.
     var steps: [Step] {
         var out: [Step] = [.role]
-        if role == .everything { out.append(.connect) }
-        if !Paths.isInstalled { out.append(.install) }
+        if role == .everything { out += [.where_, .connect] }
+        if needsInstall { out.append(.install) }
         out += [.run, .verify]
         return out
+    }
+
+    /// Captured once, not re-read from the filesystem on every access.
+    ///
+    /// `steps` used to ask `Paths.isInstalled` each time it was evaluated, so
+    /// installing the formula removed `.install` from the array while the user
+    /// was standing on it. `advance()` then looked for the current step in a
+    /// list that no longer contained it, found nothing, and returned: the
+    /// wizard dead-ended on its own success, and the only way out was the skip
+    /// button, which closed it without ever running setup.
+    @Published private(set) var needsInstall = !Paths.isInstalled
+
+    struct Detection {
+        /// True when the CLI answered at all. False means we do not know, which
+        /// is different from knowing there is nothing here.
+        var askedSuccessfully = false
+        var dockerFound = false
+        var immichVersion: String?
+        var mediaLocation: String?
+        var note: String?          // why nothing was found, in the CLI's words
+        var foundLocalImmich: Bool { immichVersion != nil }
+    }
+
+    /// Connect is only meaningful for a server on another machine. A local
+    /// Docker Immich needs no URL and no key from the user: the CLI reads both
+    /// out of the container.
+    var visibleSteps: [Step] {
+        steps.filter { $0 != .connect || location != .here }
     }
 
     var canGoBack: Bool { step != .role && !working }
 
     func advance() {
-        guard let i = steps.firstIndex(of: step), i + 1 < steps.count else { return }
-        step = steps[i + 1]
+        guard let i = visibleSteps.firstIndex(of: step), i + 1 < visibleSteps.count else { return }
+        step = visibleSteps[i + 1]
     }
 
     func goBack() {
-        guard let i = steps.firstIndex(of: step), i > 0 else { return }
-        step = steps[i - 1]
+        guard let i = visibleSteps.firstIndex(of: step), i > 0 else { return }
+        step = visibleSteps[i - 1]
     }
 
     // MARK: - probing
@@ -160,15 +216,44 @@ final class WizardModel: ObservableObject {
         }
         working = false
         failed = !ok
-        if ok { advance() }
+        if ok {
+            // Advance BEFORE clearing needsInstall: advance() walks
+            // visibleSteps, and dropping .install first would remove the step
+            // we are standing on, which is exactly the dead-end this had.
+            advance()
+            needsInstall = false
+        }
+    }
+
+    /// Ask the CLI what it can see. Never fails the flow: not finding Immich is
+    /// an answer (that is the remote case, and the ML-only case), not an error.
+    func detect() async {
+        detecting = true
+        defer { detecting = false }
+        let d = await Actions.detect()
+        detected = d
+        // Only preselect. The user can always override, because a Mac can have
+        // a local Immich and still be pointed at a different one.
+        // Preselect only on evidence. "Found Immich here" and "asked and there
+        // is none" are both answers; "could not ask" is not, and it must not
+        // silently become "remote".
+        if d.foundLocalImmich {
+            location = .here
+        } else if d.askedSuccessfully {
+            location = .remote
+        }
     }
 
     func runSetup() async {
         working = true
         failed = false
         log = []
+        // The URL is what dispatches cmd_setup. Sending one for a local
+        // Docker Immich would take the split-deployment path and ask the CLI
+        // to hand-configure what it can read out of the container.
+        let sendURL = (role == .everything && location == .some(.remote)) ? normalizedURL : ""
         let ok = await Actions.runSetup(
-            url: normalizedURL, apiKey: apiKey, mlOnly: role == .mlOnly
+            url: sendURL, apiKey: sendURL.isEmpty ? "" : apiKey, mlOnly: role == .mlOnly
         ) { line in
             Task { @MainActor in self.log.append(line) }
         }
@@ -215,7 +300,7 @@ struct SetupWizard: View {
                 Text(stepBlurb).font(.rowDetail).foregroundStyle(.secondary)
             }
             Spacer()
-            StepDots(steps: wiz.steps, current: wiz.step)
+            StepDots(steps: wiz.visibleSteps, current: wiz.step)
         }
         .padding(.horizontal, Metrics.xxl)
         .padding(.vertical, Metrics.xl)
@@ -224,7 +309,8 @@ struct SetupWizard: View {
     private var stepBlurb: String {
         switch wiz.step {
         case .role: return "What should this Mac do?"
-        case .connect: return "Where is Immich?"
+        case .where_: return "Where is Immich?"
+        case .connect: return "Connect to Immich"
         case .install: return "Install the accelerator"
         case .run: return "Setting things up"
         case .verify: return "Checking it works"
@@ -235,6 +321,7 @@ struct SetupWizard: View {
     private var content: some View {
         switch wiz.step {
         case .role: roleStep
+        case .where_: whereStep
         case .connect: connectStep
         case .install: installStep
         case .run: runStep
@@ -243,6 +330,45 @@ struct SetupWizard: View {
     }
 
     // MARK: - steps
+
+    /// The question the wizard never asked. Immich on this Mac in Docker is the
+    /// primary documented topology and the one the CLI handles best: it reads
+    /// the database and Redis credentials straight out of the running
+    /// container. Sending a URL instead routes setup down the split-deployment
+    /// path and asks the user to type all of that by hand.
+    private var whereStep: some View {
+        VStack(alignment: .leading, spacing: Metrics.lg) {
+            if wiz.detecting {
+                HStack(spacing: Metrics.sm) {
+                    ProgressView().controlSize(.small)
+                    Text("Looking for Immich on this Mac…").foregroundStyle(.secondary)
+                }
+            }
+
+            LocationCard(
+                title: "On this Mac",
+                blurb: wiz.detected?.foundLocalImmich == true
+                    ? "Found Immich \(wiz.detected?.immichVersion ?? "") running in Docker. Setup will read its settings from the container, so there is nothing to type."
+                    : "Immich runs in Docker here. Setup will find it and read its settings from the container.",
+                symbol: "desktopcomputer",
+                selected: wiz.location == .some(.here),
+                recommended: wiz.detected?.foundLocalImmich == true
+            ) { wiz.location = .here }
+
+            LocationCard(
+                title: "On another machine",
+                blurb: "A NAS or another server runs Immich. This Mac needs its address and an API key, and needs to reach the same library files.",
+                symbol: "network",
+                selected: wiz.location == .some(.remote),
+                recommended: false
+            ) { wiz.location = .remote }
+
+            if let note = wiz.detected?.note, wiz.detected?.foundLocalImmich != true {
+                FailureNote(text: note)
+            }
+        }
+        .task { if wiz.detected == nil { await wiz.detect() } }
+    }
 
     private var roleStep: some View {
         VStack(alignment: .leading, spacing: Metrics.lg) {
@@ -404,6 +530,10 @@ struct SetupWizard: View {
             Button(wiz.connectReady ? "Continue" : "Continue anyway") { wiz.advance() }
                 .keyboardShortcut(.defaultAction)
                 .disabled(wiz.normalizedURL.isEmpty)
+        case .where_:
+            Button("Continue") { wiz.advance() }
+                .keyboardShortcut(.defaultAction)
+                .disabled(wiz.detecting || wiz.location == nil)
         case .install:
             Button(wiz.working ? "Installing…" : (wiz.failed ? "Try again" : "Install")) {
                 Task { await wiz.installAccelerator() }
@@ -429,6 +559,55 @@ struct SetupWizard: View {
 }
 
 // MARK: - pieces
+
+private struct LocationCard: View {
+    let title: String
+    let blurb: String
+    let symbol: String
+    let selected: Bool
+    let recommended: Bool
+    let pick: () -> Void
+
+    var body: some View {
+        Button(action: pick) {
+            HStack(alignment: .top, spacing: Metrics.md) {
+                Image(systemName: symbol)
+                    .font(.system(size: 22))
+                    .frame(width: 34)
+                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: Metrics.sm) {
+                        Text(title).font(.headline)
+                        if recommended {
+                            Text("Detected")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(Color.accentColor.opacity(0.15), in: Capsule())
+                                .foregroundStyle(Color.accentColor)
+                        }
+                    }
+                    Text(blurb)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(Metrics.md)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(selected ? Color.accentColor.opacity(0.10) : Color.secondary.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(selected ? Color.accentColor : Color.secondary.opacity(0.25),
+                                  lineWidth: selected ? 2 : 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
 
 private struct RoleCard: View {
     let role: WizardModel.Role

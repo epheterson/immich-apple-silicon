@@ -104,6 +104,38 @@ enum Actions {
         return Paths.isInstalled
     }
 
+    /// Ask the CLI what Immich this Mac can see.
+    ///
+    /// The wizard needs to know whether Immich runs here in Docker or
+    /// elsewhere, and the app must not answer that itself: `cmd_setup`
+    /// dispatches on it, so a second implementation here could disagree with
+    /// the one that acts. `detect` changes nothing and prints only JSON.
+    static func detect() async -> WizardModel.Detection {
+        guard Paths.isInstalled else {
+            return .init(note: "The accelerator command line isn't installed yet, so nothing can be detected until it is.")
+        }
+        let (code, out) = await run(cli, ["detect"])
+        guard code == 0,
+              let data = out.data(using: .utf8),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            // Almost always an installed core older than this app, which has no
+            // `detect` subcommand. Say so instead of quietly guessing, because
+            // the guess used to be "remote" for everybody.
+            return .init(note: "This version of the accelerator can't report what's running on this Mac. Choose below.")
+        }
+        var d = WizardModel.Detection(askedSuccessfully: true)
+        d.dockerFound = json["docker"] is String
+        if let local = json["local"] as? [String: Any] {
+            d.immichVersion = local["version"] as? String
+            d.mediaLocation = local["media_location"] as? String
+        }
+        // The CLI's own wording, so the screen says the same thing the terminal
+        // would rather than a second guess at the cause.
+        d.note = (json["local_error"] as? String) ?? (json["docker_error"] as? String)
+        return d
+    }
+
     /// Run setup non-interactively and stream it. `--yes` is what makes this
     /// possible at all; without it every prompt reads EOF and answers no,
     /// including "start now?".
@@ -114,8 +146,11 @@ enum Actions {
         var args = ["setup", "--yes"]
         if mlOnly {
             args.append("--ml-only")
-        } else {
-            if !url.isEmpty { args += ["--url", url] }
+        } else if !url.isEmpty {
+            // Only for a server on another machine. With no --url, cmd_setup
+            // takes the local Docker path and reads the database and Redis
+            // credentials out of the running container instead of asking.
+            args += ["--url", url]
             if !apiKey.isEmpty { args += ["--api-key", apiKey] }
         }
         let code = await stream(cli, args, onLine: onLine)
@@ -144,10 +179,27 @@ enum Actions {
         guard known.contains(where: { obj[$0] != nil }) else { throw ConfigError.notOurs }
         try FileManager.default.createDirectory(
             at: Paths.dataDir, withIntermediateDirectories: true)
-        if FileManager.default.fileExists(atPath: Paths.configFile.path) {
-            try FileManager.default.removeItem(at: Paths.configFile)
+
+        // Staged, not deleted-then-copied. The old order removed the live
+        // config first, so a copy that failed afterwards (the backup living on
+        // a volume that went away between the read above and the write, say)
+        // left the Mac with no config at all and no way back. Write the
+        // replacement beside it, permission it, and only then swap.
+        let staged = Paths.configFile.deletingLastPathComponent()
+            .appendingPathComponent(".config-restore-\(UUID().uuidString).json")
+        try data.write(to: staged, options: .atomic)
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: staged.path)
+        do {
+            if FileManager.default.fileExists(atPath: Paths.configFile.path) {
+                _ = try FileManager.default.replaceItemAt(Paths.configFile, withItemAt: staged)
+            } else {
+                try FileManager.default.moveItem(at: staged, to: Paths.configFile)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: staged)
+            throw error
         }
-        try FileManager.default.copyItem(at: url, to: Paths.configFile)
         try? FileManager.default.setAttributes(
             [.posixPermissions: 0o600], ofItemAtPath: Paths.configFile.path)
     }

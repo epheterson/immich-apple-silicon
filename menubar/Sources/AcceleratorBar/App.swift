@@ -47,7 +47,11 @@ struct AcceleratorBarMain {
         // "wizard" renders the setup flow instead of Settings, so the first-run
         // experience can be looked at on the release machine too. It is the
         // screen most users see exactly once and we see least often.
-        let host: NSViewController = pane == "wizard"
+        // "wizard:where" renders that step directly; see WizardModel.init.
+        if pane.hasPrefix("wizard:") {
+            setenv("ACCEL_WIZARD_STEP", String(pane.dropFirst("wizard:".count)), 1)
+        }
+        let host: NSViewController = pane.hasPrefix("wizard")
             ? NSHostingController(rootView: SetupWizard(model: .shared))
             : NSHostingController(rootView: SettingsView(model: .shared))
         let window = NSWindow(contentViewController: host)
