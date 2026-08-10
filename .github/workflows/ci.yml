@@ -23,6 +23,47 @@ jobs:
           pip install pytest
           pytest -v -m "not slow"
 
+  version-bump:
+    # Merging to main is releasing: auto-tag cuts a tag from VERSION and
+    # publishes the matching CHANGELOG section verbatim as the release notes.
+    # So a PR that changes main without moving VERSION either ships silently
+    # under the previous version's notes, or ships nothing at all.
+    #
+    # Fork PRs are exempt on purpose. A contributor cannot know which release
+    # their work lands in, and racing two of them to the same number is a
+    # conflict for no reason. They merge unversioned and our own release PR
+    # does the bump, which is how 1.10.0 shipped #121, #122 and #123.
+    #
+    # Only the "did VERSION move" half lives here. That VERSION has a matching
+    # CHANGELOG heading, that it is the newest one, and that no released tag
+    # ever lost its heading are all asserted by tests/test_release_hygiene.py,
+    # which the lint job already runs.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: VERSION must move past the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          BASE=$(git show FETCH_HEAD:VERSION | tr -d '[:space:]')
+          HEAD=$(tr -d '[:space:]' < VERSION)
+          echo "base ${BASE} -> head ${HEAD}"
+          if [ "$BASE" = "$HEAD" ]; then
+            echo "::error::VERSION is still ${HEAD}. Every merge to main is a release: bump VERSION and add the matching CHANGELOG section, which becomes the published release notes."
+            exit 1
+          fi
+          # A version that moved backwards would tag an older release over a
+          # newer one, so require an actual increase rather than any change.
+          if [ "$(printf '%s\n%s\n' "$BASE" "$HEAD" | sort -V | tail -1)" != "$HEAD" ]; then
+            echo "::error::VERSION went backwards, ${BASE} -> ${HEAD}."
+            exit 1
+          fi
+
   native-ml-build:
     # Compile the native ML engine on every pull request that touches it.
     #
