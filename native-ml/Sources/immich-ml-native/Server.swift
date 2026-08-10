@@ -83,14 +83,24 @@ private func handle(_ conn: NWConnection, method: String, path: String, ctype: S
         }
         respondJSON(conn, status: "200 OK", object: health)
     case "/predict":
+        // Mirrors ml/src/main.py's request-logging middleware + _process_predict
+        // line-for-line (see Predict.swift for the rest): same message content,
+        // just prefixed with [native-ml] instead of the python logger's
+        // "TIMESTAMP - src.main - INFO -" preamble. Skips /ping and /health,
+        // which are polled every few seconds and would just be noise.
+        print("[native-ml] \(method) /predict")
         guard let boundary = ctype.range(of: "boundary=").map({
             String(ctype[$0.upperBound...]).trimmingCharacters(in: .whitespaces)
         }) else {
             respondJSON(conn, status: "400 Bad Request", object: ["detail": "expected multipart/form-data"]); return
         }
         guard let entriesData = extractPart(body, boundary: boundary, name: "entries"),
-              let entriesStr = String(data: entriesData, encoding: .utf8),
-              let entries = (try? JSONSerialization.jsonObject(with: Data(entriesStr.utf8))) as? [String: Any] else {
+              let entriesStr = String(data: entriesData, encoding: .utf8) else {
+            respondJSON(conn, status: "422 Unprocessable Entity", object: ["detail": "missing entries field"]); return
+        }
+        print("[native-ml] entries raw: \(entriesStr)")
+        guard let entries = (try? JSONSerialization.jsonObject(with: Data(entriesStr.utf8))) as? [String: Any] else {
+            print("[native-ml] Invalid entries JSON")
             respondJSON(conn, status: "422 Unprocessable Entity", object: ["detail": "invalid entries JSON"]); return
         }
         let image = extractPart(body, boundary: boundary, name: "image")
