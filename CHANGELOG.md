@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Some videos never got a thumbnail.** ffmpeg's HEVC decoder can hard-reject a stream (real HDR10/BT.2020 phone footage) that macOS's native AVFoundation decodes fine — confirmed not jellyfin-ffmpeg-specific, since a stock Homebrew ffmpeg build fails identically. The ffmpeg wrapper now falls back to QuickLook for a single-frame thumbnail extraction that fails this way; never fires for a full video transcode.
+
 ## 1.9.0 - 2026-08-07
 
 ### Added

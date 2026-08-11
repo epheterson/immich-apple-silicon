@@ -1632,6 +1632,206 @@ class TestHeicDecodeShim:
         ), "existing VIPSHOME must be preserved"
 
 
+class TestFfmpegWrapperQuickLookFallback:
+    """ffmpeg's own HEVC decoder can hard-reject a stream (e.g. real HDR10/
+    BT.2020 phone footage) that macOS's native AVFoundation decodes fine.
+    The wrapper retries a failed single-frame thumbnail extraction via
+    QuickLook before giving up. These drive the wrapper directly with stub
+    ffmpeg/qlmanage/vips binaries — the real decoders are verified on-device.
+    """
+
+    WRAPPER = REPO_ROOT / "immich_accelerator" / "ffmpeg-wrapper.sh"
+
+    # Args shaped like Immich's own video-thumbnail transcode call
+    # (BaseConfig.getBaseOutputOptions / ThumbnailConfig.getFilterOptions):
+    # `-frames:v 1` marks a single-frame extraction, `scale=...` carries the
+    # target pixel size, and the output path is always the last argument.
+    def _thumbnail_args(self, input_path, output_path, scale="-2:250"):
+        return [
+            "-skip_frame", "nointra",
+            "-i", str(input_path),
+            "-fps_mode", "vfr", "-frames:v", "1", "-update", "1",
+            "-vf", f"scale={scale}",
+            "-f", "image2", str(output_path),
+        ]
+
+    def _bash_stub(self, path_, body):
+        path_.write_text("#!/bin/bash\n" + body)
+        path_.chmod(0o755)
+
+    def _prepare_wrapper(self, tmp_path, real_ffmpeg):
+        # Mirror __main__.py's own deploy-time substitution exactly, so the
+        # tested form matches what actually ships rather than the checked-in
+        # placeholder.
+        content = self.WRAPPER.read_text().replace(
+            'REAL_FFMPEG="/opt/homebrew/bin/ffmpeg"',
+            f'REAL_FFMPEG="{real_ffmpeg}"',
+        )
+        assert 'REAL_FFMPEG="' + str(real_ffmpeg) in content, (
+            "substitution didn't take — the placeholder string in the "
+            "wrapper no longer matches what __main__.py replaces"
+        )
+        dst = tmp_path / "ffmpeg-wrapper-under-test.sh"
+        dst.write_text(content)
+        dst.chmod(0o755)
+        return dst
+
+    # A qlmanage stub that mimics real behavior closely enough for the
+    # wrapper's own logic: it writes `<outdir>/<basename(input)>.png`,
+    # discovered by parsing `-o <dir>` and taking the last arg as input,
+    # exactly like the real `qlmanage -t -s N -o DIR INPUT` invocation.
+    _QLMANAGE_SUCCEEDS = (
+        'dir=""; prev=""\n'
+        'for a in "$@"; do [[ "$prev" == "-o" ]] && dir="$a"; prev="$a"; done\n'
+        'input="${@: -1}"\n'
+        'echo FAKEPNG > "$dir/$(basename "$input").png"\n'
+    )
+    _QLMANAGE_FAILS = "exit 1\n"
+
+    # The real call is `"$VIPS_BIN" copy "$QL_RESULT" "$OUTPUT"`.
+    _VIPS_COPY = 'cp "$2" "$3"\n'
+
+    def test_successful_ffmpeg_call_passes_through_unchanged(self, tmp_path):
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "exit 0\n")
+        ql_marker = tmp_path / "qlmanage_ran"
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, f"touch {ql_marker}\nexit 1\n")
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        args = self._thumbnail_args(tmp_path / "in.mp4", tmp_path / "out.jpg")
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not ql_marker.exists(), "fallback must not run when ffmpeg succeeds"
+
+    def test_full_transcode_failure_does_not_trigger_fallback(self, tmp_path):
+        """A full transcode (no `-frames:v 1`) has no single "the frame" for
+        QuickLook to hand back — the fallback must never fire for it, and
+        ffmpeg's real exit code must propagate unchanged."""
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "exit 69\n")
+        ql_marker = tmp_path / "qlmanage_ran"
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, f"touch {ql_marker}\n" + self._QLMANAGE_SUCCEEDS)
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        output = tmp_path / "out.mp4"
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), "-i", str(tmp_path / "in.mp4"),
+             "-c:v", "libx264", "-c:a", "aac", str(output)],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 69, (
+            f"real ffmpeg exit code must propagate; got {result.returncode}"
+        )
+        assert not ql_marker.exists(), "fallback must not run for a full transcode"
+        assert not output.exists()
+
+    def test_single_frame_failure_recovers_via_quicklook_fallback(self, tmp_path):
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "exit 69\n")
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
+        vips = tmp_path / "vips_stub.sh"
+        self._bash_stub(vips, self._VIPS_COPY)
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        output = tmp_path / "out.jpg"
+        args = self._thumbnail_args(tmp_path / "in.mp4", output)
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={
+                "PATH": f"{tmp_path}:/usr/bin:/bin",
+                "IMMICH_ACCELERATOR_VIPS": str(vips),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert output.exists(), "fallback should have produced the output file"
+        assert output.read_text().strip() == "FAKEPNG"
+        assert "QuickLook/AVFoundation produced one instead" in result.stderr
+
+    def test_single_frame_failure_falls_through_when_quicklook_also_fails(
+        self, tmp_path
+    ):
+        """Never worse than without the fallback: if QuickLook can't recover
+        anything either, propagate ffmpeg's real failure."""
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "exit 69\n")
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, self._QLMANAGE_FAILS)
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        output = tmp_path / "out.jpg"
+        args = self._thumbnail_args(tmp_path / "in.mp4", output)
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 69
+        assert not output.exists()
+
+    def test_fallback_only_fires_for_known_image_extensions(self, tmp_path):
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "exit 69\n")
+        ql_marker = tmp_path / "qlmanage_ran"
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, f"touch {ql_marker}\n" + self._QLMANAGE_SUCCEEDS)
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        # .mp4 output with -frames:v 1 doesn't happen in real Immich usage,
+        # but exercises the extension guard directly rather than relying on
+        # Immich to never send it.
+        args = self._thumbnail_args(tmp_path / "in.mp4", tmp_path / "out.mp4")
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 69
+        assert not ql_marker.exists()
+
+    def test_hardware_encoder_remap_still_applies(self, tmp_path):
+        """Regression check: restructuring `exec` into a captured run (so the
+        wrapper can inspect ffmpeg's exit code) must not disturb the
+        pre-existing VideoToolbox encoder remap."""
+        ffmpeg = tmp_path / "ffmpeg"
+        seen_args = tmp_path / "seen_args"
+        self._bash_stub(ffmpeg, f'printf "%s\\n" "$@" > {seen_args}\nexit 0\n')
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), "-i", str(tmp_path / "in.mov"),
+             "-c:v", "libx264", "-preset", "fast", str(tmp_path / "out.mp4")],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        received = seen_args.read_text().splitlines()
+        assert "-hwaccel" in received and "videotoolbox" in received
+        assert "h264_videotoolbox" in received
+        assert "libx264" not in received
+        assert "-preset" not in received, "software presets must be stripped for VideoToolbox"
+
+
 class TestPgKeepaliveShim:
     """The pg keepalive shim sets keepAlive on Immich's Postgres connections so
     a stateful firewall between worker and a remote DB can't reap idle
