@@ -3604,44 +3604,85 @@ def _setup_remote(args):
     version = info["version"]
     log.info("Found Immich v%s", version)
 
-    # A remote Immich cannot be configured without its database and Redis
-    # details, and there is no safe default for them: guessing localhost and a
-    # blank password would write a config that looks complete and fails on the
-    # first job. So refuse clearly rather than raising EOFError from input()
-    # when nothing can answer, which is what the setup wizard's /dev/null stdin
-    # produced: a Python traceback in the app's log pane.
-    if not sys.stdin.isatty():
-        raise RuntimeError(
-            "Setting up from a remote Immich needs database and Redis details, "
-            "which cannot be answered without a terminal. Run "
-            f"`immich-accelerator setup --url {url}` in Terminal to finish this, "
-            "or use `setup --ml-only` if this Mac should only run machine learning."
-        )
-
-    # Interactive prompts for DB/Redis connection
-    log.info("")
-    log.info("Enter connection details for the Immich database and Redis.")
-    log.info(
-        "These must be reachable from this Mac (expose ports or use network routing)."
-    )
-    log.info("")
-
-    def prompt(label: str, default: str = "") -> str:
-        suffix = f" [{default}]" if default else ""
-        val = input(f"  {label}{suffix}: ").strip()
-        return val or default
-
-    db_hostname = prompt("Postgres host", "localhost")
-    db_port = prompt("Postgres port", "5432")
-    db_username = prompt("Postgres user", "postgres")
     import getpass
 
-    db_password = getpass.getpass("  Postgres password: ").strip()
-    db_name = prompt("Database name", "immich")
-    redis_hostname = prompt("Redis host", db_hostname)
-    redis_port = prompt("Redis port", "6379")
-    redis_username = prompt("Redis username [blank if none]", "")
-    redis_password = getpass.getpass("  Redis password [blank if none]: ").strip()
+    # Secrets arrive on a pipe, never in argv, because argv is world-readable
+    # through ps. The menu-bar app writes this JSON to the child's stdin.
+    secrets: dict = {}
+    if getattr(args, "secrets_stdin", False):
+        raw = sys.stdin.read()
+        try:
+            secrets = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"--secrets-stdin expected JSON on stdin: {e}") from e
+
+    interactive = sys.stdin.isatty() and not getattr(args, "secrets_stdin", False)
+    if interactive:
+        log.info("")
+        log.info("Enter connection details for the Immich database and Redis.")
+        log.info(
+            "These must be reachable from this Mac (expose ports or use network routing)."
+        )
+        log.info("")
+
+    def prompt(
+        label: str,
+        default: str = "",
+        supplied: str | None = None,
+        flag: str = "",
+        optional: bool = False,
+    ) -> str:
+        """Flag first, then the terminal, then the default.
+
+        Anything the caller passed is used as-is, so a GUI can answer every
+        question up front. Without a terminal there is nobody to ask, so a
+        required question with no default and no flag is an error that names
+        the flag which would have answered it, rather than an EOFError
+        traceback. `flag` is passed explicitly rather than derived from the
+        label, because deriving it produced things like
+        "--redis-username-[blank-if-none]".
+        """
+        if supplied not in (None, ""):
+            return str(supplied)
+        if not interactive:
+            if default or optional:
+                return default
+            raise RuntimeError(
+                f"{label} is required for a remote setup and no terminal is "
+                f"available to ask. Pass it with {flag}."
+            )
+        suffix = f" [{default}]" if default else ""
+        return input(f"  {label}{suffix}: ").strip() or default
+
+    def secret(label: str, key: str, required: bool) -> str:
+        if key in secrets:
+            return str(secrets[key] or "")
+        if not interactive:
+            if required:
+                raise RuntimeError(
+                    f"{label} is required for a remote setup. Pass it as "
+                    f'{{"{key}": "..."}} on stdin with --secrets-stdin.'
+                )
+            return ""
+        return getpass.getpass(f"  {label}: ").strip()
+
+    db_hostname = prompt("Postgres host", "localhost", getattr(args, "db_host", None), flag="--db-host")
+    db_port = prompt("Postgres port", "5432", getattr(args, "db_port", None), flag="--db-port")
+    db_username = prompt("Postgres user", "postgres", getattr(args, "db_user", None), flag="--db-user")
+    db_password = secret("Postgres password", "db_password", required=True)
+    db_name = prompt("Database name", "immich", getattr(args, "db_name", None), flag="--db-name")
+    redis_hostname = prompt(
+        "Redis host", db_hostname, getattr(args, "redis_host", None), flag="--redis-host"
+    )
+    redis_port = prompt("Redis port", "6379", getattr(args, "redis_port", None), flag="--redis-port")
+    redis_username = prompt(
+        "Redis username [blank if none]",
+        "",
+        getattr(args, "redis_user", None),
+        flag="--redis-user",
+        optional=True,
+    )
+    redis_password = secret("Redis password [blank if none]", "redis_password", required=False)
 
     # Probe Docker's view of the media root so we can surface mismatch
     # up-front rather than when thumbnails 404 (issue #19). Requires
@@ -3653,7 +3694,11 @@ def _setup_remote(args):
             "detect Docker's media path and prevent thumbnail 404s in split setups."
         )
         log.info("Leave blank to skip the check.")
-        api_key = getpass.getpass("  Immich API key (optional): ").strip()
+        api_key = (
+            getpass.getpass("  Immich API key (optional): ").strip()
+            if interactive
+            else ""
+        )
 
     detected_prefix = _detect_docker_media_prefix(url, api_key) if api_key else None
     if detected_prefix:
@@ -3666,20 +3711,26 @@ def _setup_remote(args):
     else:
         default_mount = ""
 
-    upload_mount = prompt("Upload/media path (as mounted on this Mac)", default_mount)
+    upload_mount = prompt(
+        "Upload/media path (as mounted on this Mac)",
+        default_mount,
+        getattr(args, "upload_mount", None),
+        flag="--upload-mount",
+    )
 
     if api_key and upload_mount:
         if _warn_on_path_mismatch(url, api_key, upload_mount):
             # Real mismatch detected. Offer to abort so the user can
             # fix the topology before we save a broken config.
-            try:
-                answer = (
-                    input("  Save config anyway and fix later? [y/N] ").strip().lower()
+            # Defaults to no, including under --yes: saving a config whose
+            # media path provably does not match Docker's is not a default
+            # anyone wants taken on their behalf. The wizard's library step
+            # exists to stop this being reached at all.
+            if not _confirm("  Save config anyway and fix later? [y/N] ", default=False):
+                log.info(
+                    "Aborted: this Mac's media path does not resolve to the same "
+                    "files Immich sees. Fix the path or the mount, then run setup again."
                 )
-            except EOFError:
-                answer = "n"
-            if answer != "y":
-                log.info("Aborted. Re-run setup after fixing the path mapping.")
                 return
 
     # Check connectivity
@@ -6053,6 +6104,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--ml-only",
         action="store_true",
         help="Set up this Mac as an ML-only network compute node (no worker, no DB)",
+    )
+    # Everything --url setup asks for interactively, so the menu-bar app can
+    # complete a split deployment itself. The app must never tell a user to go
+    # finish the job in Terminal: a GUI that hands off is a GUI that failed.
+    #
+    # No password flag on purpose. Anything in argv is visible to every process
+    # on the machine via ps; --secrets-stdin takes them on a pipe instead.
+    for flag, helptext in [
+        ("--db-host", "Postgres host reachable from this Mac"),
+        ("--db-port", "Postgres port (default 5432)"),
+        ("--db-user", "Postgres user (default postgres)"),
+        ("--db-name", "Postgres database name (default immich)"),
+        ("--redis-host", "Redis host (defaults to the Postgres host)"),
+        ("--redis-port", "Redis port (default 6379)"),
+        ("--redis-user", "Redis username, if the server needs one"),
+        ("--upload-mount", "Path on THIS Mac that resolves to Immich's media root"),
+    ]:
+        setup_p.add_argument(flag, help=helptext)
+    setup_p.add_argument(
+        "--secrets-stdin",
+        action="store_true",
+        help="Read {\"db_password\": ..., \"redis_password\": ...} as JSON on stdin, "
+        "so passwords never appear in the process list",
     )
     setup_p.add_argument(
         "--yes",

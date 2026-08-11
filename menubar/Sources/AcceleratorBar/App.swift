@@ -17,6 +17,25 @@ struct AcceleratorBarMain {
             printStatus()
             return
         }
+        // `probe-library <path>` exposes the library check to the shell, the
+        // same reason `status` and `render` exist: the wizard's answers should
+        // be verifiable on a real machine without driving the GUI.
+        if let i = CommandLine.arguments.firstIndex(of: "probe-library"),
+           CommandLine.arguments.count > i + 1 {
+            let path = CommandLine.arguments[i + 1]
+            let sem = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var out = ""
+            Task {
+                let r = await Actions.probeLibrary(path)
+                out = "\(r.ok ? "OK" : "NO") \(r.note)"
+                sem.signal()
+            }
+            while sem.wait(timeout: .now()) == .timedOut {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+            print(out)
+            return
+        }
         if let i = CommandLine.arguments.firstIndex(of: "render"),
            CommandLine.arguments.count > i + 2 {
             renderSettings(pane: CommandLine.arguments[i + 1],

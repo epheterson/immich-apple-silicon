@@ -50,6 +50,7 @@ enum Actions {
     @discardableResult
     static func stream(
         _ tool: String, _ args: [String],
+        stdin: String? = nil,
         onLine: @escaping @Sendable (String) -> Void
     ) async -> Int32 {
         await withCheckedContinuation { cont in
@@ -60,7 +61,12 @@ enum Actions {
                 // No TTY here, so setup's prompts would read EOF and answer no.
                 // Callers pass --yes; this just makes sure nothing waits on a
                 // human who cannot answer.
-                p.standardInput = FileHandle.nullDevice
+                //
+                // `stdin` carries secrets to `--secrets-stdin`. They go on a
+                // pipe rather than in `args` because argv is readable by every
+                // process on the machine through ps.
+                let inPipe = stdin.map { _ in Pipe() }
+                p.standardInput = inPipe ?? FileHandle.nullDevice
                 let out = Pipe()
                 p.standardOutput = out
                 p.standardError = out
@@ -68,6 +74,10 @@ enum Actions {
                     onLine("failed to launch: \(error)")
                     cont.resume(returning: -1)
                     return
+                }
+                if let inPipe, let text = stdin {
+                    inPipe.fileHandleForWriting.write(Data(text.utf8))
+                    try? inPipe.fileHandleForWriting.close()
                 }
                 var pending = ""
                 let handle = out.fileHandleForReading
@@ -141,9 +151,11 @@ enum Actions {
     /// including "start now?".
     static func runSetup(
         url: String, apiKey: String, mlOnly: Bool,
+        remote: WizardModel.RemoteDetails? = nil,
         onLine: @escaping @Sendable (String) -> Void
     ) async -> Bool {
         var args = ["setup", "--yes"]
+        var secrets: String?
         if mlOnly {
             args.append("--ml-only")
         } else if !url.isEmpty {
@@ -152,8 +164,25 @@ enum Actions {
             // credentials out of the running container instead of asking.
             args += ["--url", url]
             if !apiKey.isEmpty { args += ["--api-key", apiKey] }
+            if let r = remote {
+                args += [
+                    "--db-host", r.dbHost, "--db-port", r.dbPort,
+                    "--db-user", r.dbUser, "--db-name", r.dbName,
+                    "--redis-host", r.redisHost, "--redis-port", r.redisPort,
+                ]
+                if !r.redisUser.isEmpty { args += ["--redis-user", r.redisUser] }
+                if !r.mediaPath.isEmpty { args += ["--upload-mount", r.mediaPath] }
+                // Passwords never go in args; --secrets-stdin reads them here.
+                args.append("--secrets-stdin")
+                let payload: [String: String] = [
+                    "db_password": r.dbPassword, "redis_password": r.redisPassword,
+                ]
+                secrets = String(
+                    data: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(),
+                    encoding: .utf8)
+            }
         }
-        let code = await stream(cli, args, onLine: onLine)
+        let code = await stream(cli, args, stdin: secrets, onLine: onLine)
         return code == 0
     }
 
@@ -249,6 +278,63 @@ enum Actions {
 
     // The one-liner shown in onboarding when the accelerator isn't installed.
     static let installCommand = "brew install epheterson/immich-accelerator/immich-accelerator"
+
+    /// Is `path` present, a directory, and readable by us right now?
+    ///
+    /// Deliberately a real read rather than a `fileExists` check: an SMB share
+    /// that has gone away can leave a mount point that still stats fine, and a
+    /// path can exist while being unreadable. The distinction matters because
+    /// the fixes differ, so the note names which one it is.
+    static func probeLibrary(_ path: String) async -> (ok: Bool, note: String) {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global().async {
+                let fm = FileManager.default
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: path, isDirectory: &isDir) else {
+                    cont.resume(returning: (false,
+                        "Nothing at that path yet. If the library lives on a NAS, connect to the share first."))
+                    return
+                }
+                guard isDir.boolValue else {
+                    cont.resume(returning: (false, "That path is a file, not a folder."))
+                    return
+                }
+                guard let entries = try? fm.contentsOfDirectory(atPath: path) else {
+                    cont.resume(returning: (false,
+                        "The folder is there but can't be read. Check permissions, or reconnect the share."))
+                    return
+                }
+                // Immich's media root has these beside each other. Naming what
+                // is missing beats "looks wrong": pointing at the parent of the
+                // real library is the single most common mistake here.
+                let expected = ["library", "upload", "thumbs", "encoded-video"]
+                let present = expected.filter { entries.contains($0) }
+                if present.isEmpty {
+                    cont.resume(returning: (false,
+                        "Readable, but this doesn't look like Immich's media folder: none of library/, upload/, thumbs/ are in it."))
+                } else {
+                    cont.resume(returning: (true,
+                        "Readable, and contains \(present.joined(separator: ", "))."))
+                }
+            }
+        }
+    }
+
+    /// Hand off to the system's own Connect to Server flow. macOS shows its
+    /// authentication sheet and keeps credentials in the keychain, so the app
+    /// neither sees nor stores a password.
+    static func openFileServerConnect(hint: String) {
+        let host = hint.split(separator: ":").first.map(String.init) ?? hint
+        if !host.isEmpty, let url = URL(string: "smb://\(host)") {
+            NSWorkspace.shared.open(url)
+        } else {
+            // No host to guess at: open the Finder command that asks for one.
+            NSAppleScript(source: """
+            tell application "Finder" to activate
+            tell application "System Events" to keystroke "k" using command down
+            """)?.executeAndReturnError(nil)
+        }
+    }
 
     static func copyToPasteboard(_ text: String) {
         NSPasteboard.general.clearContents()

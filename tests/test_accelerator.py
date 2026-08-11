@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import signal
@@ -2935,43 +2936,83 @@ class TestDetect:
         assert json.loads(capsys.readouterr().out)  # parses whole, no prefix
 
 
-class TestRemoteSetupWithoutATerminal:
-    """The wizard runs setup with stdin on /dev/null.
+class TestRemoteSetupIsFullyScriptable:
+    """The menu-bar app must be able to finish a split deployment itself.
 
-    `_setup_remote` asks for Postgres and Redis details, and there is no safe
-    default: guessing localhost and a blank password writes a config that looks
-    complete and fails on the first job. It used to reach `input()` anyway and
-    raise EOFError, which surfaced as a Python traceback in the app's log pane.
+    A GUI that tells you to go run a command in Terminal has failed, so every
+    answer `--url` setup needs is available as a flag, and the two secrets come
+    in on a pipe rather than argv, which `ps` exposes to every process.
     """
 
-    def test_refuses_clearly_instead_of_raising_eoferror(self, tmp_data_dir):
+    ARGS = dict(
+        url="http://nas.local:2283",
+        api_key="",
+        db_host="nas.local",
+        db_port="5432",
+        db_user="postgres",
+        db_name="immich",
+        redis_host="nas.local",
+        redis_port="6379",
+        redis_user="",
+        upload_mount="/Volumes/photos",
+        secrets_stdin=True,
+        yes=True,
+        import_server=None,
+        manual=False,
+        ml_only=False,
+    )
+
+    def _run(self, m, stdin_text: str, **over):
+        args = argparse.Namespace(**{**self.ARGS, **over})
+        # cmd_setup is what turns --yes into ASSUME_YES; calling the internal
+        # directly skips that, and without it _confirm falls through to input().
+        with patch.object(m, "ASSUME_YES", True), patch.object(
+            m, "download_immich_server", return_value=Path("/tmp/server")
+        ), patch.object(
+            m, "_query_immich_api", return_value={"version": "3.0.2"}
+        ), patch.object(m.sys, "stdin", io.StringIO(stdin_text)), patch.object(
+            m, "_detect_docker_media_prefix", return_value=None
+        ), patch.object(m, "_warn_on_path_mismatch", return_value=False), patch.object(
+            m, "_validate_connectivity", return_value=True
+        ), patch.object(m, "save_config"), patch.object(
+            m, "_check_local_tools", return_value=("/usr/bin/node", None, None)
+        ), patch.object(m, "_import_server", return_value=None), patch.object(
+            m, "find_docker", side_effect=RuntimeError("no docker")
+        ), patch.object(m, "_finalize_config") as saved, patch("builtins.input", side_effect=AssertionError("prompted with no terminal")):
+            m._setup_remote(args)
+        return saved
+
+    def test_completes_from_flags_without_prompting(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
 
-        args = argparse.Namespace(url="http://nas.local:2283", api_key="k")
-        with patch.object(
-            m, "_query_immich_api", return_value={"version": "3.0.2"}
-        ), patch.object(m.sys.stdin, "isatty", return_value=False):
-            with pytest.raises(RuntimeError) as e:
-                m._setup_remote(args)
+        saved = self._run(m, json.dumps({"db_password": "pw", "redis_password": ""}))
+        cfg = saved.call_args[0][0]
+        assert cfg["db_hostname"] == "nas.local"
+        assert cfg["db_password"] == "pw"
+        assert cfg["upload_mount"] == "/Volumes/photos"
 
+    def test_a_missing_password_names_how_to_supply_it(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with pytest.raises(RuntimeError) as e:
+            self._run(m, "{}")
         said = str(e.value)
-        assert "terminal" in said.lower()
-        assert "--ml-only" in said, "must name the option that does work headlessly"
+        assert "--secrets-stdin" in said
+        assert "Terminal" not in said, "the GUI must never be told to go to Terminal"
 
-    def test_a_terminal_still_prompts(self, tmp_data_dir):
-        """The guard must not break the ordinary Terminal flow."""
+    def test_secrets_never_travel_in_argv(self, tmp_data_dir):
+        """A password in argv is readable by every process on the machine."""
         import immich_accelerator.__main__ as m
 
-        args = argparse.Namespace(url="http://nas.local:2283", api_key="k")
-        with patch.object(
-            m, "_query_immich_api", return_value={"version": "3.0.2"}
-        ), patch.object(m.sys.stdin, "isatty", return_value=True), patch(
-            "builtins.input", side_effect=EOFError
-        ):
-            # Reaching input() at all is the proof; EOFError here is the test
-            # harness, not the guard.
-            with pytest.raises(EOFError):
-                m._setup_remote(args)
+        parser = m.build_parser()
+        setup = next(
+            a for a in parser._subparsers._group_actions[0].choices.items()
+            if a[0] == "setup"
+        )[1]
+        flags = {o for action in setup._actions for o in action.option_strings}
+        assert "--db-password" not in flags
+        assert "--redis-password" not in flags
+        assert "--secrets-stdin" in flags
 
 
 class TestReconcileML:

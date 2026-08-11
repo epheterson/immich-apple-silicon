@@ -18,7 +18,27 @@ import SwiftUI
 @MainActor
 final class WizardModel: ObservableObject {
     enum Step: Int, CaseIterable {
-        case role, where_, connect, install, run, verify
+        case role, where_, connect, library, install, run, verify
+    }
+
+    /// Everything a split deployment needs, so the app can complete one itself.
+    /// The wizard collects these rather than sending anyone to Terminal: a GUI
+    /// that hands off has failed at the one job it exists for.
+    struct RemoteDetails {
+        var dbHost = ""
+        var dbPort = "5432"
+        var dbUser = "postgres"
+        var dbPassword = ""
+        var dbName = "immich"
+        var redisHost = ""
+        var redisPort = "6379"
+        var redisUser = ""
+        var redisPassword = ""
+        var mediaPath = ""
+
+        /// Redis usually lives beside Postgres; don't make people type it twice.
+        var effectiveRedisHost: String { redisHost.isEmpty ? dbHost : redisHost }
+        var ready: Bool { !dbHost.isEmpty && !dbPassword.isEmpty }
     }
 
     /// Where Immich itself runs. This is the question the wizard never asked,
@@ -67,6 +87,12 @@ final class WizardModel: ObservableObject {
     @Published var detecting = false
     /// Whatever `immich-accelerator detect` last reported. nil = not asked yet.
     @Published var detected: Detection?
+    @Published var remote = RemoteDetails()
+
+    // Library reachability, checked rather than assumed. nil = not checked yet.
+    @Published var libraryReadable: Bool?
+    @Published var libraryChecking = false
+    @Published var libraryNote = ""
     @Published var url = ""
     @Published var apiKey = ""
 
@@ -91,7 +117,9 @@ final class WizardModel: ObservableObject {
         if let want = ProcessInfo.processInfo.environment["ACCEL_WIZARD_STEP"],
            let target = Step.allCases.first(where: { "\($0)" == want || "\($0)" == want + "_" }) {
             step = target
-            if target == .connect { location = .remote }   // that step only exists for remote
+            // Both of these only exist on the remote path, so a render that
+            // asks for one has to put the model in the state that shows it.
+            if target == .connect || target == .library { location = .remote }
         }
     }
 
@@ -100,7 +128,7 @@ final class WizardModel: ObservableObject {
     /// it, so it needs no URL and no key.
     var steps: [Step] {
         var out: [Step] = [.role]
-        if role == .everything { out += [.where_, .connect] }
+        if role == .everything { out += [.where_, .connect, .library] }
         if needsInstall { out.append(.install) }
         out += [.run, .verify]
         return out
@@ -131,19 +159,40 @@ final class WizardModel: ObservableObject {
     /// Docker Immich needs no URL and no key from the user: the CLI reads both
     /// out of the container.
     var visibleSteps: [Step] {
-        steps.filter { $0 != .connect || location != .here }
+        steps.filter { step in
+            // Both only exist for a server on another machine: a local Docker
+            // Immich needs no credentials typed and shares this Mac's paths.
+            guard step == .connect || step == .library else { return true }
+            return location == .some(.remote)
+        }
     }
 
     var canGoBack: Bool { step != .role && !working }
 
+    // Navigation never silently does nothing. Both used to `guard let i =
+    // firstIndex(of: step) else { return }`, so the moment the current step
+    // fell off the visible path — which happens whenever a choice above it
+    // changes what comes next — the buttons became inert with no explanation.
+    // That is exactly how the install step trapped people, and it would have
+    // recurred for every conditional step added later. Falling back to
+    // declaration order means the worst case is landing on an unexpected step,
+    // not being stuck on a dead one.
     func advance() {
-        guard let i = visibleSteps.firstIndex(of: step), i + 1 < visibleSteps.count else { return }
-        step = visibleSteps[i + 1]
+        let path = visibleSteps
+        guard let i = path.firstIndex(of: step) else {
+            step = path.first { $0.rawValue > step.rawValue } ?? path.last ?? step
+            return
+        }
+        if i + 1 < path.count { step = path[i + 1] }
     }
 
     func goBack() {
-        guard let i = visibleSteps.firstIndex(of: step), i > 0 else { return }
-        step = visibleSteps[i - 1]
+        let path = visibleSteps
+        guard let i = path.firstIndex(of: step) else {
+            step = path.last { $0.rawValue < step.rawValue } ?? path.first ?? step
+            return
+        }
+        if i > 0 { step = path[i - 1] }
     }
 
     // MARK: - probing
@@ -153,6 +202,14 @@ final class WizardModel: ObservableObject {
     /// Two questions, two answers: a reachable server with a rejected key is a
     /// completely different fix from an unreachable one, and lumping them into
     /// one "connection failed" is what sends people to the wrong place.
+    /// Immich, Postgres and Redis are on the same box in most split setups,
+    /// so seed the host from the address already typed rather than asking for
+    /// the same string three times.
+    func seedRemoteHosts() {
+        guard let host = URL(string: normalizedURL)?.host, !host.isEmpty else { return }
+        if remote.dbHost.isEmpty { remote.dbHost = host }
+    }
+
     func probe() async {
         let base = normalizedURL
         guard !base.isEmpty else { return }
@@ -244,6 +301,34 @@ final class WizardModel: ObservableObject {
         }
     }
 
+    /// Can this Mac actually read the library, at the path Immich uses?
+    ///
+    /// A split deployment fails here more than anywhere else: the share is not
+    /// mounted, or it is mounted somewhere else, and every job then fails one
+    /// by one with nothing saying why. Checking is cheap and the answer is
+    /// unambiguous, so check rather than hope, and make it retryable because
+    /// the usual fix (mount the share) happens outside this app.
+    func checkLibrary() async {
+        libraryChecking = true
+        defer { libraryChecking = false }
+        let path = remote.mediaPath
+        guard !path.isEmpty else {
+            libraryReadable = false
+            libraryNote = "Choose the folder on this Mac that holds Immich's library."
+            return
+        }
+        let result = await Actions.probeLibrary(path)
+        libraryReadable = result.ok
+        libraryNote = result.note
+    }
+
+    /// Ask the system to connect to a file server. macOS puts up its own
+    /// authentication sheet and stores what it needs in the keychain, so no
+    /// password is ever typed into, or held by, this app.
+    func connectToServer() {
+        Actions.openFileServerConnect(hint: remote.dbHost)
+    }
+
     func runSetup() async {
         working = true
         failed = false
@@ -253,7 +338,8 @@ final class WizardModel: ObservableObject {
         // to hand-configure what it can read out of the container.
         let sendURL = (role == .everything && location == .some(.remote)) ? normalizedURL : ""
         let ok = await Actions.runSetup(
-            url: sendURL, apiKey: sendURL.isEmpty ? "" : apiKey, mlOnly: role == .mlOnly
+            url: sendURL, apiKey: sendURL.isEmpty ? "" : apiKey, mlOnly: role == .mlOnly,
+            remote: sendURL.isEmpty ? nil : remote
         ) { line in
             Task { @MainActor in self.log.append(line) }
         }
@@ -310,6 +396,7 @@ struct SetupWizard: View {
         switch wiz.step {
         case .role: return "What should this Mac do?"
         case .where_: return "Where is Immich?"
+        case .library: return "Reaching your library"
         case .connect: return "Connect to Immich"
         case .install: return "Install the accelerator"
         case .run: return "Setting things up"
@@ -322,6 +409,7 @@ struct SetupWizard: View {
         switch wiz.step {
         case .role: roleStep
         case .where_: whereStep
+        case .library: libraryStep
         case .connect: connectStep
         case .install: installStep
         case .run: runStep
@@ -370,6 +458,57 @@ struct SetupWizard: View {
         .task { if wiz.detected == nil { await wiz.detect() } }
     }
 
+    /// The step that decides whether a split deployment actually works.
+    ///
+    /// Immich's worker resolves every media path from one root, and this Mac
+    /// must see the same files at the same absolute path. When it does not,
+    /// nothing announces it: jobs just fail, one at a time, forever. So the
+    /// path is chosen explicitly, checked for real, and re-checkable, because
+    /// mounting the share happens outside this window.
+    private var libraryStep: some View {
+        VStack(alignment: .leading, spacing: Metrics.lg) {
+            Text("This Mac has to read the same files Immich does, at the same path.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: Metrics.sm) {
+                TextField("/Volumes/photos/immich", text: $wiz.remote.mediaPath)
+                    .textFieldStyle(.roundedBorder)
+                Button("Choose…") { chooseLibraryFolder() }
+            }
+
+            HStack(spacing: Metrics.sm) {
+                Button(wiz.libraryChecking ? "Checking…" : "Check again") {
+                    Task { await wiz.checkLibrary() }
+                }
+                .disabled(wiz.libraryChecking)
+                Button("Connect to Server…") { wiz.connectToServer() }
+                    .help("Opens macOS's own connect sheet; this app never sees the password.")
+                if wiz.libraryChecking { ProgressView().controlSize(.small) }
+            }
+
+            if let ok = wiz.libraryReadable {
+                ProbeRow(ok: ok, good: wiz.libraryNote, bad: wiz.libraryNote)
+            }
+        }
+        .task { if wiz.libraryReadable == nil && !wiz.remote.mediaPath.isEmpty {
+            await wiz.checkLibrary()
+        } }
+    }
+
+    private func chooseLibraryFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Use This Folder"
+        panel.message = "Pick the folder that holds Immich's library, upload and thumbs folders."
+        if panel.runModal() == .OK, let picked = panel.url {
+            wiz.remote.mediaPath = picked.path
+            Task { await wiz.checkLibrary() }
+        }
+    }
+
     private var roleStep: some View {
         VStack(alignment: .leading, spacing: Metrics.lg) {
             ForEach([WizardModel.Role.everything, .mlOnly], id: \.rawValue) { r in
@@ -402,7 +541,7 @@ struct SetupWizard: View {
 
             HStack(spacing: Metrics.md) {
                 Button(wiz.probing ? "Checking…" : "Check connection") {
-                    Task { await wiz.probe() }
+                    Task { await wiz.probe(); wiz.seedRemoteHosts() }
                 }
                 .disabled(wiz.probing || wiz.normalizedURL.isEmpty)
                 if wiz.probing { ProgressView().controlSize(.small) }
@@ -410,6 +549,43 @@ struct SetupWizard: View {
             }
 
             probeResults
+
+            Divider()
+
+            // The database and Redis details setup would otherwise ask for in
+            // a terminal. Collected here so the app can finish the job itself.
+            // A worker talks to Postgres and Redis directly; the API alone is
+            // not enough, which is why a split deployment needs these at all.
+            VStack(alignment: .leading, spacing: Metrics.md) {
+                Text("Database and Redis").font(.rowTitle)
+                Text("Your worker talks to these directly, so they have to be reachable from this Mac. Same host as Immich unless you moved them.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: Metrics.sm) {
+                    TextField("Postgres host", text: $wiz.remote.dbHost)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Port", text: $wiz.remote.dbPort)
+                        .textFieldStyle(.roundedBorder).frame(width: 70)
+                }
+                HStack(spacing: Metrics.sm) {
+                    TextField("User", text: $wiz.remote.dbUser)
+                        .textFieldStyle(.roundedBorder).frame(width: 130)
+                    SecureField("Password", text: $wiz.remote.dbPassword)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Database", text: $wiz.remote.dbName)
+                        .textFieldStyle(.roundedBorder).frame(width: 120)
+                }
+                HStack(spacing: Metrics.sm) {
+                    TextField("Redis host (same as Postgres if blank)", text: $wiz.remote.redisHost)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Port", text: $wiz.remote.redisPort)
+                        .textFieldStyle(.roundedBorder).frame(width: 70)
+                }
+                Text("The password is passed to setup on a pipe, never on the command line, so it can't be read out of the process list.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -534,6 +710,10 @@ struct SetupWizard: View {
             Button("Continue") { wiz.advance() }
                 .keyboardShortcut(.defaultAction)
                 .disabled(wiz.detecting || wiz.location == nil)
+        case .library:
+            Button("Continue") { wiz.advance() }
+                .keyboardShortcut(.defaultAction)
+                .disabled(wiz.libraryReadable != true)
         case .install:
             Button(wiz.working ? "Installing…" : (wiz.failed ? "Try again" : "Install")) {
                 Task { await wiz.installAccelerator() }
