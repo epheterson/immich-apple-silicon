@@ -1,5 +1,7 @@
 # Setup: Remote Immich + Manual Config
 
+> **Historical design doc (2026-04-03).** Captures the original design thinking; not maintained as the product evolves. For current, accurate documentation see [README.md](../../README.md) and [docs/deployment.md](../deployment.md).
+
 ## Problem
 
 Setup auto-discovers Docker on localhost. Users with NAS+Mac splits (Docker on NAS, compute on Mac) can't use it. Docker shouldn't be required on the Mac at all.
