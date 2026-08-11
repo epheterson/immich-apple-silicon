@@ -1,4 +1,5 @@
 import AppKit
+import Network
 import Foundation
 import ServiceManagement
 
@@ -278,6 +279,101 @@ enum Actions {
 
     // The one-liner shown in onboarding when the accelerator isn't installed.
     static let installCommand = "brew install epheterson/immich-accelerator/immich-accelerator"
+
+    /// Look for an Immich media root among the places one is actually likely
+    /// to be, so most people never type a path at all.
+    ///
+    /// A media root is recognisable: Immich puts library/, upload/, thumbs/ and
+    /// encoded-video/ side by side, and nothing else does. Scanning for that
+    /// shape is far more reliable than guessing names, and it is cheap: one
+    /// directory listing per mounted volume, two levels deep.
+    static func discoverLibraries() async -> [String] {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global().async {
+                let fm = FileManager.default
+                var roots: [String] = []
+                // The real mount table, not a guess at where mounts live.
+                // /Volumes is the usual place but not the only one: a launchd
+                // agent mounting a NAS at /nas is common, and scanning
+                // /Volumes alone would miss it. mountedVolumeURLs reports
+                // whatever is actually mounted, wherever it is.
+                roots += (fm.mountedVolumeURLs(includingResourceValuesForKeys: nil,
+                                               options: [.skipHiddenVolumes]) ?? [])
+                    .map(\.path)
+                roots += (try? fm.contentsOfDirectory(atPath: "/Volumes"))?
+                    .map { "/Volumes/\($0)" } ?? []
+                roots += [
+                    NSHomeDirectory() + "/.immich-accelerator/data",
+                    NSHomeDirectory() + "/immich",
+                    "/opt/immich",
+                ]
+
+                func looksLikeMediaRoot(_ path: String) -> Bool {
+                    guard let entries = try? fm.contentsOfDirectory(atPath: path) else { return false }
+                    let want = Set(["library", "upload", "thumbs", "encoded-video"])
+                    // Two of the four is enough: a library that has never
+                    // transcoded a video has no encoded-video yet.
+                    return want.intersection(entries).count >= 2
+                }
+
+                var found: [String] = []
+                for root in roots {
+                    var isDir: ObjCBool = false
+                    guard fm.fileExists(atPath: root, isDirectory: &isDir), isDir.boolValue
+                    else { continue }
+                    if looksLikeMediaRoot(root) { found.append(root); continue }
+                    // One level down: shares are usually mounted as the parent
+                    // of the library rather than the library itself.
+                    for child in (try? fm.contentsOfDirectory(atPath: root)) ?? [] {
+                        let candidate = "\(root)/\(child)"
+                        if looksLikeMediaRoot(candidate) { found.append(candidate) }
+                    }
+                }
+                // Same share can appear via several roots; keep first sighting.
+                var seen = Set<String>()
+                cont.resume(returning: found.filter { seen.insert($0).inserted })
+            }
+        }
+    }
+
+    /// Can this Mac open a TCP connection to host:port right now?
+    ///
+    /// The worker talks to Postgres and Redis directly, so "Immich answers"
+    /// says nothing about whether the parts that matter are reachable. Checking
+    /// in the form turns a setup that fails halfway into a field that is red
+    /// before anything is written.
+    static func probePort(host: String, port: String, timeout: TimeInterval = 3) async -> Bool {
+        guard !host.isEmpty, let portNum = UInt16(port), portNum > 0 else { return false }
+        return await withCheckedContinuation { cont in
+            let conn = NWConnection(
+                host: NWEndpoint.Host(host),
+                port: NWEndpoint.Port(rawValue: portNum)!,
+                using: .tcp)
+            // The state handler and the timeout race; a continuation resumed
+            // twice is a crash, so the first one through wins.
+            let lock = NSLock()
+            nonisolated(unsafe) var finished = false
+            func finish(_ ok: Bool) {
+                lock.lock()
+                let already = finished
+                finished = true
+                lock.unlock()
+                guard !already else { return }
+                conn.cancel()
+                cont.resume(returning: ok)
+            }
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready: finish(true)
+                case .failed, .cancelled: finish(false)
+                case .waiting: finish(false)   // refused / unroutable
+                default: break
+                }
+            }
+            conn.start(queue: .global())
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { finish(false) }
+        }
+    }
 
     /// Is `path` present, a directory, and readable by us right now?
     ///

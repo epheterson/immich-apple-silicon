@@ -20,6 +20,32 @@ struct AcceleratorBarMain {
         // `probe-library <path>` exposes the library check to the shell, the
         // same reason `status` and `render` exist: the wizard's answers should
         // be verifiable on a real machine without driving the GUI.
+        if let i = CommandLine.arguments.firstIndex(of: "probe-port"),
+           CommandLine.arguments.count > i + 1 {
+            let parts = CommandLine.arguments[i + 1].split(separator: ":")
+            let sem = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var ok = false
+            Task {
+                ok = await Actions.probePort(
+                    host: String(parts.first ?? ""), port: String(parts.last ?? ""))
+                sem.signal()
+            }
+            while sem.wait(timeout: .now()) == .timedOut {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+            print(ok ? "OPEN" : "CLOSED")
+            return
+        }
+        if CommandLine.arguments.contains("discover-libraries") {
+            let sem = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var out: [String] = []
+            Task { out = await Actions.discoverLibraries(); sem.signal() }
+            while sem.wait(timeout: .now()) == .timedOut {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+            print(out.isEmpty ? "(none found)" : out.joined(separator: "\n"))
+            return
+        }
         if let i = CommandLine.arguments.firstIndex(of: "probe-library"),
            CommandLine.arguments.count > i + 1 {
             let path = CommandLine.arguments[i + 1]

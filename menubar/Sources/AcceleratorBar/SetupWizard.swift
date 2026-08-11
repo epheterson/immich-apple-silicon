@@ -93,6 +93,10 @@ final class WizardModel: ObservableObject {
     @Published var libraryReadable: Bool?
     @Published var libraryChecking = false
     @Published var libraryNote = ""
+    @Published var libraryCandidates: [String] = []
+    @Published var dbReachable: Bool?
+    @Published var redisReachable: Bool?
+    @Published var probingPorts = false
     @Published var url = ""
     @Published var apiKey = ""
 
@@ -208,6 +212,9 @@ final class WizardModel: ObservableObject {
     func seedRemoteHosts() {
         guard let host = URL(string: normalizedURL)?.host, !host.isEmpty else { return }
         if remote.dbHost.isEmpty { remote.dbHost = host }
+        // Shown in the field rather than only implied, so what will be used is
+        // what is on screen.
+        if remote.redisHost.isEmpty { remote.redisHost = host }
     }
 
     func probe() async {
@@ -308,6 +315,40 @@ final class WizardModel: ObservableObject {
     /// by one with nothing saying why. Checking is cheap and the answer is
     /// unambiguous, so check rather than hope, and make it retryable because
     /// the usual fix (mount the share) happens outside this app.
+    /// Fill in everything that can be worked out rather than asked.
+    ///
+    /// Aim: for a common setup, arrive at this step with the path already
+    /// found and green, and nothing to do but press Continue.
+    func autofillLibrary() async {
+        guard remote.mediaPath.isEmpty else { return await checkLibrary() }
+        libraryChecking = true
+        let found = await Actions.discoverLibraries()
+        libraryCandidates = found
+        libraryChecking = false
+        if let only = found.first, found.count == 1 {
+            remote.mediaPath = only
+            await checkLibrary()
+        } else if found.isEmpty {
+            libraryNote = "No Immich library found on this Mac's mounted volumes yet."
+            libraryReadable = false
+        } else {
+            libraryNote = "Found \(found.count) possible libraries. Pick the one Immich uses."
+            libraryReadable = false
+        }
+    }
+
+    /// Postgres and Redis reachability, checked in the form rather than
+    /// discovered halfway through setup.
+    func probePorts() async {
+        probingPorts = true
+        defer { probingPorts = false }
+        async let db = Actions.probePort(host: remote.dbHost, port: remote.dbPort)
+        async let redis = Actions.probePort(
+            host: remote.effectiveRedisHost, port: remote.redisPort)
+        dbReachable = await db
+        redisReachable = await redis
+    }
+
     func checkLibrary() async {
         libraryChecking = true
         defer { libraryChecking = false }
@@ -487,13 +528,24 @@ struct SetupWizard: View {
                 if wiz.libraryChecking { ProgressView().controlSize(.small) }
             }
 
+            if wiz.libraryCandidates.count > 1 {
+                VStack(alignment: .leading, spacing: Metrics.sm) {
+                    Text("Found on this Mac").font(.rowTitle)
+                    ForEach(wiz.libraryCandidates, id: \.self) { candidate in
+                        Button(candidate) {
+                            wiz.remote.mediaPath = candidate
+                            Task { await wiz.checkLibrary() }
+                        }
+                        .buttonStyle(.link)
+                    }
+                }
+            }
+
             if let ok = wiz.libraryReadable {
                 ProbeRow(ok: ok, good: wiz.libraryNote, bad: wiz.libraryNote)
             }
         }
-        .task { if wiz.libraryReadable == nil && !wiz.remote.mediaPath.isEmpty {
-            await wiz.checkLibrary()
-        } }
+        .task { if wiz.libraryReadable == nil { await wiz.autofillLibrary() } }
     }
 
     private func chooseLibraryFolder() {
@@ -581,6 +633,23 @@ struct SetupWizard: View {
                         .textFieldStyle(.roundedBorder)
                     TextField("Port", text: $wiz.remote.redisPort)
                         .textFieldStyle(.roundedBorder).frame(width: 70)
+                }
+                HStack(spacing: Metrics.md) {
+                    Button(wiz.probingPorts ? "Checking…" : "Check database") {
+                        Task { await wiz.probePorts() }
+                    }
+                    .disabled(wiz.probingPorts || wiz.remote.dbHost.isEmpty)
+                    if wiz.probingPorts { ProgressView().controlSize(.small) }
+                }
+                if let db = wiz.dbReachable {
+                    ProbeRow(ok: db,
+                             good: "Postgres answered on \(wiz.remote.dbHost):\(wiz.remote.dbPort)",
+                             bad: "Nothing answered on \(wiz.remote.dbHost):\(wiz.remote.dbPort). Expose the port, or check the host.")
+                }
+                if let r = wiz.redisReachable {
+                    ProbeRow(ok: r,
+                             good: "Redis answered on \(wiz.remote.effectiveRedisHost):\(wiz.remote.redisPort)",
+                             bad: "Nothing answered on \(wiz.remote.effectiveRedisHost):\(wiz.remote.redisPort).")
                 }
                 Text("The password is passed to setup on a pipe, never on the command line, so it can't be read out of the process list.")
                     .font(.rowDetail).foregroundStyle(.secondary)
