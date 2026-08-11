@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **HEIC/RAW thumbnails could fail permanently on a NAS-backed library.** The decode shim blocked the worker's event loop (and BullMQ's lock-renewal timer) for the whole decode, and a previous fix shrank the timeout to work around that — which broke any decode slower than a few seconds, common when the library lives on a NAS over SMB. The decoder now runs async, so a slow decode no longer blocks anything, and decode concurrency is capped at 1 by default (`IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY` to raise it) since this NAS measurably slows down under concurrent reads.
+
 ## 1.9.0 - 2026-08-07
 
 ### Added
