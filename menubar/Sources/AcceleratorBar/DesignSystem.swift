@@ -116,9 +116,9 @@ struct WindowTitle: NSViewRepresentable {
             guard let window = view.window else { return }
             window.title = title
             // Keep the title as the window's identity (Mission Control, the
-            // Window menu, screenshots) but stop the title bar drawing it, or
-            // it shows twice: once leading from AppKit and once centered from
-            // the .principal toolbar item.
+            // Window menu, screenshots) but stop the title bar drawing it: the
+            // pane name is drawn as a content header instead, and AppKit's
+            // leading copy would be a second title saying the same thing.
             window.titleVisibility = .hidden
         }
     }

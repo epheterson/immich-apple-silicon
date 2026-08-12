@@ -20,6 +20,35 @@ struct AcceleratorBarMain {
         // `probe-library <path>` exposes the library check to the shell, the
         // same reason `status` and `render` exist: the wizard's answers should
         // be verifiable on a real machine without driving the GUI.
+        // What a re-run would prefill. Reads the config and applies the same
+        // mapping the wizard does, without building the view model: that is
+        // @MainActor and needs a running loop, which a one-shot CLI has not
+        // got, and it hung.
+        if CommandLine.arguments.contains("wizard-state") {
+            guard let cfg = Actions.existingConfig() else {
+                print("no config at \(Paths.configFile.path) — this would be a first run")
+                return
+            }
+            func str(_ k: String) -> String {
+                if let v = cfg[k] as? String { return v }
+                if let v = cfg[k] as? Int { return String(v) }
+                return ""
+            }
+            let micro = (cfg["worker"] as? Bool) ?? !((cfg["ml_only"] as? Bool) ?? false)
+            let ml = (cfg["ml"] as? Bool) ?? true
+            let url = str("immich_url")
+            print("""
+            rerun=true
+            microservices=\(micro) machineLearning=\(ml)
+            location=\(url.isEmpty ? "here" : "remote")
+            url=\(url)
+            apiKey=\(str("api_key").isEmpty ? "(blank)" : "(\(str("api_key").count) chars)")
+            db=\(str("db_username"))@\(str("db_hostname")):\(str("db_port"))/\(str("db_name"))
+            redis=\(str("redis_hostname")):\(str("redis_port"))
+            media=\(str("upload_mount"))
+            """)
+            return
+        }
         if let i = CommandLine.arguments.firstIndex(of: "probe-port"),
            CommandLine.arguments.count > i + 1 {
             let parts = CommandLine.arguments[i + 1].split(separator: ":")

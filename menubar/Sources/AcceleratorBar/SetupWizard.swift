@@ -52,33 +52,25 @@ final class WizardModel: ObservableObject {
         case remote    // another machine; needs URL + API key
     }
 
-    enum Role: String {
-        case everything, mlOnly
+    /// Two independent switches, not a choice between two packages.
+    ///
+    /// This was a pair of mutually exclusive role cards, "Everything" and
+    /// "Machine learning only", which made a simple thing sound like a
+    /// commitment and had no way to express "worker but let Immich keep doing
+    /// ML". These map one-to-one onto the components the CLI and Settings
+    /// already have, so what you tick here is what you see there afterwards.
+    struct Components {
+        var microservices = true
+        var machineLearning = true
 
-        var title: String {
-            switch self {
-            case .everything: return "Everything"
-            case .mlOnly: return "Machine learning only"
-            }
-        }
-        var blurb: String {
-            switch self {
-            case .everything:
-                return "This Mac processes your library: thumbnails, video transcoding, metadata, search, faces and text."
-            case .mlOnly:
-                return "This Mac only answers search, face and text requests for an Immich running somewhere else. No Docker, no database, no access to your photos."
-            }
-        }
-        var symbol: String {
-            switch self {
-            case .everything: return "square.stack.3d.up.fill"
-            case .mlOnly: return "brain.head.profile"
-            }
-        }
+        /// No worker means an ML-only node, which is a genuinely different
+        /// setup: no Docker, no database, no access to the photos.
+        var isMLOnly: Bool { !microservices && machineLearning }
+        var none: Bool { !microservices && !machineLearning }
     }
 
     @Published var step: Step = .role
-    @Published var role: Role = .everything
+    @Published var components = Components()
     /// nil until we know, either because detection has not run or because it
     /// could not answer (an older CLI with no `detect`, Docker unreachable).
     /// Deliberately not defaulted: guessing wrong here is what routed everyone
@@ -112,8 +104,13 @@ final class WizardModel: ObservableObject {
 
     private let model: StatusModel
 
+    /// True when this Mac is already set up, which changes what the wizard is
+    /// for: not a first run but an edit, so it starts from what is there.
+    let isRerun = Paths.isConfigured
+
     init(model: StatusModel) {
         self.model = model
+        prefillFromExistingConfig()
         // Lets `render wizard:<step>` capture any screen, not just the first.
         // Every step after the first is otherwise unreachable headlessly, which
         // is how a dead-ended Install step and an unasked topology question
@@ -132,7 +129,7 @@ final class WizardModel: ObservableObject {
     /// it, so it needs no URL and no key.
     var steps: [Step] {
         var out: [Step] = [.role]
-        if role == .everything { out += [.where_, .connect, .library] }
+        if components.microservices { out += [.where_, .connect, .library] }
         if needsInstall { out.append(.install) }
         out += [.run, .verify]
         return out
@@ -197,6 +194,39 @@ final class WizardModel: ObservableObject {
             return
         }
         if i > 0 { step = path[i - 1] }
+    }
+
+    /// Start from what setup last wrote, so a re-run shows the current answers
+    /// rather than an empty form. We tell people to re-run after an update;
+    /// an empty form there reads as "your settings are gone".
+    private func prefillFromExistingConfig() {
+        guard let cfg = Actions.existingConfig() else { return }
+        func str(_ key: String) -> String {
+            if let v = cfg[key] as? String { return v }
+            if let v = cfg[key] as? Int { return String(v) }
+            return ""
+        }
+        url = str("immich_url")
+        apiKey = str("api_key")
+        remote.dbHost = str("db_hostname")
+        remote.dbPort = str("db_port").isEmpty ? "5432" : str("db_port")
+        remote.dbUser = str("db_username").isEmpty ? "postgres" : str("db_username")
+        remote.dbName = str("db_name").isEmpty ? "immich" : str("db_name")
+        remote.redisHost = str("redis_hostname")
+        remote.redisPort = str("redis_port").isEmpty ? "6379" : str("redis_port")
+        remote.redisUser = str("redis_username")
+        remote.mediaPath = str("upload_mount")
+        // The password is never read back: config.json holds it, but showing it
+        // in a field would put it on screen and in a screenshot for no gain.
+        // Left blank, and setup keeps the stored one if nothing is typed.
+
+        // Components as they actually stand, so the toggles show today's truth.
+        components.microservices = (cfg["worker"] as? Bool) ?? !((cfg["ml_only"] as? Bool) ?? false)
+        components.machineLearning = (cfg["ml"] as? Bool) ?? true
+
+        // A configured Mac with a URL is by definition talking to something
+        // elsewhere; without one it is the local Docker case.
+        location = url.isEmpty ? .here : .remote
     }
 
     // MARK: - probing
@@ -377,9 +407,9 @@ final class WizardModel: ObservableObject {
         // The URL is what dispatches cmd_setup. Sending one for a local
         // Docker Immich would take the split-deployment path and ask the CLI
         // to hand-configure what it can read out of the container.
-        let sendURL = (role == .everything && location == .some(.remote)) ? normalizedURL : ""
+        let sendURL = (components.microservices && location == .some(.remote)) ? normalizedURL : ""
         let ok = await Actions.runSetup(
-            url: sendURL, apiKey: sendURL.isEmpty ? "" : apiKey, mlOnly: role == .mlOnly,
+            url: sendURL, apiKey: sendURL.isEmpty ? "" : apiKey, mlOnly: components.isMLOnly,
             remote: sendURL.isEmpty ? nil : remote
         ) { line in
             Task { @MainActor in self.log.append(line) }
@@ -563,8 +593,26 @@ struct SetupWizard: View {
 
     private var roleStep: some View {
         VStack(alignment: .leading, spacing: Metrics.lg) {
-            ForEach([WizardModel.Role.everything, .mlOnly], id: \.rawValue) { r in
-                RoleCard(role: r, selected: wiz.role == r) { wiz.role = r }
+            ComponentToggle(
+                title: "Microservices",
+                blurb: "Thumbnails, video transcoding and metadata. This is the work that makes Immich slow on a NAS.",
+                symbol: "square.stack.3d.up.fill",
+                on: $wiz.components.microservices)
+
+            ComponentToggle(
+                title: "Machine learning",
+                blurb: "Search, faces and text recognition, on this Mac's GPU and Neural Engine.",
+                symbol: "brain.head.profile",
+                on: $wiz.components.machineLearning)
+
+            if wiz.components.isMLOnly {
+                Text("With only machine learning on, this Mac never touches your photos: no Docker, no database, no library access. Point another Immich at it.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if wiz.components.none {
+                Text("Nothing selected, so there is nothing for this Mac to set up.")
+                    .font(.rowDetail).foregroundStyle(.orange)
             }
             Text("You can change any of this later in Settings, without running setup again.")
                 .font(.rowDetail).foregroundStyle(.secondary)
@@ -693,10 +741,10 @@ struct SetupWizard: View {
 
     private var runStep: some View {
         VStack(alignment: .leading, spacing: Metrics.lg) {
-            Text(wiz.role == .mlOnly
+            Text(wiz.components.isMLOnly
                  ? "Setting this Mac up as an ML node."
                  : "Connecting to Immich and preparing the worker.").font(.rowTitle)
-            if wiz.role == .everything {
+            if wiz.components.microservices {
                 Text("Setup downloads the matching Immich server files and checks Docker, the database and your media paths. Several minutes is normal.")
                     .foregroundStyle(.secondary)
             }
@@ -756,7 +804,12 @@ struct SetupWizard: View {
             }
             Spacer()
             if wiz.step != .verify {
-                Button("Skip for now") { close() }
+                // "Skip for now" only makes sense the first time, when there
+                // is something to postpone. Re-running from Settings on a
+                // working Mac, the same button means "leave things as they
+                // are", and calling that skipping implies you failed to do
+                // something.
+                Button(wiz.isRerun ? "Cancel" : "Skip for now") { close() }
                     .buttonStyle(.link)
             }
             primaryButton
@@ -858,42 +911,34 @@ private struct LocationCard: View {
     }
 }
 
-private struct RoleCard: View {
-    let role: WizardModel.Role
-    let selected: Bool
-    let pick: () -> Void
+private struct ComponentToggle: View {
+    let title: String
+    let blurb: String
+    let symbol: String
+    @Binding var on: Bool
 
     var body: some View {
-        Button(action: pick) {
-            HStack(alignment: .top, spacing: Metrics.lg) {
-                Image(systemName: role.symbol)
-                    .font(.title2)
-                    .foregroundStyle(selected ? Color.accentColor : .secondary)
-                    .frame(width: 28)
-                VStack(alignment: .leading, spacing: Metrics.sm) {
-                    Text(role.title).font(.rowTitle)
-                    Text(role.blurb)
-                        .font(.rowDetail)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .multilineTextAlignment(.leading)
-                }
-                Spacer(minLength: 0)
-                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(selected ? Color.accentColor : .secondary.opacity(0.4))
+        HStack(alignment: .top, spacing: Metrics.md) {
+            Image(systemName: symbol)
+                .font(.system(size: 22))
+                .frame(width: 34)
+                .foregroundStyle(on ? Color.accentColor : .secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.headline)
+                Text(blurb)
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(Metrics.lg)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.primary.opacity(selected ? 0.07 : 0.03))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(selected ? Color.accentColor : .clear, lineWidth: 2)
-            )
+            Spacer(minLength: Metrics.md)
+            Toggle("", isOn: $on)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .accessibilityLabel(title)
         }
-        .buttonStyle(.plain)
+        .padding(Metrics.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.06)))
     }
 }
 

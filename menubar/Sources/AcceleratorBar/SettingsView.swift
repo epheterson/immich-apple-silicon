@@ -105,17 +105,21 @@ struct SettingsView: View {
             // can be left in a state with no way back to the other panes.
             .toolbar(removing: .sidebarToggle)
         } detail: {
-            detail
-                // .principal is the supported way to center content in the
-                // title bar. navigationTitle lands centered on macOS 15 but
-                // leading on macOS 26 (the release gate runs 26), and neither
-                // setting NSWindow.title nor dropping the toolbar moved it,
-                // because the split view places its own title.
-                .toolbar {
-                    ToolbarItem(placement: .principal) {
-                        Text(pane?.title ?? "Settings").font(.headline)
-                    }
-                }
+            // The pane name is a header in the content, the way System
+            // Settings does it, rather than a .principal toolbar item.
+            // macOS 26 gives toolbar items a glass backdrop, so the centered
+            // title sat inside a visible capsule; suppressing that needs a
+            // 26-only API, and CI builds against the 15 SDK. Drawing it here
+            // is version-proof and matches the platform besides.
+            VStack(alignment: .leading, spacing: 0) {
+                Text(pane?.title ?? "Settings")
+                    .font(.title2.weight(.semibold))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Metrics.xl)
+                    .padding(.top, Metrics.lg)
+                    .padding(.bottom, Metrics.sm)
+                detail
+            }
         }
         // Still set on the window, so the title is right in Mission Control,
         // the Window menu and any screenshot of the title bar.
@@ -273,11 +277,11 @@ struct SettingsView: View {
     private var componentsTab: some View {
         Form {
             Section {
-                componentToggle("worker", $workerOn, "Worker",
+                componentToggle("worker", $workerOn, "Microservices",
                                 "Thumbnails, video transcoding, metadata")
                 componentToggle("ml", $mlOn, "Machine Learning",
                                 "Search, faces, OCR")
-                componentToggle("dashboard", $dashboardOn, "Web dashboard",
+                componentToggle("dashboard", $dashboardOn, "Web Dashboard",
                                 dashboardStatus)
             } footer: {
                 // No section header. The window title already says

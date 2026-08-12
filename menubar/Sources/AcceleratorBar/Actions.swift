@@ -280,6 +280,19 @@ enum Actions {
     // The one-liner shown in onboarding when the accelerator isn't installed.
     static let installCommand = "brew install epheterson/immich-accelerator/immich-accelerator"
 
+    /// The existing config, for prefilling a re-run.
+    ///
+    /// Re-running setup after an update is something we actively tell people to
+    /// do, so arriving at an empty form is both alarming and wrong: it looks
+    /// like the settings are gone, and anything left blank would be re-answered
+    /// from defaults. Every value here is one setup itself wrote.
+    static func existingConfig() -> [String: Any]? {
+        guard let data = try? Data(contentsOf: Paths.configFile),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return obj
+    }
+
     /// Look for an Immich media root among the places one is actually likely
     /// to be, so most people never type a path at all.
     ///
