@@ -179,7 +179,13 @@ final class SigLIPNative {
     // and was measured as a real chunk of latency alongside Resize.bicubic — see
     // that file's doc comment. Same output as the previous bounds-checked
     // sequential version, just faster on the M4's 10 cores.
-    private func patches(_ cg: CGImage, targetSize: Int, mean: [Float], std: [Float]) -> MLXArray {
+    // Returns the raw normalized patch buffer and its shape, NOT an MLXArray.
+    // Building the array here would put MLX allocation and a lazy astype node
+    // outside withMetalLock, on up to Server.swift's maxConcurrent threads at
+    // once, which is the invariant GPULock.swift exists to hold. Only the
+    // pixel work belongs outside the lock; the caller makes the array inside.
+    private func patches(_ cg: CGImage, targetSize: Int, mean: [Float], std: [Float])
+        -> (flat: [Float], rows: Int, cols: Int) {
         let patch = cfg.visionPatch
         let grid = targetSize / patch
         let (full, iw, ih) = rgbBuffer(cg)
@@ -208,7 +214,7 @@ final class SigLIPNative {
                 }
             }
         }
-        return MLXArray(flat, [grid * grid, dim]).asType(Self.computeDType)
+        return (flat, grid * grid, dim)
     }
 
     // Scoped to the GPU device for just this call (Device.withDefaultDevice
@@ -231,9 +237,11 @@ final class SigLIPNative {
         // withMetalLock so up to Server.swift's maxConcurrent requests can prep
         // their patch tensors in parallel; only the GPU submission below needs
         // to be serialized against other Metal work (see GPULock.swift).
-        let patchInput = patches(cg, targetSize: targetSize, mean: mean, std: std)
+        let prepped = patches(cg, targetSize: targetSize, mean: mean, std: std)
         return withMetalLock {
             Device.withDefaultDevice(.gpu) {
+                let patchInput = MLXArray(prepped.flat, [prepped.rows, prepped.cols])
+                    .asType(Self.computeDType)
                 let tower = cfg.vision
                 let wPatch = w("vision_model.embeddings.patch_embedding.weight")
                     .reshaped([tower.hidden, 3 * cfg.visionPatch * cfg.visionPatch])
@@ -315,6 +323,7 @@ final class SigLIPNative {
             return dst.path
         }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        sweepPartials(dir: dir, name: name)
         let url = URL(string: "https://huggingface.co/\(hfRepo)/resolve/main/model.safetensors")!
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 60
@@ -341,6 +350,27 @@ final class SigLIPNative {
         }
         try downloadWhole(session: session, url: url, dst: dst, name: name)
         return dst.path
+    }
+
+    // Delete leftover .tmp-<uuid> files from an interrupted fetch.
+    //
+    // downloadRanged preallocates the whole file (truncate to Content-Length)
+    // before writing a byte, so an interrupted 4.5GB fetch leaves something
+    // that reports its full size on disk and is named differently every time
+    // — nothing would ever have reclaimed it, and each retry added another.
+    // Only safe here, before a fetch starts, because a completed download is
+    // already renamed to model.safetensors and a concurrent one cannot exist:
+    // Models.zoo(for:) holds a single-resident-model lock across this call.
+    private static func sweepPartials(dir: URL, name: String) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
+        for entry in entries where entry.hasPrefix(".tmp-") {
+            let stale = dir.appendingPathComponent(entry)
+            let bytes = ((try? stale.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
+                .totalFileAllocatedSize) ?? 0) ?? 0
+            try? fm.removeItem(at: stale)
+            print("[native-ml] \(name): discarded interrupted download (\(bytes / 1024 / 1024)MB)")
+        }
     }
 
     private static func contentLength(session: URLSession, url: URL) -> Int? {
@@ -389,25 +419,72 @@ final class SigLIPNative {
         let ranges = (0..<chunks).map { i in (i * chunkSize, min((i + 1) * chunkSize, total) - 1) }
             .filter { $0.0 <= $0.1 }
         print("[native-ml] fetching \(name) (\(total / 1024 / 1024)MB, \(ranges.count)x parallel)")
+        // Multi-gigabyte and minutes long, so it goes on the same /health field
+        // the ONNX fetch uses. Without this the menu bar showed nothing at all
+        // during the single longest wait the service has, while Immich's jobs
+        // failed and retried in the background and the app looked idle.
+        ZooCLIP.setProgress(.init(model: name, done: 0, total: ranges.count))
+        defer { ZooCLIP.setProgress(nil) }
 
         let group = DispatchGroup()
         let errorLock = NSLock()
         var firstError: Error?
+        var completed = 0
         for (start, end) in ranges {
             group.enter()
-            fetchRange(session: session, url: url, start: start, end: end) { data, err in
-                defer { group.leave() }
-                guard let data else {
-                    errorLock.lock(); if firstError == nil { firstError = err }; errorLock.unlock()
-                    return
-                }
-                writeLock.lock()
-                defer { writeLock.unlock() }
-                do {
-                    try handle.seek(toOffset: UInt64(start))
-                    try handle.write(contentsOf: data)
-                } catch {
-                    errorLock.lock(); if firstError == nil { firstError = error }; errorLock.unlock()
+            // Dispatched, not called inline. fetchRange blocks its caller until
+            // the transfer finishes, so running it in this loop made "8x
+            // parallel" strictly sequential: every group.leave() had already
+            // run by the time group.wait() was reached, and a 4.5GB checkpoint
+            // took the full single-stream time while the label claimed
+            // otherwise.
+            DispatchQueue.global().async {
+                fetchRange(session: session, url: url, start: start, end: end) { chunkFile, err in
+                    defer { group.leave() }
+                    guard let chunkFile else {
+                        errorLock.lock(); if firstError == nil { firstError = err }; errorLock.unlock()
+                        return
+                    }
+                    defer { try? FileManager.default.removeItem(at: chunkFile) }
+                    // A 206 is not a promise that the bytes are the ones asked
+                    // for. Unchecked, a short or shifted chunk left the
+                    // preallocated file's zeros in place, still counted as
+                    // completed, and got published as model.safetensors — which
+                    // then passes the size>0 cache check forever, so the model
+                    // either fails to load on every start or loads and writes
+                    // garbage embeddings into Immich's search index.
+                    let expected = end - start + 1
+                    let got = ((try? chunkFile.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) ?? 0
+                    guard got == expected else {
+                        errorLock.lock()
+                        if firstError == nil {
+                            firstError = PredictError(
+                                status: "500 Internal Server Error",
+                                message: "\(name): range \(start)-\(end) returned "
+                                    + "\(got) bytes, expected \(expected)")
+                        }
+                        errorLock.unlock()
+                        return
+                    }
+                    writeLock.lock()
+                    defer { writeLock.unlock() }
+                    do {
+                        // Streamed in blocks rather than read whole. Eight
+                        // concurrent chunks of a 4.5GB checkpoint held the
+                        // entire file in memory at once when each chunk was an
+                        // in-memory Data, on a machine also running the worker
+                        // and an Immich stack.
+                        let reader = try FileHandle(forReadingFrom: chunkFile)
+                        defer { try? reader.close() }
+                        try handle.seek(toOffset: UInt64(start))
+                        while let block = try reader.read(upToCount: 8 << 20), !block.isEmpty {
+                            try handle.write(contentsOf: block)
+                        }
+                        completed += 1
+                        ZooCLIP.setProgress(.init(model: name, done: completed, total: ranges.count))
+                    } catch {
+                        errorLock.lock(); if firstError == nil { firstError = error }; errorLock.unlock()
+                    }
                 }
             }
         }
@@ -424,20 +501,50 @@ final class SigLIPNative {
     // One range, 3 attempts with backoff — a single dropped chunk shouldn't
     // force re-fetching the other 7/8 of a multi-GB file.
     private static func fetchRange(
-        session: URLSession, url: URL, start: Int, end: Int, completion: @escaping (Data?, Error?) -> Void
+        session: URLSession, url: URL, start: Int, end: Int, completion: @escaping (URL?, Error?) -> Void
     ) {
         var req = URLRequest(url: url)
         req.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
         var lastError: Error?
         for attempt in 1...3 {
             let sem = DispatchSemaphore(value: 0)
-            var result: Data?
-            session.dataTask(with: req) { data, resp, err in
-                if (resp as? HTTPURLResponse)?.statusCode == 206 { result = data } else { lastError = err }
+            var result: URL?
+            var ignoredRange = false
+            // downloadTask, not dataTask: the body lands in a file instead of
+            // in memory, so eight concurrent chunks cost eight file handles
+            // rather than the whole checkpoint in RAM.
+            session.downloadTask(with: req) { tmp, resp, err in
+                let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if status == 206, let tmp {
+                    // URLSession deletes its temp file when this handler
+                    // returns, so move it somewhere we own first.
+                    let hold = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("chunk-\(UUID().uuidString)")
+                    if (try? FileManager.default.moveItem(at: tmp, to: hold)) != nil {
+                        result = hold
+                    }
+                } else if status == 200 {
+                    // The Range header was ignored and the whole file came
+                    // back. contentLength() gates on the origin's
+                    // Accept-Ranges, which says nothing about what a proxy in
+                    // between does. Retrying cannot help and is ruinously
+                    // expensive: each of 8 chunks would pull the entire
+                    // multi-gigabyte file three times before the ranged path
+                    // gave up, so give up now and let the single-connection
+                    // fallback do it once.
+                    ignoredRange = true
+                } else {
+                    lastError = err
+                }
                 sem.signal()
             }.resume()
             sem.wait()
             if let result { completion(result, nil); return }
+            if ignoredRange {
+                completion(nil, PredictError(status: "500 Internal Server Error",
+                                             message: "server ignored Range (200), falling back"))
+                return
+            }
             if attempt < 3 { Thread.sleep(forTimeInterval: Double(attempt) * 2) }
         }
         completion(nil, lastError ?? PredictError(status: "500 Internal Server Error",
@@ -447,19 +554,27 @@ final class SigLIPNative {
     // Single-connection fallback: used when the server doesn't advertise
     // Content-Length/Accept-Ranges, or if the ranged path fails outright.
     private static func downloadWhole(session: URLSession, url: URL, dst: URL, name: String) throws {
+        // One opaque transfer, so there is no chunk count to report against;
+        // 0-of-1 still tells the menu bar which model is being fetched, which
+        // is the part that keeps a long wait from looking like a hang.
+        ZooCLIP.setProgress(.init(model: name, done: 0, total: 1))
+        defer { ZooCLIP.setProgress(nil) }
         var lastError = ""
         for attempt in 1...3 {
             let sem = DispatchSemaphore(value: 0)
             var result: URL?
             var status = 0
             var transportError: Error?
+            var expected = -1
             let task = session.downloadTask(with: url) { tmp, resp, err in
                 if let tmp {
                     let hold = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
                     try? FileManager.default.moveItem(at: tmp, to: hold)
                     result = hold
                 }
-                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let http = resp as? HTTPURLResponse
+                status = http?.statusCode ?? 0
+                expected = Int(http?.value(forHTTPHeaderField: "Content-Length") ?? "") ?? -1
                 transportError = err
                 sem.signal()
             }
@@ -468,6 +583,23 @@ final class SigLIPNative {
             sem.wait()
 
             if status == 200, let tmp = result {
+                // The ranged path checks every chunk against the range it asked
+                // for; this one had no check at all, and it is not a rare path
+                // (it is the fallback whenever ranges fail, including a proxy
+                // that strips the Range header). A connection that drops
+                // mid-body still yields a 200 with a short file, which would be
+                // moved into place and then satisfy the fileSize > 0 cache check
+                // on every subsequent start: a permanently broken model.
+                let got = ((try? tmp.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) ?? 0
+                if expected > 0 && got != expected {
+                    try? FileManager.default.removeItem(at: tmp)
+                    lastError = "short body: got \(got) bytes, expected \(expected)"
+                    if attempt < 3 {
+                        print("[native-ml] retrying \(name) weight fetch (\(lastError))")
+                        Thread.sleep(forTimeInterval: Double(attempt) * 2)
+                    }
+                    continue
+                }
                 try? FileManager.default.removeItem(at: dst)
                 try FileManager.default.moveItem(at: tmp, to: dst)
                 return
@@ -529,6 +661,16 @@ enum SigLIPRegistry {
             vision: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072),
             visionPatch: 16,
             text: .init(hidden: 768, layers: 12, heads: 12, intermediate: 3072), textProjection: 768),
+        // RE-MEASURED 2026-08-10, after the CPU-preprocessing rewrite and the
+        // move to bf16 compute: this model no longer stands out. Against
+        // Immich's own ONNX export on three real library preview images it
+        // measures 0.99932, 0.99953 and 0.99979 visual, 0.99983 textual — in
+        // line with every other model here. Whatever produced the number below
+        // did not survive those two commits, so the note is kept for the
+        // investigation rather than as a live caveat. Re-check on real
+        // previews, not synthetic images, if it ever resurfaces: a noise image
+        // is not a proxy for a photo here.
+        //
         // Visual embeddings here measure ~0.99 cosine against Immich's ONNX
         // export (vs. 0.999+ for every other model in this registry); textual
         // is unaffected (1.0000). Investigated 2026-08-09 and not treated as

@@ -4,7 +4,8 @@
 
 - **NEVER touch main without Eric's explicit approval.** No merging to main, no committing to main, no pushing to main. Work on branches only. When the branch is ready, say so and wait for Eric to tell you to merge and push.
 - Squash merge to main. One clean commit per release.
-- Version bump + CHANGELOG entry required for every push to main.
+- Version bump + CHANGELOG entry required for every push to main. Enforced by the `version-bump` CI job and `tests/test_release_hygiene.py`, not just convention: `auto-tag` publishes the CHANGELOG section verbatim as the release notes, so a missing bump ships silently and a missing heading makes the notes run on into every previous release.
+- Contributor PRs from forks are exempt from the bump. They merge unversioned and our own release PR carries the version and the changelog entry that credits them.
 - Tag releases as `vX.Y.Z` matching the VERSION file.
 - **After every tag push**: update the Homebrew tap (epheterson/homebrew-immich-accelerator) via `gh api` — new version, tarball URL, sha256. Verify on Mac Mini. Never skip this.
 

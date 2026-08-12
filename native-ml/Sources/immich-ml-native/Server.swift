@@ -8,6 +8,34 @@ import Network
 func startServer(port: UInt16, models: Models, maxConcurrent: Int = 4) {
     let sem = DispatchSemaphore(value: maxConcurrent)
     let listener = try! NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: port)!)
+    // NWListener reports a bind failure asynchronously through this handler, it
+    // does not throw from the initializer. Without a handler the failure is
+    // swallowed whole: the process stays parked in dispatchMain() forever,
+    // listening to nothing, looking alive to anything that only checks whether
+    // the PID exists. Every subsequent start then leaks another one, and
+    // ml.pid ends up naming a process that serves no traffic while some older
+    // instance still owns the port, so `restart` politely kills the wrong
+    // process and changes nothing. Measured on a real box: 6 leaked instances
+    // over 4 days, `status` reporting a PID that was not the listener.
+    // Exiting instead makes the failure visible and lets the supervisor act.
+    listener.stateUpdateHandler = { state in
+        switch state {
+        case .ready:
+            print("[native-ml] listening on port \(port)")
+        case .failed(let error):
+            FileHandle.standardError.write(
+                Data("[native-ml] cannot listen on port \(port): \(error)\n".utf8))
+            exit(70)   // EX_SOFTWARE
+        case .waiting(let error):
+            // Transient by contract (Network.framework retries on its own), so
+            // not fatal. Logged because a listener stuck here answers nothing
+            // and the silence is otherwise indistinguishable from idle.
+            FileHandle.standardError.write(
+                Data("[native-ml] waiting to listen on port \(port): \(error)\n".utf8))
+        default:
+            break
+        }
+    }
     listener.newConnectionHandler = { conn in
         conn.start(queue: .global())
         readRequest(conn, buffer: Data(), models: models, sem: sem)
@@ -98,9 +126,12 @@ private func handle(_ conn: NWConnection, method: String, path: String, ctype: S
               let entriesStr = String(data: entriesData, encoding: .utf8) else {
             respondJSON(conn, status: "422 Unprocessable Entity", object: ["detail": "missing entries field"]); return
         }
-        print("[native-ml] entries raw: \(entriesStr)")
         guard let entries = (try? JSONSerialization.jsonObject(with: Data(entriesStr.utf8))) as? [String: Any] else {
-            print("[native-ml] Invalid entries JSON")
+            // The raw field is logged only when it failed to parse. Logging it
+            // on every request put a copy of the entries JSON in ml.log for
+            // each of a library's assets, which is noise on a six-figure
+            // import and tells you nothing the per-task lines don't.
+            print("[native-ml] Invalid entries JSON: \(entriesStr)")
             respondJSON(conn, status: "422 Unprocessable Entity", object: ["detail": "invalid entries JSON"]); return
         }
         let image = extractPart(body, boundary: boundary, name: "image")

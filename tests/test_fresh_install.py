@@ -12,6 +12,7 @@ Every test here simulates an environment the maintainer doesn't have.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import venv
 from pathlib import Path
@@ -1489,6 +1490,58 @@ class TestHeicDecodeShim:
             pytest.skip("node not installed")
         return node
 
+    def test_a_second_output_does_not_re_apply_the_chain(self, tmp_path):
+        """Two outputs from one pipeline must each get the chain once.
+
+        The lazy proxy records chain calls and replays them when a terminal
+        method runs. Replaying onto a single shared Sharp instance meant the
+        second output got rotate/resize applied on top of the first, because
+        real chain methods return `this`. Immich 3.0.2 does not reuse a
+        pipeline, so nothing triggers it today, but this shim wraps whichever
+        Immich the user is running and the failure is silent: wrong pixels, no
+        error. Each terminal builds its own instance now.
+        """
+        node = self._node_or_skip()
+        # A fake Sharp that records what was applied to each instance it makes.
+        (tmp_path / "node_modules" / "sharp").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "node_modules" / "sharp" / "index.js").write_text(
+            "const instances=[];"
+            "function fakeSharp(){const mine=[];instances.push(mine);"
+            "const i={rotate(){mine.push('rotate');return i;},"
+            "resize(){mine.push('resize');return i;},"
+            "async toBuffer(){return Buffer.from('x');},"
+            "async metadata(){return {};}};return i;}"
+            "fakeSharp.cache=function(){};fakeSharp.__instances=instances;"
+            "module.exports=fakeSharp;\n"
+        )
+        driver = tmp_path / "driver.js"
+        # A .arw path routes into the lazy proxy on a pure string check, with
+        # no file needed; the decode fails and falls back, which is fine here.
+        driver.write_text(
+            "const sharp=require('sharp');"
+            "(async () => {"
+            "  const p = sharp('/tmp/nonexistent-chain-probe.arw');"
+            "  await p.rotate(90).resize(100).toBuffer();"
+            "  await p.toBuffer();"
+            "  const per = sharp.__instances.map(i => i.join('+'));"
+            "  process.stdout.write('PER:'+JSON.stringify(per)+'\\n');"
+            "})().catch(e => { console.error(e); process.exit(1); });\n"
+        )
+        r = subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver)],
+            cwd=str(tmp_path),
+            env={"PATH": "/usr/bin:/bin"},
+            capture_output=True, text=True, timeout=30,
+        )
+        assert r.returncode == 0, r.stderr
+        line = next(l for l in r.stdout.splitlines() if l.startswith("PER:"))
+        applied = json.loads(line[len("PER:"):])
+        assert applied, "the proxy never built a Sharp instance"
+        for chain in applied:
+            assert chain.count("rotate") <= 1, (
+                f"chain applied more than once to one instance: {applied}"
+            )
+
     def test_routes_heic_to_vips_and_passes_others_through(self, tmp_path):
         """HEIC path is decoded to a Buffer via the primary (vips) decoder; a
         non-HEIC path passes through untouched as a string."""
@@ -1905,9 +1958,18 @@ class TestFfmpegWrapperQuickLookFallback:
         assert not ql_marker.exists(), "fallback must not run for a full transcode"
         assert not output.exists()
 
+    # What ffmpeg actually prints when its HEVC decoder rejects a stream. The
+    # fallback keys on this rather than on the exit code, so the stub has to
+    # produce it: a bare non-zero exit is a different situation (a truncated
+    # file, a bad seek) and must NOT be papered over.
+    _DECODE_REJECTED_STDERR = (
+        "echo '[hevc @ 0x7f8] Error while decoding stream #0:0: "
+        "Invalid data found when processing input' >&2\n"
+    )
+
     def test_single_frame_failure_recovers_via_quicklook_fallback(self, tmp_path):
         ffmpeg = tmp_path / "ffmpeg"
-        self._bash_stub(ffmpeg, "exit 69\n")
+        self._bash_stub(ffmpeg, self._DECODE_REJECTED_STDERR + "exit 69\n")
         qlmanage = tmp_path / "qlmanage"
         self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
         vips = tmp_path / "vips_stub.sh"
@@ -1930,6 +1992,33 @@ class TestFfmpegWrapperQuickLookFallback:
         assert output.exists(), "fallback should have produced the output file"
         assert output.read_text().strip() == "FAKEPNG"
         assert "QuickLook/AVFoundation produced one instead" in result.stderr
+
+    def test_a_non_decode_failure_is_not_papered_over(self, tmp_path):
+        """A broken file must stay broken.
+
+        The fallback used to fire on any non-zero exit, so a truncated upload
+        or a seek past the end still got a poster frame out of QuickLook and
+        exited 0: Immich recorded a corrupt asset as successfully thumbnailed
+        and nobody ever found out. Only a decoder rejection qualifies now.
+        """
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "echo 'in.mp4: No such file or directory' >&2\nexit 1\n")
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
+        vips = tmp_path / "vips_stub.sh"
+        self._bash_stub(vips, self._VIPS_COPY)
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        output = tmp_path / "out.jpg"
+        args = self._thumbnail_args(tmp_path / "in.mp4", output)
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin",
+                 "IMMICH_ACCELERATOR_VIPS": str(vips)},
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 1, "ffmpeg's real failure must propagate"
+        assert not output.exists(), "no thumbnail should be invented for a broken file"
 
     def test_single_frame_failure_falls_through_when_quicklook_also_fails(
         self, tmp_path

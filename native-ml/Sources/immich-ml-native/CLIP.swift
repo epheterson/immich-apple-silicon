@@ -25,7 +25,10 @@ final class CLIPEncoder {
     // crop 224, rescale /255, normalize. Resize filter parity matters for CLIP.
     // Row-parallel + unsafe-pointer-backed, same rationale as SigLIPNative's
     // patches() (see that file and Resize.swift).
-    private func patches(_ cg: CGImage) -> MLXArray {
+    // Pure CPU: returns the flat patch buffer and its shape, not an MLXArray.
+    // Constructing the array here would run MLX allocation outside metalLock
+    // on several request threads at once (see SigLIPNative.patches).
+    private func patches(_ cg: CGImage) -> (flat: [Float], rows: Int, cols: Int) {
         let S = Self.IMG
         let (full, w, h) = rgbBuffer(cg)
         let short = min(w, h)
@@ -55,7 +58,7 @@ final class CLIPEncoder {
                 }
             }
         }
-        return MLXArray(flat, [nP * nP, dim])
+        return (flat, nP * nP, dim)
     }
 
     private func ln(_ x: MLXArray, _ g: MLXArray, _ b: MLXArray) -> MLXArray {
@@ -78,8 +81,9 @@ final class CLIPEncoder {
     // Concurrency: guarded by metalLock (GPULock.swift) — see that file. CPU-only
     // patch extraction runs before the lock, same rationale as SigLIPNative.embedVisual.
     func embed(_ cg: CGImage) -> [Float] {
-        let patchInput = patches(cg)
+        let prepped = patches(cg)
         return withMetalLock {
+            let patchInput = MLXArray(prepped.flat, [prepped.rows, prepped.cols])
             let wPatch = w("vision_model.embeddings.patch_embedding.weight").reshaped([Self.H, 3 * Self.PATCH * Self.PATCH])
             var x = matmul(patchInput, wPatch.transposed())
             x = concatenated([w("vision_model.embeddings.class_embedding").reshaped([1, Self.H]), x], axis: 0)
