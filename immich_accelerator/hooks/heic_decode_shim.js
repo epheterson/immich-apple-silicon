@@ -314,16 +314,29 @@ const TERMINAL_ASYNC_METHODS = new Set(['toBuffer', 'toFile', 'metadata', 'stats
 // is now async. Records synchronous chain calls and replays them once decode
 // resolves; a terminal call (toBuffer etc.) awaits it first.
 function lazyDecodedSharp(input, options, realSharp) {
-    const ready = decodeToBuffer(input).then(
-        (buf) => realSharp(buf !== null ? buf : input, options)
-    );
+    // Resolve to the decoded SOURCE, not to a Sharp instance. Each terminal
+    // call then builds its own instance and applies the chain to that.
+    //
+    // Sharing one instance replayed the whole recorded chain onto it every
+    // time a terminal method ran, and real Sharp chain methods return `this`,
+    // so a second output re-applied rotate/resize on top of the first. Immich
+    // 3.0.2 happens not to reuse a pipeline (every output calls sharp() again),
+    // so nothing triggers it today — but this shim wraps whatever Immich the
+    // user is running, and an upstream change to reuse one pipeline would
+    // silently double-transform their thumbnails with no error anywhere.
+    const decoded = decodeToBuffer(input).then((buf) => (buf !== null ? buf : input));
+    // Never an unhandled rejection: nothing awaits `decoded` until a terminal
+    // method runs, and if no terminal ever runs (an exception between sharp()
+    // and .toBuffer(), say) an unattached rejection would take the worker down
+    // on Node 15+, where that is fatal by default.
+    decoded.catch(() => {});
     const calls = [];
     const proxy = new Proxy(function () {}, {
         get(_target, prop) {
             if (typeof prop === 'symbol' || NON_CHAIN_PROPS.has(prop)) return undefined;
             if (TERMINAL_ASYNC_METHODS.has(prop)) {
                 return async (...args) => {
-                    let instance = await ready;
+                    let instance = realSharp(await decoded, options);
                     for (const [method, methodArgs] of calls) {
                         instance = instance[method](...methodArgs);
                     }

@@ -12,6 +12,7 @@ Every test here simulates an environment the maintainer doesn't have.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import venv
 from pathlib import Path
@@ -1488,6 +1489,58 @@ class TestHeicDecodeShim:
         if not node:
             pytest.skip("node not installed")
         return node
+
+    def test_a_second_output_does_not_re_apply_the_chain(self, tmp_path):
+        """Two outputs from one pipeline must each get the chain once.
+
+        The lazy proxy records chain calls and replays them when a terminal
+        method runs. Replaying onto a single shared Sharp instance meant the
+        second output got rotate/resize applied on top of the first, because
+        real chain methods return `this`. Immich 3.0.2 does not reuse a
+        pipeline, so nothing triggers it today, but this shim wraps whichever
+        Immich the user is running and the failure is silent: wrong pixels, no
+        error. Each terminal builds its own instance now.
+        """
+        node = self._node_or_skip()
+        # A fake Sharp that records what was applied to each instance it makes.
+        (tmp_path / "node_modules" / "sharp").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "node_modules" / "sharp" / "index.js").write_text(
+            "const instances=[];"
+            "function fakeSharp(){const mine=[];instances.push(mine);"
+            "const i={rotate(){mine.push('rotate');return i;},"
+            "resize(){mine.push('resize');return i;},"
+            "async toBuffer(){return Buffer.from('x');},"
+            "async metadata(){return {};}};return i;}"
+            "fakeSharp.cache=function(){};fakeSharp.__instances=instances;"
+            "module.exports=fakeSharp;\n"
+        )
+        driver = tmp_path / "driver.js"
+        # A .arw path routes into the lazy proxy on a pure string check, with
+        # no file needed; the decode fails and falls back, which is fine here.
+        driver.write_text(
+            "const sharp=require('sharp');"
+            "(async () => {"
+            "  const p = sharp('/tmp/nonexistent-chain-probe.arw');"
+            "  await p.rotate(90).resize(100).toBuffer();"
+            "  await p.toBuffer();"
+            "  const per = sharp.__instances.map(i => i.join('+'));"
+            "  process.stdout.write('PER:'+JSON.stringify(per)+'\\n');"
+            "})().catch(e => { console.error(e); process.exit(1); });\n"
+        )
+        r = subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver)],
+            cwd=str(tmp_path),
+            env={"PATH": "/usr/bin:/bin"},
+            capture_output=True, text=True, timeout=30,
+        )
+        assert r.returncode == 0, r.stderr
+        line = next(l for l in r.stdout.splitlines() if l.startswith("PER:"))
+        applied = json.loads(line[len("PER:"):])
+        assert applied, "the proxy never built a Sharp instance"
+        for chain in applied:
+            assert chain.count("rotate") <= 1, (
+                f"chain applied more than once to one instance: {applied}"
+            )
 
     def test_routes_heic_to_vips_and_passes_others_through(self, tmp_path):
         """HEIC path is decoded to a Buffer via the primary (vips) decoder; a
