@@ -93,7 +93,10 @@ fi
 # not paper over). The wrapper is the parent rather than exec'ing, because it
 # has work to do afterwards; forward the usual signals so killing the wrapper
 # still kills ffmpeg instead of orphaning it.
-FF_ERR=$(mktemp -t immich-ffmpeg-err)
+# Explicit X's: BSD mktemp accepts a bare -t template, GNU requires them,
+# and the wrapper's tests run on Linux in CI even though it only ever
+# executes on macOS.
+FF_ERR=$(mktemp "${TMPDIR:-/tmp}/immich-ffmpeg-err.XXXXXX")
 cleanup() { rm -f "$FF_ERR"; [[ -n "${QL_DIR:-}" ]] && rm -rf "$QL_DIR"; }
 trap cleanup EXIT
 "$REAL_FFMPEG" "${RUN_ARGS[@]}" 2> >(tee "$FF_ERR" >&2) &
