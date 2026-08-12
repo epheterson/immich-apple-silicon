@@ -2859,6 +2859,42 @@ class TestWatchDispatch:
             assert m._watch_without_worker({"worker": False}) == m._SWITCH
 
 
+class TestComponentNaming:
+    """One thing, one name, in the UI and on the command line.
+
+    Settings, the menu bar and Diagnostics each called the worker something
+    different at one point, which is the confusion the rename set out to fix.
+    The config key and the CLI argument stay "worker" forever, because they are
+    in people's scripts and config files.
+    """
+
+    def test_every_component_has_a_label(self):
+        import immich_accelerator.__main__ as m
+
+        for c in m.COMPONENTS:
+            assert c in m.COMPONENT_LABELS, f"{c} has no display name"
+
+    def test_the_ui_name_works_on_the_command_line(self, tmp_data_dir):
+        """Someone who read "Microservices" in Settings should be able to type
+        it, rather than having to know it is spelled "worker" underneath."""
+        import immich_accelerator.__main__ as m
+
+        for alias, canonical in m.COMPONENT_ALIASES.items():
+            assert canonical in m.COMPONENTS
+            with patch.object(m, "_set_component", return_value=True) as setter:
+                m.cmd_component(argparse.Namespace(name=alias, state="on"))
+            assert setter.call_args[0][0] == canonical, (
+                f"{alias} did not resolve to {canonical}"
+            )
+
+    def test_the_canonical_names_still_work(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_set_component", return_value=True) as setter:
+            m.cmd_component(argparse.Namespace(name="worker", state="off"))
+        assert setter.call_args[0][0] == "worker"
+
+
 class TestDetect:
     """`detect` answers the wizard's topology question.
 

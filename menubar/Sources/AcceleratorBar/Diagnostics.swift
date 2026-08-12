@@ -45,7 +45,7 @@ enum Diagnostics {
                          detail: snap.version.isEmpty ? "unknown" : "v\(snap.version)",
                          level: snap.version.isEmpty ? .warn : .ok))
 
-        out.append(Check(label: "Worker",
+        out.append(Check(label: "Microservices",
                          detail: !snap.workerEnabled ? "off"
                              : (snap.workerUp ? "running" : "enabled, not running"),
                          level: !snap.workerEnabled ? .info : (snap.workerUp ? .ok : .fail)))

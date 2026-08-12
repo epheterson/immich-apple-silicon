@@ -9,7 +9,9 @@ enum ServiceState: Equatable {
         switch self {
         case .running: return "Running"
         case .stopped: return "Stopped"
-        case .degraded: return "Degraded"
+        // "Needs attention" rather than "Degraded": it says what to do
+        // about it, which is the only reason to show a state at all.
+        case .degraded: return "Needs attention"
         }
     }
 }

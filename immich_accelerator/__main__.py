@@ -2281,6 +2281,20 @@ def _dashboard_port() -> int:
 # so "video but not thumbnails" is Immich's job scheduler, not ours.
 COMPONENTS = ("worker", "ml", "dashboard")
 
+# What each component is called in writing. The config key and the CLI argument
+# stay "worker" forever, because they are in people's scripts and config files;
+# only the word we print changes, so the CLI, the menu bar and Settings finally
+# agree on one name for one thing.
+COMPONENT_LABELS = {
+    "worker": "Microservices",
+    "ml": "Machine Learning",
+    "dashboard": "Web Dashboard",
+}
+
+# Accepted on the command line in addition to the canonical name, so someone
+# who read "Microservices" in the UI can type it and have it work.
+COMPONENT_ALIASES = {"microservices": "worker", "machine-learning": "ml", "web-dashboard": "dashboard"}
+
 # How to say each one in a sentence. str.capitalize() turns "ml" into "Ml".
 COMPONENT_LABELS = {
     "worker": "Worker",
@@ -5809,6 +5823,9 @@ def cmd_component(args):
     happen is Immich's job scheduler, not ours."""
     name = getattr(args, "name", None)
     state = getattr(args, "state", None)
+    # Accept what the UI shows as well as what the config calls it.
+    if name:
+        name = COMPONENT_ALIASES.get(name, name)
 
     if not name:
         config = load_config()
@@ -5819,7 +5836,7 @@ def cmd_component(args):
                 detail = "disabled"
             else:
                 detail = "running" if running else "enabled, not running"
-            log.info("  %-10s %s", component, detail)
+            log.info("  %-14s %s", COMPONENT_LABELS[component], detail)
         return
 
     if name not in COMPONENTS:

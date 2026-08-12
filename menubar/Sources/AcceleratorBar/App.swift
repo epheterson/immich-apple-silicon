@@ -125,9 +125,16 @@ struct AcceleratorBarMain {
         if pane.hasPrefix("wizard:") {
             setenv("ACCEL_WIZARD_STEP", String(pane.dropFirst("wizard:".count)), 1)
         }
-        let host: NSViewController = pane.hasPrefix("wizard")
-            ? NSHostingController(rootView: SetupWizard(model: .shared))
-            : NSHostingController(rootView: SettingsView(model: .shared))
+        // "panel" renders the menu-bar popover, the surface people actually
+        // live in and the one nothing could capture until now.
+        let host: NSViewController
+        if pane == "panel" {
+            host = NSHostingController(rootView: MenuView(model: .shared))
+        } else if pane.hasPrefix("wizard") {
+            host = NSHostingController(rootView: SetupWizard(model: .shared))
+        } else {
+            host = NSHostingController(rootView: SettingsView(model: .shared))
+        }
         let window = NSWindow(contentViewController: host)
         window.styleMask = [.titled, .closable]
         window.title = "Immich Accelerator Settings"

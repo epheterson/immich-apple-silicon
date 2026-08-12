@@ -85,9 +85,24 @@ struct SettingsView: View {
     @State private var configNote: String?
     @State private var configFailed = false
 
+    /// Diagnostics is not a place you go, it is what appears when something
+    /// is wrong. As a permanent tab it was eight rows of green ticks, which is
+    /// a debug dump in a nice frame: when every row is a tick, the ticks carry
+    /// no information. It earns its place in the list only when a check fails,
+    /// or while you are standing in it.
+    private var visiblePanes: [Pane] {
+        Pane.allCases.filter { $0 != .diagnostics || somethingIsWrong || pane == .diagnostics }
+    }
+
+    private var somethingIsWrong: Bool {
+        if model.snap.overall != .running { return true }
+        return Diagnostics.checks(config: config, snap: model.snap)
+            .contains { $0.level == .fail }
+    }
+
     var body: some View {
         NavigationSplitView {
-            List(Pane.allCases, selection: $pane) { p in
+            List(visiblePanes, selection: $pane) { p in
                 Label {
                     Text(p.title)
                 } icon: {
