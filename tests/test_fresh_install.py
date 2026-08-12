@@ -1434,7 +1434,11 @@ class TestHeicDecodeShim:
             "function fakeSharp(input){"
             "process.stdout.write('INPUT_TYPE:'+"
             "(Buffer.isBuffer(input)?'buffer':typeof input)+'\\n');"
-            "return {};}"
+            # A real Sharp instance is only usable via its (async) output
+            # methods; the shim's lazy proxy defers the decode until one of
+            # those is called. metadata() here stands in for that terminal
+            # call so the driver exercises the real chain-then-await shape.
+            "return {metadata: async () => ({})};}"
             "fakeSharp.cache=function(){};"
             "module.exports=fakeSharp;\n"
         )
@@ -1454,11 +1458,18 @@ class TestHeicDecodeShim:
 
     def _run(self, tmp_path, node, env_extra, argv):
         driver = tmp_path / "driver.js"
+        # Decode is async now, so sharp(path) alone starts it but doesn't wait
+        # for it. Await metadata() per file, sequentially, so INPUT_TYPE lines
+        # land in a deterministic order regardless of decode latency — this is
+        # also exactly the chain-then-await shape Immich's own code uses.
+        awaits = "".join(
+            f"await sharp(process.argv[{i + 2}]).metadata();" for i in range(len(argv))
+        )
         driver.write_text(
             "const sharp=require('sharp');"
             "process.stdout.write('WRAPPED:'+(sharp.__heicShimWrapped===true)+'\\n');"
-            + "".join(f"sharp(process.argv[{i + 2}]);" for i in range(len(argv)))
-            + "\n"
+            f"(async () => {{{awaits}}})().catch(e => {{ console.error(e); process.exit(1); }});"
+            "\n"
         )
         env = {"PATH": "/usr/bin:/bin", **env_extra}
         return subprocess.run(
@@ -1630,6 +1641,164 @@ class TestHeicDecodeShim:
         assert (
             marker.read_text().strip() == "[" + str(real) + "]"
         ), "existing VIPSHOME must be preserved"
+
+    # --- async decode: lock-renewal-starvation regression + concurrency ---
+
+    def test_chain_calls_are_replayed_onto_real_sharp_in_order(self, tmp_path):
+        """Immich chains synchronous pipeline calls (rotate, resize, ...)
+        before awaiting a terminal method (toBuffer/toFile/metadata). Since
+        the decode is now async, sharp() can't call the real Sharp
+        synchronously anymore — it must record those chained calls and
+        replay them, in order and with their original arguments, onto the
+        real instance once decode resolves. This is the mechanism that lets
+        the decode run fully async while still looking like an ordinary
+        chainable Sharp pipeline to callers."""
+        node = self._node_or_skip()
+        sharp_dir = tmp_path / "node_modules" / "sharp"
+        sharp_dir.mkdir(parents=True)
+        (sharp_dir / "index.js").write_text(
+            "function fakeSharp(input){"
+            "const calls=[];"
+            "const inst={"
+            "rotate:(...a)=>{calls.push('rotate('+JSON.stringify(a)+')');return inst;},"
+            "resize:(...a)=>{calls.push('resize('+JSON.stringify(a)+')');return inst;},"
+            "toBuffer:async()=>{process.stdout.write('CALLS:'+calls.join(',')+'\\n');return Buffer.from('x');},"
+            "};"
+            "return inst;}"
+            "fakeSharp.cache=function(){};"
+            "module.exports=fakeSharp;\n"
+        )
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(vips, self._TIFF)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+        driver = tmp_path / "driver.js"
+        driver.write_text(
+            "const sharp=require('sharp');"
+            "sharp(process.argv[2]).rotate(90).resize(200,200).toBuffer()"
+            ".catch(e=>{console.error(e);process.exit(1);});\n"
+        )
+        env = {"PATH": "/usr/bin:/bin", "IMMICH_ACCELERATOR_VIPS": str(vips)}
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver), str(heic)],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "CALLS:rotate([90]),resize([200,200])" in result.stdout, result.stdout
+
+    def test_decode_does_not_block_the_event_loop(self, tmp_path):
+        """The bug this fix addresses: a synchronous (execFileSync) decode
+        used to block Node's entire event loop — and with it BullMQ's
+        lock-renewal timer — for the decode's full duration
+        (#could-not-renew-lock). Prove the event loop keeps ticking during a
+        slow decode by racing a timer against it; with the old synchronous
+        decode this would report ~0 ticks."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(vips, "sleep 0.3\n" + self._TIFF)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+        driver = tmp_path / "driver.js"
+        driver.write_text(
+            "const sharp=require('sharp');"
+            "let ticks=0;"
+            "const timer=setInterval(()=>{ticks++;},20);"
+            "sharp(process.argv[2]).metadata().then(()=>{"
+            "clearInterval(timer);"
+            "process.stdout.write('TICKS:'+ticks+'\\n');"
+            "}).catch(e=>{console.error(e);process.exit(1);});\n"
+        )
+        env = {"PATH": "/usr/bin:/bin", "IMMICH_ACCELERATOR_VIPS": str(vips)}
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver), str(heic)],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stderr
+        ticks = int(result.stdout.split("TICKS:")[1].strip())
+        assert ticks >= 5, (
+            f"event loop was blocked during decode (only {ticks} timer "
+            f"ticks in ~300ms of decode time); output: {result.stdout}"
+        )
+
+    def _run_two_concurrently(self, tmp_path, node, vips, env_extra):
+        heic1 = tmp_path / "a.heic"
+        heic1.write_bytes(self._HEIC_BYTES)
+        heic2 = tmp_path / "b.heic"
+        heic2.write_bytes(self._HEIC_BYTES)
+        driver = tmp_path / "driver.js"
+        driver.write_text(
+            "const sharp=require('sharp');"
+            "Promise.all([sharp(process.argv[2]).metadata(),sharp(process.argv[3]).metadata()])"
+            ".then(()=>process.stdout.write('DONE\\n'))"
+            ".catch(e=>{console.error(e);process.exit(1);});\n"
+        )
+        env = {"PATH": "/usr/bin:/bin", "IMMICH_ACCELERATOR_VIPS": str(vips), **env_extra}
+        return subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver), str(heic1), str(heic2)],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    def test_decode_concurrency_defaults_to_serialized(self, tmp_path):
+        """Async execFile let BullMQ's job concurrency fire multiple
+        concurrent decodes at once; measured on a real NAS/SMB share, that
+        made things SLOWER, not faster (a modest NAS degrades under
+        concurrent reads rather than parallelizing them). Default
+        concurrency is 1 — verify two decodes issued at the same time never
+        actually overlap."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        lock_dir = tmp_path / "running.lock"
+        violations = tmp_path / "violations"
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(
+            vips,
+            f'if ! mkdir "{lock_dir}" 2>/dev/null; then echo overlap >> "{violations}"; fi\n'
+            "sleep 0.15\n"
+            f'rmdir "{lock_dir}"\n' + self._TIFF,
+        )
+        result = self._run_two_concurrently(tmp_path, node, vips, {})
+        assert result.returncode == 0, result.stderr
+        assert "DONE" in result.stdout
+        assert (
+            not violations.exists()
+        ), "two decodes ran concurrently despite the default concurrency of 1"
+
+    def test_decode_concurrency_env_override_allows_parallel_decodes(self, tmp_path):
+        """IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY raises the limit for an
+        operator on storage that can actually take concurrent reads —
+        confirm it isn't a no-op by proving decodes DO overlap once raised."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        lock_dir = tmp_path / "running.lock"
+        overlapped = tmp_path / "overlapped"
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(
+            vips,
+            f'if ! mkdir "{lock_dir}" 2>/dev/null; then touch "{overlapped}"; fi\n'
+            "sleep 0.15\n"
+            f'rmdir "{lock_dir}" 2>/dev/null\n' + self._TIFF,
+        )
+        result = self._run_two_concurrently(
+            tmp_path, node, vips, {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "2"}
+        )
+        assert result.returncode == 0, result.stderr
+        assert "DONE" in result.stdout
+        assert (
+            overlapped.exists()
+        ), "raising concurrency to 2 should let two decodes run at once"
 
 
 class TestFfmpegWrapperQuickLookFallback:

@@ -16,6 +16,21 @@ final class ZooCLIP {
         let size: SizeValue
         let mean: [Float]
         let std: [Float]
+        let resizeMode: String
+
+        enum CodingKeys: String, CodingKey {
+            case size, mean, std
+            case resizeMode = "resize_mode"
+        }
+
+        init(from d: Swift.Decoder) throws {
+            let c = try d.container(keyedBy: CodingKeys.self)
+            size = try c.decode(SizeValue.self, forKey: .size)
+            mean = try c.decode([Float].self, forKey: .mean)
+            std = try c.decode([Float].self, forKey: .std)
+            // open_clip's own default (transform.py) when the key is absent.
+            resizeMode = try c.decodeIfPresent(String.self, forKey: .resizeMode) ?? "shortest"
+        }
 
         enum SizeValue: Decodable {
             case int(Int), list([Int])
@@ -44,8 +59,11 @@ final class ZooCLIP {
     // Sessions load eagerly in init: after init the instance is immutable, so
     // concurrent requests never mutate shared state (a lazy-cache inout here
     // trips Swift's exclusivity enforcement under the concurrent server).
-    private let visualSession: ORTSession
-    private let textualSession: ORTSession
+    // Both nil exactly when `native` is set (see init): any name in
+    // SigLIPRegistry routes through native mlx-swift instead of onnxruntime.
+    private let visualSession: ORTSession?
+    private let textualSession: ORTSession?
+    private let native: SigLIPNative?
 
     static let zooDir = NATIVE_CACHE_DIR.appendingPathComponent("zoo")
 
@@ -69,6 +87,14 @@ final class ZooCLIP {
         dir = Self.zooDir.appendingPathComponent(name)
         try Self.ensureFiles(name: name, dir: dir)
 
+        // Benchmark-only escape hatch (scripts/native-ml-siglip-benchmark.py):
+        // run a SigLIPRegistry model through the onnxruntime branch anyway, so
+        // the "before native" baseline is measured with the exact same
+        // preprocessing/session code this file used to run for every SigLIP
+        // model, not a separately-written comparison harness. Never set in
+        // production; unset behaves exactly as before.
+        let forceONNX = ProcessInfo.processInfo.environment["ZOOCLIP_FORCE_ONNX"] == "1"
+
         // Large models keep their weights in external data files beside
         // model.onnx (#116). Resolve those once per model; the marker keeps a
         // later model switch from re-querying the API for an already-complete
@@ -81,7 +107,11 @@ final class ZooCLIP {
         // load would skip the fetch and fail on the missing weights with no way
         // back short of deleting a hidden file.
         let marker = dir.appendingPathComponent(".external-data-checked")
-        if !FileManager.default.fileExists(atPath: marker.path) {
+        // Native mlx-swift path uses its own safetensors checkpoint (fetched
+        // straight from the model's HF owner, see SigLIPNative), not this
+        // model's ONNX weights — skip fetching several GB of external data
+        // that would go unused.
+        if (SigLIPRegistry.config(for: name) == nil || forceONNX), !FileManager.default.fileExists(atPath: marker.path) {
             if let external = Self.externalDataFiles(name: name) {
                 if !external.isEmpty {
                     print("[native-ml] \(name): fetching \(external.count) external data files")
@@ -149,8 +179,15 @@ final class ZooCLIP {
                                message: "model \(name): tokenizer unsupported (\(String(describing: loadError)))")
         }
 
-        visualSession = try Self.loadSession(dir: dir, name: name, tower: "visual", dim: embedDim)
-        textualSession = try Self.loadSession(dir: dir, name: name, tower: "textual", dim: embedDim)
+        if let sig = SigLIPRegistry.config(for: name), !forceONNX {
+            native = try SigLIPNative(config: sig, weightsPath: SigLIPNative.ensureWeights(hfRepo: sig.hfRepo, name: name))
+            visualSession = nil
+            textualSession = nil
+        } else {
+            native = nil
+            visualSession = try Self.loadSession(dir: dir, name: name, tower: "visual", dim: embedDim)
+            textualSession = try Self.loadSession(dir: dir, name: name, tower: "textual", dim: embedDim)
+        }
     }
 
     private static func loadSession(dir: URL, name: String, tower: String, dim: Int) throws -> ORTSession {
@@ -165,27 +202,58 @@ final class ZooCLIP {
     // MARK: - inference
 
     func embedVisual(_ cg: CGImage) throws -> [Float] {
-        let session = visualSession
+        if let native {
+            return native.embedVisual(cg, targetSize: pre.size.first, mean: pre.mean, std: pre.std)
+        }
+        guard let session = visualSession else {
+            throw PredictError(status: "500 Internal Server Error", message: "no visual backend (\(name))")
+        }
         let size = pre.size.first
         let (rgb, w, h) = rgbBuffer(cg)
-        // Exact immich_ml resize_pil: short side -> size, long side int() truncated.
-        let newW: Int, newH: Int
-        if w < h {
-            newW = size
-            newH = Int(Double(h) / Double(w) * Double(size))
-        } else {
-            newW = Int(Double(w) / Double(h) * Double(size))
-            newH = size
+        // open_clip transform.py has three resize_mode values; Immich's zoo
+        // only ever uses two of them (checked all 54 immich-app/* repos):
+        // "shortest" (32 models — the CLIP-family default) and "squash" (22
+        // — the whole SigLIP/SigLIP2 family plus a few others). No shipped
+        // model uses "longest", so it's not implemented — fail loudly rather
+        // than silently mis-resize if that ever changes.
+        let resized: [UInt8]
+        switch pre.resizeMode {
+        case "squash":
+            // Resize(image_size): stretch straight to size x size, no crop.
+            resized = (w == size && h == size) ? rgb : Resize.bicubic(rgb, w: w, h: h, outW: size, outH: size)
+        case "shortest":
+            // Exact immich_ml resize_pil: short side -> size, long side int() truncated.
+            let newW: Int, newH: Int
+            if w < h {
+                newW = size
+                newH = Int(Double(h) / Double(w) * Double(size))
+            } else {
+                newW = Int(Double(w) / Double(h) * Double(size))
+                newH = size
+            }
+            let stretched = (newW == w && newH == h) ? rgb : Resize.bicubic(rgb, w: w, h: h, outW: newW, outH: newH)
+            // Exact immich_ml crop_pil: int() centers.
+            let left = Int(Double(newW) / 2 - Double(size) / 2)
+            let upper = Int(Double(newH) / 2 - Double(size) / 2)
+            var cropped = [UInt8](repeating: 0, count: size * size * 3)
+            for yy in 0..<size {
+                for xx in 0..<size {
+                    let srcBase = ((upper + yy) * newW + (left + xx)) * 3
+                    let dstBase = (yy * size + xx) * 3
+                    for c in 0..<3 { cropped[dstBase + c] = stretched[srcBase + c] }
+                }
+            }
+            resized = cropped
+        default:
+            throw PredictError(status: "422 Unprocessable Entity",
+                               message: "model \(name): unsupported resize_mode '\(pre.resizeMode)'")
         }
-        let resized = (newW == w && newH == h) ? rgb : Resize.bicubic(rgb, w: w, h: h, outW: newW, outH: newH)
-        // Exact immich_ml crop_pil: int() centers.
-        let left = Int(Double(newW) / 2 - Double(size) / 2)
-        let upper = Int(Double(newH) / 2 - Double(size) / 2)
+
         var x = [Float](repeating: 0, count: 3 * size * size)
         for c in 0..<3 {
             for yy in 0..<size {
                 for xx in 0..<size {
-                    let px = Float(resized[((upper + yy) * newW + (left + xx)) * 3 + c]) / 255.0
+                    let px = Float(resized[(yy * size + xx) * 3 + c]) / 255.0
                     x[c * size * size + yy * size + xx] = (px - pre.mean[c]) / pre.std[c]
                 }
             }
@@ -197,7 +265,6 @@ final class ZooCLIP {
     }
 
     func embedTextual(_ text: String) throws -> [Float] {
-        let session = textualSession
         // Exact immich_ml clean_text (+ canonicalize for SigLIP-family).
         var t = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         if canonicalize {
@@ -213,6 +280,11 @@ final class ZooCLIP {
             ids = Array(ids.prefix(contextLength - 1)) + [eot]
         }
         while ids.count < contextLength { ids.append(padId) }
+
+        if let native { return native.embedTextual(ids) }
+        guard let session = textualSession else {
+            throw PredictError(status: "500 Internal Server Error", message: "no textual backend (\(name))")
+        }
 
         func intTensor(_ v: [Int], type: Int) -> ORTSession.Tensor {
             type == 2 ? .int64(v.map(Int64.init), shape: [1, Int64(contextLength)])
@@ -371,7 +443,16 @@ final class ZooCLIP {
                     }
                     continue
                 }
-                do { _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp) } catch {
+                do {
+                    // replaceItemAt requires an atomic rename and throws
+                    // EXDEV ("Cross-device link") instead of falling back
+                    // when dst's volume differs from tmp's (any cache
+                    // directory on an external or secondary disk, not just
+                    // a theoretical case — verified on-device); moveItem
+                    // handles that cross-volume case correctly.
+                    try? FileManager.default.removeItem(at: dst)
+                    try FileManager.default.moveItem(at: tmp, to: dst)
+                } catch {
                     throw PredictError(status: "500 Internal Server Error",
                                        message: "model \(name): cannot store \(f) (\(error))")
                 }
