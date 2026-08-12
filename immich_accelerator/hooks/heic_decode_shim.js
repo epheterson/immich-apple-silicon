@@ -230,6 +230,9 @@ function decoderEnv() {
 // measured, 4 concurrent vips decodes took 37s+ (still not done) vs 20.7s for
 // one alone. Cap concurrent decoder processes; default 1 matches what
 // execFileSync gave for free before.
+// A queued decode gives up rather than waiting forever; see acquireDecodeSlot.
+const DECODE_QUEUE_TIMEOUT_MS =
+    Number(process.env.IMMICH_ACCELERATOR_HEIC_QUEUE_TIMEOUT_MS) || 180000;
 const DECODE_CONCURRENCY = Number(process.env.IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY) || 1;
 let activeDecodes = 0;
 const decodeWaitQueue = [];
@@ -238,22 +241,55 @@ function acquireDecodeSlot() {
         activeDecodes += 1;
         return Promise.resolve();
     }
-    return new Promise((resolve) => decodeWaitQueue.push(resolve));
+    // Bounded, because an unbounded wait is how one stuck decoder stops every
+    // HEIC and RAW thumbnail on the machine. execFile's timeout only sends
+    // SIGTERM, and a vips blocked in uninterruptible I/O on a stalled SMB
+    // mount (precisely the NAS case this is for) ignores it and never exits:
+    // its promise never settles, the finally never runs, and with the default
+    // concurrency of 1 the single slot is gone for the life of the worker.
+    // Before this rewrite the decode was synchronous with a hard 30s ceiling,
+    // so that could not happen; giving up the slot restores that guarantee.
+    return new Promise((resolve, reject) => {
+        const waiter = { resolve, done: false };
+        const timer = setTimeout(() => {
+            if (waiter.done) return;
+            waiter.done = true;
+            const i = decodeWaitQueue.indexOf(waiter);
+            if (i !== -1) decodeWaitQueue.splice(i, 1);
+            reject(new Error(
+                `waited over ${DECODE_QUEUE_TIMEOUT_MS}ms for a decode slot`));
+        }, DECODE_QUEUE_TIMEOUT_MS);
+        waiter.fire = () => {
+            if (waiter.done) return false;
+            waiter.done = true;
+            clearTimeout(timer);
+            resolve();
+            return true;
+        };
+        decodeWaitQueue.push(waiter);
+    });
 }
 function releaseDecodeSlot() {
-    const next = decodeWaitQueue.shift();
-    if (next) {
-        next();
-    } else {
-        activeDecodes -= 1;
+    // Skip waiters that already timed out, or the slot is handed to nobody.
+    while (decodeWaitQueue.length) {
+        const next = decodeWaitQueue.shift();
+        if (next.fire && next.fire()) return;
     }
+    activeDecodes -= 1;
 }
 
 // Decode a HEIC file to a lossless TIFF buffer, trying each decoder in
 // preference order until one yields a valid TIFF. Resolves to null if none
 // succeed (caller falls back to real Sharp).
 async function decodeToBuffer(input) {
-    await acquireDecodeSlot();
+    try {
+        await acquireDecodeSlot();
+    } catch (e) {
+        // Never held the slot, so must not release one. Falling back to real
+        // Sharp is the same thing every other decode failure here does.
+        process.stderr.write(`[immich-accelerator] ${input}: ${e.message}; falling back to Sharp\n`);
+        return null;
+    }
     try {
         return await decodeToBufferUnthrottled(input);
     } finally {
@@ -277,6 +313,12 @@ async function decodeToBufferUnthrottled(input) {
             await execFileAsync(dec.bin, dec.args(input, tmp), {
                 timeout: remaining,
                 env: decoderEnv(),
+                // The synchronous version ignored stdout and piped stderr.
+                // execFile buffers both into a 1MB maxBuffer by default and
+                // KILLS the child on overflow, so a chatty decoder on a large
+                // RAW would fail a decode that was working. We only care
+                // whether the output file is a valid TIFF.
+                maxBuffer: 8 * 1024 * 1024,
             });
             const buf = fs.readFileSync(tmp);
             if (isTiff(buf)) return buf;

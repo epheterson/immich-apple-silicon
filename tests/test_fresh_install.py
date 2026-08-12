@@ -1958,9 +1958,18 @@ class TestFfmpegWrapperQuickLookFallback:
         assert not ql_marker.exists(), "fallback must not run for a full transcode"
         assert not output.exists()
 
+    # What ffmpeg actually prints when its HEVC decoder rejects a stream. The
+    # fallback keys on this rather than on the exit code, so the stub has to
+    # produce it: a bare non-zero exit is a different situation (a truncated
+    # file, a bad seek) and must NOT be papered over.
+    _DECODE_REJECTED_STDERR = (
+        "echo '[hevc @ 0x7f8] Error while decoding stream #0:0: "
+        "Invalid data found when processing input' >&2\n"
+    )
+
     def test_single_frame_failure_recovers_via_quicklook_fallback(self, tmp_path):
         ffmpeg = tmp_path / "ffmpeg"
-        self._bash_stub(ffmpeg, "exit 69\n")
+        self._bash_stub(ffmpeg, self._DECODE_REJECTED_STDERR + "exit 69\n")
         qlmanage = tmp_path / "qlmanage"
         self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
         vips = tmp_path / "vips_stub.sh"
@@ -1983,6 +1992,33 @@ class TestFfmpegWrapperQuickLookFallback:
         assert output.exists(), "fallback should have produced the output file"
         assert output.read_text().strip() == "FAKEPNG"
         assert "QuickLook/AVFoundation produced one instead" in result.stderr
+
+    def test_a_non_decode_failure_is_not_papered_over(self, tmp_path):
+        """A broken file must stay broken.
+
+        The fallback used to fire on any non-zero exit, so a truncated upload
+        or a seek past the end still got a poster frame out of QuickLook and
+        exited 0: Immich recorded a corrupt asset as successfully thumbnailed
+        and nobody ever found out. Only a decoder rejection qualifies now.
+        """
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "echo 'in.mp4: No such file or directory' >&2\nexit 1\n")
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
+        vips = tmp_path / "vips_stub.sh"
+        self._bash_stub(vips, self._VIPS_COPY)
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        output = tmp_path / "out.jpg"
+        args = self._thumbnail_args(tmp_path / "in.mp4", output)
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin",
+                 "IMMICH_ACCELERATOR_VIPS": str(vips)},
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 1, "ffmpeg's real failure must propagate"
+        assert not output.exists(), "no thumbnail should be invented for a broken file"
 
     def test_single_frame_failure_falls_through_when_quicklook_also_fails(
         self, tmp_path
