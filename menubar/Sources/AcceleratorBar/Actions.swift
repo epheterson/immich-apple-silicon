@@ -280,6 +280,22 @@ enum Actions {
     // The one-liner shown in onboarding when the accelerator isn't installed.
     static let installCommand = "brew install epheterson/immich-accelerator/immich-accelerator"
 
+    /// Whether the accelerator starts at login. Asked of the CLI, because the
+    /// answer differs by install: Homebrew uses brew services, a source
+    /// checkout uses a launch agent, and only the CLI knows which applies.
+    static func autostartEnabled() async -> Bool {
+        guard Paths.isInstalled else { return false }
+        let (code, out) = await run(cli, ["autostart"])
+        return code == 0 && out.trimmingCharacters(in: .whitespacesAndNewlines) == "on"
+    }
+
+    @discardableResult
+    static func setAutostart(_ on: Bool) async -> Bool {
+        guard Paths.isInstalled else { return false }
+        let (code, _) = await run(cli, ["autostart", on ? "on" : "off"])
+        return code == 0
+    }
+
     /// The existing config, for prefilling a re-run.
     ///
     /// Re-running setup after an update is something we actively tell people to
@@ -401,16 +417,16 @@ enum Actions {
                 var isDir: ObjCBool = false
                 guard fm.fileExists(atPath: path, isDirectory: &isDir) else {
                     cont.resume(returning: (false,
-                        "Nothing at that path yet. If the library lives on a NAS, connect to the share first."))
+                        "Path not found."))
                     return
                 }
                 guard isDir.boolValue else {
-                    cont.resume(returning: (false, "That path is a file, not a folder."))
+                    cont.resume(returning: (false, "Not a folder."))
                     return
                 }
                 guard let entries = try? fm.contentsOfDirectory(atPath: path) else {
                     cont.resume(returning: (false,
-                        "The folder is there but can't be read. Check permissions, or reconnect the share."))
+                        "Can't read that folder."))
                     return
                 }
                 // Immich's media root has these beside each other. Naming what
@@ -420,10 +436,10 @@ enum Actions {
                 let present = expected.filter { entries.contains($0) }
                 if present.isEmpty {
                     cont.resume(returning: (false,
-                        "Readable, but this doesn't look like Immich's media folder: none of library/, upload/, thumbs/ are in it."))
+                        "No Immich folders inside. Check the path."))
                 } else {
                     cont.resume(returning: (true,
-                        "Readable, and contains \(present.joined(separator: ", "))."))
+                        "Media folder found."))
                 }
             }
         }

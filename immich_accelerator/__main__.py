@@ -4277,6 +4277,85 @@ def reconcile_ml(config: dict) -> None:
         log.error("  ML restart failed")
 
 
+def _is_brew_install() -> bool:
+    return "/Cellar/immich-accelerator/" in str(Path(__file__).resolve())
+
+
+def _find_brew() -> str | None:
+    for p in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _autostart_state() -> tuple[bool, str]:
+    """(on, how). Two mechanisms, because installs differ.
+
+    A Homebrew install auto-starts through `brew services`, which survives
+    upgrades; a source install uses a plist we wrote. Asking "is it on" has to
+    check whichever one applies, or the switch in Settings lies.
+    """
+    if _is_brew_install():
+        brew = _find_brew()
+        if not brew:
+            return False, "brew"
+        out = subprocess.run(
+            [brew, "services", "list"], capture_output=True, text=True, timeout=20
+        ).stdout
+        for line in out.splitlines():
+            if line.startswith("immich-accelerator"):
+                return ("started" in line or "scheduled" in line), "brew"
+        return False, "brew"
+    plist = LAUNCH_AGENTS_DIR / "com.immich.accelerator.plist"
+    return plist.exists(), "launchd"
+
+
+def cmd_autostart(args):
+    """Turn "start on login" on or off, or report it. Not the same thing as the
+    menu-bar app's own login item, which only controls the icon."""
+    want = getattr(args, "state", None)
+    on, how = _autostart_state()
+    if want is None:
+        print("on" if on else "off")
+        return
+
+    turn_on = want == "on"
+    if how == "brew":
+        brew = _find_brew()
+        if not brew:
+            raise RuntimeError("Homebrew not found, so brew services can't be set.")
+        verb = "start" if turn_on else "stop"
+        r = subprocess.run(
+            [brew, "services", verb, "immich-accelerator"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"brew services {verb} failed: {r.stderr.strip()}")
+    else:
+        plist = LAUNCH_AGENTS_DIR / "com.immich.accelerator.plist"
+        if turn_on:
+            src = Path(__file__).parent.parent / "launchd" / "com.immich.accelerator.plist"
+            if not src.exists():
+                raise RuntimeError("No launch agent template to install.")
+            content = src.read_text()
+            content = content.replace(
+                "/path/to/immich-apple-silicon", str(Path(__file__).parent.parent.resolve())
+            ).replace("/opt/homebrew/bin/python3", sys.executable)
+            plist.parent.mkdir(parents=True, exist_ok=True)
+            plist.write_text(content)
+            subprocess.run(["launchctl", "load", str(plist)], capture_output=True, timeout=20)
+        else:
+            # bootout, not just unlink: removing the file leaves the job
+            # registered and running until the next reboot.
+            uid = os.getuid()
+            subprocess.run(
+                ["launchctl", "bootout", f"gui/{uid}/com.immich.accelerator"],
+                capture_output=True, timeout=20,
+            )
+            plist.unlink(missing_ok=True)
+    log.info("Start at login: %s", "on" if turn_on else "off")
+
+
 def cmd_detect(_args):
     """Report what Immich this Mac can see, as JSON. Changes nothing.
 
@@ -6163,6 +6242,11 @@ def build_parser() -> argparse.ArgumentParser:
         "ml-test",
         help="Diagnose the ML service (health + CLIP + OCR round-trip)",
     )
+    auto_p = sub.add_parser(
+        "autostart",
+        help="Start the accelerator at login (on/off; omit to report)",
+    )
+    auto_p.add_argument("state", nargs="?", choices=["on", "off"])
     sub.add_parser(
         "detect",
         help="Report what Immich this Mac can see, as JSON (used by the setup wizard)",
@@ -6198,6 +6282,7 @@ def main():
             "component": cmd_component,
             "ml-test": cmd_ml_test,
             "detect": cmd_detect,
+            "autostart": cmd_autostart,
             "uninstall": cmd_uninstall,
         }[args.command](args)
     except RuntimeError as e:

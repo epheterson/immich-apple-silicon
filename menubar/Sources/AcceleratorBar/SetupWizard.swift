@@ -359,10 +359,10 @@ final class WizardModel: ObservableObject {
             remote.mediaPath = only
             await checkLibrary()
         } else if found.isEmpty {
-            libraryNote = "No Immich library found on this Mac's mounted volumes yet."
+            libraryNote = "No library found."
             libraryReadable = false
         } else {
-            libraryNote = "Found \(found.count) possible libraries. Pick the one Immich uses."
+            libraryNote = "\(found.count) libraries found. Choose one."
             libraryReadable = false
         }
     }
@@ -385,7 +385,7 @@ final class WizardModel: ObservableObject {
         let path = remote.mediaPath
         guard !path.isEmpty else {
             libraryReadable = false
-            libraryNote = "Choose the folder on this Mac that holds Immich's library."
+            libraryNote = "Choose Immich's media folder."
             return
         }
         let result = await Actions.probeLibrary(path)
@@ -500,15 +500,15 @@ struct SetupWizard: View {
             if wiz.detecting {
                 HStack(spacing: Metrics.sm) {
                     ProgressView().controlSize(.small)
-                    Text("Looking for Immich on this Mac…").foregroundStyle(.secondary)
+                    Text("Looking for Immich…").foregroundStyle(.secondary)
                 }
             }
 
             LocationCard(
                 title: "On this Mac",
                 blurb: wiz.detected?.foundLocalImmich == true
-                    ? "Found Immich \(wiz.detected?.immichVersion ?? "") running in Docker. Setup will read its settings from the container, so there is nothing to type."
-                    : "Immich runs in Docker here. Setup will find it and read its settings from the container.",
+                    ? "Immich \(wiz.detected?.immichVersion ?? "") is running here. Nothing to enter."
+                    : "Immich runs in Docker on this Mac.",
                 symbol: "desktopcomputer",
                 selected: wiz.location == .some(.here),
                 recommended: wiz.detected?.foundLocalImmich == true
@@ -516,7 +516,7 @@ struct SetupWizard: View {
 
             LocationCard(
                 title: "On another machine",
-                blurb: "A NAS or another server runs Immich. This Mac needs its address and an API key, and needs to reach the same library files.",
+                blurb: "Immich runs on a NAS or another server.",
                 symbol: "network",
                 selected: wiz.location == .some(.remote),
                 recommended: false
@@ -538,7 +538,7 @@ struct SetupWizard: View {
     /// mounting the share happens outside this window.
     private var libraryStep: some View {
         VStack(alignment: .leading, spacing: Metrics.lg) {
-            Text("This Mac has to read the same files Immich does, at the same path.")
+            Text("Immich's media folder, as this Mac sees it.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -554,7 +554,7 @@ struct SetupWizard: View {
                 }
                 .disabled(wiz.libraryChecking)
                 Button("Connect to Server…") { wiz.connectToServer() }
-                    .help("Opens macOS's own connect sheet; this app never sees the password.")
+                    .help("Mount a network share.")
                 if wiz.libraryChecking { ProgressView().controlSize(.small) }
             }
 
@@ -584,7 +584,7 @@ struct SetupWizard: View {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.prompt = "Use This Folder"
-        panel.message = "Pick the folder that holds Immich's library, upload and thumbs folders."
+        panel.message = "Choose Immich's media folder."
         if panel.runModal() == .OK, let picked = panel.url {
             wiz.remote.mediaPath = picked.path
             Task { await wiz.checkLibrary() }
@@ -595,28 +595,25 @@ struct SetupWizard: View {
         VStack(alignment: .leading, spacing: Metrics.lg) {
             ComponentToggle(
                 title: "Microservices",
-                blurb: "Thumbnails, video transcoding and metadata. This is the work that makes Immich slow on a NAS.",
+                blurb: "Thumbnails, video transcoding, metadata.",
                 symbol: "square.stack.3d.up.fill",
                 on: $wiz.components.microservices)
 
             ComponentToggle(
                 title: "Machine learning",
-                blurb: "Search, faces and text recognition, on this Mac's GPU and Neural Engine.",
+                blurb: "Search, faces, text recognition.",
                 symbol: "brain.head.profile",
                 on: $wiz.components.machineLearning)
 
             if wiz.components.isMLOnly {
-                Text("With only machine learning on, this Mac never touches your photos: no Docker, no database, no library access. Point another Immich at it.")
+                Text("No Docker, database, or access to your photos. Point another Immich at this Mac.")
                     .font(.rowDetail).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if wiz.components.none {
-                Text("Nothing selected, so there is nothing for this Mac to set up.")
+                Text("Turn on at least one.")
                     .font(.rowDetail).foregroundStyle(.orange)
             }
-            Text("You can change any of this later in Settings, without running setup again.")
-                .font(.rowDetail).foregroundStyle(.secondary)
-                .padding(.top, Metrics.sm)
         }
     }
 
@@ -627,15 +624,13 @@ struct SetupWizard: View {
                 TextField("nas.local:2283", text: $wiz.url)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { Task { await wiz.probe() } }
-                Text("The address you open Immich at. A bare host and port is fine.")
-                    .font(.rowDetail).foregroundStyle(.secondary)
             }
 
             VStack(alignment: .leading, spacing: Metrics.md) {
                 Text("API key").font(.rowTitle)
                 SecureField("paste your key", text: $wiz.apiKey)
                     .textFieldStyle(.roundedBorder)
-                Text("Immich → Account Settings → API Keys. Used for job counts and the Re-queue button. You can add it later.")
+                Text("Immich → Account Settings → API Keys. Optional.")
                     .font(.rowDetail).foregroundStyle(.secondary)
             }
 
@@ -658,9 +653,6 @@ struct SetupWizard: View {
             // not enough, which is why a split deployment needs these at all.
             VStack(alignment: .leading, spacing: Metrics.md) {
                 Text("Database and Redis").font(.rowTitle)
-                Text("Your worker talks to these directly, so they have to be reachable from this Mac. Same host as Immich unless you moved them.")
-                    .font(.rowDetail).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
 
                 HStack(spacing: Metrics.sm) {
                     TextField("Postgres host", text: $wiz.remote.dbHost)
@@ -691,17 +683,14 @@ struct SetupWizard: View {
                 }
                 if let db = wiz.dbReachable {
                     ProbeRow(ok: db,
-                             good: "Postgres answered on \(wiz.remote.dbHost):\(wiz.remote.dbPort)",
-                             bad: "Nothing answered on \(wiz.remote.dbHost):\(wiz.remote.dbPort). Expose the port, or check the host.")
+                             good: "Postgres reachable.",
+                             bad: "No response from \(wiz.remote.dbHost):\(wiz.remote.dbPort).")
                 }
                 if let r = wiz.redisReachable {
                     ProbeRow(ok: r,
-                             good: "Redis answered on \(wiz.remote.effectiveRedisHost):\(wiz.remote.redisPort)",
-                             bad: "Nothing answered on \(wiz.remote.effectiveRedisHost):\(wiz.remote.redisPort).")
+                             good: "Redis reachable.",
+                             bad: "No response from \(wiz.remote.effectiveRedisHost):\(wiz.remote.redisPort).")
                 }
-                Text("The password is passed to setup on a pipe, never on the command line, so it can't be read out of the process list.")
-                    .font(.rowDetail).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -713,8 +702,8 @@ struct SetupWizard: View {
                 ProbeRow(
                     ok: reachable,
                     good: wiz.immichVersion.isEmpty
-                        ? "Immich answered." : "Immich \(wiz.immichVersion) answered.",
-                    bad: "Nothing answered at \(wiz.normalizedURL). Check the address and that Immich is running.")
+                        ? "Immich answered." : "Immich \(wiz.immichVersion).",
+                    bad: "No response from \(wiz.normalizedURL).")
             }
             // Only meaningful once the server answered: a key cannot be
             // judged against a server that never replied.
@@ -722,19 +711,19 @@ struct SetupWizard: View {
                 ProbeRow(
                     ok: valid,
                     good: "API key accepted.",
-                    bad: "Immich rejected that key. Setup will still finish; job counts stay off until it's fixed.")
+                    bad: "Key rejected.")
             }
         }
     }
 
     private var installStep: some View {
         VStack(alignment: .leading, spacing: Metrics.lg) {
-            Text("The accelerator command isn't installed yet.").font(.rowTitle)
-            Text("It installs with Homebrew, which also keeps it updated. This takes a few minutes the first time, mostly downloading.")
+            Text("Accelerator not installed.").font(.rowTitle)
+            Text("Installs with Homebrew. Takes a few minutes.")
                 .foregroundStyle(.secondary)
             if wiz.working || !wiz.log.isEmpty { LogPane(lines: wiz.log, working: wiz.working) }
             if wiz.failed {
-                FailureNote(text: "The install did not finish. The output above says why; you can also run it yourself:\n\(Actions.installCommand)")
+                FailureNote(text: "Install failed.\n\(Actions.installCommand)")
             }
         }
     }
@@ -742,10 +731,10 @@ struct SetupWizard: View {
     private var runStep: some View {
         VStack(alignment: .leading, spacing: Metrics.lg) {
             Text(wiz.components.isMLOnly
-                 ? "Setting this Mac up as an ML node."
-                 : "Connecting to Immich and preparing the worker.").font(.rowTitle)
+                 ? "Setting up machine learning."
+                 : "Setting up.").font(.rowTitle)
             if wiz.components.microservices {
-                Text("Setup downloads the matching Immich server files and checks Docker, the database and your media paths. Several minutes is normal.")
+                Text("Downloads Immich's server files. Takes a few minutes.")
                     .foregroundStyle(.secondary)
             }
             // Reopened from Settings on a box that already works. Setup is the
@@ -753,11 +742,11 @@ struct SetupWizard: View {
             // rewrite config.json, so say that before the button is pressed
             // rather than after.
             if Paths.isConfigured && wiz.log.isEmpty && !wiz.working {
-                FailureNote(text: "This Mac is already set up. Running setup again re-detects everything and rewrites the configuration. Your API key, ML address and component switches are carried across. Back up first from Settings → General if you want a copy.")
+                FailureNote(text: "Already set up. Running setup again rewrites the configuration.")
             }
             if wiz.working || !wiz.log.isEmpty { LogPane(lines: wiz.log, working: wiz.working) }
             if wiz.failed {
-                FailureNote(text: "Setup stopped early. The output above says why. Nothing is broken; you can fix the cause and run this step again.")
+                FailureNote(text: "Setup failed. See the output above.")
             }
         }
     }
@@ -990,7 +979,7 @@ private struct LogPane: View {
             if working {
                 HStack(spacing: Metrics.md) {
                     ProgressView().controlSize(.small)
-                    Text("Working. You can leave this window open.")
+                    Text("Working…")
                         .font(.rowDetail).foregroundStyle(.secondary)
                 }
             }

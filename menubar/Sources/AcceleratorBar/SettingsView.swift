@@ -81,6 +81,7 @@ struct SettingsView: View {
     @State private var applyingComponent: String?
     @State private var componentError: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
+    @State private var autostartOn = false
     @State private var configNote: String?
     @State private var configFailed = false
 
@@ -140,6 +141,10 @@ struct SettingsView: View {
     }
 
     private func load() {
+        // Read the real state rather than assume: the service can be turned on
+        // or off from the terminal, and a switch showing the wrong thing is
+        // worse than no switch.
+        Task { autostartOn = await Actions.autostartEnabled() }
         config = StatusModel.readConfig()
         savedEngine = (config["ml_engine"] as? String) ?? "native"
         engine = savedEngine
@@ -169,18 +174,19 @@ struct SettingsView: View {
                 LabeledContent("Immich", value: immichSummary)
             }
 
-            Section {
-                Toggle("Launch menu bar at login", isOn: $launchAtLogin)
+            // Two separate things that were one switch. The icon and the
+            // service have nothing to do with each other: quitting the app
+            // does not stop your photos being processed, and turning the
+            // service off does not remove the icon. One switch could only ever
+            // describe one of them, so it described the icon and a footnote
+            // apologised for the rest.
+            Section("Startup") {
+                Toggle("Start accelerator at login", isOn: $autostartOn)
+                    .onChange(of: autostartOn) { _, on in
+                        Task { await Actions.setAutostart(on) }
+                    }
+                Toggle("Show menu bar icon at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
-            } header: {
-                Text("Startup")
-            } footer: {
-                // The distinction people actually get wrong: this switch is
-                // about the menu bar icon, not about whether photos get
-                // processed. The background service is brew's, and it runs
-                // whether or not anyone is logged in.
-                Text("The accelerator itself runs as a background service and is unaffected by this.")
-                    .font(.rowDetail).foregroundStyle(.secondary)
             }
 
             Section("Software Update") {
