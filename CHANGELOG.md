@@ -4,6 +4,8 @@
 
 ### Fixed
 - **HEIC/RAW thumbnails could fail permanently on a NAS-backed library.** The decode shim blocked the worker's event loop (and BullMQ's lock-renewal timer) for the whole decode, and a previous fix shrank the timeout to work around that — which broke any decode slower than a few seconds, common when the library lives on a NAS over SMB. The decoder now runs async, so a slow decode no longer blocks anything, and decode concurrency is capped at 1 by default (`IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY` to raise it) since this NAS measurably slows down under concurrent reads.
+- **Some videos never got a thumbnail.** ffmpeg's HEVC decoder can hard-reject a stream (real HDR10/BT.2020 phone footage) that macOS's native AVFoundation decodes fine — confirmed not jellyfin-ffmpeg-specific, since a stock Homebrew ffmpeg build fails identically. The ffmpeg wrapper now falls back to QuickLook for a single-frame thumbnail extraction that fails this way; never fires for a full video transcode.
+
 
 ## 1.9.0 - 2026-08-07
 

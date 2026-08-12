@@ -9,6 +9,16 @@
 
 REAL_FFMPEG="/opt/homebrew/bin/ffmpeg"
 
+# Used by the QuickLook fallback below to convert its PNG output to whatever
+# format Immich asked for.
+if [[ -n "${IMMICH_ACCELERATOR_VIPS:-}" ]]; then
+    VIPS_BIN="$IMMICH_ACCELERATOR_VIPS"
+elif [[ -x "/opt/homebrew/bin/vips" ]]; then
+    VIPS_BIN="/opt/homebrew/bin/vips"
+else
+    VIPS_BIN="/usr/local/bin/vips"
+fi
+
 ARGS=("$@")
 USE_HW=false
 USE_HEVC=false
@@ -60,7 +70,49 @@ if [[ "$USE_HW" == true ]]; then
         LAST="${NEW_ARGS[$((len-1))]}"
         NEW_ARGS=("${NEW_ARGS[@]:0:$((len-1))}" "-tag:v" "hvc1" "$LAST")
     fi
-    exec "$REAL_FFMPEG" -hwaccel videotoolbox "${NEW_ARGS[@]}"
+    RUN_ARGS=(-hwaccel videotoolbox "${NEW_ARGS[@]}")
 else
-    exec "$REAL_FFMPEG" "${NEW_ARGS[@]}"
+    RUN_ARGS=("${NEW_ARGS[@]}")
 fi
+
+"$REAL_FFMPEG" "${RUN_ARGS[@]}"
+STATUS=$?
+[[ $STATUS -eq 0 ]] && exit 0
+
+# ffmpeg's HEVC decoder can hard-reject a stream that macOS's AVFoundation
+# decodes fine (seen on real HDR10 phone clips; a stock Homebrew ffmpeg build
+# fails identically, so this isn't jellyfin-ffmpeg-specific). Only retry via
+# QuickLook for a single-frame thumbnail (`-frames:v 1`) — a full transcode
+# has no single frame for QuickLook to hand back.
+IS_SINGLE_FRAME=false
+INPUT=""
+for ((i=0; i<${#ARGS[@]}; i++)); do
+    if [[ "${ARGS[$i]}" == "-frames:v" && "${ARGS[$((i+1))]:-}" == "1" ]]; then
+        IS_SINGLE_FRAME=true
+    fi
+    if [[ "${ARGS[$i]}" == "-i" ]]; then
+        INPUT="${ARGS[$((i+1))]:-}"
+    fi
+done
+OUTPUT="${ARGS[${#ARGS[@]}-1]}"
+
+if [[ "$IS_SINGLE_FRAME" == true && -n "$INPUT" && ( "$OUTPUT" == *.jpg || "$OUTPUT" == *.jpeg || "$OUTPUT" == *.png || "$OUTPUT" == *.webp ) ]]; then
+    QL_DIR=$(mktemp -d)
+    # Target pixel size lives in Immich's own `scale=W:H` filter (one side is
+    # -2, meaning "preserve aspect ratio"); take whichever side is positive.
+    SCALE_ARG=$(printf '%s\n' "${ARGS[@]}" | grep -o 'scale=[0-9-]*:[0-9-]*' | head -1)
+    QL_SIZE=$(echo "$SCALE_ARG" | grep -oE '[0-9]+' | sort -rn | head -1)
+    [[ -z "$QL_SIZE" ]] && QL_SIZE=1080
+    if qlmanage -t -s "$QL_SIZE" -o "$QL_DIR" "$INPUT" >/dev/null 2>&1; then
+        QL_RESULT=$(find "$QL_DIR" -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \) -print -quit)
+        # vips, not sips: sips can't write webp, which this install uses for thumbnails.
+        if [[ -n "$QL_RESULT" ]] && "$VIPS_BIN" copy "$QL_RESULT" "$OUTPUT" >/dev/null 2>&1; then
+            echo "[immich-accelerator] ffmpeg couldn't decode $INPUT for a thumbnail; QuickLook/AVFoundation produced one instead" >&2
+            rm -rf "$QL_DIR"
+            exit 0
+        fi
+    fi
+    rm -rf "$QL_DIR"
+fi
+
+exit "$STATUS"
