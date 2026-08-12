@@ -1,6 +1,6 @@
 # Contributing
 
-New to the repo? [ARCHITECTURE.md](ARCHITECTURE.md) has one paragraph per top-level directory.
+New to the repo? See [Repo layout](README.md#repo-layout) for a brief tour of each top-level directory.
 
 ## Before you push
 

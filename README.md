@@ -118,8 +118,26 @@ Everything past the quick start lives in [`docs/`](docs/):
 | [docs/known-differences.md](docs/known-differences.md) | Where native output can differ from Docker, and why it usually doesn't matter                                                                           |
 | [docs/troubleshooting.md](docs/troubleshooting.md)     | Symptom → cause → fix for common setup and runtime issues                                                                                               |
 | [docs/security.md](docs/security.md)                   | Safety guarantees and every network-facing surface                                                                                                      |
-| [ARCHITECTURE.md](ARCHITECTURE.md)                     | What each top-level directory in this repo is and how it's built/tested                                                                                 |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                     | Testing requirements and PR guidelines                                                                                                                  |
+
+## Repo layout
+
+```text
+immich-apple-silicon/
+├── immich_accelerator/  # Python CLI: setup wizard, worker/ML process management, dashboard (FastAPI+uvicorn), ffmpeg-wrapper.sh, install hooks
+├── native-ml/           # Swift package: native ML engine (mlx-swift CLIP, Apple Vision faces/OCR, onnxruntime for the ONNX zoo + ArcFace)
+├── menubar/             # SwiftUI menu-bar app: status at a glance, start/stop/restart, ml-test, logs
+├── ml/                  # Git submodule: Python ML service fallback (managed fork of immich-ml-metal)
+├── docker/              # docker-compose.yml template, rendered into a user's install with their paths/env vars
+├── launchd/             # LaunchAgent plist for non-Homebrew (git checkout) installs
+├── scripts/             # E2E VM install harness, real-model ML preflight gates, benchmarks, Homebrew formula renderer
+├── tests/               # pytest suite for immich_accelerator/ (compose templates, config parsing, fresh-install regressions)
+├── docs/                # User-facing docs (table above), plus docs/testing/ and docs/plans/
+├── CLAUDE.md            # Working agreement for AI-assisted changes (git workflow, ML preflight gate, code style)
+├── CONTRIBUTING.md      # Human contribution requirements
+├── CHANGELOG.md         # Release notes
+└── VERSION              # Current version, tagged vX.Y.Z
+```
 
 ## What we modify (and how to undo it)
 
