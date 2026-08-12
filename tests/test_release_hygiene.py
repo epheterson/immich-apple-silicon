@@ -11,6 +11,7 @@ simulating the awk in ci.yml, which is not a control.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -87,6 +88,13 @@ class TestChangelogIsExtractable:
         except (OSError, subprocess.SubprocessError):  # pragma: no cover
             pytest.skip("git unavailable")
         if not tags:
+            # Not a skip in CI: this is the only check that catches a deleted
+            # heading, and silently skipping is how it managed to never run.
+            if os.environ.get("CI"):
+                pytest.fail(
+                    "no tags in this checkout, so this check cannot run. "
+                    "The workflow needs fetch-depth: 0."
+                )
             pytest.skip("no tags in this checkout (shallow clone)")
         documented = set(headings())
         missing = sorted(

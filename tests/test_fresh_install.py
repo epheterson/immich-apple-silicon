@@ -12,6 +12,7 @@ Every test here simulates an environment the maintainer doesn't have.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import venv
 from pathlib import Path
@@ -1434,7 +1435,11 @@ class TestHeicDecodeShim:
             "function fakeSharp(input){"
             "process.stdout.write('INPUT_TYPE:'+"
             "(Buffer.isBuffer(input)?'buffer':typeof input)+'\\n');"
-            "return {};}"
+            # A real Sharp instance is only usable via its (async) output
+            # methods; the shim's lazy proxy defers the decode until one of
+            # those is called. metadata() here stands in for that terminal
+            # call so the driver exercises the real chain-then-await shape.
+            "return {metadata: async () => ({})};}"
             "fakeSharp.cache=function(){};"
             "module.exports=fakeSharp;\n"
         )
@@ -1454,11 +1459,18 @@ class TestHeicDecodeShim:
 
     def _run(self, tmp_path, node, env_extra, argv):
         driver = tmp_path / "driver.js"
+        # Decode is async now, so sharp(path) alone starts it but doesn't wait
+        # for it. Await metadata() per file, sequentially, so INPUT_TYPE lines
+        # land in a deterministic order regardless of decode latency — this is
+        # also exactly the chain-then-await shape Immich's own code uses.
+        awaits = "".join(
+            f"await sharp(process.argv[{i + 2}]).metadata();" for i in range(len(argv))
+        )
         driver.write_text(
             "const sharp=require('sharp');"
             "process.stdout.write('WRAPPED:'+(sharp.__heicShimWrapped===true)+'\\n');"
-            + "".join(f"sharp(process.argv[{i + 2}]);" for i in range(len(argv)))
-            + "\n"
+            f"(async () => {{{awaits}}})().catch(e => {{ console.error(e); process.exit(1); }});"
+            "\n"
         )
         env = {"PATH": "/usr/bin:/bin", **env_extra}
         return subprocess.run(
@@ -1477,6 +1489,58 @@ class TestHeicDecodeShim:
         if not node:
             pytest.skip("node not installed")
         return node
+
+    def test_a_second_output_does_not_re_apply_the_chain(self, tmp_path):
+        """Two outputs from one pipeline must each get the chain once.
+
+        The lazy proxy records chain calls and replays them when a terminal
+        method runs. Replaying onto a single shared Sharp instance meant the
+        second output got rotate/resize applied on top of the first, because
+        real chain methods return `this`. Immich 3.0.2 does not reuse a
+        pipeline, so nothing triggers it today, but this shim wraps whichever
+        Immich the user is running and the failure is silent: wrong pixels, no
+        error. Each terminal builds its own instance now.
+        """
+        node = self._node_or_skip()
+        # A fake Sharp that records what was applied to each instance it makes.
+        (tmp_path / "node_modules" / "sharp").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "node_modules" / "sharp" / "index.js").write_text(
+            "const instances=[];"
+            "function fakeSharp(){const mine=[];instances.push(mine);"
+            "const i={rotate(){mine.push('rotate');return i;},"
+            "resize(){mine.push('resize');return i;},"
+            "async toBuffer(){return Buffer.from('x');},"
+            "async metadata(){return {};}};return i;}"
+            "fakeSharp.cache=function(){};fakeSharp.__instances=instances;"
+            "module.exports=fakeSharp;\n"
+        )
+        driver = tmp_path / "driver.js"
+        # A .arw path routes into the lazy proxy on a pure string check, with
+        # no file needed; the decode fails and falls back, which is fine here.
+        driver.write_text(
+            "const sharp=require('sharp');"
+            "(async () => {"
+            "  const p = sharp('/tmp/nonexistent-chain-probe.arw');"
+            "  await p.rotate(90).resize(100).toBuffer();"
+            "  await p.toBuffer();"
+            "  const per = sharp.__instances.map(i => i.join('+'));"
+            "  process.stdout.write('PER:'+JSON.stringify(per)+'\\n');"
+            "})().catch(e => { console.error(e); process.exit(1); });\n"
+        )
+        r = subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver)],
+            cwd=str(tmp_path),
+            env={"PATH": "/usr/bin:/bin"},
+            capture_output=True, text=True, timeout=30,
+        )
+        assert r.returncode == 0, r.stderr
+        line = next(l for l in r.stdout.splitlines() if l.startswith("PER:"))
+        applied = json.loads(line[len("PER:"):])
+        assert applied, "the proxy never built a Sharp instance"
+        for chain in applied:
+            assert chain.count("rotate") <= 1, (
+                f"chain applied more than once to one instance: {applied}"
+            )
 
     def test_routes_heic_to_vips_and_passes_others_through(self, tmp_path):
         """HEIC path is decoded to a Buffer via the primary (vips) decoder; a
@@ -1630,6 +1694,400 @@ class TestHeicDecodeShim:
         assert (
             marker.read_text().strip() == "[" + str(real) + "]"
         ), "existing VIPSHOME must be preserved"
+
+    # --- async decode: lock-renewal-starvation regression + concurrency ---
+
+    def test_chain_calls_are_replayed_onto_real_sharp_in_order(self, tmp_path):
+        """Immich chains synchronous pipeline calls (rotate, resize, ...)
+        before awaiting a terminal method (toBuffer/toFile/metadata). Since
+        the decode is now async, sharp() can't call the real Sharp
+        synchronously anymore — it must record those chained calls and
+        replay them, in order and with their original arguments, onto the
+        real instance once decode resolves. This is the mechanism that lets
+        the decode run fully async while still looking like an ordinary
+        chainable Sharp pipeline to callers."""
+        node = self._node_or_skip()
+        sharp_dir = tmp_path / "node_modules" / "sharp"
+        sharp_dir.mkdir(parents=True)
+        (sharp_dir / "index.js").write_text(
+            "function fakeSharp(input){"
+            "const calls=[];"
+            "const inst={"
+            "rotate:(...a)=>{calls.push('rotate('+JSON.stringify(a)+')');return inst;},"
+            "resize:(...a)=>{calls.push('resize('+JSON.stringify(a)+')');return inst;},"
+            "toBuffer:async()=>{process.stdout.write('CALLS:'+calls.join(',')+'\\n');return Buffer.from('x');},"
+            "};"
+            "return inst;}"
+            "fakeSharp.cache=function(){};"
+            "module.exports=fakeSharp;\n"
+        )
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(vips, self._TIFF)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+        driver = tmp_path / "driver.js"
+        driver.write_text(
+            "const sharp=require('sharp');"
+            "sharp(process.argv[2]).rotate(90).resize(200,200).toBuffer()"
+            ".catch(e=>{console.error(e);process.exit(1);});\n"
+        )
+        env = {"PATH": "/usr/bin:/bin", "IMMICH_ACCELERATOR_VIPS": str(vips)}
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver), str(heic)],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "CALLS:rotate([90]),resize([200,200])" in result.stdout, result.stdout
+
+    def test_decode_does_not_block_the_event_loop(self, tmp_path):
+        """The bug this fix addresses: a synchronous (execFileSync) decode
+        used to block Node's entire event loop — and with it BullMQ's
+        lock-renewal timer — for the decode's full duration
+        (#could-not-renew-lock). Prove the event loop keeps ticking during a
+        slow decode by racing a timer against it; with the old synchronous
+        decode this would report ~0 ticks."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(vips, "sleep 0.3\n" + self._TIFF)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+        driver = tmp_path / "driver.js"
+        driver.write_text(
+            "const sharp=require('sharp');"
+            "let ticks=0;"
+            "const timer=setInterval(()=>{ticks++;},20);"
+            "sharp(process.argv[2]).metadata().then(()=>{"
+            "clearInterval(timer);"
+            "process.stdout.write('TICKS:'+ticks+'\\n');"
+            "}).catch(e=>{console.error(e);process.exit(1);});\n"
+        )
+        env = {"PATH": "/usr/bin:/bin", "IMMICH_ACCELERATOR_VIPS": str(vips)}
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver), str(heic)],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stderr
+        ticks = int(result.stdout.split("TICKS:")[1].strip())
+        assert ticks >= 5, (
+            f"event loop was blocked during decode (only {ticks} timer "
+            f"ticks in ~300ms of decode time); output: {result.stdout}"
+        )
+
+    def _run_two_concurrently(self, tmp_path, node, vips, env_extra):
+        heic1 = tmp_path / "a.heic"
+        heic1.write_bytes(self._HEIC_BYTES)
+        heic2 = tmp_path / "b.heic"
+        heic2.write_bytes(self._HEIC_BYTES)
+        driver = tmp_path / "driver.js"
+        driver.write_text(
+            "const sharp=require('sharp');"
+            "Promise.all([sharp(process.argv[2]).metadata(),sharp(process.argv[3]).metadata()])"
+            ".then(()=>process.stdout.write('DONE\\n'))"
+            ".catch(e=>{console.error(e);process.exit(1);});\n"
+        )
+        env = {"PATH": "/usr/bin:/bin", "IMMICH_ACCELERATOR_VIPS": str(vips), **env_extra}
+        return subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver), str(heic1), str(heic2)],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    def test_decode_concurrency_defaults_to_serialized(self, tmp_path):
+        """Async execFile let BullMQ's job concurrency fire multiple
+        concurrent decodes at once; measured on a real NAS/SMB share, that
+        made things SLOWER, not faster (a modest NAS degrades under
+        concurrent reads rather than parallelizing them). Default
+        concurrency is 1 — verify two decodes issued at the same time never
+        actually overlap."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        lock_dir = tmp_path / "running.lock"
+        violations = tmp_path / "violations"
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(
+            vips,
+            f'if ! mkdir "{lock_dir}" 2>/dev/null; then echo overlap >> "{violations}"; fi\n'
+            "sleep 0.15\n"
+            f'rmdir "{lock_dir}"\n' + self._TIFF,
+        )
+        result = self._run_two_concurrently(tmp_path, node, vips, {})
+        assert result.returncode == 0, result.stderr
+        assert "DONE" in result.stdout
+        assert (
+            not violations.exists()
+        ), "two decodes ran concurrently despite the default concurrency of 1"
+
+    def test_decode_concurrency_env_override_allows_parallel_decodes(self, tmp_path):
+        """IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY raises the limit for an
+        operator on storage that can actually take concurrent reads —
+        confirm it isn't a no-op by proving decodes DO overlap once raised."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        lock_dir = tmp_path / "running.lock"
+        overlapped = tmp_path / "overlapped"
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(
+            vips,
+            f'if ! mkdir "{lock_dir}" 2>/dev/null; then touch "{overlapped}"; fi\n'
+            "sleep 0.15\n"
+            f'rmdir "{lock_dir}" 2>/dev/null\n' + self._TIFF,
+        )
+        result = self._run_two_concurrently(
+            tmp_path, node, vips, {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "2"}
+        )
+        assert result.returncode == 0, result.stderr
+        assert "DONE" in result.stdout
+        assert (
+            overlapped.exists()
+        ), "raising concurrency to 2 should let two decodes run at once"
+
+
+class TestFfmpegWrapperQuickLookFallback:
+    """ffmpeg's own HEVC decoder can hard-reject a stream (e.g. real HDR10/
+    BT.2020 phone footage) that macOS's native AVFoundation decodes fine.
+    The wrapper retries a failed single-frame thumbnail extraction via
+    QuickLook before giving up. These drive the wrapper directly with stub
+    ffmpeg/qlmanage/vips binaries — the real decoders are verified on-device.
+    """
+
+    WRAPPER = REPO_ROOT / "immich_accelerator" / "ffmpeg-wrapper.sh"
+
+    # Args shaped like Immich's own video-thumbnail transcode call
+    # (BaseConfig.getBaseOutputOptions / ThumbnailConfig.getFilterOptions):
+    # `-frames:v 1` marks a single-frame extraction, `scale=...` carries the
+    # target pixel size, and the output path is always the last argument.
+    def _thumbnail_args(self, input_path, output_path, scale="-2:250"):
+        return [
+            "-skip_frame", "nointra",
+            "-i", str(input_path),
+            "-fps_mode", "vfr", "-frames:v", "1", "-update", "1",
+            "-vf", f"scale={scale}",
+            "-f", "image2", str(output_path),
+        ]
+
+    def _bash_stub(self, path_, body):
+        path_.write_text("#!/bin/bash\n" + body)
+        path_.chmod(0o755)
+
+    def _prepare_wrapper(self, tmp_path, real_ffmpeg):
+        # Mirror __main__.py's own deploy-time substitution exactly, so the
+        # tested form matches what actually ships rather than the checked-in
+        # placeholder.
+        content = self.WRAPPER.read_text().replace(
+            'REAL_FFMPEG="/opt/homebrew/bin/ffmpeg"',
+            f'REAL_FFMPEG="{real_ffmpeg}"',
+        )
+        assert 'REAL_FFMPEG="' + str(real_ffmpeg) in content, (
+            "substitution didn't take — the placeholder string in the "
+            "wrapper no longer matches what __main__.py replaces"
+        )
+        dst = tmp_path / "ffmpeg-wrapper-under-test.sh"
+        dst.write_text(content)
+        dst.chmod(0o755)
+        return dst
+
+    # A qlmanage stub that mimics real behavior closely enough for the
+    # wrapper's own logic: it writes `<outdir>/<basename(input)>.png`,
+    # discovered by parsing `-o <dir>` and taking the last arg as input,
+    # exactly like the real `qlmanage -t -s N -o DIR INPUT` invocation.
+    _QLMANAGE_SUCCEEDS = (
+        'dir=""; prev=""\n'
+        'for a in "$@"; do [[ "$prev" == "-o" ]] && dir="$a"; prev="$a"; done\n'
+        'input="${@: -1}"\n'
+        'echo FAKEPNG > "$dir/$(basename "$input").png"\n'
+    )
+    _QLMANAGE_FAILS = "exit 1\n"
+
+    # The real call is `"$VIPS_BIN" copy "$QL_RESULT" "$OUTPUT"`.
+    _VIPS_COPY = 'cp "$2" "$3"\n'
+
+    def test_successful_ffmpeg_call_passes_through_unchanged(self, tmp_path):
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "exit 0\n")
+        ql_marker = tmp_path / "qlmanage_ran"
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, f"touch {ql_marker}\nexit 1\n")
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        args = self._thumbnail_args(tmp_path / "in.mp4", tmp_path / "out.jpg")
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not ql_marker.exists(), "fallback must not run when ffmpeg succeeds"
+
+    def test_full_transcode_failure_does_not_trigger_fallback(self, tmp_path):
+        """A full transcode (no `-frames:v 1`) has no single "the frame" for
+        QuickLook to hand back — the fallback must never fire for it, and
+        ffmpeg's real exit code must propagate unchanged."""
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "exit 69\n")
+        ql_marker = tmp_path / "qlmanage_ran"
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, f"touch {ql_marker}\n" + self._QLMANAGE_SUCCEEDS)
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        output = tmp_path / "out.mp4"
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), "-i", str(tmp_path / "in.mp4"),
+             "-c:v", "libx264", "-c:a", "aac", str(output)],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 69, (
+            f"real ffmpeg exit code must propagate; got {result.returncode}"
+        )
+        assert not ql_marker.exists(), "fallback must not run for a full transcode"
+        assert not output.exists()
+
+    # What ffmpeg actually prints when its HEVC decoder rejects a stream. The
+    # fallback keys on this rather than on the exit code, so the stub has to
+    # produce it: a bare non-zero exit is a different situation (a truncated
+    # file, a bad seek) and must NOT be papered over.
+    _DECODE_REJECTED_STDERR = (
+        "echo '[hevc @ 0x7f8] Error while decoding stream #0:0: "
+        "Invalid data found when processing input' >&2\n"
+    )
+
+    def test_single_frame_failure_recovers_via_quicklook_fallback(self, tmp_path):
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, self._DECODE_REJECTED_STDERR + "exit 69\n")
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
+        vips = tmp_path / "vips_stub.sh"
+        self._bash_stub(vips, self._VIPS_COPY)
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        output = tmp_path / "out.jpg"
+        args = self._thumbnail_args(tmp_path / "in.mp4", output)
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={
+                "PATH": f"{tmp_path}:/usr/bin:/bin",
+                "IMMICH_ACCELERATOR_VIPS": str(vips),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert output.exists(), "fallback should have produced the output file"
+        assert output.read_text().strip() == "FAKEPNG"
+        assert "QuickLook/AVFoundation produced one instead" in result.stderr
+
+    def test_a_non_decode_failure_is_not_papered_over(self, tmp_path):
+        """A broken file must stay broken.
+
+        The fallback used to fire on any non-zero exit, so a truncated upload
+        or a seek past the end still got a poster frame out of QuickLook and
+        exited 0: Immich recorded a corrupt asset as successfully thumbnailed
+        and nobody ever found out. Only a decoder rejection qualifies now.
+        """
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "echo 'in.mp4: No such file or directory' >&2\nexit 1\n")
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
+        vips = tmp_path / "vips_stub.sh"
+        self._bash_stub(vips, self._VIPS_COPY)
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        output = tmp_path / "out.jpg"
+        args = self._thumbnail_args(tmp_path / "in.mp4", output)
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin",
+                 "IMMICH_ACCELERATOR_VIPS": str(vips)},
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 1, "ffmpeg's real failure must propagate"
+        assert not output.exists(), "no thumbnail should be invented for a broken file"
+
+    def test_single_frame_failure_falls_through_when_quicklook_also_fails(
+        self, tmp_path
+    ):
+        """Never worse than without the fallback: if QuickLook can't recover
+        anything either, propagate ffmpeg's real failure."""
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "exit 69\n")
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, self._QLMANAGE_FAILS)
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        output = tmp_path / "out.jpg"
+        args = self._thumbnail_args(tmp_path / "in.mp4", output)
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 69
+        assert not output.exists()
+
+    def test_fallback_only_fires_for_known_image_extensions(self, tmp_path):
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, "exit 69\n")
+        ql_marker = tmp_path / "qlmanage_ran"
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, f"touch {ql_marker}\n" + self._QLMANAGE_SUCCEEDS)
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        # .mp4 output with -frames:v 1 doesn't happen in real Immich usage,
+        # but exercises the extension guard directly rather than relying on
+        # Immich to never send it.
+        args = self._thumbnail_args(tmp_path / "in.mp4", tmp_path / "out.mp4")
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 69
+        assert not ql_marker.exists()
+
+    def test_hardware_encoder_remap_still_applies(self, tmp_path):
+        """Regression check: restructuring `exec` into a captured run (so the
+        wrapper can inspect ffmpeg's exit code) must not disturb the
+        pre-existing VideoToolbox encoder remap."""
+        ffmpeg = tmp_path / "ffmpeg"
+        seen_args = tmp_path / "seen_args"
+        self._bash_stub(ffmpeg, f'printf "%s\\n" "$@" > {seen_args}\nexit 0\n')
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), "-i", str(tmp_path / "in.mov"),
+             "-c:v", "libx264", "-preset", "fast", str(tmp_path / "out.mp4")],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        received = seen_args.read_text().splitlines()
+        assert "-hwaccel" in received and "videotoolbox" in received
+        assert "h264_videotoolbox" in received
+        assert "libx264" not in received
+        assert "-preset" not in received, "software presets must be stripped for VideoToolbox"
 
 
 class TestPgKeepaliveShim:

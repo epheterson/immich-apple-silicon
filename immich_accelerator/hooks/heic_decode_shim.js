@@ -50,6 +50,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const cp = require('child_process');
+const util = require('util');
+
+const execFileAsync = util.promisify(cp.execFile);
 
 // Resolve a decoder binary. An explicit env override is honored VERBATIM: an
 // operator forcing a specific build should fail loudly (a bad path errors on
@@ -184,10 +187,11 @@ function isRawPath(input) {
     return RAW_EXTS.has(input.slice(dot + 1).toLowerCase());
 }
 
-// The decode runs synchronously in the sharp() constructor, so a hung decoder
-// stalls the worker's event loop. Cap the TOTAL time across all decoders (not
-// per-decoder) so trying the fallback can't multiply the worst case.
-const DECODE_BUDGET_MS = 30000;
+// Decode now runs via async execFile, so a slow decode can't block the event
+// loop or starve BullMQ's lock renewal — this is a hang-safety ceiling, not
+// an event-loop-protection lever. Raised well above 8s because a NAS-backed
+// library (e.g. SMB) can take 20+ seconds for a normal read, not a hang.
+const DECODE_BUDGET_MS = Number(process.env.IMMICH_ACCELERATOR_HEIC_DECODE_BUDGET_MS) || 120000;
 
 // A real TIFF starts with "II*\0" (little-endian) or "MM\0*" (big-endian). Both
 // our decoders emit TIFF; requiring the magic rejects an empty or half-written
@@ -221,11 +225,79 @@ function decoderEnv() {
     return process.env;
 }
 
-// Decode a HEIC file to a lossless TIFF buffer, trying each available decoder in
-// preference order until one yields a valid TIFF. Returns the buffer, or null if
-// every decoder is unavailable or fails (caller falls back to the real Sharp, so
-// behavior is never worse than without the shim).
-function decodeToBuffer(input) {
+// Async execFile lets BullMQ run several decodes concurrently, but a modest
+// NAS degrades under concurrent reads instead of parallelizing them —
+// measured, 4 concurrent vips decodes took 37s+ (still not done) vs 20.7s for
+// one alone. Cap concurrent decoder processes; default 1 matches what
+// execFileSync gave for free before.
+// A queued decode gives up rather than waiting forever; see acquireDecodeSlot.
+const DECODE_QUEUE_TIMEOUT_MS =
+    Number(process.env.IMMICH_ACCELERATOR_HEIC_QUEUE_TIMEOUT_MS) || 180000;
+const DECODE_CONCURRENCY = Number(process.env.IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY) || 1;
+let activeDecodes = 0;
+const decodeWaitQueue = [];
+function acquireDecodeSlot() {
+    if (activeDecodes < DECODE_CONCURRENCY) {
+        activeDecodes += 1;
+        return Promise.resolve();
+    }
+    // Bounded, because an unbounded wait is how one stuck decoder stops every
+    // HEIC and RAW thumbnail on the machine. execFile's timeout only sends
+    // SIGTERM, and a vips blocked in uninterruptible I/O on a stalled SMB
+    // mount (precisely the NAS case this is for) ignores it and never exits:
+    // its promise never settles, the finally never runs, and with the default
+    // concurrency of 1 the single slot is gone for the life of the worker.
+    // Before this rewrite the decode was synchronous with a hard 30s ceiling,
+    // so that could not happen; giving up the slot restores that guarantee.
+    return new Promise((resolve, reject) => {
+        const waiter = { resolve, done: false };
+        const timer = setTimeout(() => {
+            if (waiter.done) return;
+            waiter.done = true;
+            const i = decodeWaitQueue.indexOf(waiter);
+            if (i !== -1) decodeWaitQueue.splice(i, 1);
+            reject(new Error(
+                `waited over ${DECODE_QUEUE_TIMEOUT_MS}ms for a decode slot`));
+        }, DECODE_QUEUE_TIMEOUT_MS);
+        waiter.fire = () => {
+            if (waiter.done) return false;
+            waiter.done = true;
+            clearTimeout(timer);
+            resolve();
+            return true;
+        };
+        decodeWaitQueue.push(waiter);
+    });
+}
+function releaseDecodeSlot() {
+    // Skip waiters that already timed out, or the slot is handed to nobody.
+    while (decodeWaitQueue.length) {
+        const next = decodeWaitQueue.shift();
+        if (next.fire && next.fire()) return;
+    }
+    activeDecodes -= 1;
+}
+
+// Decode a HEIC file to a lossless TIFF buffer, trying each decoder in
+// preference order until one yields a valid TIFF. Resolves to null if none
+// succeed (caller falls back to real Sharp).
+async function decodeToBuffer(input) {
+    try {
+        await acquireDecodeSlot();
+    } catch (e) {
+        // Never held the slot, so must not release one. Falling back to real
+        // Sharp is the same thing every other decode failure here does.
+        process.stderr.write(`[immich-accelerator] ${input}: ${e.message}; falling back to Sharp\n`);
+        return null;
+    }
+    try {
+        return await decodeToBufferUnthrottled(input);
+    } finally {
+        releaseDecodeSlot();
+    }
+}
+
+async function decodeToBufferUnthrottled(input) {
     const deadline = Date.now() + DECODE_BUDGET_MS;
     let attempted = 0;
     for (const dec of DECODERS) {
@@ -238,10 +310,15 @@ function decodeToBuffer(input) {
             `iaa-heic-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e9)}.tiff`
         );
         try {
-            cp.execFileSync(dec.bin, dec.args(input, tmp), {
-                stdio: ['ignore', 'ignore', 'pipe'],
+            await execFileAsync(dec.bin, dec.args(input, tmp), {
                 timeout: remaining,
                 env: decoderEnv(),
+                // The synchronous version ignored stdout and piped stderr.
+                // execFile buffers both into a 1MB maxBuffer by default and
+                // KILLS the child on overflow, so a chatty decoder on a large
+                // RAW would fail a decode that was working. We only care
+                // whether the output file is a valid TIFF.
+                maxBuffer: 8 * 1024 * 1024,
             });
             const buf = fs.readFileSync(tmp);
             if (isTiff(buf)) return buf;
@@ -267,18 +344,63 @@ function decodeToBuffer(input) {
     return null;
 }
 
+// then/catch/finally must not look like chain methods, or code that
+// duck-types "is this a Promise" would misbehave.
+const NON_CHAIN_PROPS = new Set(['then', 'catch', 'finally', 'constructor']);
+
+// These trigger real pixel decode and return a Promise; everything else
+// Immich calls (rotate, resize, toFormat, ...) is a synchronous setter.
+const TERMINAL_ASYNC_METHODS = new Set(['toBuffer', 'toFile', 'metadata', 'stats']);
+
+// sharp() must return synchronously and support chaining even though decode
+// is now async. Records synchronous chain calls and replays them once decode
+// resolves; a terminal call (toBuffer etc.) awaits it first.
+function lazyDecodedSharp(input, options, realSharp) {
+    // Resolve to the decoded SOURCE, not to a Sharp instance. Each terminal
+    // call then builds its own instance and applies the chain to that.
+    //
+    // Sharing one instance replayed the whole recorded chain onto it every
+    // time a terminal method ran, and real Sharp chain methods return `this`,
+    // so a second output re-applied rotate/resize on top of the first. Immich
+    // 3.0.2 happens not to reuse a pipeline (every output calls sharp() again),
+    // so nothing triggers it today — but this shim wraps whatever Immich the
+    // user is running, and an upstream change to reuse one pipeline would
+    // silently double-transform their thumbnails with no error anywhere.
+    const decoded = decodeToBuffer(input).then((buf) => (buf !== null ? buf : input));
+    // Never an unhandled rejection: nothing awaits `decoded` until a terminal
+    // method runs, and if no terminal ever runs (an exception between sharp()
+    // and .toBuffer(), say) an unattached rejection would take the worker down
+    // on Node 15+, where that is fatal by default.
+    decoded.catch(() => {});
+    const calls = [];
+    const proxy = new Proxy(function () {}, {
+        get(_target, prop) {
+            if (typeof prop === 'symbol' || NON_CHAIN_PROPS.has(prop)) return undefined;
+            if (TERMINAL_ASYNC_METHODS.has(prop)) {
+                return async (...args) => {
+                    let instance = realSharp(await decoded, options);
+                    for (const [method, methodArgs] of calls) {
+                        instance = instance[method](...methodArgs);
+                    }
+                    return instance[prop](...args);
+                };
+            }
+            return (...args) => {
+                calls.push([prop, args]);
+                return proxy;
+            };
+        },
+    });
+    return proxy;
+}
+
 // Wrap the real Sharp factory so HEVC-HEIC paths are pre-decoded.
 function wrapSharp(realSharp) {
     function sharp(input, options) {
         // isRawPath is a pure string check; isHevcHeicPath reads the ftyp box.
         // Test the cheap one first so RAW paths route with no filesystem I/O.
         if (isRawPath(input) || isHevcHeicPath(input)) {
-            const buf = decodeToBuffer(input);
-            if (buf !== null) {
-                return realSharp(buf, options);
-            }
-            // Fall through to the real Sharp so the user still gets Immich's
-            // normal (libheif) error path rather than a silent difference.
+            return lazyDecodedSharp(input, options, realSharp);
         }
         return realSharp(input, options);
     }
