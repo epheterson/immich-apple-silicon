@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.11.0 - 2026-08-13
+
+### Added
+- **Set up the accelerator from the menu bar app.** The whole flow runs in the app, including a NAS-plus-Mac split deployment, which previously had to be finished in Terminal. It asks where Immich is and detects a local Docker install, finds your library on mounted volumes, checks that Postgres and Redis are reachable before writing anything, and starts from your existing settings when you run it again after an update.
+- **Separate switches for starting the accelerator at login and showing the menu bar icon.** They were one switch that only controlled the icon. Also available as `immich-accelerator autostart [on|off]`.
+- **`immich-accelerator detect`** reports what Immich this Mac can see, as JSON.
+
+### Changed
+- **The menu bar panel shows what is happening rather than everything it can do.** One status line, what is left to process, and the action. Open Logs, Check for Updates and the login switch moved to Settings, where they already existed.
+- **One name for the worker.** It is called Microservices everywhere in the app now. `worker` still works as the config key and the CLI argument, and `microservices` is accepted as an alias.
+- **Diagnostics appears when something needs attention** instead of sitting in Settings as a permanent tab of green ticks.
+
 ## 1.10.0 - 2026-08-10
 
 ### Added

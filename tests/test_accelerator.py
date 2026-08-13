@@ -3519,9 +3519,24 @@ class TestSetupYesFlag:
         import immich_accelerator.__main__ as m
 
         args = m.build_parser().parse_args(["setup", "--ml-only", "--yes"])
+        # subprocess is captured, not executed. `--yes` takes the default on
+        # "install as a system service", so this path now runs `launchctl
+        # load` where the old EOFError declined it. Patching LAUNCH_AGENTS_DIR
+        # puts the plist in a temp dir but does nothing about launchctl, which
+        # registers with the real user session; pytest then deletes the temp
+        # dir and the job stays registered against a file that is gone. That
+        # happened twice on real Macs before this was pinned down.
+        calls = []
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
         with patch.object(m, "_find_ml_dir", return_value=None), patch.object(
             m, "cmd_start"
-        ) as start, patch.object(m, "log"), patch(
+        ) as start, patch.object(m, "log"), patch.object(
+            m.subprocess, "run", side_effect=fake_run
+        ), patch(
             "builtins.input", side_effect=AssertionError("setup --yes must not ask")
         ):
             m.cmd_setup(args)
@@ -3530,6 +3545,15 @@ class TestSetupYesFlag:
         saved = m.load_config()
         assert saved["worker"] is False
         assert saved["ml"] is True
+
+        # Whatever it loads must live under the patched directory, never the
+        # user's own. This is the assertion the incident was missing.
+        for cmd in calls:
+            if isinstance(cmd, (list, tuple)) and "launchctl" in str(cmd[0]):
+                target = str(cmd[-1])
+                assert str(tmp_data_dir["launch_agents"]) in target, (
+                    f"launchctl aimed outside the test sandbox: {target}"
+                )
 
     def test_yes_does_not_install_a_launch_agent_in_the_real_home(
         self, tmp_data_dir, monkeypatch

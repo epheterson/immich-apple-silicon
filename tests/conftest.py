@@ -7,7 +7,40 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import subprocess
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def no_real_machine_state(monkeypatch):
+    """Fail any test that tries to mutate this machine's launchd or brew.
+
+    Patching a path is not isolation when the command still targets the real
+    system. tmp_data_dir redirects LAUNCH_AGENTS_DIR so the plist lands in a
+    temp dir, but `launchctl load` registers it with the actual user session,
+    and pytest then deletes the directory: the job stays registered forever
+    pointing at a file that no longer exists. That has now happened twice on a
+    real Mac, once leaving a crash-looping agent behind.
+
+    This is deliberately a hard failure rather than a silent no-op. A test that
+    reaches launchctl is testing something it did not mean to, and should say
+    so.
+    """
+    real_run = subprocess.run
+
+    def guarded(cmd, *a, **kw):
+        first = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else cmd
+        name = str(first).rsplit("/", 1)[-1]
+        if name in {"launchctl", "brew"}:
+            raise AssertionError(
+                f"test tried to run {name!r} against the real machine. "
+                "Patch the call, or the caller, instead."
+            )
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", guarded)
+    yield
 
 
 @pytest.fixture
