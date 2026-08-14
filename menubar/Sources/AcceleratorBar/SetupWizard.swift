@@ -437,7 +437,9 @@ final class WizardModel: ObservableObject {
         working = false
         failed = !ok
         if ok {
-            Task { await waitForServices() } advance() }
+            advance()
+            Task { await waitForServices() }
+        }
     }
 }
 
