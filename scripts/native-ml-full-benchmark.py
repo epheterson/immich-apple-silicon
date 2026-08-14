@@ -13,12 +13,25 @@ but that comparison excluded the default model. This script drives the
 `fullbench` binary mode (main.swift) that covers both in one process, one
 table, regenerable by anyone instead of a one-off number in a commit message.
 
-TEST IMAGE
-----------
-A real photo, not synthetic noise: COCO val2017 000000039769.jpg ("two cats
-on a couch"), the exact image HuggingFace's own CLIP model card uses as its
-worked example. Downloaded on demand and cached locally — never committed to
-this repo. See IMAGE_SOURCES below for the exact URL and provenance note.
+TEST IMAGES
+-----------
+Five real photos, not synthetic noise: well-known COCO val2017 images (the
+"two cats" one is HuggingFace's own CLIP model card worked example; the
+others are similarly famous reference images from pycocotools' and
+Detectron2's own demos — see IMAGE_SOURCES below for exact URLs and
+provenance notes). Timed iterations cycle through all five so the reported
+median reflects varied real content instead of one image's caching quirks.
+Downloaded on demand and cached locally — never committed to this repo.
+
+MODEL COVERAGE
+---------------
+Defaults to the full SigLIP/SigLIP2 registry (17 models, see ALL_SIGLIP_MODELS
+below — kept in sync with SigLIPRegistry.models in SigLIPNative.swift) plus
+the production default (ViT-B-32__openai), since every one of them is a
+native-vs-onnxruntime comparison ZooCLIP can actually make (see ZooCLIP.init:
+useNative only trips for a SigLIPRegistry hit). Every other zoo model
+(ViT-B-16, ViT-L-14, LAION variants, ...) has no native path, so benchmarking
+it here would just compare onnxruntime against itself.
 
 USAGE
 -----
@@ -37,20 +50,60 @@ import sys
 import urllib.request
 from datetime import datetime, timezone
 
-# One per tower scale, so the default run is fast but still representative
-# (SO400M/384 needs a one-time multi-GB onnxruntime external-data download).
-DEFAULT_EXTRA_CLIP_MODELS = [
-    "ViT-B-16-SigLIP-256__webli",
+# The full SigLIP/SigLIP2 registry — keep in sync with SigLIPRegistry.models
+# in SigLIPNative.swift. Every entry here gets a real native-vs-onnxruntime
+# comparison (see MODEL COVERAGE above); models already live in the local
+# clip-dir cache from ordinary use, so running all of them costs time, not
+# bandwidth.
+ALL_SIGLIP_MODELS = [
+    "ViT-B-16-SigLIP__webli",
+    "ViT-B-16-SigLIP2__webli",
     "ViT-L-16-SigLIP2-256__webli",
     "ViT-SO400M-16-SigLIP2-384__webli",
+    "ViT-SO400M-14-SigLIP2-378__webli",
+    "ViT-SO400M-16-SigLIP2-512__webli",
+    "ViT-L-16-SigLIP2-512__webli",
+    "ViT-SO400M-16-SigLIP2-256__webli",
+    "ViT-SO400M-14-SigLIP2__webli",
+    "ViT-L-16-SigLIP2-384__webli",
+    "ViT-B-32-SigLIP2-256__webli",
+    "ViT-SO400M-14-SigLIP-384__webli",
+    "ViT-L-16-SigLIP-384__webli",
+    "ViT-L-16-SigLIP-256__webli",
+    "ViT-B-16-SigLIP-512__webli",
+    "ViT-B-16-SigLIP-384__webli",
+    "ViT-B-16-SigLIP-256__webli",
 ]
+DEFAULT_EXTRA_CLIP_MODELS = ALL_SIGLIP_MODELS
 
-# (local filename, source URL, one-line provenance note)
+# (local filename, source URL, one-line provenance note). All five are
+# well-known, permissively-licensed COCO val2017 images already hot-linked by
+# other ML tooling's own docs/demos — not arbitrary picks.
 IMAGE_SOURCES = {
-    "clip.jpg": (
+    "clip-cats.jpg": (
         "http://images.cocodataset.org/val2017/000000039769.jpg",
-        "COCO val2017 000000039769.jpg — the image used in HuggingFace's own "
-        "CLIP model card example.",
+        "COCO val2017 000000039769.jpg — two cats on a couch, the image used "
+        "in HuggingFace's own CLIP model card example.",
+    ),
+    "clip-livingroom.jpg": (
+        "http://images.cocodataset.org/val2017/000000000139.jpg",
+        "COCO val2017 000000000139.jpg — indoor living/dining room scene, a "
+        "long-standing COCO API getting-started example image.",
+    ),
+    "clip-bear.jpg": (
+        "http://images.cocodataset.org/val2017/000000000285.jpg",
+        "COCO val2017 000000000285.jpg — close-up portrait of a brown bear.",
+    ),
+    "clip-dogwalk.jpg": (
+        "http://images.cocodataset.org/val2017/000000324158.jpg",
+        "COCO val2017 000000324158.jpg — person walking a dog on a paved "
+        "path, the image pycocotools' own demo notebook queries by category "
+        "(person/dog/skateboard).",
+    ),
+    "clip-guard.jpg": (
+        "http://images.cocodataset.org/val2017/000000439715.jpg",
+        "COCO val2017 000000439715.jpg — mounted ceremonial guard, the input "
+        "image Detectron2's own Colab quick-start demo downloads.",
     ),
 }
 
@@ -104,7 +157,7 @@ def run_fullbench(binary: str, clip_dir: str, images: dict,
         "ML_CLIP_DIR": clip_dir,
         "BENCH_ITERS": str(iters),
         "BENCH_WARMUP": str(warmup),
-        "BENCH_CLIP_IMAGE": images["clip.jpg"],
+        "BENCH_CLIP_IMAGES": ",".join(images.values()),
         "BENCH_CLIP_MODELS": ",".join(extra_models),
     }
     print(f"[bench] running fullbench (iters={iters}, warmup={warmup}, "
@@ -215,10 +268,11 @@ def render_markdown(clip_rows: list, repo_dir: str, iters: int, warmup: int) -> 
 
     out += [
         "",
-        "## Test image",
+        "## Test images",
         "",
-        "A real photo from a small, well-known community reference set, downloaded"
-        " on demand and cached outside the repo (not committed here):",
+        f"{len(IMAGE_SOURCES)} real photos from a well-known community reference set"
+        " (COCO val2017), downloaded on demand and cached outside the repo (not"
+        " committed here). Timed iterations cycle through all of them:",
         "",
     ]
     for fname, (url, note) in IMAGE_SOURCES.items():
@@ -236,12 +290,14 @@ def main() -> int:
     ap.add_argument("--image-cache-dir", default=os.path.expanduser("~/.cache/immich-ml-native/bench-images"))
     ap.add_argument("--iterations", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
-    ap.add_argument("--timeout", type=int, default=1800,
-                     help="subprocess timeout; extra CLIP models may need a one-time "
-                          "multi-GB external-data download")
+    ap.add_argument("--timeout", type=int, default=5400,
+                     help="subprocess timeout; the full SigLIP registry default is slow to "
+                          "run end to end, and a model missing from the clip-dir cache needs "
+                          "a one-time multi-GB external-data download")
     ap.add_argument("--extra-clip-models", default=",".join(DEFAULT_EXTRA_CLIP_MODELS),
                      help="comma-separated extra zoo CLIP models to benchmark alongside "
-                          "the production default, or 'none'")
+                          "the production default — defaults to the full SigLIP/SigLIP2 "
+                          "registry (all 17), or 'none'")
     ap.add_argument("--out", default=os.path.join(repo_dir, "docs", "native-ml-benchmarks.md"))
     args = ap.parse_args()
 

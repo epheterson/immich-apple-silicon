@@ -63,29 +63,32 @@ if CommandLine.arguments.contains("zootest") {
 }
 
 // --- CLIP latency benchmark: default CLIP (mlx fast path) and optional zoo
-// CLIP models, each measured native AND onnxruntime side by side, on a real
-// photo (not synthetic noise). Used by scripts/native-ml-full-benchmark.py to
-// generate docs/native-ml-benchmarks.md. Every CLIP model (including the
-// production default, ViT-B-32__openai, which normally stays on the
-// CLIPEncoder/CLIPText mlx fast path — see Models.swift) gets both a native
-// and an onnxruntime number from ZooCLIP's forceONNX parameter, in the same
-// process, same preprocessing code — only the inference backend differs.
+// CLIP models, each measured native AND onnxruntime side by side, on a small
+// set of real photos (not synthetic noise), cycled across timed iterations so
+// the median reflects varied real content rather than one image's caching
+// quirks. Used by scripts/native-ml-full-benchmark.py to generate
+// docs/native-ml-benchmarks.md. Every CLIP model (including the production
+// default, ViT-B-32__openai, which normally stays on the CLIPEncoder/CLIPText
+// mlx fast path — see Models.swift) gets both a native and an onnxruntime
+// number from ZooCLIP's forceONNX parameter, in the same process, same
+// preprocessing code — only the inference backend differs.
 if CommandLine.arguments.contains("fullbench") {
     let iters = Int(ProcessInfo.processInfo.environment["BENCH_ITERS"] ?? "") ?? 20
     let warmup = Int(ProcessInfo.processInfo.environment["BENCH_WARMUP"] ?? "") ?? 3
     let phrase = ProcessInfo.processInfo.environment["BENCH_PHRASE"] ?? "a photo of a cat"
     let clipDir = ProcessInfo.processInfo.environment["ML_CLIP_DIR"] ?? "/tmp/mlx032test/clipmodel"
-    let clipImagePath = ProcessInfo.processInfo.environment["BENCH_CLIP_IMAGE"] ?? "/tmp/clip_testimg.png"
+    let clipImagePaths = (ProcessInfo.processInfo.environment["BENCH_CLIP_IMAGES"] ?? "/tmp/clip_testimg.png")
+        .split(separator: ",").map(String.init)
     let extraModels = ProcessInfo.processInfo.environment["BENCH_CLIP_MODELS"]
         .map { $0.split(separator: ",").map(String.init) } ?? []
     let clipModels = [Models.defaultClip] + extraModels
 
-    func fbTimeMs(_ n: Int, _ body: () throws -> Void) rethrows -> [Double] {
+    func fbTimeMs(_ n: Int, _ body: (Int) throws -> Void) rethrows -> [Double] {
         var samples: [Double] = []
         samples.reserveCapacity(n)
-        for _ in 0..<n {
+        for i in 0..<n {
             let start = DispatchTime.now()
-            try body()
+            try body(i)
             let end = DispatchTime.now()
             samples.append(Double(end.uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
         }
@@ -96,7 +99,8 @@ if CommandLine.arguments.contains("fullbench") {
         return s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
     }
 
-    if let cg = loadCGImage(clipImagePath) {
+    let cgs = clipImagePaths.compactMap(loadCGImage)
+    if !cgs.isEmpty {
         for name in clipModels {
             do {
                 let nativeVisual: Double
@@ -105,26 +109,26 @@ if CommandLine.arguments.contains("fullbench") {
                     // Production fast path: CLIPEncoder/CLIPText (mlx), not ZooCLIP.
                     let clip = CLIPEncoder(modelDir: clipDir)
                     let text = CLIPText(modelDir: clipDir, tokenizer: CLIPTokenizer(modelDir: clipDir))
-                    _ = fbTimeMs(warmup) { _ = clip.embed(cg) }
-                    nativeVisual = fbMedian(fbTimeMs(iters) { _ = clip.embed(cg) })
-                    _ = fbTimeMs(warmup) { _ = text.encode(phrase) }
-                    nativeTextual = fbMedian(fbTimeMs(iters) { _ = text.encode(phrase) })
+                    _ = fbTimeMs(warmup) { _ in _ = clip.embed(cgs[0]) }
+                    nativeVisual = fbMedian(fbTimeMs(iters) { i in _ = clip.embed(cgs[i % cgs.count]) })
+                    _ = fbTimeMs(warmup) { _ in _ = text.encode(phrase) }
+                    nativeTextual = fbMedian(fbTimeMs(iters) { _ in _ = text.encode(phrase) })
                 } else {
                     let zoo = try ZooCLIP(name: name, forceONNX: false)
-                    _ = try fbTimeMs(warmup) { _ = try zoo.embedVisual(cg) }
-                    nativeVisual = fbMedian(try fbTimeMs(iters) { _ = try zoo.embedVisual(cg) })
-                    _ = try fbTimeMs(warmup) { _ = try zoo.embedTextual(phrase) }
-                    nativeTextual = fbMedian(try fbTimeMs(iters) { _ = try zoo.embedTextual(phrase) })
+                    _ = try fbTimeMs(warmup) { _ in _ = try zoo.embedVisual(cgs[0]) }
+                    nativeVisual = fbMedian(try fbTimeMs(iters) { i in _ = try zoo.embedVisual(cgs[i % cgs.count]) })
+                    _ = try fbTimeMs(warmup) { _ in _ = try zoo.embedTextual(phrase) }
+                    nativeTextual = fbMedian(try fbTimeMs(iters) { _ in _ = try zoo.embedTextual(phrase) })
                 }
 
-                // onnxruntime branch, same model, same image — for the default
+                // onnxruntime branch, same model, same images — for the default
                 // model this is naturally onnx regardless of the flag (no
                 // SigLIPRegistry entry for ViT-B-32__openai; see ZooCLIP.init).
                 let onnxZoo = try ZooCLIP(name: name, forceONNX: true)
-                _ = try fbTimeMs(warmup) { _ = try onnxZoo.embedVisual(cg) }
-                let onnxVisual = fbMedian(try fbTimeMs(iters) { _ = try onnxZoo.embedVisual(cg) })
-                _ = try fbTimeMs(warmup) { _ = try onnxZoo.embedTextual(phrase) }
-                let onnxTextual = fbMedian(try fbTimeMs(iters) { _ = try onnxZoo.embedTextual(phrase) })
+                _ = try fbTimeMs(warmup) { _ in _ = try onnxZoo.embedVisual(cgs[0]) }
+                let onnxVisual = fbMedian(try fbTimeMs(iters) { i in _ = try onnxZoo.embedVisual(cgs[i % cgs.count]) })
+                _ = try fbTimeMs(warmup) { _ in _ = try onnxZoo.embedTextual(phrase) }
+                let onnxTextual = fbMedian(try fbTimeMs(iters) { _ in _ = try onnxZoo.embedTextual(phrase) })
 
                 print("BENCH clip model=\(name) native_visual_ms=\(nativeVisual) onnx_visual_ms=\(onnxVisual) "
                       + "native_textual_ms=\(nativeTextual) onnx_textual_ms=\(onnxTextual) n=\(iters)")
@@ -133,7 +137,7 @@ if CommandLine.arguments.contains("fullbench") {
             }
         }
     } else {
-        print("BENCH clip FAILED no image at \(clipImagePath)")
+        print("BENCH clip FAILED no loadable images among \(clipImagePaths)")
     }
 
     exit(0)
