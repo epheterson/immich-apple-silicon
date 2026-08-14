@@ -1702,23 +1702,30 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
 # --- Process management ---
 
 
+def snapshot_config() -> None:
+    """Keep the current config as `.previous`, once, before a run changes it.
+
+    Deliberately not inside save_config. Setup writes the config several times
+    in a single run, so rotating on every write meant the good copy was
+    overwritten by the first of those writes seconds later: the backup existed
+    exactly until the moment it was needed. Taken at the start of a run, it is
+    the config as it was before anything touched it, which is the only version
+    anyone wants back.
+    """
+    if not CONFIG_FILE.exists():
+        return
+    try:
+        previous = CONFIG_FILE.with_name(CONFIG_FILE.name + ".previous")
+        shutil.copy2(CONFIG_FILE, previous)
+        os.chmod(previous, 0o600)
+    except OSError as e:
+        # Never block a run on the backup: a config that cannot be written is a
+        # broken install, a backup that cannot be written is not.
+        log.debug("could not keep a previous config: %s", e)
+
+
 def save_config(config: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Keep the version being replaced. Re-running setup is the documented way
-    # to repair an install and the menu bar offers it as a button, so config
-    # rewrites are routine and a bad one leaves nothing to go back to. One
-    # slot, not a timestamped pile: what anyone ever wants is the last one that
-    # worked, and a directory full of dated copies is its own problem.
-    if CONFIG_FILE.exists():
-        try:
-            previous = CONFIG_FILE.with_name(CONFIG_FILE.name + ".previous")
-            shutil.copy2(CONFIG_FILE, previous)
-            os.chmod(previous, 0o600)
-        except OSError as e:
-            # Never block saving on the backup: a config that cannot be written
-            # is a broken install, a backup that cannot be written is not.
-            log.debug("could not keep a previous config: %s", e)
 
     # Atomic write: tmp file + rename prevents corruption if interrupted
     tmp = CONFIG_FILE.with_suffix(".tmp")
@@ -3453,8 +3460,16 @@ def _fresh_install(docker: str, photos_path: str = "", data_path: str = "") -> b
     # Through _confirm so --yes answers it. Defaulting to yes is right: the
     # container only reads your photos and writes the media directory, and
     # running it as you is what keeps those files owned by you.
-    run_as_user = _confirm(
-        f"  Run the Immich server container as the current user (uid {os.getuid()})? [Y/n] "
+    # Not _confirm alone: with nobody to ask it answers no, which is the
+    # deliberate contract everywhere else but is wrong here. This one has a
+    # correct unattended answer, and it is yes: running as the invoking user is
+    # what keeps the media files owned by them rather than root.
+    run_as_user = (
+        _confirm(
+            f"  Run the Immich server container as the current user (uid {os.getuid()})? [Y/n] "
+        )
+        if (interactive or ASSUME_YES)
+        else True
     )
     user_line = f'    user: "{os.getuid()}"\n' if run_as_user else ""
 
@@ -3535,11 +3550,11 @@ def _setup_local(args):
     log.info("Detecting Immich instance...")
 
     # Step 1: Find or install Docker
-    try:
-        docker = _find_docker_or_install()
-    except RuntimeError as e:
-        log.error("%s", e)
-        return
+    # Raised, not swallowed. Every `return` from here exits 0, and the menu bar
+    # has nothing but the exit code to go on: it moved a user with no Docker
+    # to "Checking it works" and told them setup had succeeded when no config
+    # had been written at all.
+    docker = _find_docker_or_install()
     _ensure_docker_running(docker)
 
     # Step 2: Check for existing Immich
@@ -3714,9 +3729,18 @@ def _setup_remote(args):
         # password back out of config.json, so it sends an empty one on a
         # re-run; taking that literally would overwrite a working password with
         # nothing and break the install the user was trying to repair.
-        kept = str(existing.get(key) or "")
+        # Same server only. A stored password belongs to the Immich it was
+        # generated for, and a Mac being re-pointed at a different one would
+        # otherwise have the old stack's credential written as the new one:
+        # setup reports success, connectivity only opens a socket, and every
+        # job then fails on authentication with nothing saying why.
+        same_server = (
+            str(existing.get("db_hostname") or "") == db_hostname
+            and str(existing.get("db_port") or "") == str(db_port)
+        )
+        kept = str(existing.get(key) or "") if same_server else ""
         if kept:
-            log.info("  %s: keeping the one already configured", label)
+            log.info("  %s: keeping the one already configured for %s", label, db_hostname)
             return kept
         if key in secrets or not interactive:
             if required:
@@ -3748,6 +3772,8 @@ def _setup_remote(args):
     # Probe Docker's view of the media root so we can surface mismatch
     # up-front rather than when thumbnails 404 (issue #19). Requires
     # API key — prompt for one if the user didn't pass it.
+    if not api_key:
+        api_key = str(secrets.get("api_key") or "")
     if not api_key:
         log.info("")
         log.info("Your Immich API key (Settings → API Keys in the web UI) lets us")
@@ -3788,11 +3814,10 @@ def _setup_remote(args):
             # anyone wants taken on their behalf. The wizard's library step
             # exists to stop this being reached at all.
             if not _confirm("  Save config anyway and fix later? [y/N] ", default=False):
-                log.info(
-                    "Aborted: this Mac's media path does not resolve to the same "
-                    "files Immich sees. Fix the path or the mount, then run setup again."
+                raise RuntimeError(
+                    "This Mac's media path does not resolve to the same files "
+                    "Immich sees. Fix the path or the mount, then run setup again."
                 )
-                return
 
     # Check connectivity
     config = {
@@ -3802,8 +3827,10 @@ def _setup_remote(args):
         "redis_port": redis_port,
     }
     if not _validate_connectivity(config):
-        log.error("Cannot reach DB or Redis. Check the host/port and try again.")
-        return
+        raise RuntimeError(
+            "Cannot reach the database or Redis from this Mac. Check the host "
+            "and port, and that they are exposed to this machine."
+        )
 
     node, ffmpeg_path, ml_dir = _check_local_tools()
 
@@ -3981,6 +4008,9 @@ def cmd_setup(args):
     # a Namespace by hand and should not have to know about this flag.
     global ASSUME_YES
     ASSUME_YES = bool(getattr(args, "yes", False))
+
+    # Before anything is written, so a bad run is recoverable.
+    snapshot_config()
 
     if args.ml_only:
         _setup_ml_only(args)

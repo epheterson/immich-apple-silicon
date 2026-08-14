@@ -196,12 +196,19 @@ struct SettingsView: View {
             // describe one of them, so it described the icon and a footnote
             // apologised for the rest.
             Section("Startup") {
-                Toggle("Start accelerator at login", isOn: $autostartOn)
+                Toggle("Run accelerator as a background service", isOn: $autostartOn)
                     .onChange(of: autostartOn) { _, on in
                         Task { await Actions.setAutostart(on) }
                     }
                 Toggle("Show menu bar icon at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
+            } footer: {
+                // Says what it does. brew services has no "keep running but
+                // do not start next time": turning it off stops the service
+                // now as well, and a switch labelled "at login" that silently
+                // stops your processing is worse than a longer label.
+                Text("Turning this off stops the accelerator now, as well as at login.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
             }
 
             Section("Software Update") {

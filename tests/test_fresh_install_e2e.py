@@ -73,16 +73,18 @@ class TestCreateImmichFromScratch:
         # No terminal, and any prompt is a failure rather than a hang: this is
         # the app's exact situation, and the whole point is that it completes
         # without one.
-        with patch.object(m.sys.stdin, "isatty", return_value=False), patch.object(
-            m, "ASSUME_YES", True
-        ), patch("builtins.input", side_effect=AssertionError("must not prompt")):
-            ok = m._fresh_install(docker, str(photos), str(data))
-
-        assert ok is True, "fresh install reported failure"
-
         project = m.MANAGED_DOCKER_DIR
         compose = project / "docker-compose.yml"
+        # The try starts before the call, not after it. _fresh_install brings
+        # containers up partway through, so a failure inside it used to leave a
+        # running Immich stack behind on the runner with nothing to stop it.
         try:
+            with patch.object(m.sys.stdin, "isatty", return_value=False), patch.object(
+                m, "ASSUME_YES", True
+            ), patch("builtins.input", side_effect=AssertionError("must not prompt")):
+                ok = m._fresh_install(docker, str(photos), str(data))
+
+            assert ok is True, "fresh install reported failure"
             assert compose.is_file(), "no compose file was written"
             written = compose.read_text()
             assert str(photos) in written, "the photo path never reached the compose"

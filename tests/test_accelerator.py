@@ -2859,6 +2859,57 @@ class TestWatchDispatch:
             assert m._watch_without_worker({"worker": False}) == m._SWITCH
 
 
+class TestSetupFailuresAreVisibleToTheApp:
+    """The menu bar has only the exit code to go on.
+
+    Several aborts logged an error and returned, which exits 0, so the wizard
+    reported success and moved the user to "Checking it works" when no config
+    had been written at all.
+    """
+
+    def test_unreachable_database_is_an_error(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        args = argparse.Namespace(
+            url="http://nas:2283", api_key="", db_host="nas", db_port="5432",
+            db_user="postgres", db_name="immich", redis_host="nas",
+            redis_port="6379", redis_user="", upload_mount="/v/p",
+            secrets_stdin=True, yes=True, import_server=None, manual=False,
+            ml_only=False, photos_path=None, data_path=None,
+        )
+        with patch.object(m, "ASSUME_YES", True), patch.object(
+            m, "_query_immich_api", return_value={"version": "3.0.2"}
+        ), patch.object(m.sys, "stdin", io.StringIO('{"db_password": "p"}')), patch.object(
+            m, "_detect_docker_media_prefix", return_value=None
+        ), patch.object(m, "_warn_on_path_mismatch", return_value=False), patch.object(
+            m, "_validate_connectivity", return_value=False
+        ), patch.object(m, "log"):
+            with pytest.raises(RuntimeError) as e:
+                m._setup_remote(args)
+        assert "database" in str(e.value).lower()
+
+    def test_a_media_path_mismatch_is_an_error(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        args = argparse.Namespace(
+            url="http://nas:2283", api_key="k", db_host="nas", db_port="5432",
+            db_user="postgres", db_name="immich", redis_host="nas",
+            redis_port="6379", redis_user="", upload_mount="/v/p",
+            secrets_stdin=True, yes=True, import_server=None, manual=False,
+            ml_only=False, photos_path=None, data_path=None,
+        )
+        with patch.object(m, "ASSUME_YES", True), patch.object(
+            m, "_query_immich_api", return_value={"version": "3.0.2"}
+        ), patch.object(m.sys, "stdin", io.StringIO('{"db_password": "p"}')), patch.object(
+            m, "_detect_docker_media_prefix", return_value="/data/immich"
+        ), patch.object(m, "_warn_on_path_mismatch", return_value=True), patch.object(
+            m, "log"
+        ):
+            with pytest.raises(RuntimeError) as e:
+                m._setup_remote(args)
+        assert "media path" in str(e.value).lower()
+
+
 class TestRerunKeepsStoredSecrets:
     """The wizard never reads a password back out of config.json, on purpose,
     so on a re-run it sends an empty one. Taking that literally would overwrite
@@ -2892,14 +2943,30 @@ class TestRerunKeepsStoredSecrets:
     def test_an_empty_password_keeps_the_stored_one(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
 
-        m.save_config({"db_password": "original", "redis_password": "rpw"})
+        m.save_config({
+            "db_hostname": "nas.local", "db_port": "5432",
+            "db_password": "original", "redis_password": "rpw",
+        })
         cfg = self._run(m, json.dumps({"db_password": "", "redis_password": ""}))
         assert cfg["db_password"] == "original", "a re-run wiped the database password"
+
+    def test_a_different_server_does_not_inherit_the_password(self, tmp_data_dir):
+        """Re-pointing a Mac at another Immich must not reuse the old stack's
+        credential. Setup would report success, connectivity only opens a
+        socket, and every job would then fail on authentication."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({
+            "db_hostname": "old-box", "db_port": "5432", "db_password": "old-secret",
+        })
+        with pytest.raises(RuntimeError) as e:
+            self._run(m, json.dumps({"db_password": ""}))
+        assert "--secrets-stdin" in str(e.value)
 
     def test_a_supplied_password_still_wins(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
 
-        m.save_config({"db_password": "original"})
+        m.save_config({"db_hostname": "nas.local", "db_port": "5432", "db_password": "original"})
         cfg = self._run(m, json.dumps({"db_password": "changed", "redis_password": ""}))
         assert cfg["db_password"] == "changed"
 
@@ -2917,10 +2984,11 @@ class TestConfigIsNeverSilentlyLost:
     replaced, which made a bad re-run unrecoverable unless the user had thought
     to press Back Up first."""
 
-    def test_the_replaced_config_is_kept(self, tmp_data_dir):
+    def test_the_config_from_before_the_run_is_kept(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
 
         m.save_config({"immich_url": "http://first"})
+        m.snapshot_config()
         m.save_config({"immich_url": "http://second"})
 
         previous = tmp_data_dir["config_file"].with_name("config.json.previous")
@@ -2928,18 +2996,31 @@ class TestConfigIsNeverSilentlyLost:
         assert json.loads(previous.read_text())["immich_url"] == "http://first"
         assert m.load_config()["immich_url"] == "http://second"
 
+    def test_a_run_that_writes_repeatedly_keeps_the_original(self, tmp_data_dir):
+        """Setup saves several times per run. Rotating on every write meant the
+        good copy was destroyed by the first of those writes."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"immich_url": "http://before"})
+        m.snapshot_config()
+        for i in range(3):
+            m.save_config({"immich_url": f"http://during-{i}"})
+        previous = tmp_data_dir["config_file"].with_name("config.json.previous")
+        assert json.loads(previous.read_text())["immich_url"] == "http://before"
+
     def test_the_backup_is_not_world_readable(self, tmp_data_dir):
         """It holds the same database password and API key as the original."""
         import immich_accelerator.__main__ as m
 
         m.save_config({"api_key": "secret"})
-        m.save_config({"api_key": "secret2"})
+        m.snapshot_config()
         previous = tmp_data_dir["config_file"].with_name("config.json.previous")
         assert oct(previous.stat().st_mode)[-3:] == "600"
 
     def test_a_first_save_needs_no_backup(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
 
+        m.snapshot_config()
         m.save_config({"immich_url": "http://only"})
         assert not tmp_data_dir["config_file"].with_name("config.json.previous").exists()
 
@@ -2950,6 +3031,7 @@ class TestConfigIsNeverSilentlyLost:
 
         m.save_config({"immich_url": "http://first"})
         with patch.object(m.shutil, "copy2", side_effect=OSError("read-only")):
+            m.snapshot_config()
             m.save_config({"immich_url": "http://second"})
         assert m.load_config()["immich_url"] == "http://second"
 
