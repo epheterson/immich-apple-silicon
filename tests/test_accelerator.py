@@ -2859,6 +2859,34 @@ class TestWatchDispatch:
             assert m._watch_without_worker({"worker": False}) == m._SWITCH
 
 
+class TestSetupWithoutPkgConfig:
+    """Reported by @pl4za: setup died on a Mac with no pkg-config.
+
+    _ensure_vips uses pkg-config only as a fallback for a libvips somewhere
+    unusual, but the call was unguarded, so FileNotFoundError propagated out of
+    a check whose whole job is to answer "is vips here" and took setup with it.
+    """
+
+    def test_missing_pkg_config_does_not_abort_setup(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m.os.path, "isfile", return_value=False), patch.object(
+            m.subprocess, "run", side_effect=FileNotFoundError("pkg-config")
+        ), patch.object(m, "_brew_install", return_value=True) as install:
+            m._ensure_vips()   # must not raise
+        install.assert_called_once_with("vips")
+
+    def test_pkg_config_finding_vips_is_still_enough(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        ok = subprocess.CompletedProcess(["pkg-config"], 0, b"", b"")
+        with patch.object(m.os.path, "isfile", return_value=False), patch.object(
+            m.subprocess, "run", return_value=ok
+        ), patch.object(m, "_brew_install") as install:
+            m._ensure_vips()
+        install.assert_not_called()
+
+
 class TestComponentNaming:
     """One thing, one name, in the UI and on the command line.
 

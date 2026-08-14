@@ -85,6 +85,9 @@ final class WizardModel: ObservableObject {
     @Published var libraryReadable: Bool?
     @Published var libraryChecking = false
     @Published var libraryNote = ""
+
+    /// True while the services started by setup are still coming up.
+    @Published var settling = false
     @Published var libraryCandidates: [String] = []
     @Published var dbReachable: Bool?
     @Published var redisReachable: Bool?
@@ -227,6 +230,22 @@ final class WizardModel: ObservableObject {
         // A configured Mac with a URL is by definition talking to something
         // elsewhere; without one it is the local Docker case.
         location = url.isEmpty ? .here : .remote
+    }
+
+    /// Give the services a moment to come up before judging them.
+    ///
+    /// Bounded, and it stops early the moment things are running, so the
+    /// verify step shows "Starting…" for as long as that is true and the real
+    /// checks after that. Never blocks anything: the step is usable throughout.
+    private func waitForServices(timeout: TimeInterval = 90) async {
+        settling = true
+        defer { settling = false }
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            await model.refresh()
+            if model.snap.overall == .running { return }
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+        }
     }
 
     // MARK: - probing
@@ -417,7 +436,8 @@ final class WizardModel: ObservableObject {
         await model.refresh()
         working = false
         failed = !ok
-        if ok { advance() }
+        if ok {
+            Task { await waitForServices() } advance() }
     }
 }
 
@@ -753,6 +773,15 @@ struct SetupWizard: View {
 
     private var verifyStep: some View {
         VStack(alignment: .leading, spacing: Metrics.lg) {
+            // Services take a while to come up, and setup hands over the moment
+            // it returns. Reporting "Needs attention" for that window is both
+            // alarming and wrong: nothing needs attention, it is starting.
+            if wiz.settling {
+                HStack(spacing: Metrics.sm) {
+                    ProgressView().controlSize(.small)
+                    Text("Starting…").foregroundStyle(.secondary)
+                }
+            }
             // Real state, not "config.json exists". Each row is the live
             // snapshot the menu bar uses.
             ForEach(Diagnostics.checks(config: StatusModel.readConfig(), snap: model.snap)) { c in
@@ -954,18 +983,26 @@ private struct LogPane: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.sm) {
+            HStack {
+                Spacer()
+                Button("Copy") {
+                    Actions.copyToPasteboard(lines.joined(separator: "\n"))
+                }
+                .buttonStyle(.link)
+                .disabled(lines.isEmpty)
+            }
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
-                            Text(line)
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(i)
-                        }
-                    }
-                    .padding(Metrics.md)
+                    // One Text, not one per line. Per-line Text views each own
+                    // their own selection, so a drag could never cross a line
+                    // boundary and the output could not be copied out whole,
+                    // which is the only reason to look at it after a failure.
+                    Text(lines.joined(separator: "\n"))
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(Metrics.md)
+                        .id(lines.count)
                 }
                 .frame(height: 180)
                 .background(
@@ -973,7 +1010,7 @@ private struct LogPane: View {
                         .fill(Color(nsColor: .textBackgroundColor))
                 )
                 .onChange(of: lines.count) { _, n in
-                    withAnimation { proxy.scrollTo(n - 1, anchor: .bottom) }
+                    withAnimation { proxy.scrollTo(n, anchor: .bottom) }
                 }
             }
             if working {

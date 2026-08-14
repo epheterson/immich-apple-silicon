@@ -2562,12 +2562,18 @@ def _ensure_vips() -> None:
     for p in vips_paths:
         if os.path.isfile(p):
             return
-    # Also check via pkg-config
-    r = subprocess.run(
-        ["pkg-config", "--exists", "vips"], capture_output=True, timeout=5
-    )
-    if r.returncode == 0:
-        return
+    # Also check via pkg-config, if it is even installed. It is a fallback for
+    # a libvips in a non-standard place, so its absence means "cannot tell",
+    # not "fail": letting FileNotFoundError out of here aborted the whole of
+    # setup on any Mac without pkg-config, which is most of them.
+    try:
+        r = subprocess.run(
+            ["pkg-config", "--exists", "vips"], capture_output=True, timeout=5
+        )
+        if r.returncode == 0:
+            return
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass
     if not _brew_install("vips"):
         log.warning(
             "libvips not found. Sharp rebuild may fail. Install: brew install vips"
