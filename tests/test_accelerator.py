@@ -2859,6 +2859,58 @@ class TestWatchDispatch:
             assert m._watch_without_worker({"worker": False}) == m._SWITCH
 
 
+class TestRerunKeepsStoredSecrets:
+    """The wizard never reads a password back out of config.json, on purpose,
+    so on a re-run it sends an empty one. Taking that literally would overwrite
+    a working password with nothing, breaking the install the user was trying
+    to repair. Found before shipping by asking what a re-run on a real Mac
+    would actually write."""
+
+    ARGS = dict(
+        url="http://nas.local:2283", api_key="", db_host="nas.local", db_port="5432",
+        db_user="postgres", db_name="immich", redis_host="nas.local",
+        redis_port="6379", redis_user="", upload_mount="/Volumes/photos",
+        secrets_stdin=True, yes=True, import_server=None, manual=False, ml_only=False,
+        photos_path=None, data_path=None,
+    )
+
+    def _run(self, m, stdin_text):
+        args = argparse.Namespace(**self.ARGS)
+        with patch.object(m, "ASSUME_YES", True), patch.object(
+            m, "download_immich_server", return_value=Path("/tmp/s")
+        ), patch.object(m, "_query_immich_api", return_value={"version": "3.0.2"}
+        ), patch.object(m.sys, "stdin", io.StringIO(stdin_text)), patch.object(
+            m, "_detect_docker_media_prefix", return_value=None
+        ), patch.object(m, "_warn_on_path_mismatch", return_value=False), patch.object(
+            m, "_validate_connectivity", return_value=True
+        ), patch.object(m, "_check_local_tools", return_value=("/usr/bin/node", None, None)
+        ), patch.object(m, "find_docker", side_effect=RuntimeError("no docker")
+        ), patch.object(m, "_finalize_config") as fin, patch.object(m, "log"):
+            m._setup_remote(args)
+        return fin.call_args[0][0]
+
+    def test_an_empty_password_keeps_the_stored_one(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"db_password": "original", "redis_password": "rpw"})
+        cfg = self._run(m, json.dumps({"db_password": "", "redis_password": ""}))
+        assert cfg["db_password"] == "original", "a re-run wiped the database password"
+
+    def test_a_supplied_password_still_wins(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"db_password": "original"})
+        cfg = self._run(m, json.dumps({"db_password": "changed", "redis_password": ""}))
+        assert cfg["db_password"] == "changed"
+
+    def test_nothing_stored_and_nothing_supplied_is_still_an_error(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with pytest.raises(RuntimeError) as e:
+            self._run(m, json.dumps({"db_password": ""}))
+        assert "--secrets-stdin" in str(e.value)
+
+
 class TestConfigIsNeverSilentlyLost:
     """Re-running setup is the documented repair, and the menu bar makes it a
     button, so config rewrites are routine. Nothing kept the version being

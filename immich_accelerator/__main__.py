@@ -3702,14 +3702,27 @@ def _setup_remote(args):
         suffix = f" [{default}]" if default else ""
         return input(f"  {label}{suffix}: ").strip() or default
 
+    # What this Mac already knows, for a re-run. Setup is the documented repair
+    # path, so most runs are second runs.
+    existing = load_config() if CONFIG_FILE.exists() else {}
+
     def secret(label: str, key: str, required: bool) -> str:
-        if key in secrets:
-            return str(secrets[key] or "")
-        if not interactive:
+        supplied = str(secrets.get(key) or "")
+        if supplied:
+            return supplied
+        # Blank does not mean blank. The menu bar deliberately never reads a
+        # password back out of config.json, so it sends an empty one on a
+        # re-run; taking that literally would overwrite a working password with
+        # nothing and break the install the user was trying to repair.
+        kept = str(existing.get(key) or "")
+        if kept:
+            log.info("  %s: keeping the one already configured", label)
+            return kept
+        if key in secrets or not interactive:
             if required:
                 raise RuntimeError(
-                    f"{label} is required for a remote setup. Pass it as "
-                    f'{{"{key}": "..."}} on stdin with --secrets-stdin.'
+                    f"{label} is required for a remote setup and none is stored. "
+                    f'Pass it as {{"{key}": "..."}} on stdin with --secrets-stdin.'
                 )
             return ""
         return getpass.getpass(f"  {label}: ").strip()
