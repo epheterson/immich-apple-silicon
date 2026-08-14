@@ -2859,6 +2859,46 @@ class TestWatchDispatch:
             assert m._watch_without_worker({"worker": False}) == m._SWITCH
 
 
+class TestFreshInstallFromTheApp:
+    """Creating a new Immich needs two answers, and it must not invent them.
+
+    From the menu bar there is no terminal, and the old code took EOFError as
+    "no" and gave up, so the from-scratch flow simply did not exist in the app.
+    Routing it through --yes would have been worse: it would have said yes and
+    then built a whole Immich stack around ~/Pictures and a default data dir
+    the user never picked, which re-running setup does not undo.
+    """
+
+    def test_refuses_rather_than_guessing_when_nothing_can_be_asked(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m.sys.stdin, "isatty", return_value=False):
+            with pytest.raises(RuntimeError) as e:
+                m._fresh_install("/usr/bin/docker")
+        said = str(e.value)
+        assert "--photos-path" in said and "--data-path" in said
+
+    def test_supplied_paths_skip_the_prompts(self, tmp_data_dir, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        photos = tmp_path / "photos"; photos.mkdir()
+        data = tmp_path / "data"
+        with patch.object(m.sys.stdin, "isatty", return_value=False), patch.object(
+            m, "ASSUME_YES", True
+        ), patch.object(m, "_ensure_docker_running"), patch(
+            "builtins.input", side_effect=AssertionError("must not prompt")
+        ), patch.object(m, "log"):
+            try:
+                m._fresh_install("/usr/bin/docker", str(photos), str(data))
+            except AssertionError:
+                raise
+            except Exception:
+                # Anything past the prompts (compose, docker) is out of scope;
+                # not prompting is the whole assertion.
+                pass
+        assert data.is_dir(), "the data directory should have been created"
+
+
 class TestSetupWithoutPkgConfig:
     """Reported by @pl4za: setup died on a Mac with no pkg-config.
 

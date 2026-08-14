@@ -153,12 +153,17 @@ enum Actions {
     static func runSetup(
         url: String, apiKey: String, mlOnly: Bool,
         remote: WizardModel.RemoteDetails? = nil,
+        newImmich: (photos: String, data: String)? = nil,
         onLine: @escaping @Sendable (String) -> Void
     ) async -> Bool {
         var args = ["setup", "--yes"]
         var secrets: String?
         if mlOnly {
             args.append("--ml-only")
+        } else if let fresh = newImmich, !fresh.photos.isEmpty, !fresh.data.isEmpty {
+            // Creating Immich from scratch: the two answers setup would
+            // otherwise ask for in a terminal it does not have.
+            args += ["--photos-path", fresh.photos, "--data-path", fresh.data]
         } else if !url.isEmpty {
             // Only for a server on another machine. With no --url, cmd_setup
             // takes the local Docker path and reads the database and Redis

@@ -3372,39 +3372,55 @@ def _ensure_docker_running(docker: str) -> None:
     raise RuntimeError("Could not start Docker. Start it manually and re-run setup.")
 
 
-def _fresh_install(docker: str) -> bool:
-    """Set up Immich from scratch. Returns True if successful."""
-    log.info("")
-    log.info("No Immich instance found. Set up a fresh one?")
-    try:
-        answer = input("  [Y/n] ").strip().lower()
-    except EOFError:
-        return False
-    if answer and answer != "y":
-        return False
+def _fresh_install(docker: str, photos_path: str = "", data_path: str = "") -> bool:
+    """Set up Immich from scratch. Returns True if successful.
+
+    The two paths can be supplied by the caller, which is how the menu-bar app
+    drives this: it asks the same two questions in its own window. They are
+    never defaulted silently when nothing can be asked. Guessing ~/Pictures and
+    building a whole Immich stack around it is a far worse outcome than saying
+    what is missing, and it is not undone by re-running setup.
+    """
+    interactive = sys.stdin.isatty()
+    supplied = bool(photos_path and data_path)
+
+    if not supplied and not interactive:
+        raise RuntimeError(
+            "No Immich found, and creating one needs a photo library path and a "
+            "data path, which cannot be asked for without a terminal. Pass "
+            "--photos-path and --data-path, or run setup in Terminal."
+        )
+
+    if not supplied:
+        log.info("")
+        log.info("No Immich instance found. Set up a fresh one?")
+        if not _confirm("  [Y/n] "):
+            return False
 
     # Ask for paths
-    log.info("")
-    default_photos = str(Path.home() / "Pictures")
-    try:
-        photos_path = input(
-            f"  Where are your photos stored? [{default_photos}]: "
-        ).strip()
-    except EOFError:
-        photos_path = ""
-    photos_path = photos_path or default_photos
+    if not photos_path:
+        log.info("")
+        default_photos = str(Path.home() / "Pictures")
+        try:
+            photos_path = input(
+                f"  Where are your photos stored? [{default_photos}]: "
+            ).strip()
+        except EOFError:
+            photos_path = ""
+        photos_path = photos_path or default_photos
     if not Path(photos_path).is_dir():
         log.error("Directory does not exist: %s", photos_path)
         return False
 
-    default_data = str(DATA_DIR / "data")
-    try:
-        data_path = input(
-            f"  Where should Immich store its data? [{default_data}]: "
-        ).strip()
-    except EOFError:
-        data_path = ""
-    data_path = data_path or default_data
+    if not data_path:
+        default_data = str(DATA_DIR / "data")
+        try:
+            data_path = input(
+                f"  Where should Immich store its data? [{default_data}]: "
+            ).strip()
+        except EOFError:
+            data_path = ""
+        data_path = data_path or default_data
     Path(data_path).mkdir(parents=True, exist_ok=True)
 
     # Run the server container as the invoking user instead of root.
@@ -3417,21 +3433,13 @@ def _fresh_install(docker: str) -> bool:
     # volume and the network, never your host files, so there's nothing to
     # gain by changing them. No GID is needed — Docker defaults the
     # supplementary group to 0, which is fine for owner-writable mounts.
-    run_as_user = True
     log.info("")
-    try:
-        answer = (
-            input(
-                "  Run the Immich server container as the current user "
-                f"(uid {os.getuid()})? [Y/n] "
-            )
-            .strip()
-            .lower()
-        )
-    except EOFError:
-        answer = ""
-    if answer and answer != "y":
-        run_as_user = False
+    # Through _confirm so --yes answers it. Defaulting to yes is right: the
+    # container only reads your photos and writes the media directory, and
+    # running it as you is what keeps those files owned by you.
+    run_as_user = _confirm(
+        f"  Run the Immich server container as the current user (uid {os.getuid()})? [Y/n] "
+    )
     user_line = f'    user: "{os.getuid()}"\n' if run_as_user else ""
 
     # Check ports
@@ -3543,7 +3551,11 @@ def _setup_local(args):
                 return
         else:
             # No Immich at all — offer fresh install
-            if not _fresh_install(docker):
+            if not _fresh_install(
+                docker,
+                getattr(args, "photos_path", "") or "",
+                getattr(args, "data_path", "") or "",
+            ):
                 return
             try:
                 immich = detect_immich(docker)
@@ -6222,6 +6234,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("--redis-port", "Redis port (default 6379)"),
         ("--redis-user", "Redis username, if the server needs one"),
         ("--upload-mount", "Path on THIS Mac that resolves to Immich's media root"),
+        ("--photos-path", "Existing photo library to import, when creating a new Immich"),
+        ("--data-path", "Where a newly created Immich should store its data"),
     ]:
         setup_p.add_argument(flag, help=helptext)
     setup_p.add_argument(

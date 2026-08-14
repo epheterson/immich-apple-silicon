@@ -18,7 +18,7 @@ import SwiftUI
 @MainActor
 final class WizardModel: ObservableObject {
     enum Step: Int, CaseIterable {
-        case role, where_, connect, library, install, run, verify
+        case role, where_, newImmich, connect, library, install, run, verify
     }
 
     /// Everything a split deployment needs, so the app can complete one itself.
@@ -79,6 +79,13 @@ final class WizardModel: ObservableObject {
     @Published var detecting = false
     /// Whatever `immich-accelerator detect` last reported. nil = not asked yet.
     @Published var detected: Detection?
+    /// Docker is here but Immich is not, so setup would be creating one.
+    var wantsNewImmich: Bool {
+        guard let d = detected else { return false }
+        return d.askedSuccessfully && !d.foundLocalImmich
+    }
+    @Published var photosPath = ""
+    @Published var dataPath = ""
     @Published var remote = RemoteDetails()
 
     // Library reachability, checked rather than assumed. nil = not checked yet.
@@ -132,7 +139,7 @@ final class WizardModel: ObservableObject {
     /// it, so it needs no URL and no key.
     var steps: [Step] {
         var out: [Step] = [.role]
-        if components.microservices { out += [.where_, .connect, .library] }
+        if components.microservices { out += [.where_, .newImmich, .connect, .library] }
         if needsInstall { out.append(.install) }
         out += [.run, .verify]
         return out
@@ -164,6 +171,10 @@ final class WizardModel: ObservableObject {
     /// out of the container.
     var visibleSteps: [Step] {
         steps.filter { step in
+            // Only when Immich is meant to be here and there is none yet.
+            if step == .newImmich {
+                return location == .some(.here) && wantsNewImmich
+            }
             // Both only exist for a server on another machine: a local Docker
             // Immich needs no credentials typed and shares this Mac's paths.
             guard step == .connect || step == .library else { return true }
@@ -429,7 +440,8 @@ final class WizardModel: ObservableObject {
         let sendURL = (components.microservices && location == .some(.remote)) ? normalizedURL : ""
         let ok = await Actions.runSetup(
             url: sendURL, apiKey: sendURL.isEmpty ? "" : apiKey, mlOnly: components.isMLOnly,
-            remote: sendURL.isEmpty ? nil : remote
+            remote: sendURL.isEmpty ? nil : remote,
+            newImmich: wantsNewImmich ? (photosPath, dataPath) : nil
         ) { line in
             Task { @MainActor in self.log.append(line) }
         }
@@ -489,6 +501,7 @@ struct SetupWizard: View {
         switch wiz.step {
         case .role: return "What should this Mac do?"
         case .where_: return "Where is Immich?"
+        case .newImmich: return "Create Immich"
         case .library: return "Reaching your library"
         case .connect: return "Connect to Immich"
         case .install: return "Install the accelerator"
@@ -502,6 +515,7 @@ struct SetupWizard: View {
         switch wiz.step {
         case .role: roleStep
         case .where_: whereStep
+        case .newImmich: newImmichStep
         case .library: libraryStep
         case .connect: connectStep
         case .install: installStep
@@ -517,6 +531,51 @@ struct SetupWizard: View {
     /// the database and Redis credentials straight out of the running
     /// container. Sending a URL instead routes setup down the split-deployment
     /// path and asks the user to type all of that by hand.
+    /// Docker is here, Immich is not. Setup can build the whole stack, and it
+    /// needs exactly two answers to do it. They are asked here rather than
+    /// defaulted, because a wrong guess creates a real Immich pointed at the
+    /// wrong folder and re-running setup does not undo that.
+    private var newImmichStep: some View {
+        VStack(alignment: .leading, spacing: Metrics.lg) {
+            Text("No Immich found. Setup can create one.")
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: Metrics.sm) {
+                Text("Your photos").font(.rowTitle)
+                HStack(spacing: Metrics.sm) {
+                    TextField("~/Pictures", text: $wiz.photosPath)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Choose…") { pick(into: { wiz.photosPath = $0 },
+                                              message: "Choose your photo library.") }
+                }
+                Text("Mounted read only, for Immich to import from.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: Metrics.sm) {
+                Text("Immich's data").font(.rowTitle)
+                HStack(spacing: Metrics.sm) {
+                    TextField("~/.immich-accelerator/data", text: $wiz.dataPath)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Choose…") { pick(into: { wiz.dataPath = $0 },
+                                              message: "Choose where Immich should store its data.") }
+                }
+                Text("Thumbnails, transcoded video and backups. This grows with your library.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func pick(into set: @escaping (String) -> Void, message: String) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Use This Folder"
+        panel.message = message
+        if panel.runModal() == .OK, let url = panel.url { set(url.path) }
+    }
+
     private var whereStep: some View {
         VStack(alignment: .leading, spacing: Metrics.lg) {
             if wiz.detecting {
@@ -534,7 +593,13 @@ struct SetupWizard: View {
                 symbol: "desktopcomputer",
                 selected: wiz.location == .some(.here),
                 recommended: wiz.detected?.foundLocalImmich == true
-            ) { wiz.location = .here }
+            ) {
+                wiz.location = .here
+                // Only now. Shelling out to Docker before you have said Immich
+                // is here is work on behalf of someone who may not run Docker
+                // at all, and it is slow when the daemon is down.
+                Task { await wiz.detect() }
+            }
 
             LocationCard(
                 title: "On another machine",
@@ -548,7 +613,7 @@ struct SetupWizard: View {
                 FailureNote(text: note)
             }
         }
-        .task { if wiz.detected == nil { await wiz.detect() } }
+
     }
 
     /// The step that decides whether a split deployment actually works.
@@ -875,6 +940,10 @@ struct SetupWizard: View {
             Button("Continue") { wiz.advance() }
                 .keyboardShortcut(.defaultAction)
                 .disabled(wiz.detecting || wiz.location == nil)
+        case .newImmich:
+            Button("Continue") { wiz.advance() }
+                .keyboardShortcut(.defaultAction)
+                .disabled(wiz.photosPath.isEmpty || wiz.dataPath.isEmpty)
         case .library:
             Button("Continue") { wiz.advance() }
                 .keyboardShortcut(.defaultAction)
