@@ -215,6 +215,19 @@ final class WizardModel: ObservableObject {
     /// an empty form there reads as "your settings are gone".
     private func prefillFromExistingConfig() {
         guard let cfg = Actions.existingConfig() else { return }
+        prefill(from: cfg)
+    }
+
+    /// Fill the wizard in from a configuration, then carry on through the
+    /// normal steps.
+    ///
+    /// Prefill rather than restore, because the realistic use is a second Mac:
+    /// the server address, key and database all carry over, but the media path
+    /// almost never does, since the share is mounted somewhere else. Writing
+    /// the file straight out would produce a config that looks right and fails
+    /// on the first job. Going through the steps means the library check gets
+    /// a look at the one field that is usually wrong.
+    func prefill(from cfg: [String: Any]) {
         func str(_ key: String) -> String {
             if let v = cfg[key] as? String { return v }
             if let v = cfg[key] as? Int { return String(v) }
@@ -688,6 +701,27 @@ struct SetupWizard: View {
         return "This path has to match the one Immich itself uses, exactly. If they differ, setup succeeds and jobs fail afterwards."
     }
 
+    @State private var importedFrom: String?
+
+    /// Set up another Mac from one that already works, or come back after a
+    /// reinstall. Everything portable is filled in; nothing is written until
+    /// you reach the run step, so the parts that do not transfer can be fixed
+    /// on the way through.
+    private func importConfig() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.json]
+        panel.prompt = "Use This Configuration"
+        panel.message = "Choose a config.json saved from another Mac."
+        guard panel.runModal() == .OK, let url = panel.url,
+              let data = try? Data(contentsOf: url),
+              let cfg = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return }
+        wiz.prefill(from: cfg)
+        importedFrom = url.lastPathComponent
+    }
+
     private func chooseLibraryFolder() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -723,6 +757,17 @@ struct SetupWizard: View {
             if wiz.components.none {
                 Text("Turn on at least one.")
                     .font(.rowDetail).foregroundStyle(.orange)
+            }
+
+            Divider().padding(.vertical, Metrics.sm)
+
+            HStack(spacing: Metrics.sm) {
+                Button("Start from an existing configuration…") { importConfig() }
+                    .buttonStyle(.link)
+                if importedFrom != nil {
+                    Text("Loaded. Check each step, the media path usually differs.")
+                        .font(.rowDetail).foregroundStyle(.secondary)
+                }
             }
         }
     }
