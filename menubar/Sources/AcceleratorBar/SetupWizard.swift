@@ -564,6 +564,18 @@ struct SetupWizard: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            // The single most common way a split deployment fails, and it fails
+            // silently: Immich stores absolute paths, so the worker looks for
+            // the exact string the server uses. A share mounted somewhere else
+            // reads fine here and produces jobs that fail one at a time later.
+            // Always, not only when we happen to know Immich's path. On a
+            // split deployment we do not know it, and that is exactly the case
+            // this catches.
+            CalloutRow(
+                text: pathHint,
+                action: "How to map it",
+                url: "https://github.com/epheterson/immich-apple-silicon#split-deployment-nas--mac")
+
             HStack(spacing: Metrics.sm) {
                 TextField("/Volumes/photos/immich", text: $wiz.remote.mediaPath)
                     .textFieldStyle(.roundedBorder)
@@ -598,6 +610,17 @@ struct SetupWizard: View {
             }
         }
         .task { if wiz.libraryReadable == nil { await wiz.autofillLibrary() } }
+    }
+
+    /// Immich stores absolute paths, so the worker looks for the exact string
+    /// the server uses. A share mounted somewhere else reads fine here and
+    /// produces jobs that fail one at a time later, with nothing pointing at
+    /// the cause.
+    private var pathHint: String {
+        if let want = wiz.detected?.mediaLocation, !want.isEmpty {
+            return "Immich uses \(want). This Mac has to reach the same files at that exact path."
+        }
+        return "This path has to match the one Immich itself uses, exactly. If they differ, setup succeeds and jobs fail afterwards."
     }
 
     private func chooseLibraryFolder() {
@@ -928,6 +951,29 @@ private struct LocationCard: View {
             )
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct CalloutRow: View {
+    let text: String
+    let action: String
+    let url: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: Metrics.md) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(text)
+                    .font(.rowDetail)
+                    .fixedSize(horizontal: false, vertical: true)
+                Link(action, destination: URL(string: url)!)
+                    .font(.rowDetail)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(Metrics.md)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.10)))
     }
 }
 
