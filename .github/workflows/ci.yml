@@ -27,7 +27,9 @@ jobs:
       - name: Run pytest (fast)
         run: |
           pip install pytest
-          pytest -v -m "not slow"
+          # docker too: those build real containers and belong to the
+          # fresh-install-docker job, which has a daemon.
+          pytest -v -m "not slow and not docker"
 
   version-bump:
     # Merging to main is releasing: auto-tag cuts a tag from VERSION and

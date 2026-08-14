@@ -80,7 +80,7 @@ class TestCreateImmichFromScratch:
 
         assert ok is True, "fresh install reported failure"
 
-        project = m.DATA_DIR
+        project = m.MANAGED_DOCKER_DIR
         compose = project / "docker-compose.yml"
         try:
             assert compose.is_file(), "no compose file was written"
@@ -124,5 +124,5 @@ class TestCreateImmichFromScratch:
 
         assert ok is False
         assert not (
-            m.DATA_DIR / "docker-compose.yml"
+            m.MANAGED_DOCKER_DIR / "docker-compose.yml"
         ).exists(), "a stack was written for a photo path that does not exist"

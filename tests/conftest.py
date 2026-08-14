@@ -75,6 +75,8 @@ def tmp_data_dir(tmp_path):
     log_dir.mkdir()
     config_file = data_dir / "config.json"
     lock_file = data_dir / "start.lock"
+    managed_docker = data_dir / "docker"
+    native_cache = tmp_path / ".cache" / "immich-ml-native"
     launch_agents = tmp_path / "Library" / "LaunchAgents"
     launch_agents.mkdir(parents=True)
 
@@ -86,6 +88,13 @@ def tmp_data_dir(tmp_path):
         LOG_DIR=log_dir,
         LOCK_FILE=lock_file,
         LAUNCH_AGENTS_DIR=launch_agents,
+        # Both are computed from Path.home() at import time, so patching
+        # DATA_DIR alone leaves them aimed at the real directories. That is
+        # how a test wrote a docker-compose into a live install and how the
+        # launchd incidents happened: a constant derived once at import is
+        # invisible to a fixture that patches only its parent.
+        MANAGED_DOCKER_DIR=managed_docker,
+        NATIVE_CACHE=native_cache,
         # reconcile_ml's "has it been quiet too long" timer. Module state, so a
         # test that leaves it set decides the outcome of the next one; patching
         # it here means every test starts from "no silence recorded yet".
@@ -98,6 +107,7 @@ def tmp_data_dir(tmp_path):
             "log_dir": log_dir,
             "lock_file": lock_file,
             "launch_agents": launch_agents,
+            "managed_docker": managed_docker,
         }
 
 
