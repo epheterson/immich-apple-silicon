@@ -147,6 +147,15 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      # Before the hand-rolled stack below, because both want port 2283
+      # and this one tears its own down. This is the path the menu bar
+      # app drives when it creates Immich from scratch, and the only
+      # part of the product that builds infrastructure rather than
+      # configuring it.
+      - name: Create Immich from scratch through the real code path
+        run: |
+          pip install pytest
+          pytest -v -m docker
       - name: Generate compose from template
         run: |
           python3 -c "
