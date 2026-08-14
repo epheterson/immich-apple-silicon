@@ -2859,6 +2859,49 @@ class TestWatchDispatch:
             assert m._watch_without_worker({"worker": False}) == m._SWITCH
 
 
+class TestConfigIsNeverSilentlyLost:
+    """Re-running setup is the documented repair, and the menu bar makes it a
+    button, so config rewrites are routine. Nothing kept the version being
+    replaced, which made a bad re-run unrecoverable unless the user had thought
+    to press Back Up first."""
+
+    def test_the_replaced_config_is_kept(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"immich_url": "http://first"})
+        m.save_config({"immich_url": "http://second"})
+
+        previous = tmp_data_dir["config_file"].with_name("config.json.previous")
+        assert previous.is_file(), "the replaced config was not kept"
+        assert json.loads(previous.read_text())["immich_url"] == "http://first"
+        assert m.load_config()["immich_url"] == "http://second"
+
+    def test_the_backup_is_not_world_readable(self, tmp_data_dir):
+        """It holds the same database password and API key as the original."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"api_key": "secret"})
+        m.save_config({"api_key": "secret2"})
+        previous = tmp_data_dir["config_file"].with_name("config.json.previous")
+        assert oct(previous.stat().st_mode)[-3:] == "600"
+
+    def test_a_first_save_needs_no_backup(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"immich_url": "http://only"})
+        assert not tmp_data_dir["config_file"].with_name("config.json.previous").exists()
+
+    def test_an_unwritable_backup_does_not_block_the_save(self, tmp_data_dir):
+        """A config that cannot be written is a broken install. A backup that
+        cannot be written is not, and must not become one."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"immich_url": "http://first"})
+        with patch.object(m.shutil, "copy2", side_effect=OSError("read-only")):
+            m.save_config({"immich_url": "http://second"})
+        assert m.load_config()["immich_url"] == "http://second"
+
+
 class TestFreshInstallFromTheApp:
     """Creating a new Immich needs two answers, and it must not invent them.
 

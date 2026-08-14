@@ -1704,6 +1704,22 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
 
 def save_config(config: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Keep the version being replaced. Re-running setup is the documented way
+    # to repair an install and the menu bar offers it as a button, so config
+    # rewrites are routine and a bad one leaves nothing to go back to. One
+    # slot, not a timestamped pile: what anyone ever wants is the last one that
+    # worked, and a directory full of dated copies is its own problem.
+    if CONFIG_FILE.exists():
+        try:
+            previous = CONFIG_FILE.with_name(CONFIG_FILE.name + ".previous")
+            shutil.copy2(CONFIG_FILE, previous)
+            os.chmod(previous, 0o600)
+        except OSError as e:
+            # Never block saving on the backup: a config that cannot be written
+            # is a broken install, a backup that cannot be written is not.
+            log.debug("could not keep a previous config: %s", e)
+
     # Atomic write: tmp file + rename prevents corruption if interrupted
     tmp = CONFIG_FILE.with_suffix(".tmp")
     with open(tmp, "w") as f:
