@@ -371,14 +371,12 @@ final class WizardModel: ObservableObject {
         detected = d
         // Only preselect. The user can always override, because a Mac can have
         // a local Immich and still be pointed at a different one.
-        // Preselect only on evidence. "Found Immich here" and "asked and there
-        // is none" are both answers; "could not ask" is not, and it must not
-        // silently become "remote".
-        if d.foundLocalImmich {
-            location = .here
-        } else if d.askedSuccessfully {
-            location = .remote
-        }
+        // Never touches `location`. Detection only runs after the user has
+        // said "On this Mac", so assigning here overwrote the very choice that
+        // triggered it: finding no Immich flipped the selection to "another
+        // machine" a second later, which also made the Create Immich step
+        // unreachable, since that step is gated on the choice it had just
+        // undone.
     }
 
     /// Can this Mac actually read the library, at the path Immich uses?
@@ -454,9 +452,21 @@ final class WizardModel: ObservableObject {
         let ok = await Actions.runSetup(
             url: sendURL, apiKey: sendURL.isEmpty ? "" : apiKey, mlOnly: components.isMLOnly,
             remote: sendURL.isEmpty ? nil : remote,
-            newImmich: wantsNewImmich ? (photosPath, dataPath) : nil
+            // Only for a local Immich we are creating. Left ungated, a user who
+            // filled these in, went Back and switched to "another machine" got
+            // a whole new local stack built instead of a connection to theirs.
+            newImmich: (location == .some(.here) && wantsNewImmich)
+                ? (photosPath, dataPath) : nil
         ) { line in
             Task { @MainActor in self.log.append(line) }
+        }
+        // Setup turns every component on. Anything switched off on the first
+        // step was silently discarded unless it happened to make the whole run
+        // ml-only, so a user who turned machine learning off got it anyway.
+        if ok {
+            await Actions.applyComponents(
+                microservices: components.microservices,
+                machineLearning: components.machineLearning)
         }
         await model.refresh()
         working = false
@@ -976,6 +986,7 @@ struct SetupWizard: View {
         switch wiz.step {
         case .role:
             Button("Continue") { wiz.advance() }
+                .disabled(wiz.components.none)
                 .keyboardShortcut(.defaultAction)
         case .connect:
             Button(wiz.connectReady ? "Continue" : "Continue anyway") { wiz.advance() }

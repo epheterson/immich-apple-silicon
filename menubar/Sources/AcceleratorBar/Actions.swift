@@ -150,6 +150,21 @@ enum Actions {
     /// Run setup non-interactively and stream it. `--yes` is what makes this
     /// possible at all; without it every prompt reads EOF and answers no,
     /// including "start now?".
+    private static func jsonSecrets(apiKey: String, db: String, redis: String) -> String {
+        let payload = ["api_key": apiKey, "db_password": db, "redis_password": redis]
+        return String(
+            data: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(),
+            encoding: .utf8) ?? "{}"
+    }
+
+    /// Put the components where the user left them. Setup turns everything on,
+    /// so a switch turned off on the first step has to be re-applied after.
+    static func applyComponents(microservices: Bool, machineLearning: Bool) async {
+        for (name, on) in [("worker", microservices), ("ml", machineLearning)] where !on {
+            _ = await run(cli, ["component", name, "off"])
+        }
+    }
+
     static func runSetup(
         url: String, apiKey: String, mlOnly: Bool,
         remote: WizardModel.RemoteDetails? = nil,
@@ -160,16 +175,10 @@ enum Actions {
         var secrets: String?
         if mlOnly {
             args.append("--ml-only")
-        } else if let fresh = newImmich, !fresh.photos.isEmpty, !fresh.data.isEmpty {
-            // Creating Immich from scratch: the two answers setup would
-            // otherwise ask for in a terminal it does not have.
-            args += ["--photos-path", fresh.photos, "--data-path", fresh.data]
         } else if !url.isEmpty {
-            // Only for a server on another machine. With no --url, cmd_setup
-            // takes the local Docker path and reads the database and Redis
-            // credentials out of the running container instead of asking.
+            // Tested first. A URL is the user saying "my Immich is over there",
+            // and no leftover state should be able to outvote it.
             args += ["--url", url]
-            if !apiKey.isEmpty { args += ["--api-key", apiKey] }
             if let r = remote {
                 args += [
                     "--db-host", r.dbHost, "--db-port", r.dbPort,
@@ -178,15 +187,17 @@ enum Actions {
                 ]
                 if !r.redisUser.isEmpty { args += ["--redis-user", r.redisUser] }
                 if !r.mediaPath.isEmpty { args += ["--upload-mount", r.mediaPath] }
-                // Passwords never go in args; --secrets-stdin reads them here.
-                args.append("--secrets-stdin")
-                let payload: [String: String] = [
-                    "db_password": r.dbPassword, "redis_password": r.redisPassword,
-                ]
-                secrets = String(
-                    data: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(),
-                    encoding: .utf8)
             }
+            // The API key goes on the pipe with the passwords. It is a
+            // credential, and argv is readable by every process on the machine,
+            // which is the entire reason --secrets-stdin exists.
+            args.append("--secrets-stdin")
+            secrets = jsonSecrets(
+                apiKey: apiKey, db: remote?.dbPassword ?? "", redis: remote?.redisPassword ?? "")
+        } else if let fresh = newImmich, !fresh.photos.isEmpty, !fresh.data.isEmpty {
+            // Creating Immich from scratch: the two answers setup would
+            // otherwise ask for in a terminal it does not have.
+            args += ["--photos-path", fresh.photos, "--data-path", fresh.data]
         }
         let code = await stream(cli, args, stdin: secrets, onLine: onLine)
         return code == 0
