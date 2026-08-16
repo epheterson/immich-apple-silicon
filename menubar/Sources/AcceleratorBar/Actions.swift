@@ -11,6 +11,58 @@ enum LaunchAtLogin {
     }
 }
 
+// Remembers which SMB shares were mounted when the user turned this on, and
+// remounts any that go missing at every launch. macOS drops NAS shares
+// silently under network/sleep churn (see split-deployment troubleshooting);
+// remounting is a manual "Connect to Server" nobody remembers to redo after
+// a wake, so photos quietly stop processing — worker.log fills with ENOENT
+// on every file the worker touches, but nothing in the UI says why.
+enum MountSharesAtLogin {
+    private static let key = "MountSharesAtLoginURLs"
+
+    static var isEnabled: Bool { UserDefaults.standard.array(forKey: key) != nil }
+
+    // Turning it on snapshots whichever SMB shares are mounted right now.
+    // Turning it off forgets that list — re-enabling later re-snapshots
+    // rather than remounting something the user may have unmounted on purpose.
+    static func set(_ on: Bool) async {
+        if on {
+            let (_, out) = await Actions.run("/sbin/mount", [])
+            UserDefaults.standard.set(smbURLs(fromMountOutput: out), forKey: key)
+        } else {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+    }
+
+    // Parses `mount` for smbfs lines, e.g.
+    //   //pi@192.168.1.2/immich on /Volumes/immich (smbfs, nodev, nosuid, ...)
+    // into smb:// URLs NSWorkspace can hand back to Finder for a remount.
+    static func smbURLs(fromMountOutput out: String) -> [String] {
+        out.split(separator: "\n").compactMap { line -> String? in
+            guard line.contains("(smbfs"), let onRange = line.range(of: " on /Volumes/") else {
+                return nil
+            }
+            let remote = line[line.startIndex..<onRange.lowerBound]
+            guard remote.hasPrefix("//") else { return nil }
+            return "smb:" + remote
+        }
+    }
+
+    // Called once at launch. Best-effort and silent: `open` hands off to
+    // Finder/diskarbitrationd, which only prompts for credentials if none
+    // were saved to Keychain from the share's original manual mount.
+    static func remountMissing() {
+        guard let urls = UserDefaults.standard.array(forKey: key) as? [String] else { return }
+        for urlString in urls {
+            guard let shareName = urlString.split(separator: "/").last else { continue }
+            let mountPoint = "/Volumes/\(shareName)"
+            guard !FileManager.default.fileExists(atPath: mountPoint),
+                  let url = URL(string: urlString) else { continue }
+            NSWorkspace.shared.open(url)
+        }
+    }
+}
+
 // Daily actions, shelling out to the same commands a user would run.
 enum Actions {
     static let brew = "/opt/homebrew/bin/brew"
