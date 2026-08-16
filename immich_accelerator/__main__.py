@@ -101,6 +101,11 @@ _ml_foreign_listener_warned = False
 
 
 SYNTHETIC_CONF = Path("/etc/synthetic.d/immich-accelerator")
+# Pre-1.3.3 installs put the entry here instead, and uninstall still has to
+# clean it out. A constant rather than two literals, so tests can point it
+# somewhere harmless: it is a shared system file that other software writes to,
+# and the code rewrites it through `sudo tee`.
+LEGACY_SYNTHETIC_CONF = Path("/etc/synthetic.conf")
 
 
 def _build_link_ok() -> bool:
@@ -196,7 +201,7 @@ def _ensure_build_link():
     if _build_link_ok():
         # Migrate legacy synthetic.conf entry to synthetic.d if needed
         if not SYNTHETIC_CONF.exists():
-            legacy = Path("/etc/synthetic.conf")
+            legacy = LEGACY_SYNTHETIC_CONF
             try:
                 content = legacy.read_text() if legacy.exists() else ""
             except OSError:
@@ -387,7 +392,7 @@ def _remove_build_link():
             log.warning("  Could not update %s: %s", SYNTHETIC_CONF, e)
 
     # Also clean legacy entry from /etc/synthetic.conf (pre-v1.3.3)
-    legacy_conf = Path("/etc/synthetic.conf")
+    legacy_conf = LEGACY_SYNTHETIC_CONF
     if legacy_conf.exists():
         try:
             content = legacy_conf.read_text()
