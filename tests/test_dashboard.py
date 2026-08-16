@@ -613,3 +613,25 @@ class TestFastAPIApp:
             data = resp.json()
             for v in data.values():
                 assert v == "ok"
+
+
+class TestDashboardHtmlDoneLabel:
+    """dashboard.html's per-task rateText decision (chip.tasks.forEach) must
+    never render 'done' while Immich's job queue is still active for that
+    task. The DB-derived pct (asset markers already set) can reach ~100%
+    while a queue is genuinely still running — a fresh upload not yet
+    counted in the DB total, or jobs re-queued for already-processed assets
+    (e.g. after a retry). Regression guard for exactly that: 'accelerator
+    dashboard shows done but there are pending/waiting items'."""
+
+    HTML_PATH = Path(__file__).parent.parent / "immich_accelerator" / "dashboard.html"
+
+    def test_qactive_checked_before_pct_done(self):
+        src = self.HTML_PATH.read_text()
+        qactive_branch = src.index("} else if (qActive) {")
+        pct_done_branch = src.index("} else if (p.pct >= 99.9) {")
+        assert qactive_branch < pct_done_branch, (
+            "the qActive branch must come before the pct>=99.9 'done' branch "
+            "in dashboard.html's rateText chain, or a still-active queue "
+            "renders as 'done' whenever the DB-derived ratio is already ~100%"
+        )
