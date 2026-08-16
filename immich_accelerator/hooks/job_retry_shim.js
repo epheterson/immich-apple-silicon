@@ -55,10 +55,21 @@
 'use strict';
 
 const ENABLED = process.env.IMMICH_ACCEL_JOB_RETRY !== '0';
-// Effectively unlimited by default — bullmq requires a finite number, and
-// this is high enough that no real job will ever exhaust it.
+// Finite, and chosen from the backoff arithmetic rather than picked to feel
+// large. With a 10s base capped at 5 minutes, the first six attempts cover
+// 10+20+40+80+160+300 seconds and every attempt after that is another 5
+// minutes, so 100 attempts is a little over 8 hours of retrying: enough to
+// sleep through a NAS being down overnight and still be processing in the
+// morning.
+//
+// Deliberately not unlimited. Immich's attempts:1 is wrong for a dropped
+// connection, but unlimited is wrong for a genuinely broken asset: a corrupt
+// file would occupy a worker slot every 5 minutes for the life of the
+// install, the queue would never drain, and the dashboard would honestly
+// report "processing" forever. Set IMMICH_ACCEL_JOB_RETRY_ATTEMPTS if you
+// want the old behaviour.
 const ATTEMPTS = parseInt(
-    process.env.IMMICH_ACCEL_JOB_RETRY_ATTEMPTS || String(Number.MAX_SAFE_INTEGER), 10
+    process.env.IMMICH_ACCEL_JOB_RETRY_ATTEMPTS || '100', 10
 );
 const BASE_MS = parseInt(
     process.env.IMMICH_ACCEL_JOB_RETRY_BACKOFF_MS || '10000', 10
@@ -137,7 +148,7 @@ function patchBullmq(bullmq) {
         patchWorkerPrototype(bullmq.Worker.prototype);
     }
     process.stderr.write(
-        `[immich-accelerator] job retry enabled (attempts effectively unlimited, ` +
+        `[immich-accelerator] job retry enabled (${ATTEMPTS} attempts, ` +
         `backoff ${BASE_MS}ms exponential capped at ${MAX_MS}ms, resets on restart)\n`
     );
 }

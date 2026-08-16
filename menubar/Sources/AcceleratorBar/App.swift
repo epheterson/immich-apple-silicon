@@ -17,6 +17,16 @@ struct AcceleratorBarMain {
             printStatus()
             return
         }
+        // Exposes the mount parser to the shell so it can be checked against
+        // real `mount` output rather than an invented sample. The two bugs
+        // fixed in it were both only visible in real output.
+        if CommandLine.arguments.contains("parse-mounts") {
+            let out = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            for share in MountSharesAtLogin.shares(fromMountOutput: out) {
+                print("\(share.url) -> \(share.mountPoint)")
+            }
+            return
+        }
         if let i = CommandLine.arguments.firstIndex(of: "render"),
            CommandLine.arguments.count > i + 2 {
             renderSettings(pane: CommandLine.arguments[i + 1],
