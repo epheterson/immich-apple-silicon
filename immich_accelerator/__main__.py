@@ -4780,6 +4780,20 @@ def _cmd_start(args):
             f"{existing} {require_arg}".strip() if existing else require_arg
         )
 
+    # job retry shim: Immich hardcodes `attempts: 1` (no retry) for every
+    # BullMQ queue. In a split deployment a transient connection drop to a
+    # remote Postgres/Redis or a brief SMB hiccup permanently fails the job
+    # instead of retrying. We wrap `bullmq`'s Queue constructor to raise the
+    # attempt count with exponential backoff. Same --require interposition;
+    # Immich's source is untouched.
+    job_retry_shim = Path(__file__).parent / "hooks" / "job_retry_shim.js"
+    if job_retry_shim.exists():
+        existing = worker_env.get("NODE_OPTIONS", "").strip()
+        require_arg = f'--require "{job_retry_shim}"'
+        worker_env["NODE_OPTIONS"] = (
+            f"{existing} {require_arg}".strip() if existing else require_arg
+        )
+
     # /build link points to our build-data dir (set up during setup).
     # Required for Immich 2.7+ plugin WASM paths stored in the shared DB.
     build_data = DATA_DIR / "build-data"
