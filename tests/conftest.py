@@ -61,6 +61,7 @@ def tmp_data_dir(tmp_path):
     lock_file = data_dir / "start.lock"
     synthetic_conf = tmp_path / "synthetic.d" / "immich-accelerator"
     synthetic_conf.parent.mkdir(parents=True, exist_ok=True)
+    legacy_synthetic = tmp_path / "synthetic.conf"
 
     with patch.multiple(
         "immich_accelerator.__main__",
@@ -72,6 +73,7 @@ def tmp_data_dir(tmp_path):
         # A real install has this file, and two tests wrote to and removed the
         # user's actual /etc/synthetic.d entry.
         SYNTHETIC_CONF=synthetic_conf,
+        LEGACY_SYNTHETIC_CONF=legacy_synthetic,
         # reconcile_ml's "has it been quiet too long" timer. Module state, so a
         # test that leaves it set decides the outcome of the next one; patching
         # it here means every test starts from "no silence recorded yet".
