@@ -55,27 +55,29 @@
 'use strict';
 
 const ENABLED = process.env.IMMICH_ACCEL_JOB_RETRY !== '0';
-// Finite, and chosen from the backoff arithmetic rather than picked to feel
-// large. With a 10s base capped at 5 minutes, the first six attempts cover
-// 10+20+40+80+160+300 seconds and every attempt after that is another 5
-// minutes, so 100 attempts is a little over 8 hours of retrying: enough to
-// sleep through a NAS being down overnight and still be processing in the
-// morning.
+// Unlimited, deliberately. A job that stops retrying needs a human to notice
+// and requeue it, and if that is required anyway then a service that runs
+// unattended has not done its job. A NAS down for a week should come back to
+// a library that catches up on its own.
 //
-// Deliberately not unlimited. Immich's attempts:1 is wrong for a dropped
-// connection, but unlimited is wrong for a genuinely broken asset: a corrupt
-// file would occupy a worker slot every 5 minutes for the life of the
-// install, the queue would never drain, and the dashboard would honestly
-// report "processing" forever. Set IMMICH_ACCEL_JOB_RETRY_ATTEMPTS if you
-// want the old behaviour.
+// What keeps that affordable is the cap below, not a limit on attempts: a
+// permanently broken asset retries on the ceiling interval forever, which at
+// an hour is 24 quick failures a day and costs essentially nothing. Delayed
+// jobs sit in bullmq's delayed set rather than occupying a worker, so the
+// only real cost is the log line.
 const ATTEMPTS = parseInt(
-    process.env.IMMICH_ACCEL_JOB_RETRY_ATTEMPTS || '100', 10
+    process.env.IMMICH_ACCEL_JOB_RETRY_ATTEMPTS || String(Number.MAX_SAFE_INTEGER), 10
 );
 const BASE_MS = parseInt(
     process.env.IMMICH_ACCEL_JOB_RETRY_BACKOFF_MS || '10000', 10
 );
+// An hour, not five minutes. The ceiling is what decides both halves of this:
+// how quickly a week-long outage recovers once the mount is back (within one
+// interval), and what a permanently failing job costs in the meantime (one
+// attempt per interval, forever). Five minutes made unlimited retries noisy;
+// an hour makes them cheap enough that they never need to stop.
 const MAX_MS = parseInt(
-    process.env.IMMICH_ACCEL_JOB_RETRY_BACKOFF_MAX_MS || String(5 * 60 * 1000), 10
+    process.env.IMMICH_ACCEL_JOB_RETRY_BACKOFF_MAX_MS || String(60 * 60 * 1000), 10
 );
 const BACKOFF_TYPE = 'immich-accel';
 
@@ -148,7 +150,7 @@ function patchBullmq(bullmq) {
         patchWorkerPrototype(bullmq.Worker.prototype);
     }
     process.stderr.write(
-        `[immich-accelerator] job retry enabled (${ATTEMPTS} attempts, ` +
+        `[immich-accelerator] job retry enabled (unlimited attempts, ` +
         `backoff ${BASE_MS}ms exponential capped at ${MAX_MS}ms, resets on restart)\n`
     );
 }
