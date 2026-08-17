@@ -1,4 +1,7 @@
-"""A library on a network mount goes away, and the accelerator survives it.
+"""Things the accelerator depends on go away, and it survives them.
+
+Covers the library disappearing off a network mount, and the ML engine wedging
+and being replaced without silently downgrading to the slow one.
 
 macOS drops SMB and NFS mounts on sleep, on a flaky network, and when a NAS
 reboots. Immich stores absolute paths, so every job then fails instantly on
@@ -376,3 +379,44 @@ class TestPauseIsVisible:
             m._watch_worker(dict(cfg))
         marker = m.read_paused()
         assert marker and marker["detail"] == "/nas/photos"
+
+
+class TestMLRestartDoesNotDowngradeTheEngine:
+    """A wedged native engine that is killed and restarted too quickly fails to
+    bind, and the caller falls back to the Python venv. The Mac then runs on
+    the slow engine indefinitely, with one warning line to show for it.
+    """
+
+    def test_a_restart_waits_for_the_port_to_be_released(self):
+        busy = [True, True, False]
+        with patch.object(m, "port_in_use", side_effect=lambda p: busy.pop(0)), patch.object(
+            m.time, "sleep"
+        ):
+            assert m.wait_for_port_free(3003, timeout=5) is True
+
+    def test_a_port_that_never_frees_is_reported(self):
+        with patch.object(m, "port_in_use", return_value=True), patch.object(
+            m.time, "sleep"
+        ):
+            assert m.wait_for_port_free(3003, timeout=0.1) is False
+
+    def test_a_wedged_service_is_not_replaced_while_it_holds_the_port(self):
+        """Starting anyway is what silently downgrades the engine."""
+        cfg = {"ml": True, "ml_port": 3003}
+        with patch.object(m, "_component_enabled", return_value=True), patch.object(
+            m, "read_pid", return_value=4242
+        ), patch.object(m, "_ml_ping", return_value=False), patch.object(
+            m, "kill_pid"
+        ), patch.object(
+            m, "wait_for_port_free", return_value=False
+        ), patch.object(
+            m, "_start_ml_service"
+        ) as start, patch.object(
+            m, "log"
+        ), patch.object(
+            m, "_ml_unresponsive_since", (4242, 0.0)
+        ), patch.object(
+            m.time, "monotonic", return_value=10_000.0
+        ):
+            m.reconcile_ml(cfg)
+        start.assert_not_called()

@@ -4224,6 +4224,38 @@ def _start_ml_preferred(config: dict):
     return None, None, False
 
 
+def port_in_use(port: int) -> bool:
+    """Is anything listening on this port right now?
+
+    A plain TCP connect, deliberately not /ping: the case this exists for is a
+    wedged service that still holds the socket but answers nothing, which is
+    exactly what a health check cannot see.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            return sock.connect_ex(("127.0.0.1", int(port))) == 0
+    except (OSError, ValueError):
+        return False
+
+
+def wait_for_port_free(port: int, timeout: float = 10.0) -> bool:
+    """Wait for a killed service to actually let go of its port.
+
+    Process exit and socket release are not the same instant, and the native
+    engine now exits rather than lingering when it cannot bind (#38). Starting
+    the replacement too early therefore means the native start fails, the
+    caller falls back to the Python venv, and the machine quietly runs on the
+    slow engine until somebody restarts it by hand.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not port_in_use(port):
+            return True
+        time.sleep(0.25)
+    return not port_in_use(port)
+
+
 def _ml_verify_or_fallback(config: dict, pid: int, engine: str):
     """Verify the (already-started) native engine becomes healthy; if not, kill
     it and start the Python venv. No-op for the venv engine. Returns (pid, engine).
@@ -4232,6 +4264,7 @@ def _ml_verify_or_fallback(config: dict, pid: int, engine: str):
         return pid, engine
     log.warning("  native ML did not become healthy; falling back to venv")
     kill_pid("ml")
+    wait_for_port_free(config.get("ml_port", 3003))
     venv = _venv_ml_spec(config, os.environ.copy())
     if venv is not None:
         cmd, cwd, senv = venv
@@ -4303,6 +4336,15 @@ def reconcile_ml(config: dict) -> None:
             "ML process %d has not answered for %ds, restarting it.", pid, int(stuck)
         )
         kill_pid("ml")
+        if not wait_for_port_free(config.get("ml_port", 3003)):
+            log.warning(
+                "  Port %s is still held after stopping the wedged ML service; "
+                "leaving it for the next cycle rather than starting a second "
+                "one into a bind conflict.",
+                config.get("ml_port", 3003),
+            )
+            _ml_unresponsive_since = None
+            return
         _ml_unresponsive_since = None
         wedged = True
     # Somebody is already serving our port, and it isn't us: we have no PID.
