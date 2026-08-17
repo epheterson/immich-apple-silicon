@@ -1,5 +1,7 @@
 # Immich Accelerator — Design Document
 
+> **Historical design doc (2026-03-31).** Captures the original design thinking; not maintained as the product evolves. For current, accurate documentation see [README.md](../../README.md) and [ARCHITECTURE.md](../../ARCHITECTURE.md).
+
 ## What is this?
 
 A macOS app (menu bar + CLI) that runs Immich's microservices worker natively on Apple Silicon, giving it access to VideoToolbox hardware transcoding and fast CPU processing. Paired with a native ML service for Metal/CoreML/Vision acceleration.
