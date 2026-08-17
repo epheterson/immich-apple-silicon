@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.11.0 - 2026-08-16
+
+### Fixed
+- **A library on a network mount that goes away no longer shreds the queue.** macOS drops SMB and NFS mounts on sleep, on network churn, and when a NAS reboots. Immich stores absolute paths, so every job then failed instantly on ENOENT: nothing crashed, jobs drained into failures, and no log line named the cause. The worker is now paused while the library is unreachable and starts again by itself when it returns. Diagnosed on real hardware by [@pl4za](https://github.com/pl4za) ([#130](https://github.com/epheterson/immich-apple-silicon/pull/130)).
+- **The accelerator puts the mount back on its own.** While the library is healthy it records how the mount is put together, then replays that if the mount drops, at the exact path Immich has in its database rather than wherever Finder would land it. Works for SMB and NFS, and needs no menu bar app. Attempts back off, and stop if the server rejects the credentials rather than retrying a known-bad password into an account lockout.
+- **`status` says why a worker is down.** A worker held down for a missing library used to look exactly like one the user turned off, which invites starting it by hand into the same failure.
+- **A wedged ML service no longer downgrades the engine when it restarts.** Killing it and starting the replacement in the same breath raced the socket release; since 1.10.0 the native engine exits rather than lingering when it cannot bind, so losing that race meant falling back to the Python venv and running on the slow engine until someone noticed. Both restart paths now wait for the port to actually be free.
+- **Jobs retry until they can actually succeed.** A NAS that is unreachable for a week is not a reason to give up on a photo. Retries stay unlimited, with the delay between them now rising to an hour instead of five minutes so a long outage costs a handful of attempts rather than thousands. Contributed by [@pl4za](https://github.com/pl4za) ([#129](https://github.com/epheterson/immich-apple-silicon/pull/129)).
+- **The dashboard no longer reports a queue as done while it is still working.** Contributed by [@pl4za](https://github.com/pl4za) ([#131](https://github.com/epheterson/immich-apple-silicon/pull/131)).
+- **The HEIC/RAW decode shim handles `clone()` and stream use.** A pipeline forked into two outputs had both branches recorded on one list, so each output silently received the other's operations. Immich 3.0.2 does not do this on the HEIC path, so no thumbnail shipped wrong, but the shim wraps whatever Immich the user is running.
+
+### Added
+- **Mount NAS shares at login**, a Settings switch that remembers the SMB shares mounted when you turn it on and reconnects any that are missing. Contributed by [@pl4za](https://github.com/pl4za) ([#130](https://github.com/epheterson/immich-apple-silicon/pull/130)).
+
+### Changed
+- **The README is a table of contents instead of a wall.** Usage, deployment, the ML engine, known differences, troubleshooting and security are separate documents now, with a repo layout tree and a guide to the scripts. Contributed by [@lesurJ](https://github.com/lesurJ) ([#128](https://github.com/epheterson/immich-apple-silicon/pull/128)).
+- **The test suite passes on a Mac that is running the accelerator.** Tests read the real launch agent directory, scanned the machine for live worker processes, and made real HTTP calls to a running ML service, so anyone who developed on their own install saw failures that had nothing to do with their change ([#132](https://github.com/epheterson/immich-apple-silicon/pull/132)).
+
 ## 1.10.0 - 2026-08-10
 
 ### Added

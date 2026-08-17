@@ -1,6 +1,6 @@
 # Immich Accelerator — Design Document
 
-> **Historical design doc (2026-03-31).** Captures the original design thinking; not maintained as the product evolves. For current, accurate documentation see [README.md](../../README.md) and [ARCHITECTURE.md](../../ARCHITECTURE.md).
+> **Historical design doc (2026-03-31).** Captures the original design thinking; not maintained as the product evolves. For current, accurate documentation see [README.md](../../README.md) and the documents it links to.
 
 ## What is this?
 
