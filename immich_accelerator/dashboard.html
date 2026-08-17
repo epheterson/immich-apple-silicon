@@ -432,10 +432,14 @@ function render(d) {
       let rateText;
       if (rate > 0) {
         rateText = rate + '/min' + (eta ? ' \u00b7 ' + eta : '') + (qc > 0 ? ' \u00b7 ' + qc + ' queued' : '');
+      } else if (qActive) {
+        // Checked before the pct>=99.9 "done" branch below: a queue that's
+        // still active (jobs re-queued for already-processed assets, a fresh
+        // upload not yet counted in the DB total) must never render "done"
+        // just because the DB-derived ratio happens to already be ~100%.
+        rateText = 'processing' + (qc > 0 ? ' \u00b7 ' + qc + ' queued' : '');
       } else if (p.pct >= 99.9) {
         rateText = 'done';
-      } else if (qActive) {
-        rateText = 'processing' + (qc > 0 ? ' \u00b7 ' + qc + ' queued' : '');
       } else if (noApi && p.done < p.total) {
         rateText = d.jobs_api_error ? 'no job data: ' + d.jobs_api_error : 'no job data (check api_key in config)';
       } else {
