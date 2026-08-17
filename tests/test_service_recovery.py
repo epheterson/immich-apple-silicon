@@ -423,3 +423,59 @@ class TestMLRestartDoesNotDowngradeTheEngine:
         ):
             m.reconcile_ml(cfg)
         start.assert_not_called()
+
+
+class TestMLAdoption:
+    """A pidfile can go missing while the process it named is healthy. The
+    watcher then pinged the port, got an answer from a process it had no PID
+    for, and classified its own engine as somebody else's service to leave
+    alone: status said stopped while ML served, and nothing would have
+    restarted it if it wedged. Four days of that on the release Mac.
+    """
+
+    NATIVE = "/opt/homebrew/opt/immich-accelerator/libexec/native-ml/immich-ml-native serve 3003"
+    VENV = "/opt/homebrew/Cellar/immich-accelerator/1.10.0/libexec/ml/venv/bin/python3.11 -m src.main"
+    DOCKER = "/usr/local/bin/com.docker.backend -watchdog -native-api"
+
+    def _ps(self, cmd):
+        def run(argv, **kw):
+            if argv[0].endswith("lsof"):
+                return MagicMock(stdout="64933\n")
+            return MagicMock(stdout=cmd)
+
+        return patch.object(m.subprocess, "run", side_effect=run)
+
+    def test_our_native_engine_is_adopted(self, tmp_data_dir):
+        with self._ps(self.NATIVE), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) == 64933
+        assert (tmp_data_dir["pid_dir"] / "ml.pid").exists(), "adoption must persist"
+
+    def test_our_venv_engine_is_adopted(self, tmp_data_dir):
+        with self._ps(self.VENV), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) == 64933
+
+    def test_somebody_elses_service_is_left_alone(self, tmp_data_dir):
+        """Docker's own ML container serves the same port on plenty of setups.
+        Adopting it would have us kill and restart a container we do not own."""
+        with self._ps(self.DOCKER), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) is None
+
+    def test_nothing_listening_is_not_an_adoption(self, tmp_data_dir):
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(stdout="")
+        ), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) is None
+
+    def test_reconcile_adopts_instead_of_calling_it_foreign(self, tmp_data_dir):
+        with patch.object(m, "_component_enabled", return_value=True), patch.object(
+            m, "read_pid", return_value=None
+        ), patch.object(m, "_ml_ping", return_value=True), patch.object(
+            m, "adopt_live_ml", return_value=64933
+        ) as adopt, patch.object(
+            m, "_start_ml_service"
+        ) as start, patch.object(m, "log") as log:
+            m.reconcile_ml({"ml": True, "ml_port": 3003})
+        adopt.assert_called_once()
+        start.assert_not_called()
+        said = " ".join(str(c) for c in log.warning.call_args_list)
+        assert "already served by something" not in said
