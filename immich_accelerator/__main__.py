@@ -90,6 +90,15 @@ SUPPORTED_NODE_MAJORS = (22, 24)
 # native start loads weights before it serves, and a first-use model fetch is
 # gigabytes, so the grace has to clear the longest legitimate silence.
 ML_UNRESPONSIVE_GRACE = 300.0
+
+# How long the library has to stay unreachable before the worker is paused.
+# A slow NAS and a missing one look identical to a single probe: the probe has
+# a 10s timeout, and a Synology mid-backup or a Wi-Fi hiccup can exceed that
+# while the library is perfectly fine. Pausing on the first failure would stop
+# the worker mid-job and start it again 30s later, which is the thrash this
+# whole mechanism exists to prevent. A remount is still attempted immediately,
+# since that is cheap and may fix things before the grace ever expires.
+MEDIA_UNREACHABLE_GRACE = 120.0
 # (pid, monotonic time it first went quiet). The PID is half the state, not
 # bookkeeping: a bare timestamp belongs to no particular process, so a service
 # replaced between two ticks inherits the dead one's elapsed silence and gets
@@ -2148,6 +2157,30 @@ def mount_recipe_for(root: str) -> dict | None:
         if covers and (best is None or len(point) > len(best["mountpoint"])):
             best = {"fstype": fstype, "spec": spec.strip(), "mountpoint": point}
     return best
+
+
+def is_mounted(point: str) -> bool:
+    """Is something already mounted at this exact path?
+
+    macOS will happily stack a second mount on an occupied mount point, and the
+    probe can report a healthy mount as unreachable when the server is merely
+    slow. Without this check, one slow NAS could leave the path buried under a
+    pile of mounts that only a reboot fully unwinds.
+    """
+    try:
+        out = subprocess.run(
+            ["/sbin/mount"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in out.splitlines():
+        head, sep, _ = line.rpartition(" (")
+        if not sep:
+            continue
+        _, sep, existing = head.partition(" on ")
+        if sep and existing.strip() == point:
+            return True
+    return False
 
 
 def remount(recipe: dict) -> tuple[bool, str]:
@@ -5523,6 +5556,14 @@ def _attempt_remount(config: dict, state: dict) -> None:
 
     state["attempts"] = attempts + 1
     state["last"] = now
+    if is_mounted(recipe.get("mountpoint", "")):
+        # The probe said unreachable but the mount is there, so this is a slow
+        # or half-dead server, not a missing one. Mounting again would stack a
+        # second mount on the same path and fix nothing.
+        log.debug("Mount point %s is still mounted; not remounting over it.",
+                  recipe.get("mountpoint"))
+        return
+
     log.info(
         "Trying to remount the library (%s from %s at %s)...",
         recipe.get("fstype"),
@@ -5576,6 +5617,7 @@ def _watch_worker(config: dict) -> str | None:
     # watcher restart is a clean slate.
     media_paused = False
     remount_state: dict = {}  # {attempts, last, blocked} for the remount backoff
+    media_down_since: float | None = None  # first failed probe of a run
     # This loop's state starts clean, so any marker from a previous run is
     # stale and would make status report a pause that is not happening.
     set_paused("")
@@ -5664,10 +5706,25 @@ def _watch_worker(config: dict) -> str | None:
             # unattended is for.
             if config.get("require_media_ready", True):
                 if not media_ready_now(config):
+                    if media_down_since is None:
+                        media_down_since = time.monotonic()
+                        log.warning(
+                            "Library did not respond at %s. Trying to remount it, "
+                            "and leaving the worker alone until this has lasted "
+                            "%ds, since a slow mount and a missing one look the "
+                            "same to one probe.",
+                            config.get("upload_mount") or "?",
+                            int(MEDIA_UNREACHABLE_GRACE),
+                        )
+                    # Immediately, not after the grace: a successful remount here
+                    # means the worker is never stopped at all.
+                    _attempt_remount(config, remount_state)
+                    if time.monotonic() - media_down_since < MEDIA_UNREACHABLE_GRACE:
+                        continue
                     if not media_paused:
                         media_paused = True
                         log.error(
-                            "Library is not reachable at %s. Pausing the worker "
+                            "Library still not reachable at %s. Pausing the worker "
                             "so jobs are not failed against a missing mount; it "
                             "will start again on its own when the mount is back.",
                             config.get("upload_mount") or "?",
@@ -5675,7 +5732,6 @@ def _watch_worker(config: dict) -> str | None:
                         set_paused("library-unreachable", config.get("upload_mount") or "")
                     if read_pid("worker"):
                         kill_pid("worker")
-                    _attempt_remount(config, remount_state)
                     # Nothing else this cycle is meaningful with no library:
                     # the crash-check below would restart the worker straight
                     # back into the same failure. The remount, if it worked, is
@@ -5696,6 +5752,7 @@ def _watch_worker(config: dict) -> str | None:
                         recipe["fstype"],
                         recipe["spec"],
                     )
+                media_down_since = None
                 if remount_state:
                     remount_state.clear()
 
