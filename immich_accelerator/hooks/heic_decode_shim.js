@@ -352,6 +352,16 @@ const NON_CHAIN_PROPS = new Set(['then', 'catch', 'finally', 'constructor']);
 // Immich calls (rotate, resize, toFormat, ...) is a synchronous setter.
 const TERMINAL_ASYNC_METHODS = new Set(['toBuffer', 'toFile', 'metadata', 'stats']);
 
+// Sharp instances are also Duplex streams. This proxy cannot be one: the
+// decode it stands in for is async, and a stream has to exist synchronously.
+// Immich 3.0.2 never streams on the HEIC path, but if a future version does,
+// failing here by name beats returning a proxy where a stream was expected and
+// letting it fail somewhere unrecognisable.
+const STREAM_PROPS = new Set([
+    'pipe', 'on', 'once', 'off', 'emit', 'read', 'write', 'end', 'destroy',
+    'removeListener', 'addListener', 'unpipe', 'pause', 'resume',
+]);
+
 // sharp() must return synchronously and support chaining even though decode
 // is now async. Records synchronous chain calls and replays them once decode
 // resolves; a terminal call (toBuffer etc.) awaits it first.
@@ -372,10 +382,26 @@ function lazyDecodedSharp(input, options, realSharp) {
     // and .toBuffer(), say) an unattached rejection would take the worker down
     // on Node 15+, where that is fatal by default.
     decoded.catch(() => {});
-    const calls = [];
-    const proxy = new Proxy(function () {}, {
+    // Built per proxy so clone() can hand out an independent copy.
+    const build = (calls) => {
+      const proxy = new Proxy(function () {}, {
         get(_target, prop) {
             if (typeof prop === 'symbol' || NON_CHAIN_PROPS.has(prop)) return undefined;
+            // clone() exists to fork a pipeline into two outputs. Recorded as
+            // an ordinary chain call it returned the same proxy, so both
+            // branches appended to one list and each output got the other's
+            // operations too.
+            if (prop === 'clone') return () => build([...calls]);
+            if (STREAM_PROPS.has(prop)) {
+                return () => {
+                    throw new Error(
+                        `immich-accelerator HEIC shim: sharp().${prop}() is not ` +
+                        'supported on HEIC/RAW input, which this shim decodes ' +
+                        'ahead of Sharp. Use toBuffer() or toFile(), or report ' +
+                        'this at github.com/epheterson/immich-apple-silicon.'
+                    );
+                };
+            }
             if (TERMINAL_ASYNC_METHODS.has(prop)) {
                 return async (...args) => {
                     let instance = realSharp(await decoded, options);
@@ -390,8 +416,10 @@ function lazyDecodedSharp(input, options, realSharp) {
                 return proxy;
             };
         },
-    });
-    return proxy;
+      });
+      return proxy;
+    };
+    return build([]);
 }
 
 // Wrap the real Sharp factory so HEVC-HEIC paths are pre-decoded.
@@ -426,3 +454,8 @@ Module._load = function (request, parent, isMain) {
     }
     return mod;
 };
+
+// Loaded via `node --require`, where exports go unused. They exist so the
+// chain-replay behaviour can be driven directly from a test rather than
+// inferred from thumbnails.
+module.exports = { wrapSharp, lazyDecodedSharp };
