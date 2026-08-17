@@ -45,6 +45,10 @@ PID_DIR = DATA_DIR / "pids"
 # Advisory lock so a component toggle and the watcher cannot both run cmd_start.
 LOCK_FILE = DATA_DIR / "start.lock"
 LOG_DIR = DATA_DIR / "logs"
+# Why the worker is deliberately not running. The watch loop owns this file;
+# status and the menu bar read it so a paused worker reads as "the library is
+# gone" instead of a bare "Stopped" the user cannot explain.
+PAUSE_FILE = DATA_DIR / "paused.json"
 
 # Records the package version the running worker was started with, so the watch
 # loop can tell when a `brew upgrade` left the worker on stale code.
@@ -2213,6 +2217,27 @@ def _media_probe(
         return result.returncode == 0, []
     except (subprocess.SubprocessError, OSError):
         return False, []
+
+
+def set_paused(reason: str, detail: str = "") -> None:
+    """Record why the worker is down, or clear it when reason is empty."""
+    try:
+        if not reason:
+            PAUSE_FILE.unlink(missing_ok=True)
+            return
+        PAUSE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PAUSE_FILE.write_text(
+            json.dumps({"reason": reason, "detail": detail, "since": time.time()})
+        )
+    except OSError:
+        pass  # a status nicety; never worth failing the loop over
+
+
+def read_paused() -> dict | None:
+    try:
+        return json.loads(PAUSE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def media_ready_now(config: dict) -> bool:
@@ -5123,6 +5148,9 @@ def stop_all_fast() -> None:
 
 
 def cmd_stop(_args):
+    # An explicit stop is not a pause. Leaving the marker behind would have
+    # status blame a missing library for a worker the user turned off.
+    set_paused("")
     stopped = False
     for name in ("worker", "ml", "dashboard"):
         if kill_pid(name):
@@ -5136,6 +5164,14 @@ def cmd_status(_args):
     worker_pid = read_pid("worker")
     ml_pid = read_pid("ml")
     config = load_config() if CONFIG_FILE.exists() else {}
+
+    paused = read_paused()
+    if paused and paused.get("reason") == "library-unreachable":
+        log.warning(
+            "Worker:     paused, library is not reachable at %s",
+            paused.get("detail") or "?",
+        )
+        log.warning("            It starts again on its own when the mount is back.")
 
     if not worker_pid and not ml_pid:
         # "Disabled" and "stopped" are different facts, and a user who turned a
@@ -5438,6 +5474,9 @@ def _watch_worker(config: dict) -> str | None:
     # watcher restart is a clean slate.
     media_paused = False
     remount_state: dict = {}  # {attempts, last, blocked} for the remount backoff
+    # This loop's state starts clean, so any marker from a previous run is
+    # stale and would make status report a pause that is not happening.
+    set_paused("")
 
     # A detached worker survives `brew services restart`, so a freshly-launched
     # watch (new code) would otherwise adopt a worker still running the OLD code
@@ -5531,6 +5570,7 @@ def _watch_worker(config: dict) -> str | None:
                             "will start again on its own when the mount is back.",
                             config.get("upload_mount") or "?",
                         )
+                        set_paused("library-unreachable", config.get("upload_mount") or "")
                     if read_pid("worker"):
                         kill_pid("worker")
                     _attempt_remount(config, remount_state)
@@ -5563,6 +5603,7 @@ def _watch_worker(config: dict) -> str | None:
                         "Library is reachable again at %s. Starting the worker.",
                         config.get("upload_mount") or "?",
                     )
+                    set_paused("")
                     # Start it here rather than falling through to the
                     # crash-check: the worker did not crash, we stopped it, and
                     # the log should say so.

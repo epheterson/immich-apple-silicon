@@ -59,6 +59,7 @@ def tmp_data_dir(tmp_path):
     log_dir.mkdir()
     config_file = data_dir / "config.json"
     lock_file = data_dir / "start.lock"
+    pause_file = data_dir / "paused.json"
     synthetic_conf = tmp_path / "synthetic.d" / "immich-accelerator"
     synthetic_conf.parent.mkdir(parents=True, exist_ok=True)
     legacy_synthetic = tmp_path / "synthetic.conf"
@@ -70,6 +71,7 @@ def tmp_data_dir(tmp_path):
         PID_DIR=pid_dir,
         LOG_DIR=log_dir,
         LOCK_FILE=lock_file,
+        PAUSE_FILE=pause_file,
         # A real install has this file, and two tests wrote to and removed the
         # user's actual /etc/synthetic.d entry.
         SYNTHETIC_CONF=synthetic_conf,
@@ -85,6 +87,7 @@ def tmp_data_dir(tmp_path):
             "pid_dir": pid_dir,
             "log_dir": log_dir,
             "lock_file": lock_file,
+            "pause_file": pause_file,
         }
 
 
