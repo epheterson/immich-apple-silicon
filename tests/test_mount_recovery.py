@@ -72,6 +72,19 @@ class TestMountRecipe:
         with _mount(nested):
             assert m.mount_recipe_for("/nas/inner/photos")["mountpoint"] == "/nas/inner"
 
+    def test_a_path_reached_through_a_symlink_still_matches(self, tmp_path):
+        """/sbin/mount reports resolved paths. On a real Mac /tmp is a symlink
+        to /private/tmp, and an unresolved compare silently finds no mount at
+        all, which reads as "nothing to remount" rather than as a bug."""
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        out = f"nas:/vol on {real} (nfs, nodev)\n"
+        with _mount(out):
+            r = m.mount_recipe_for(str(link / "photos"))
+        assert r is not None and r["mountpoint"] == str(real)
+
     def test_survives_mount_being_unavailable(self):
         with patch.object(m.subprocess, "run", side_effect=OSError("boom")):
             assert m.mount_recipe_for("/nas") is None

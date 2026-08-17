@@ -2118,6 +2118,14 @@ def mount_recipe_for(root: str) -> dict | None:
     except (OSError, subprocess.SubprocessError):
         return None
 
+    # The mount table reports resolved paths (/private/tmp, not /tmp), so a
+    # config path that goes through a symlink would match nothing. Resolving is
+    # safe here because a recipe is only ever recorded while the mount is up.
+    try:
+        root = str(Path(root).resolve())
+    except OSError:
+        pass
+
     best = None
     for line in out.splitlines():
         head, sep, tail = line.rpartition(" (")
