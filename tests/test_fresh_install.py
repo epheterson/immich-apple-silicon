@@ -2181,7 +2181,7 @@ class TestPgKeepaliveShim:
 
 
 class TestJobRetryShim:
-    """The job retry shim gives BullMQ jobs a generous bounded attempt
+    """The job retry shim gives BullMQ jobs an unlimited attempt
     count with exponential backoff that resets whenever the accelerator
     restarts. Immich hardcodes `attempts: 1` (no retry) for every queue
     (config.repository.js), so a transient connection drop in a split
@@ -2265,7 +2265,7 @@ class TestJobRetryShim:
 
     @pytest.mark.slow
     def test_shim_raises_attempts_via_add_and_addbulk(self, tmp_path):
-        """add()/addBulk() should get a generous bounded attempts count
+        """add()/addBulk() should get an unlimited attempts count
         and a backoff marker injected when the caller didn't ask for
         anything explicit, the way Immich's job.repository.js calls them —
         while an explicit caller-set attempts count survives untouched."""
@@ -2308,13 +2308,13 @@ class TestJobRetryShim:
         )
         assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
         out = result.stdout
-        # 100, not unlimited: enough retrying to sleep through an overnight
-        # outage, bounded so a genuinely broken asset eventually stops
-        # occupying a worker slot every five minutes forever.
-        assert "ATTEMPTS:100" in out, out
+        # Unlimited on purpose: a job that stops retrying needs a human to
+        # requeue it, which defeats running unattended. The hourly ceiling is
+        # what makes that affordable, not a limit on attempts.
+        assert f"ATTEMPTS:{2**53 - 1}" in out, out
         assert "BACKOFF_TYPE:immich-accel" in out, out
         assert "EXPLICIT_ATTEMPTS:5" in out, out  # never override a real explicit choice
-        assert "BULK_A_ATTEMPTS:100" in out, out
+        assert f"BULK_A_ATTEMPTS:{2**53 - 1}" in out, out
         assert "BULK_B_ATTEMPTS:7" in out, out
 
     @pytest.mark.slow
