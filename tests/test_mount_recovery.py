@@ -302,3 +302,64 @@ class TestWatchLoopPausesOnMissingLibrary:
         into a pause it can never leave."""
         assert m.media_ready_now({"upload_mount": "", "media_id": ""}) is True
         assert m.media_ready_now({"upload_mount": "/nas", "media_id": ""}) is True
+
+
+class TestPauseIsVisible:
+    """A worker that is down for a reason must say so. Otherwise status reads
+    "stopped", the user starts it by hand, and it fails every job again."""
+
+    def test_status_explains_a_paused_worker(self, tmp_data_dir, capsys):
+        m.set_paused("library-unreachable", "/nas/photos")
+        with patch.object(m, "read_pid", return_value=None), patch.object(
+            m, "log"
+        ) as log:
+            m.cmd_status(None)
+        said = " ".join(str(c) for c in log.warning.call_args_list)
+        assert "/nas/photos" in said
+        assert "not reachable" in said
+
+    def test_an_explicit_stop_clears_the_marker(self, tmp_data_dir):
+        """Otherwise `stop` leaves status blaming the NAS for a worker the user
+        turned off on purpose."""
+        m.set_paused("library-unreachable", "/nas")
+        with patch.object(m, "kill_pid", return_value=False), patch.object(m, "log"):
+            m.cmd_stop(None)
+        assert m.read_paused() is None
+
+    def test_a_stale_marker_does_not_outlive_the_watcher(self, tmp_data_dir):
+        m.set_paused("library-unreachable", "/nas")
+        mocks = {
+            "load_config": MagicMock(side_effect=[{"worker": True}, KeyboardInterrupt()]),
+            "media_ready_now": MagicMock(return_value=True),
+            "read_pid": MagicMock(return_value=999),
+            "kill_pid": MagicMock(),
+            "cmd_start": MagicMock(),
+            "cmd_stop": MagicMock(),
+            "reconcile_components": MagicMock(),
+            "cap_service_logs": MagicMock(),
+            "_upgraded_on_disk": MagicMock(return_value=False),
+            "log": MagicMock(),
+        }
+        with patch.multiple(m, **mocks):
+            m._watch_worker({"worker": True})
+        assert m.read_paused() is None
+
+    def test_the_marker_is_written_when_the_library_drops(self, tmp_data_dir):
+        cfg = {"worker": True, "upload_mount": "/nas/photos", "media_id": "x"}
+        mocks = {
+            "load_config": MagicMock(side_effect=[dict(cfg), dict(cfg), KeyboardInterrupt()]),
+            "media_ready_now": MagicMock(return_value=False),
+            "read_pid": MagicMock(return_value=None),
+            "kill_pid": MagicMock(),
+            "cmd_start": MagicMock(),
+            "cmd_stop": MagicMock(),
+            "reconcile_components": MagicMock(),
+            "cap_service_logs": MagicMock(),
+            "_upgraded_on_disk": MagicMock(return_value=False),
+            "_attempt_remount": MagicMock(),
+            "log": MagicMock(),
+        }
+        with patch.multiple(m, **mocks):
+            m._watch_worker(dict(cfg))
+        marker = m.read_paused()
+        assert marker and marker["detail"] == "/nas/photos"
