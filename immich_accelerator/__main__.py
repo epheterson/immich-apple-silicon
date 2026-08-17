@@ -2087,6 +2087,101 @@ except Exception as e:
 """
 
 
+# Network filesystems we know how to remount. Local disks are deliberately
+# excluded: if an APFS volume vanished, remounting is not our call to make.
+_REMOUNTABLE_FS = {"smbfs", "nfs", "afpfs"}
+
+# Backoff between remount attempts, in seconds. A NAS that is off overnight
+# should not be probed every 30s, and an SMB server should never be hit with a
+# tight retry loop; repeated failed auth is how accounts get locked.
+_REMOUNT_BACKOFF = (0, 60, 300, 900)
+
+
+def mount_recipe_for(root: str) -> dict | None:
+    """The mount that provides `root`, as something we could replay later.
+
+    Parsed from /sbin/mount, whose lines read `<spec> on <point> (<fs>, ...)`.
+    The spec keeps its URL encoding (`Time%20Machine`) because that is the form
+    mount_smbfs wants back.
+
+    Returns None for local disks and for a root that is not on its own mount:
+    both mean there is nothing here we should be replaying.
+    """
+    try:
+        out = subprocess.run(
+            ["/sbin/mount"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    best = None
+    for line in out.splitlines():
+        head, sep, tail = line.rpartition(" (")
+        if not sep or not head:
+            continue
+        fstype = tail.split(",")[0].rstrip(")").strip()
+        if fstype not in _REMOUNTABLE_FS:
+            continue
+        # Split on the FIRST " on ": the spec (//user@host/share) does not
+        # contain it, while mount points routinely do ("/Volumes/Time Machine").
+        spec, sep, point = head.partition(" on ")
+        if not sep:
+            continue
+        try:
+            covers = Path(root) == Path(point) or Path(point) in Path(root).parents
+        except (OSError, ValueError):
+            continue
+        # Longest match wins, so a share mounted inside another share is
+        # recorded as itself rather than as its parent.
+        if covers and (best is None or len(point) > len(best["mountpoint"])):
+            best = {"fstype": fstype, "spec": spec.strip(), "mountpoint": point}
+    return best
+
+
+def remount(recipe: dict) -> tuple[bool, str]:
+    """Replay a recorded mount. Returns (ok, reason).
+
+    reason is "auth" when the server rejected our credentials, which the caller
+    must treat as terminal: retrying a bad password in a loop locks accounts.
+
+    -N on mount_smbfs means "never prompt". There is no terminal here, so a
+    prompt would hang the watcher forever; with -N the credentials come from the
+    login keychain, which is where they already are if the share was ever
+    mounted in Finder with "remember this password".
+    """
+    fstype, spec, point = recipe["fstype"], recipe["spec"], recipe["mountpoint"]
+    if fstype == "smbfs":
+        cmd = ["/sbin/mount_smbfs", "-N", spec, point]
+    elif fstype == "nfs":
+        cmd = ["/sbin/mount_nfs", spec, point]
+    else:
+        return False, f"no non-interactive remount for {fstype}"
+
+    try:
+        Path(point).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"cannot create mount point: {exc}"
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return False, "mount timed out"
+    except OSError as exc:
+        return False, str(exc)
+
+    if proc.returncode == 0:
+        return True, ""
+    err = (proc.stderr or proc.stdout or "").strip().splitlines()
+    detail = err[-1] if err else f"exit {proc.returncode}"
+    lowered = detail.lower()
+    if any(
+        k in lowered
+        for k in ("authentication", "permission denied", "not permitted", "password")
+    ):
+        return False, "auth"
+    return False, detail
+
+
 def _media_probe(
     mode: str, root: str, media_id: str, timeout: int = 15
 ) -> tuple[bool, list[str]]:
@@ -2118,6 +2213,24 @@ def _media_probe(
         return result.returncode == 0, []
     except (subprocess.SubprocessError, OSError):
         return False, []
+
+
+def media_ready_now(config: dict) -> bool:
+    """Is the media root reachable right now? Cheap enough to ask every cycle.
+
+    ensure_media_ready does the same probe but also establishes the marker on
+    first run and prints a full explanation, which is right once at startup and
+    wrong thirty seconds later. This is the quiet version for the watch loop.
+
+    A missing media_id means the marker has not been established yet, so there
+    is nothing to verify against; leave that to ensure_media_ready at start.
+    """
+    root = config.get("upload_mount") or ""
+    media_id = config.get("media_id") or ""
+    if not root or not media_id:
+        return True
+    ok, _dangling = _media_probe("verify", root, media_id, timeout=10)
+    return ok
 
 
 def ensure_media_ready(config: dict) -> bool:
@@ -5250,6 +5363,52 @@ def cmd_watch(_args):
 _SWITCH = "switch"
 
 
+def _attempt_remount(config: dict, state: dict) -> None:
+    """Try to put the library mount back, on a backoff, at most until the
+    server tells us the credentials are wrong.
+
+    `state` carries attempts/last/blocked across watch cycles. Once the server
+    reports an auth failure we stop for good rather than retrying a password we
+    now know is rejected: a background loop is exactly how an account ends up
+    locked out, and unlike a network blip that is not something waiting fixes.
+    """
+    recipe = config.get("mount_recipe")
+    if not recipe or state.get("blocked"):
+        return
+
+    attempts = state.get("attempts", 0)
+    wait = _REMOUNT_BACKOFF[min(attempts, len(_REMOUNT_BACKOFF) - 1)]
+    now = time.monotonic()
+    last = state.get("last")
+    if last is not None and now - last < wait:
+        return
+
+    state["attempts"] = attempts + 1
+    state["last"] = now
+    log.info(
+        "Trying to remount the library (%s from %s at %s)...",
+        recipe.get("fstype"),
+        recipe.get("spec"),
+        recipe.get("mountpoint"),
+    )
+    ok, reason = remount(recipe)
+    if ok:
+        log.info("Remounted the library. Checking it on the next cycle.")
+        state.clear()
+        return
+    if reason == "auth":
+        state["blocked"] = True
+        log.error(
+            "The server rejected our credentials for %s, so we will not keep "
+            "trying (repeated attempts can lock the account). Mount the share "
+            "in Finder and save the password in the keychain, then the "
+            "accelerator can do this on its own.",
+            recipe.get("spec"),
+        )
+        return
+    log.warning("  Remount failed: %s", reason)
+
+
 def _watch_worker(config: dict) -> str | None:
     """cmd_watch's worker loop. Returns _SWITCH if the worker was disabled
     mid-flight, so cmd_watch can hand over to the worker-free loop."""
@@ -5274,6 +5433,11 @@ def _watch_worker(config: dict) -> str | None:
 
     signal.signal(signal.SIGTERM, _graceful_stop)
     signal.signal(signal.SIGINT, _graceful_stop)
+
+    # Loop-local rather than module state: it cannot leak between tests, and a
+    # watcher restart is a clean slate.
+    media_paused = False
+    remount_state: dict = {}  # {attempts, last, blocked} for the remount backoff
 
     # A detached worker survives `brew services restart`, so a freshly-launched
     # watch (new code) would otherwise adopt a worker still running the OLD code
@@ -5347,6 +5511,67 @@ def _watch_worker(config: dict) -> str | None:
             # way to turn one off) takes effect on a running install, and a
             # crashed one is restarted while it is enabled.
             reconcile_components(config)
+
+            # The library can go away while we are running, and until now
+            # nothing noticed. macOS drops network mounts on sleep or network
+            # churn; Immich stores absolute paths, so every job then fails
+            # instantly on ENOENT. The worker stayed up and shredded the queue
+            # while the logs filled with errors that never named the cause.
+            #
+            # Pause instead. A stopped worker is honest and recovers by itself
+            # the moment the mount returns, which is what a service running
+            # unattended is for.
+            if config.get("require_media_ready", True):
+                if not media_ready_now(config):
+                    if not media_paused:
+                        media_paused = True
+                        log.error(
+                            "Library is not reachable at %s. Pausing the worker "
+                            "so jobs are not failed against a missing mount; it "
+                            "will start again on its own when the mount is back.",
+                            config.get("upload_mount") or "?",
+                        )
+                    if read_pid("worker"):
+                        kill_pid("worker")
+                    _attempt_remount(config, remount_state)
+                    # Nothing else this cycle is meaningful with no library:
+                    # the crash-check below would restart the worker straight
+                    # back into the same failure. The remount, if it worked, is
+                    # picked up by next cycle's probe.
+                    continue
+
+                # Healthy: remember how this mount is put together, while we
+                # can still see it. A recipe recorded now is what lets us
+                # rebuild the mount later, at the exact path Immich stores in
+                # its database rather than wherever Finder would land it.
+                recipe = mount_recipe_for(config.get("upload_mount") or "")
+                if recipe and recipe != config.get("mount_recipe"):
+                    config["mount_recipe"] = recipe
+                    save_config(config)
+                    log.info(
+                        "Recorded how the library is mounted (%s from %s), so it "
+                        "can be remounted automatically if it drops.",
+                        recipe["fstype"],
+                        recipe["spec"],
+                    )
+                if remount_state:
+                    remount_state.clear()
+
+                if media_paused:
+                    media_paused = False
+                    log.info(
+                        "Library is reachable again at %s. Starting the worker.",
+                        config.get("upload_mount") or "?",
+                    )
+                    # Start it here rather than falling through to the
+                    # crash-check: the worker did not crash, we stopped it, and
+                    # the log should say so.
+                    if not read_pid("worker"):
+                        try:
+                            cmd_start(argparse.Namespace(force=True))
+                        except RuntimeError:
+                            log.error("  Worker start after the library returned failed")
+                        worker_handled = True
 
             # fd-leak safety net (#89): restart the worker before a runaway
             # open-file-descriptor count (an upstream Immich leak on some media)
