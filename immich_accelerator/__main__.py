@@ -46,6 +46,16 @@ PID_DIR = DATA_DIR / "pids"
 LOCK_FILE = DATA_DIR / "start.lock"
 LOG_DIR = DATA_DIR / "logs"
 
+# Where setup would install the launch agent. A module-level constant for the
+# same reason as the paths above: anything computed inline from Path.home() is
+# invisible to the test fixture, and therefore reaches the developer's real
+# machine. This one did: `setup --yes` under pytest installed a live,
+# KeepAlive'd launch agent into the real ~/Library/LaunchAgents and left it
+# crash-looping every 10 seconds. Before --yes existed the prompt raised
+# EOFError under pytest and the answer defaulted to no, so the hole was there
+# all along and merely dormant.
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+
 # Records the package version the running worker was started with, so the watch
 # loop can tell when a `brew upgrade` left the worker on stale code.
 WORKER_VERSION_FILE = PID_DIR / "worker.version"
@@ -111,6 +121,41 @@ def _build_link_ok() -> bool:
         return target.exists() and target.resolve() == build_data.resolve()
     except OSError:
         return False
+
+
+# Set by `setup --yes`. Module-level rather than threaded through a dozen
+# call sites, because it is a property of how the process was invoked, not of
+# any one question.
+ASSUME_YES = False
+
+
+def _confirm(prompt: str, default: bool = True) -> bool:
+    """Ask a yes/no question, or take the default without asking.
+
+    Three cases, and they really are different:
+
+    - ``--yes``: take the default and say so. This is what lets the menu-bar
+      app run setup itself instead of handing the user to Terminal.
+    - stdin is not a terminal and ``--yes`` was not passed: answer no. Every
+      one of these prompts already fell back to no on EOFError, and that is
+      worth keeping, because a piped setup silently answering "yes, install a
+      launch agent" would be a nasty surprise.
+    - otherwise: ask.
+
+    Note the asymmetry: absent ``--yes``, a non-interactive run answers *no*
+    even to a ``[Y/n]`` question whose default is yes. Refusing to act is the
+    safe direction when nobody is there to read the question.
+    """
+    if ASSUME_YES:
+        log.info("%s%s", prompt, "yes" if default else "no")
+        return default
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        return False
+    if not answer:
+        return default
+    return answer == "y"
 
 
 def _synthetic_build_entry(build_data: Path) -> str:
@@ -275,11 +320,7 @@ def _ensure_build_link():
     log.info("This uses macOS synthetic links (requires sudo once).")
     log.info("")
 
-    try:
-        answer = input("Create /build link? [Y/n] ").strip().lower()
-    except EOFError:
-        return False
-    if answer and answer != "y":
+    if not _confirm("Create /build link? [Y/n] "):
         return False
 
     # Write our file in /etc/synthetic.d/ (avoids touching shared synthetic.conf).
@@ -469,11 +510,12 @@ def _ensure_homebrew() -> str | None:
     for p in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]:
         if os.path.isfile(p):
             return p
-    try:
-        answer = input("  Homebrew not found. Install it? [Y/n] ").strip().lower()
-    except EOFError:
-        return None
-    if answer and answer != "y":
+    # Routed through _confirm so `--yes` reaches it. It used to call input()
+    # directly, which under the wizard's /dev/null stdin raised EOFError and
+    # returned None: the flag documented as "take the default answer" was
+    # silently answering no to every dependency install, so a Mac missing Node
+    # failed setup where the Terminal flow would have offered to fix it.
+    if not _confirm("  Homebrew not found. Install it? [Y/n] "):
         return None
     log.info("  Installing Homebrew...")
     result = subprocess.run(
@@ -499,15 +541,9 @@ def _brew_install(package: str) -> bool:
     if not brew:
         return False
 
-    try:
-        answer = (
-            input(f"  {package} not found. Install with Homebrew? [Y/n] ")
-            .strip()
-            .lower()
-        )
-    except EOFError:
-        return False
-    if answer and answer != "y":
+    # Same reason as _ensure_homebrew: `--yes` only reaches prompts that go
+    # through _confirm, and this one gates every dependency setup installs.
+    if not _confirm(f"  {package} not found. Install with Homebrew? [Y/n] "):
         return False
 
     log.info("  Installing %s...", package)
@@ -1666,8 +1702,31 @@ def extract_immich_server(docker: str, container: str, version: str) -> Path:
 # --- Process management ---
 
 
+def snapshot_config() -> None:
+    """Keep the current config as `.previous`, once, before a run changes it.
+
+    Deliberately not inside save_config. Setup writes the config several times
+    in a single run, so rotating on every write meant the good copy was
+    overwritten by the first of those writes seconds later: the backup existed
+    exactly until the moment it was needed. Taken at the start of a run, it is
+    the config as it was before anything touched it, which is the only version
+    anyone wants back.
+    """
+    if not CONFIG_FILE.exists():
+        return
+    try:
+        previous = CONFIG_FILE.with_name(CONFIG_FILE.name + ".previous")
+        shutil.copy2(CONFIG_FILE, previous)
+        os.chmod(previous, 0o600)
+    except OSError as e:
+        # Never block a run on the backup: a config that cannot be written is a
+        # broken install, a backup that cannot be written is not.
+        log.debug("could not keep a previous config: %s", e)
+
+
 def save_config(config: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
     # Atomic write: tmp file + rename prevents corruption if interrupted
     tmp = CONFIG_FILE.with_suffix(".tmp")
     with open(tmp, "w") as f:
@@ -2245,6 +2304,20 @@ def _dashboard_port() -> int:
 # so "video but not thumbnails" is Immich's job scheduler, not ours.
 COMPONENTS = ("worker", "ml", "dashboard")
 
+# What each component is called in writing. The config key and the CLI argument
+# stay "worker" forever, because they are in people's scripts and config files;
+# only the word we print changes, so the CLI, the menu bar and Settings finally
+# agree on one name for one thing.
+COMPONENT_LABELS = {
+    "worker": "Microservices",
+    "ml": "Machine Learning",
+    "dashboard": "Web Dashboard",
+}
+
+# Accepted on the command line in addition to the canonical name, so someone
+# who read "Microservices" in the UI can type it and have it work.
+COMPONENT_ALIASES = {"microservices": "worker", "machine-learning": "ml", "web-dashboard": "dashboard"}
+
 # How to say each one in a sentence. str.capitalize() turns "ml" into "Ml".
 COMPONENT_LABELS = {
     "worker": "Worker",
@@ -2512,12 +2585,18 @@ def _ensure_vips() -> None:
     for p in vips_paths:
         if os.path.isfile(p):
             return
-    # Also check via pkg-config
-    r = subprocess.run(
-        ["pkg-config", "--exists", "vips"], capture_output=True, timeout=5
-    )
-    if r.returncode == 0:
-        return
+    # Also check via pkg-config, if it is even installed. It is a fallback for
+    # a libvips in a non-standard place, so its absence means "cannot tell",
+    # not "fail": letting FileNotFoundError out of here aborted the whole of
+    # setup on any Mac without pkg-config, which is most of them.
+    try:
+        r = subprocess.run(
+            ["pkg-config", "--exists", "vips"], capture_output=True, timeout=5
+        )
+        if r.returncode == 0:
+            return
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass
     if not _brew_install("vips"):
         log.warning(
             "libvips not found. Sharp rebuild may fail. Install: brew install vips"
@@ -2626,11 +2705,7 @@ def _finalize_config(config: dict) -> None:
 
     # Auto-start services
     log.info("")
-    try:
-        answer = input("  Start Immich Accelerator now? [Y/n] ").strip().lower()
-    except EOFError:
-        answer = "n"
-    if not answer or answer == "y":
+    if _confirm("  Start Immich Accelerator now? [Y/n] "):
         cmd_start(argparse.Namespace(force=True))
 
     # Offer to install launchd service (watch mode — manages worker, ML, and dashboard).
@@ -2642,24 +2717,14 @@ def _finalize_config(config: dict) -> None:
     plist_src = (
         Path(__file__).parent.parent / "launchd" / "com.immich.accelerator.plist"
     )
-    plist_dst = (
-        Path.home() / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
-    )
+    plist_dst = LAUNCH_AGENTS_DIR / "com.immich.accelerator.plist"
 
     if is_brew_install:
         log.info("")
         log.info("Installed via Homebrew. To auto-start on login:")
         log.info("  brew services start immich-accelerator")
     elif plist_src.exists() and not plist_dst.exists():
-        try:
-            answer = (
-                input("  Install as system service (auto-starts on login)? [Y/n] ")
-                .strip()
-                .lower()
-            )
-        except EOFError:
-            answer = "n"
-        if not answer or answer == "y":
+        if _confirm("  Install as system service (auto-starts on login)? [Y/n] "):
             content = plist_src.read_text()
             repo_dir = str(Path(__file__).parent.parent.resolve())
             content = content.replace("/path/to/immich-apple-silicon", repo_dir)
@@ -3330,39 +3395,55 @@ def _ensure_docker_running(docker: str) -> None:
     raise RuntimeError("Could not start Docker. Start it manually and re-run setup.")
 
 
-def _fresh_install(docker: str) -> bool:
-    """Set up Immich from scratch. Returns True if successful."""
-    log.info("")
-    log.info("No Immich instance found. Set up a fresh one?")
-    try:
-        answer = input("  [Y/n] ").strip().lower()
-    except EOFError:
-        return False
-    if answer and answer != "y":
-        return False
+def _fresh_install(docker: str, photos_path: str = "", data_path: str = "") -> bool:
+    """Set up Immich from scratch. Returns True if successful.
+
+    The two paths can be supplied by the caller, which is how the menu-bar app
+    drives this: it asks the same two questions in its own window. They are
+    never defaulted silently when nothing can be asked. Guessing ~/Pictures and
+    building a whole Immich stack around it is a far worse outcome than saying
+    what is missing, and it is not undone by re-running setup.
+    """
+    interactive = sys.stdin.isatty()
+    supplied = bool(photos_path and data_path)
+
+    if not supplied and not interactive:
+        raise RuntimeError(
+            "No Immich found, and creating one needs a photo library path and a "
+            "data path, which cannot be asked for without a terminal. Pass "
+            "--photos-path and --data-path, or run setup in Terminal."
+        )
+
+    if not supplied:
+        log.info("")
+        log.info("No Immich instance found. Set up a fresh one?")
+        if not _confirm("  [Y/n] "):
+            return False
 
     # Ask for paths
-    log.info("")
-    default_photos = str(Path.home() / "Pictures")
-    try:
-        photos_path = input(
-            f"  Where are your photos stored? [{default_photos}]: "
-        ).strip()
-    except EOFError:
-        photos_path = ""
-    photos_path = photos_path or default_photos
+    if not photos_path:
+        log.info("")
+        default_photos = str(Path.home() / "Pictures")
+        try:
+            photos_path = input(
+                f"  Where are your photos stored? [{default_photos}]: "
+            ).strip()
+        except EOFError:
+            photos_path = ""
+        photos_path = photos_path or default_photos
     if not Path(photos_path).is_dir():
         log.error("Directory does not exist: %s", photos_path)
         return False
 
-    default_data = str(DATA_DIR / "data")
-    try:
-        data_path = input(
-            f"  Where should Immich store its data? [{default_data}]: "
-        ).strip()
-    except EOFError:
-        data_path = ""
-    data_path = data_path or default_data
+    if not data_path:
+        default_data = str(DATA_DIR / "data")
+        try:
+            data_path = input(
+                f"  Where should Immich store its data? [{default_data}]: "
+            ).strip()
+        except EOFError:
+            data_path = ""
+        data_path = data_path or default_data
     Path(data_path).mkdir(parents=True, exist_ok=True)
 
     # Run the server container as the invoking user instead of root.
@@ -3375,21 +3456,21 @@ def _fresh_install(docker: str) -> bool:
     # volume and the network, never your host files, so there's nothing to
     # gain by changing them. No GID is needed — Docker defaults the
     # supplementary group to 0, which is fine for owner-writable mounts.
-    run_as_user = True
     log.info("")
-    try:
-        answer = (
-            input(
-                "  Run the Immich server container as the current user "
-                f"(uid {os.getuid()})? [Y/n] "
-            )
-            .strip()
-            .lower()
+    # Through _confirm so --yes answers it. Defaulting to yes is right: the
+    # container only reads your photos and writes the media directory, and
+    # running it as you is what keeps those files owned by you.
+    # Not _confirm alone: with nobody to ask it answers no, which is the
+    # deliberate contract everywhere else but is wrong here. This one has a
+    # correct unattended answer, and it is yes: running as the invoking user is
+    # what keeps the media files owned by them rather than root.
+    run_as_user = (
+        _confirm(
+            f"  Run the Immich server container as the current user (uid {os.getuid()})? [Y/n] "
         )
-    except EOFError:
-        answer = ""
-    if answer and answer != "y":
-        run_as_user = False
+        if (interactive or ASSUME_YES)
+        else True
+    )
     user_line = f'    user: "{os.getuid()}"\n' if run_as_user else ""
 
     # Check ports
@@ -3469,11 +3550,11 @@ def _setup_local(args):
     log.info("Detecting Immich instance...")
 
     # Step 1: Find or install Docker
-    try:
-        docker = _find_docker_or_install()
-    except RuntimeError as e:
-        log.error("%s", e)
-        return
+    # Raised, not swallowed. Every `return` from here exits 0, and the menu bar
+    # has nothing but the exit code to go on: it moved a user with no Docker
+    # to "Checking it works" and told them setup had succeeded when no config
+    # had been written at all.
+    docker = _find_docker_or_install()
     _ensure_docker_running(docker)
 
     # Step 2: Check for existing Immich
@@ -3501,7 +3582,11 @@ def _setup_local(args):
                 return
         else:
             # No Immich at all — offer fresh install
-            if not _fresh_install(docker):
+            if not _fresh_install(
+                docker,
+                getattr(args, "photos_path", "") or "",
+                getattr(args, "data_path", "") or "",
+            ):
                 return
             try:
                 immich = detect_immich(docker)
@@ -3582,34 +3667,113 @@ def _setup_remote(args):
     version = info["version"]
     log.info("Found Immich v%s", version)
 
-    # Interactive prompts for DB/Redis connection
-    log.info("")
-    log.info("Enter connection details for the Immich database and Redis.")
-    log.info(
-        "These must be reachable from this Mac (expose ports or use network routing)."
-    )
-    log.info("")
-
-    def prompt(label: str, default: str = "") -> str:
-        suffix = f" [{default}]" if default else ""
-        val = input(f"  {label}{suffix}: ").strip()
-        return val or default
-
-    db_hostname = prompt("Postgres host", "localhost")
-    db_port = prompt("Postgres port", "5432")
-    db_username = prompt("Postgres user", "postgres")
     import getpass
 
-    db_password = getpass.getpass("  Postgres password: ").strip()
-    db_name = prompt("Database name", "immich")
-    redis_hostname = prompt("Redis host", db_hostname)
-    redis_port = prompt("Redis port", "6379")
-    redis_username = prompt("Redis username [blank if none]", "")
-    redis_password = getpass.getpass("  Redis password [blank if none]: ").strip()
+    # Secrets arrive on a pipe, never in argv, because argv is world-readable
+    # through ps. The menu-bar app writes this JSON to the child's stdin.
+    secrets: dict = {}
+    if getattr(args, "secrets_stdin", False):
+        raw = sys.stdin.read()
+        try:
+            secrets = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"--secrets-stdin expected JSON on stdin: {e}") from e
+
+    interactive = sys.stdin.isatty() and not getattr(args, "secrets_stdin", False)
+    if interactive:
+        log.info("")
+        log.info("Enter connection details for the Immich database and Redis.")
+        log.info(
+            "These must be reachable from this Mac (expose ports or use network routing)."
+        )
+        log.info("")
+
+    def prompt(
+        label: str,
+        default: str = "",
+        supplied: str | None = None,
+        flag: str = "",
+        optional: bool = False,
+    ) -> str:
+        """Flag first, then the terminal, then the default.
+
+        Anything the caller passed is used as-is, so a GUI can answer every
+        question up front. Without a terminal there is nobody to ask, so a
+        required question with no default and no flag is an error that names
+        the flag which would have answered it, rather than an EOFError
+        traceback. `flag` is passed explicitly rather than derived from the
+        label, because deriving it produced things like
+        "--redis-username-[blank-if-none]".
+        """
+        if supplied not in (None, ""):
+            return str(supplied)
+        if not interactive:
+            if default or optional:
+                return default
+            raise RuntimeError(
+                f"{label} is required for a remote setup and no terminal is "
+                f"available to ask. Pass it with {flag}."
+            )
+        suffix = f" [{default}]" if default else ""
+        return input(f"  {label}{suffix}: ").strip() or default
+
+    # What this Mac already knows, for a re-run. Setup is the documented repair
+    # path, so most runs are second runs.
+    existing = load_config() if CONFIG_FILE.exists() else {}
+
+    def secret(label: str, key: str, required: bool) -> str:
+        supplied = str(secrets.get(key) or "")
+        if supplied:
+            return supplied
+        # Blank does not mean blank. The menu bar deliberately never reads a
+        # password back out of config.json, so it sends an empty one on a
+        # re-run; taking that literally would overwrite a working password with
+        # nothing and break the install the user was trying to repair.
+        # Same server only. A stored password belongs to the Immich it was
+        # generated for, and a Mac being re-pointed at a different one would
+        # otherwise have the old stack's credential written as the new one:
+        # setup reports success, connectivity only opens a socket, and every
+        # job then fails on authentication with nothing saying why.
+        same_server = (
+            str(existing.get("db_hostname") or "") == db_hostname
+            and str(existing.get("db_port") or "") == str(db_port)
+        )
+        kept = str(existing.get(key) or "") if same_server else ""
+        if kept:
+            log.info("  %s: keeping the one already configured for %s", label, db_hostname)
+            return kept
+        if key in secrets or not interactive:
+            if required:
+                raise RuntimeError(
+                    f"{label} is required for a remote setup and none is stored. "
+                    f'Pass it as {{"{key}": "..."}} on stdin with --secrets-stdin.'
+                )
+            return ""
+        return getpass.getpass(f"  {label}: ").strip()
+
+    db_hostname = prompt("Postgres host", "localhost", getattr(args, "db_host", None), flag="--db-host")
+    db_port = prompt("Postgres port", "5432", getattr(args, "db_port", None), flag="--db-port")
+    db_username = prompt("Postgres user", "postgres", getattr(args, "db_user", None), flag="--db-user")
+    db_password = secret("Postgres password", "db_password", required=True)
+    db_name = prompt("Database name", "immich", getattr(args, "db_name", None), flag="--db-name")
+    redis_hostname = prompt(
+        "Redis host", db_hostname, getattr(args, "redis_host", None), flag="--redis-host"
+    )
+    redis_port = prompt("Redis port", "6379", getattr(args, "redis_port", None), flag="--redis-port")
+    redis_username = prompt(
+        "Redis username [blank if none]",
+        "",
+        getattr(args, "redis_user", None),
+        flag="--redis-user",
+        optional=True,
+    )
+    redis_password = secret("Redis password [blank if none]", "redis_password", required=False)
 
     # Probe Docker's view of the media root so we can surface mismatch
     # up-front rather than when thumbnails 404 (issue #19). Requires
     # API key — prompt for one if the user didn't pass it.
+    if not api_key:
+        api_key = str(secrets.get("api_key") or "")
     if not api_key:
         log.info("")
         log.info("Your Immich API key (Settings → API Keys in the web UI) lets us")
@@ -3617,7 +3781,11 @@ def _setup_remote(args):
             "detect Docker's media path and prevent thumbnail 404s in split setups."
         )
         log.info("Leave blank to skip the check.")
-        api_key = getpass.getpass("  Immich API key (optional): ").strip()
+        api_key = (
+            getpass.getpass("  Immich API key (optional): ").strip()
+            if interactive
+            else ""
+        )
 
     detected_prefix = _detect_docker_media_prefix(url, api_key) if api_key else None
     if detected_prefix:
@@ -3630,21 +3798,26 @@ def _setup_remote(args):
     else:
         default_mount = ""
 
-    upload_mount = prompt("Upload/media path (as mounted on this Mac)", default_mount)
+    upload_mount = prompt(
+        "Upload/media path (as mounted on this Mac)",
+        default_mount,
+        getattr(args, "upload_mount", None),
+        flag="--upload-mount",
+    )
 
     if api_key and upload_mount:
         if _warn_on_path_mismatch(url, api_key, upload_mount):
             # Real mismatch detected. Offer to abort so the user can
             # fix the topology before we save a broken config.
-            try:
-                answer = (
-                    input("  Save config anyway and fix later? [y/N] ").strip().lower()
+            # Defaults to no, including under --yes: saving a config whose
+            # media path provably does not match Docker's is not a default
+            # anyone wants taken on their behalf. The wizard's library step
+            # exists to stop this being reached at all.
+            if not _confirm("  Save config anyway and fix later? [y/N] ", default=False):
+                raise RuntimeError(
+                    "This Mac's media path does not resolve to the same files "
+                    "Immich sees. Fix the path or the mount, then run setup again."
                 )
-            except EOFError:
-                answer = "n"
-            if answer != "y":
-                log.info("Aborted. Re-run setup after fixing the path mapping.")
-                return
 
     # Check connectivity
     config = {
@@ -3654,8 +3827,10 @@ def _setup_remote(args):
         "redis_port": redis_port,
     }
     if not _validate_connectivity(config):
-        log.error("Cannot reach DB or Redis. Check the host/port and try again.")
-        return
+        raise RuntimeError(
+            "Cannot reach the database or Redis from this Mac. Check the host "
+            "and port, and that they are exposed to this machine."
+        )
 
     node, ffmpeg_path, ml_dir = _check_local_tools()
 
@@ -3829,6 +4004,14 @@ def _setup_ml_only(args) -> None:
 
 def cmd_setup(args):
     """Set up the accelerator. Dispatches to local, remote, manual, or ml-only mode."""
+    # Set before anything can prompt. getattr, because other entry points build
+    # a Namespace by hand and should not have to know about this flag.
+    global ASSUME_YES
+    ASSUME_YES = bool(getattr(args, "yes", False))
+
+    # Before anything is written, so a bad run is recoverable.
+    snapshot_config()
+
     if args.ml_only:
         _setup_ml_only(args)
     elif args.manual:
@@ -4185,6 +4368,130 @@ def reconcile_ml(config: dict) -> None:
         log.error("  ML restart failed")
 
 
+def _is_brew_install() -> bool:
+    return "/Cellar/immich-accelerator/" in str(Path(__file__).resolve())
+
+
+def _find_brew() -> str | None:
+    for p in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _autostart_state() -> tuple[bool, str]:
+    """(on, how). Two mechanisms, because installs differ.
+
+    A Homebrew install auto-starts through `brew services`, which survives
+    upgrades; a source install uses a plist we wrote. Asking "is it on" has to
+    check whichever one applies, or the switch in Settings lies.
+    """
+    if _is_brew_install():
+        brew = _find_brew()
+        if not brew:
+            return False, "brew"
+        out = subprocess.run(
+            [brew, "services", "list"], capture_output=True, text=True, timeout=20
+        ).stdout
+        for line in out.splitlines():
+            if line.startswith("immich-accelerator"):
+                return ("started" in line or "scheduled" in line), "brew"
+        return False, "brew"
+    plist = LAUNCH_AGENTS_DIR / "com.immich.accelerator.plist"
+    return plist.exists(), "launchd"
+
+
+def cmd_autostart(args):
+    """Turn "start on login" on or off, or report it. Not the same thing as the
+    menu-bar app's own login item, which only controls the icon."""
+    want = getattr(args, "state", None)
+    on, how = _autostart_state()
+    if want is None:
+        print("on" if on else "off")
+        return
+
+    turn_on = want == "on"
+    if how == "brew":
+        brew = _find_brew()
+        if not brew:
+            raise RuntimeError("Homebrew not found, so brew services can't be set.")
+        verb = "start" if turn_on else "stop"
+        r = subprocess.run(
+            [brew, "services", verb, "immich-accelerator"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"brew services {verb} failed: {r.stderr.strip()}")
+    else:
+        plist = LAUNCH_AGENTS_DIR / "com.immich.accelerator.plist"
+        if turn_on:
+            src = Path(__file__).parent.parent / "launchd" / "com.immich.accelerator.plist"
+            if not src.exists():
+                raise RuntimeError("No launch agent template to install.")
+            content = src.read_text()
+            content = content.replace(
+                "/path/to/immich-apple-silicon", str(Path(__file__).parent.parent.resolve())
+            ).replace("/opt/homebrew/bin/python3", sys.executable)
+            plist.parent.mkdir(parents=True, exist_ok=True)
+            plist.write_text(content)
+            subprocess.run(["launchctl", "load", str(plist)], capture_output=True, timeout=20)
+        else:
+            # bootout, not just unlink: removing the file leaves the job
+            # registered and running until the next reboot.
+            uid = os.getuid()
+            subprocess.run(
+                ["launchctl", "bootout", f"gui/{uid}/com.immich.accelerator"],
+                capture_output=True, timeout=20,
+            )
+            plist.unlink(missing_ok=True)
+    log.info("Start at login: %s", "on" if turn_on else "off")
+
+
+def cmd_detect(_args):
+    """Report what Immich this Mac can see, as JSON. Changes nothing.
+
+    Exists for the setup wizard, which needs to know whether Immich is running
+    here in Docker or somewhere else. The app used to answer that by assumption:
+    it always passed --url, which routed every user down the remote path and
+    made the local Docker flow unreachable from the GUI entirely. Detection
+    belongs next to the code that acts on it, so the two cannot drift.
+
+    Deliberately never raises for "nothing found": absence is an answer the
+    caller has to render, not an error. Only the JSON goes to stdout, so the
+    caller can parse it without filtering log lines.
+    """
+    out: dict = {
+        "configured": CONFIG_FILE.exists(),
+        "docker": None,
+        "local": None,
+    }
+    docker = None
+    try:
+        docker = find_docker()
+        out["docker"] = docker
+    except RuntimeError as e:
+        out["docker_error"] = str(e)
+
+    if docker:
+        try:
+            info = detect_immich(docker)
+            out["local"] = {
+                "container": info.get("container"),
+                "version": info.get("version"),
+                "media_location": info.get("media_location"),
+                "workers_include": info.get("workers_include"),
+                "ml_url": info.get("ml_url"),
+                # The API is published on the host by every compose we generate
+                # and by Immich's own; the wizard shows this for confirmation
+                # rather than treating it as gospel.
+                "url": "http://localhost:2283",
+            }
+        except RuntimeError as e:
+            out["local_error"] = str(e)
+
+    print(json.dumps(out, indent=2))
+
+
 def reconcile_components(config: dict) -> None:
     """Make the running state match the config for every component the caller
     is responsible for, except the worker.
@@ -4242,11 +4549,7 @@ def _find_ml_dir() -> Path | None:
         log.warning("  Install with: brew install python@3.11")
         return None
 
-    try:
-        answer = input("  Set up ML service venv? [Y/n] ").strip().lower()
-    except EOFError:
-        return None
-    if answer and answer != "y":
+    if not _confirm("  Set up ML service venv? [Y/n] "):
         return None
 
     log.info("  Creating venv with %s...", python)
@@ -5597,6 +5900,9 @@ def cmd_component(args):
     happen is Immich's job scheduler, not ours."""
     name = getattr(args, "name", None)
     state = getattr(args, "state", None)
+    # Accept what the UI shows as well as what the config calls it.
+    if name:
+        name = COMPONENT_ALIASES.get(name, name)
 
     if not name:
         config = load_config()
@@ -5607,7 +5913,7 @@ def cmd_component(args):
                 detail = "disabled"
             else:
                 detail = "running" if running else "enabled, not running"
-            log.info("  %-10s %s", component, detail)
+            log.info("  %-14s %s", COMPONENT_LABELS[component], detail)
         return
 
     if name not in COMPONENTS:
@@ -5855,7 +6161,7 @@ def cmd_ml_test(_args):
 
 def cmd_uninstall(_args):
     """Remove services, data, and launchd config."""
-    plist = Path.home() / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
+    plist = LAUNCH_AGENTS_DIR / "com.immich.accelerator.plist"
     is_brew_install = "/Cellar/immich-accelerator/" in str(Path(__file__).resolve())
     ml_venv = Path(__file__).parent.parent / "ml" / "venv"
 
@@ -5938,13 +6244,13 @@ def cmd_uninstall(_args):
     log.info("  docker compose up -d")
 
 
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-5s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI, as one function so tests can use the real thing.
 
+    This lived inline in main(), and the test suite kept a hand-written copy of
+    it to parse against. A duplicated parser drifts silently: a flag added here
+    and not there is a test asserting the behaviour of a CLI nobody ships.
+    """
     parser = argparse.ArgumentParser(
         prog="immich-accelerator",
         description="Immich Accelerator — native macOS microservices worker",
@@ -5971,6 +6277,37 @@ def main():
         "--ml-only",
         action="store_true",
         help="Set up this Mac as an ML-only network compute node (no worker, no DB)",
+    )
+    # Everything --url setup asks for interactively, so the menu-bar app can
+    # complete a split deployment itself. The app must never tell a user to go
+    # finish the job in Terminal: a GUI that hands off is a GUI that failed.
+    #
+    # No password flag on purpose. Anything in argv is visible to every process
+    # on the machine via ps; --secrets-stdin takes them on a pipe instead.
+    for flag, helptext in [
+        ("--db-host", "Postgres host reachable from this Mac"),
+        ("--db-port", "Postgres port (default 5432)"),
+        ("--db-user", "Postgres user (default postgres)"),
+        ("--db-name", "Postgres database name (default immich)"),
+        ("--redis-host", "Redis host (defaults to the Postgres host)"),
+        ("--redis-port", "Redis port (default 6379)"),
+        ("--redis-user", "Redis username, if the server needs one"),
+        ("--upload-mount", "Path on THIS Mac that resolves to Immich's media root"),
+        ("--photos-path", "Existing photo library to import, when creating a new Immich"),
+        ("--data-path", "Where a newly created Immich should store its data"),
+    ]:
+        setup_p.add_argument(flag, help=helptext)
+    setup_p.add_argument(
+        "--secrets-stdin",
+        action="store_true",
+        help="Read {\"db_password\": ..., \"redis_password\": ...} as JSON on stdin, "
+        "so passwords never appear in the process list",
+    )
+    setup_p.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Take the default answer to every yes/no prompt (for scripts and the menu-bar app)",
     )
     start_p = sub.add_parser("start", help="Start native worker + ML")
     start_p.add_argument("--force", action="store_true", help="Restart if running")
@@ -6001,8 +6338,28 @@ def main():
         "ml-test",
         help="Diagnose the ML service (health + CLIP + OCR round-trip)",
     )
+    auto_p = sub.add_parser(
+        "autostart",
+        help="Start the accelerator at login (on/off; omit to report)",
+    )
+    auto_p.add_argument("state", nargs="?", choices=["on", "off"])
+    sub.add_parser(
+        "detect",
+        help="Report what Immich this Mac can see, as JSON (used by the setup wizard)",
+    )
     sub.add_parser("uninstall", help="Remove services, data, and launchd config")
 
+    return parser
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-5s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = build_parser()
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -6020,6 +6377,8 @@ def main():
             "dashboard": cmd_dashboard,
             "component": cmd_component,
             "ml-test": cmd_ml_test,
+            "detect": cmd_detect,
+            "autostart": cmd_autostart,
             "uninstall": cmd_uninstall,
         }[args.command](args)
     except RuntimeError as e:

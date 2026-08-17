@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import signal
@@ -730,32 +731,15 @@ class TestCLIParsing:
         assert exc.value.code == 1
 
     def _build_parser(self):
-        """Build the same parser as main() for testing."""
-        parser = argparse.ArgumentParser(prog="immich-accelerator")
-        parser.add_argument("--version", action="version", version="test")
-        sub = parser.add_subparsers(dest="command")
+        """The real parser, not a copy of it.
 
-        setup_p = sub.add_parser("setup")
-        setup_p.add_argument("--url")
-        setup_p.add_argument("--api-key")
-        setup_p.add_argument("--manual", action="store_true")
-        setup_p.add_argument("--import-server", metavar="DIR")
-        setup_p.add_argument("--ml-only", action="store_true")
-        start_p = sub.add_parser("start")
-        start_p.add_argument("--force", action="store_true")
-        sub.add_parser("stop")
-        sub.add_parser("status")
-        logs_p = sub.add_parser("logs")
-        logs_p.add_argument(
-            "service", nargs="?", choices=["worker", "ml"], default="worker"
-        )
-        sub.add_parser("update")
-        sub.add_parser("watch")
-        dash_p = sub.add_parser("dashboard")
-        dash_p.add_argument("state", nargs="?", choices=["on", "off"])
-        dash_p.add_argument("--port", type=int, default=8420)
-        sub.add_parser("uninstall")
-        return parser
+        This used to hand-rebuild the whole CLI, which meant a flag added to
+        __main__ and not here produced tests asserting the behaviour of a CLI
+        nobody ships. build_parser() exists so there is one definition.
+        """
+        import immich_accelerator.__main__ as m
+
+        return m.build_parser()
 
 
 # ---------------------------------------------------------------------------
@@ -2875,6 +2859,443 @@ class TestWatchDispatch:
             assert m._watch_without_worker({"worker": False}) == m._SWITCH
 
 
+class TestSetupFailuresAreVisibleToTheApp:
+    """The menu bar has only the exit code to go on.
+
+    Several aborts logged an error and returned, which exits 0, so the wizard
+    reported success and moved the user to "Checking it works" when no config
+    had been written at all.
+    """
+
+    def test_unreachable_database_is_an_error(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        args = argparse.Namespace(
+            url="http://nas:2283", api_key="", db_host="nas", db_port="5432",
+            db_user="postgres", db_name="immich", redis_host="nas",
+            redis_port="6379", redis_user="", upload_mount="/v/p",
+            secrets_stdin=True, yes=True, import_server=None, manual=False,
+            ml_only=False, photos_path=None, data_path=None,
+        )
+        with patch.object(m, "ASSUME_YES", True), patch.object(
+            m, "_query_immich_api", return_value={"version": "3.0.2"}
+        ), patch.object(m.sys, "stdin", io.StringIO('{"db_password": "p"}')), patch.object(
+            m, "_detect_docker_media_prefix", return_value=None
+        ), patch.object(m, "_warn_on_path_mismatch", return_value=False), patch.object(
+            m, "_validate_connectivity", return_value=False
+        ), patch.object(m, "log"):
+            with pytest.raises(RuntimeError) as e:
+                m._setup_remote(args)
+        assert "database" in str(e.value).lower()
+
+    def test_a_media_path_mismatch_is_an_error(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        args = argparse.Namespace(
+            url="http://nas:2283", api_key="k", db_host="nas", db_port="5432",
+            db_user="postgres", db_name="immich", redis_host="nas",
+            redis_port="6379", redis_user="", upload_mount="/v/p",
+            secrets_stdin=True, yes=True, import_server=None, manual=False,
+            ml_only=False, photos_path=None, data_path=None,
+        )
+        with patch.object(m, "ASSUME_YES", True), patch.object(
+            m, "_query_immich_api", return_value={"version": "3.0.2"}
+        ), patch.object(m.sys, "stdin", io.StringIO('{"db_password": "p"}')), patch.object(
+            m, "_detect_docker_media_prefix", return_value="/data/immich"
+        ), patch.object(m, "_warn_on_path_mismatch", return_value=True), patch.object(
+            m, "log"
+        ):
+            with pytest.raises(RuntimeError) as e:
+                m._setup_remote(args)
+        assert "media path" in str(e.value).lower()
+
+
+class TestRerunKeepsStoredSecrets:
+    """The wizard never reads a password back out of config.json, on purpose,
+    so on a re-run it sends an empty one. Taking that literally would overwrite
+    a working password with nothing, breaking the install the user was trying
+    to repair. Found before shipping by asking what a re-run on a real Mac
+    would actually write."""
+
+    ARGS = dict(
+        url="http://nas.local:2283", api_key="", db_host="nas.local", db_port="5432",
+        db_user="postgres", db_name="immich", redis_host="nas.local",
+        redis_port="6379", redis_user="", upload_mount="/Volumes/photos",
+        secrets_stdin=True, yes=True, import_server=None, manual=False, ml_only=False,
+        photos_path=None, data_path=None,
+    )
+
+    def _run(self, m, stdin_text):
+        args = argparse.Namespace(**self.ARGS)
+        with patch.object(m, "ASSUME_YES", True), patch.object(
+            m, "download_immich_server", return_value=Path("/tmp/s")
+        ), patch.object(m, "_query_immich_api", return_value={"version": "3.0.2"}
+        ), patch.object(m.sys, "stdin", io.StringIO(stdin_text)), patch.object(
+            m, "_detect_docker_media_prefix", return_value=None
+        ), patch.object(m, "_warn_on_path_mismatch", return_value=False), patch.object(
+            m, "_validate_connectivity", return_value=True
+        ), patch.object(m, "_check_local_tools", return_value=("/usr/bin/node", None, None)
+        ), patch.object(m, "find_docker", side_effect=RuntimeError("no docker")
+        ), patch.object(m, "_finalize_config") as fin, patch.object(m, "log"):
+            m._setup_remote(args)
+        return fin.call_args[0][0]
+
+    def test_an_empty_password_keeps_the_stored_one(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        m.save_config({
+            "db_hostname": "nas.local", "db_port": "5432",
+            "db_password": "original", "redis_password": "rpw",
+        })
+        cfg = self._run(m, json.dumps({"db_password": "", "redis_password": ""}))
+        assert cfg["db_password"] == "original", "a re-run wiped the database password"
+
+    def test_a_different_server_does_not_inherit_the_password(self, tmp_data_dir):
+        """Re-pointing a Mac at another Immich must not reuse the old stack's
+        credential. Setup would report success, connectivity only opens a
+        socket, and every job would then fail on authentication."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({
+            "db_hostname": "old-box", "db_port": "5432", "db_password": "old-secret",
+        })
+        with pytest.raises(RuntimeError) as e:
+            self._run(m, json.dumps({"db_password": ""}))
+        assert "--secrets-stdin" in str(e.value)
+
+    def test_a_supplied_password_still_wins(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"db_hostname": "nas.local", "db_port": "5432", "db_password": "original"})
+        cfg = self._run(m, json.dumps({"db_password": "changed", "redis_password": ""}))
+        assert cfg["db_password"] == "changed"
+
+    def test_nothing_stored_and_nothing_supplied_is_still_an_error(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with pytest.raises(RuntimeError) as e:
+            self._run(m, json.dumps({"db_password": ""}))
+        assert "--secrets-stdin" in str(e.value)
+
+
+class TestConfigIsNeverSilentlyLost:
+    """Re-running setup is the documented repair, and the menu bar makes it a
+    button, so config rewrites are routine. Nothing kept the version being
+    replaced, which made a bad re-run unrecoverable unless the user had thought
+    to press Back Up first."""
+
+    def test_the_config_from_before_the_run_is_kept(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"immich_url": "http://first"})
+        m.snapshot_config()
+        m.save_config({"immich_url": "http://second"})
+
+        previous = tmp_data_dir["config_file"].with_name("config.json.previous")
+        assert previous.is_file(), "the replaced config was not kept"
+        assert json.loads(previous.read_text())["immich_url"] == "http://first"
+        assert m.load_config()["immich_url"] == "http://second"
+
+    def test_a_run_that_writes_repeatedly_keeps_the_original(self, tmp_data_dir):
+        """Setup saves several times per run. Rotating on every write meant the
+        good copy was destroyed by the first of those writes."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"immich_url": "http://before"})
+        m.snapshot_config()
+        for i in range(3):
+            m.save_config({"immich_url": f"http://during-{i}"})
+        previous = tmp_data_dir["config_file"].with_name("config.json.previous")
+        assert json.loads(previous.read_text())["immich_url"] == "http://before"
+
+    def test_the_backup_is_not_world_readable(self, tmp_data_dir):
+        """It holds the same database password and API key as the original."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"api_key": "secret"})
+        m.snapshot_config()
+        previous = tmp_data_dir["config_file"].with_name("config.json.previous")
+        assert oct(previous.stat().st_mode)[-3:] == "600"
+
+    def test_a_first_save_needs_no_backup(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        m.snapshot_config()
+        m.save_config({"immich_url": "http://only"})
+        assert not tmp_data_dir["config_file"].with_name("config.json.previous").exists()
+
+    def test_an_unwritable_backup_does_not_block_the_save(self, tmp_data_dir):
+        """A config that cannot be written is a broken install. A backup that
+        cannot be written is not, and must not become one."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"immich_url": "http://first"})
+        with patch.object(m.shutil, "copy2", side_effect=OSError("read-only")):
+            m.snapshot_config()
+            m.save_config({"immich_url": "http://second"})
+        assert m.load_config()["immich_url"] == "http://second"
+
+
+class TestFreshInstallFromTheApp:
+    """Creating a new Immich needs two answers, and it must not invent them.
+
+    From the menu bar there is no terminal, and the old code took EOFError as
+    "no" and gave up, so the from-scratch flow simply did not exist in the app.
+    Routing it through --yes would have been worse: it would have said yes and
+    then built a whole Immich stack around ~/Pictures and a default data dir
+    the user never picked, which re-running setup does not undo.
+    """
+
+    def test_refuses_rather_than_guessing_when_nothing_can_be_asked(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m.sys.stdin, "isatty", return_value=False):
+            with pytest.raises(RuntimeError) as e:
+                m._fresh_install("/usr/bin/docker")
+        said = str(e.value)
+        assert "--photos-path" in said and "--data-path" in said
+
+    def test_supplied_paths_skip_the_prompts(self, tmp_data_dir, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        photos = tmp_path / "photos"; photos.mkdir()
+        data = tmp_path / "data"
+        with patch.object(m.sys.stdin, "isatty", return_value=False), patch.object(
+            m, "ASSUME_YES", True
+        ), patch.object(m, "_ensure_docker_running"), patch(
+            "builtins.input", side_effect=AssertionError("must not prompt")
+        ), patch.object(m, "log"):
+            try:
+                m._fresh_install("/usr/bin/docker", str(photos), str(data))
+            except AssertionError:
+                raise
+            except Exception:
+                # Anything past the prompts (compose, docker) is out of scope;
+                # not prompting is the whole assertion.
+                pass
+        assert data.is_dir(), "the data directory should have been created"
+
+
+class TestSetupWithoutPkgConfig:
+    """Reported by @pl4za: setup died on a Mac with no pkg-config.
+
+    _ensure_vips uses pkg-config only as a fallback for a libvips somewhere
+    unusual, but the call was unguarded, so FileNotFoundError propagated out of
+    a check whose whole job is to answer "is vips here" and took setup with it.
+    """
+
+    def test_missing_pkg_config_does_not_abort_setup(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m.os.path, "isfile", return_value=False), patch.object(
+            m.subprocess, "run", side_effect=FileNotFoundError("pkg-config")
+        ), patch.object(m, "_brew_install", return_value=True) as install:
+            m._ensure_vips()   # must not raise
+        install.assert_called_once_with("vips")
+
+    def test_pkg_config_finding_vips_is_still_enough(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        ok = subprocess.CompletedProcess(["pkg-config"], 0, b"", b"")
+        with patch.object(m.os.path, "isfile", return_value=False), patch.object(
+            m.subprocess, "run", return_value=ok
+        ), patch.object(m, "_brew_install") as install:
+            m._ensure_vips()
+        install.assert_not_called()
+
+
+class TestComponentNaming:
+    """One thing, one name, in the UI and on the command line.
+
+    Settings, the menu bar and Diagnostics each called the worker something
+    different at one point, which is the confusion the rename set out to fix.
+    The config key and the CLI argument stay "worker" forever, because they are
+    in people's scripts and config files.
+    """
+
+    def test_every_component_has_a_label(self):
+        import immich_accelerator.__main__ as m
+
+        for c in m.COMPONENTS:
+            assert c in m.COMPONENT_LABELS, f"{c} has no display name"
+
+    def test_the_ui_name_works_on_the_command_line(self, tmp_data_dir):
+        """Someone who read "Microservices" in Settings should be able to type
+        it, rather than having to know it is spelled "worker" underneath."""
+        import immich_accelerator.__main__ as m
+
+        for alias, canonical in m.COMPONENT_ALIASES.items():
+            assert canonical in m.COMPONENTS
+            with patch.object(m, "_set_component", return_value=True) as setter:
+                m.cmd_component(argparse.Namespace(name=alias, state="on"))
+            assert setter.call_args[0][0] == canonical, (
+                f"{alias} did not resolve to {canonical}"
+            )
+
+    def test_the_canonical_names_still_work(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "_set_component", return_value=True) as setter:
+            m.cmd_component(argparse.Namespace(name="worker", state="off"))
+        assert setter.call_args[0][0] == "worker"
+
+
+class TestDetect:
+    """`detect` answers the wizard's topology question.
+
+    The wizard used to answer it by assumption, always passing --url, which
+    routed every user to the remote setup path and made the local Docker flow
+    unreachable from the app. Detection lives in the CLI so the thing that
+    decides and the thing that acts cannot drift apart.
+    """
+
+    def _run(self, m, capsys) -> dict:
+        m.cmd_detect(argparse.Namespace())
+        return json.loads(capsys.readouterr().out)
+
+    def test_reports_a_local_immich(self, tmp_data_dir, capsys):
+        import immich_accelerator.__main__ as m
+
+        found = {
+            "container": "immich_server",
+            "version": "3.0.2",
+            "media_location": "/nas/immich",
+            "workers_include": "api",
+            "ml_url": "http://host.docker.internal:3003",
+        }
+        with patch.object(
+            m, "find_docker", return_value="/usr/bin/docker"
+        ), patch.object(m, "detect_immich", return_value=found):
+            out = self._run(m, capsys)
+        assert out["local"]["version"] == "3.0.2"
+        assert out["local"]["media_location"] == "/nas/immich"
+        assert "local_error" not in out
+
+    def test_no_docker_is_an_answer_not_an_error(self, tmp_data_dir, capsys):
+        """A Mac with no Docker is the ML-only case, which is supported."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "find_docker", side_effect=RuntimeError("Docker not found")
+        ):
+            out = self._run(m, capsys)
+        assert out["docker"] is None
+        assert out["local"] is None
+        assert "Docker not found" in out["docker_error"]
+
+    def test_docker_without_immich_is_reported_distinctly(self, tmp_data_dir, capsys):
+        """Docker running but no Immich is a different fix from no Docker, so
+        the wizard has to be able to tell them apart."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "find_docker", return_value="/usr/bin/docker"
+        ), patch.object(
+            m, "detect_immich", side_effect=RuntimeError("No Immich server container")
+        ):
+            out = self._run(m, capsys)
+        assert out["docker"] == "/usr/bin/docker"
+        assert out["local"] is None
+        assert "No Immich server container" in out["local_error"]
+
+    def test_reports_whether_this_mac_is_already_configured(self, tmp_data_dir, capsys):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "find_docker", side_effect=RuntimeError("no docker")):
+            assert self._run(m, capsys)["configured"] is False
+            tmp_data_dir["config_file"].write_text("{}")
+            assert self._run(m, capsys)["configured"] is True
+
+    def test_output_is_only_json(self, tmp_data_dir, capsys):
+        """The wizard parses stdout, so a stray log line would break it."""
+        import immich_accelerator.__main__ as m
+
+        with patch.object(
+            m, "find_docker", return_value="/usr/bin/docker"
+        ), patch.object(m, "detect_immich", side_effect=RuntimeError("nope")):
+            m.cmd_detect(argparse.Namespace())
+        assert json.loads(capsys.readouterr().out)  # parses whole, no prefix
+
+
+class TestRemoteSetupIsFullyScriptable:
+    """The menu-bar app must be able to finish a split deployment itself.
+
+    A GUI that tells you to go run a command in Terminal has failed, so every
+    answer `--url` setup needs is available as a flag, and the two secrets come
+    in on a pipe rather than argv, which `ps` exposes to every process.
+    """
+
+    ARGS = dict(
+        url="http://nas.local:2283",
+        api_key="",
+        db_host="nas.local",
+        db_port="5432",
+        db_user="postgres",
+        db_name="immich",
+        redis_host="nas.local",
+        redis_port="6379",
+        redis_user="",
+        upload_mount="/Volumes/photos",
+        secrets_stdin=True,
+        yes=True,
+        import_server=None,
+        manual=False,
+        ml_only=False,
+    )
+
+    def _run(self, m, stdin_text: str, **over):
+        args = argparse.Namespace(**{**self.ARGS, **over})
+        # cmd_setup is what turns --yes into ASSUME_YES; calling the internal
+        # directly skips that, and without it _confirm falls through to input().
+        with patch.object(m, "ASSUME_YES", True), patch.object(
+            m, "download_immich_server", return_value=Path("/tmp/server")
+        ), patch.object(
+            m, "_query_immich_api", return_value={"version": "3.0.2"}
+        ), patch.object(m.sys, "stdin", io.StringIO(stdin_text)), patch.object(
+            m, "_detect_docker_media_prefix", return_value=None
+        ), patch.object(m, "_warn_on_path_mismatch", return_value=False), patch.object(
+            m, "_validate_connectivity", return_value=True
+        ), patch.object(m, "save_config"), patch.object(
+            m, "_check_local_tools", return_value=("/usr/bin/node", None, None)
+        ), patch.object(m, "_import_server", return_value=None), patch.object(
+            m, "find_docker", side_effect=RuntimeError("no docker")
+        ), patch.object(m, "_finalize_config") as saved, patch("builtins.input", side_effect=AssertionError("prompted with no terminal")):
+            m._setup_remote(args)
+        return saved
+
+    def test_completes_from_flags_without_prompting(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        saved = self._run(m, json.dumps({"db_password": "pw", "redis_password": ""}))
+        cfg = saved.call_args[0][0]
+        assert cfg["db_hostname"] == "nas.local"
+        assert cfg["db_password"] == "pw"
+        assert cfg["upload_mount"] == "/Volumes/photos"
+
+    def test_a_missing_password_names_how_to_supply_it(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        with pytest.raises(RuntimeError) as e:
+            self._run(m, "{}")
+        said = str(e.value)
+        assert "--secrets-stdin" in said
+        assert "Terminal" not in said, "the GUI must never be told to go to Terminal"
+
+    def test_secrets_never_travel_in_argv(self, tmp_data_dir):
+        """A password in argv is readable by every process on the machine."""
+        import immich_accelerator.__main__ as m
+
+        parser = m.build_parser()
+        setup = next(
+            a for a in parser._subparsers._group_actions[0].choices.items()
+            if a[0] == "setup"
+        )[1]
+        flags = {o for action in setup._actions for o in action.option_strings}
+        assert "--db-password" not in flags
+        assert "--redis-password" not in flags
+        assert "--secrets-stdin" in flags
+
+
 class TestReconcileML:
     """reconcile_ml: the ML half of the one-enforcement-point rule."""
 
@@ -3248,6 +3669,182 @@ class TestRestartWorkerDelegatesToTheWatcher:
         ) as kill:
             assert m._restart_worker("for a test") is True
             kill.assert_not_called()
+
+
+class TestConfirm:
+    """_confirm: the one place setup decides whether to ask.
+
+    This exists so the menu-bar app can run setup itself instead of handing the
+    user to Terminal and losing every signal about what happened.
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_flag(self):
+        import immich_accelerator.__main__ as m
+
+        m.ASSUME_YES = False
+        yield
+        m.ASSUME_YES = False
+
+    def test_asks_when_interactive(self):
+        import immich_accelerator.__main__ as m
+
+        with patch("builtins.input", return_value="y") as ask:
+            assert m._confirm("go? [Y/n] ") is True
+            ask.assert_called_once()
+
+    def test_empty_answer_takes_the_default(self):
+        import immich_accelerator.__main__ as m
+
+        with patch("builtins.input", return_value=""):
+            assert m._confirm("go? [Y/n] ", default=True) is True
+            assert m._confirm("go? [y/N] ", default=False) is False
+
+    def test_explicit_no_beats_the_default(self):
+        import immich_accelerator.__main__ as m
+
+        with patch("builtins.input", return_value="n"):
+            assert m._confirm("go? [Y/n] ", default=True) is False
+
+    def test_assume_yes_does_not_read_stdin(self):
+        import immich_accelerator.__main__ as m
+
+        m.ASSUME_YES = True
+        with patch("builtins.input", side_effect=AssertionError("must not ask")):
+            assert m._confirm("go? [Y/n] ", default=True) is True
+            assert m._confirm("go? [y/N] ", default=False) is False
+
+    def test_non_interactive_without_yes_refuses(self):
+        """The asymmetry, and it is deliberate.
+
+        Every one of these prompts already answered "no" on EOFError, and that
+        stays: a piped setup silently answering "yes, install a launch agent"
+        would be a nasty surprise. Refusing to act is the safe direction when
+        nobody is there to read the question. --yes is how you opt in.
+        """
+        import immich_accelerator.__main__ as m
+
+        with patch("builtins.input", side_effect=EOFError):
+            assert m._confirm("go? [Y/n] ", default=True) is False
+
+
+class TestSetupYesFlag:
+    """`setup --yes` is what makes an in-app setup possible at all."""
+
+    @pytest.fixture(autouse=True)
+    def reset_flag(self):
+        import immich_accelerator.__main__ as m
+
+        m.ASSUME_YES = False
+        yield
+        m.ASSUME_YES = False
+
+    def test_flag_parses_and_arms_the_module(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        args = m.build_parser().parse_args(["setup", "--ml-only", "--yes"])
+        assert args.yes is True
+        with patch.object(m, "_setup_ml_only") as setup:
+            m.cmd_setup(args)
+            setup.assert_called_once()
+        assert m.ASSUME_YES is True
+
+    def test_absent_flag_leaves_prompts_alone(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        args = m.build_parser().parse_args(["setup", "--ml-only"])
+        assert args.yes is False
+        with patch.object(m, "_setup_ml_only"):
+            m.cmd_setup(args)
+        assert m.ASSUME_YES is False
+
+    def test_ml_only_with_yes_starts_without_asking(self, tmp_data_dir):
+        """End to end through the real _finalize_config: the whole point is
+        that nothing blocks on stdin and the services actually come up."""
+        import immich_accelerator.__main__ as m
+
+        args = m.build_parser().parse_args(["setup", "--ml-only", "--yes"])
+        # subprocess is captured, not executed. `--yes` takes the default on
+        # "install as a system service", so this path now runs `launchctl
+        # load` where the old EOFError declined it. Patching LAUNCH_AGENTS_DIR
+        # puts the plist in a temp dir but does nothing about launchctl, which
+        # registers with the real user session; pytest then deletes the temp
+        # dir and the job stays registered against a file that is gone. That
+        # happened twice on real Macs before this was pinned down.
+        calls = []
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch.object(m, "_find_ml_dir", return_value=None), patch.object(
+            m, "cmd_start"
+        ) as start, patch.object(m, "log"), patch.object(
+            m.subprocess, "run", side_effect=fake_run
+        ), patch(
+            "builtins.input", side_effect=AssertionError("setup --yes must not ask")
+        ):
+            m.cmd_setup(args)
+
+        start.assert_called_once()
+        saved = m.load_config()
+        assert saved["worker"] is False
+        assert saved["ml"] is True
+
+        # Whatever it loads must live under the patched directory, never the
+        # user's own. This is the assertion the incident was missing.
+        for cmd in calls:
+            if isinstance(cmd, (list, tuple)) and "launchctl" in str(cmd[0]):
+                target = str(cmd[-1])
+                assert str(tmp_data_dir["launch_agents"]) in target, (
+                    f"launchctl aimed outside the test sandbox: {target}"
+                )
+
+    def test_yes_does_not_install_a_launch_agent_in_the_real_home(
+        self, tmp_data_dir, monkeypatch
+    ):
+        """The bug this flag caused, pinned.
+
+        Running the suite installed a live KeepAlive'd launch agent into the
+        developer's real ~/Library/LaunchAgents and left it crash-looping
+        every 10 seconds. The path was computed inline from Path.home(), so
+        the fixture never saw it; `input()` raising EOFError under pytest was
+        the only thing that had been preventing it, and --yes removed that.
+        """
+        import immich_accelerator.__main__ as m
+
+        real_home_agents = Path.home() / "Library" / "LaunchAgents"
+        before = (
+            set(real_home_agents.glob("com.immich.*"))
+            if real_home_agents.exists()
+            else set()
+        )
+
+        # Force the branch that installs it: a non-brew layout with the
+        # template present and no plist yet.
+        src = tmp_data_dir["data_dir"] / "launchd"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "com.immich.accelerator.plist").write_text("<plist/>")
+
+        args = m.build_parser().parse_args(["setup", "--ml-only", "--yes"])
+        with patch.object(m, "_find_ml_dir", return_value=None), patch.object(
+            m, "cmd_start"
+        ), patch.object(m, "log"), patch("subprocess.run"):
+            m.cmd_setup(args)
+
+        after = (
+            set(real_home_agents.glob("com.immich.*"))
+            if real_home_agents.exists()
+            else set()
+        )
+        assert after == before, f"setup wrote into the real home: {after - before}"
+
+    def test_the_fixture_isolates_the_launch_agents_dir(self, tmp_data_dir):
+        """Derived, so the next path someone computes inline is caught here."""
+        import immich_accelerator.__main__ as m
+
+        assert m.LAUNCH_AGENTS_DIR == tmp_data_dir["launch_agents"]
+        assert Path.home() not in m.LAUNCH_AGENTS_DIR.parents
 
 
 class TestSetupReestablishesComponents:

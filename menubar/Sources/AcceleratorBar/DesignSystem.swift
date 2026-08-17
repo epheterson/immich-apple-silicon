@@ -33,6 +33,12 @@ enum Metrics {
     /// of checks, and scrolling a list is not a defect.
     static let settingsWidth: CGFloat = 700
     static let settingsHeight: CGFloat = 480
+    /// The setup wizard. Wider than Settings because its steps carry
+    /// explanatory prose and a live log pane, and taller so the log does not
+    /// squeeze the buttons off the bottom.
+    static let wizardWidth: CGFloat = 620
+    static let wizardHeight: CGFloat = 560
+
     /// Wide enough for "Machine Learning" beside its glyph. At 190 it
     /// truncated to "Machine Le...", which is the sort of thing that only
     /// shows up when you render the window and look at it.
@@ -110,9 +116,9 @@ struct WindowTitle: NSViewRepresentable {
             guard let window = view.window else { return }
             window.title = title
             // Keep the title as the window's identity (Mission Control, the
-            // Window menu, screenshots) but stop the title bar drawing it, or
-            // it shows twice: once leading from AppKit and once centered from
-            // the .principal toolbar item.
+            // Window menu, screenshots) but stop the title bar drawing it: the
+            // pane name is drawn as a content header instead, and AppKit's
+            // leading copy would be a second title saying the same thing.
             window.titleVisibility = .hidden
         }
     }

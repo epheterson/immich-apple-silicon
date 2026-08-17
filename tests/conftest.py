@@ -7,7 +7,40 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import subprocess
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def no_real_machine_state(monkeypatch):
+    """Fail any test that tries to mutate this machine's launchd or brew.
+
+    Patching a path is not isolation when the command still targets the real
+    system. tmp_data_dir redirects LAUNCH_AGENTS_DIR so the plist lands in a
+    temp dir, but `launchctl load` registers it with the actual user session,
+    and pytest then deletes the directory: the job stays registered forever
+    pointing at a file that no longer exists. That has now happened twice on a
+    real Mac, once leaving a crash-looping agent behind.
+
+    This is deliberately a hard failure rather than a silent no-op. A test that
+    reaches launchctl is testing something it did not mean to, and should say
+    so.
+    """
+    real_run = subprocess.run
+
+    def guarded(cmd, *a, **kw):
+        first = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else cmd
+        name = str(first).rsplit("/", 1)[-1]
+        if name in {"launchctl", "brew"}:
+            raise AssertionError(
+                f"test tried to run {name!r} against the real machine. "
+                "Patch the call, or the caller, instead."
+            )
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", guarded)
+    yield
 
 
 @pytest.fixture
@@ -24,6 +57,13 @@ def tmp_data_dir(tmp_path):
     timeout, or the watcher's worker restart stalls for the length of the
     suite and Immich sits with no worker while the tests pass.
 
+    LAUNCH_AGENTS_DIR is the same trap with worse consequences. `setup --yes`
+    under pytest installed a live, KeepAlive'd launch agent into the real
+    ~/Library/LaunchAgents and left it crash-looping every 10 seconds. That
+    hole predates --yes: the prompt used to raise EOFError under pytest and
+    default to no, so nothing was written and nobody noticed. Adding a flag
+    that answers yes turned a dormant isolation gap into a live one.
+
     Same class of trap as read_pid's global process scan: the fixture looks
     isolating and is not.
     """
@@ -35,6 +75,10 @@ def tmp_data_dir(tmp_path):
     log_dir.mkdir()
     config_file = data_dir / "config.json"
     lock_file = data_dir / "start.lock"
+    managed_docker = data_dir / "docker"
+    native_cache = tmp_path / ".cache" / "immich-ml-native"
+    launch_agents = tmp_path / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True)
 
     with patch.multiple(
         "immich_accelerator.__main__",
@@ -43,6 +87,14 @@ def tmp_data_dir(tmp_path):
         PID_DIR=pid_dir,
         LOG_DIR=log_dir,
         LOCK_FILE=lock_file,
+        LAUNCH_AGENTS_DIR=launch_agents,
+        # Both are computed from Path.home() at import time, so patching
+        # DATA_DIR alone leaves them aimed at the real directories. That is
+        # how a test wrote a docker-compose into a live install and how the
+        # launchd incidents happened: a constant derived once at import is
+        # invisible to a fixture that patches only its parent.
+        MANAGED_DOCKER_DIR=managed_docker,
+        NATIVE_CACHE=native_cache,
         # reconcile_ml's "has it been quiet too long" timer. Module state, so a
         # test that leaves it set decides the outcome of the next one; patching
         # it here means every test starts from "no silence recorded yet".
@@ -54,6 +106,8 @@ def tmp_data_dir(tmp_path):
             "pid_dir": pid_dir,
             "log_dir": log_dir,
             "lock_file": lock_file,
+            "launch_agents": launch_agents,
+            "managed_docker": managed_docker,
         }
 
 

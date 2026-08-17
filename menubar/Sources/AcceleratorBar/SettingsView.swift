@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The settings window: a sidebar and a grouped `Form`, which is what a macOS
@@ -80,10 +81,28 @@ struct SettingsView: View {
     @State private var applyingComponent: String?
     @State private var componentError: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
+    @State private var autostartOn = false
+    @State private var configNote: String?
+    @State private var configFailed = false
+
+    /// Diagnostics is not a place you go, it is what appears when something
+    /// is wrong. As a permanent tab it was eight rows of green ticks, which is
+    /// a debug dump in a nice frame: when every row is a tick, the ticks carry
+    /// no information. It earns its place in the list only when a check fails,
+    /// or while you are standing in it.
+    private var visiblePanes: [Pane] {
+        Pane.allCases.filter { $0 != .diagnostics || somethingIsWrong || pane == .diagnostics }
+    }
+
+    private var somethingIsWrong: Bool {
+        if model.snap.overall != .running { return true }
+        return Diagnostics.checks(config: config, snap: model.snap)
+            .contains { $0.level == .fail }
+    }
 
     var body: some View {
         NavigationSplitView {
-            List(Pane.allCases, selection: $pane) { p in
+            List(visiblePanes, selection: $pane) { p in
                 Label {
                     Text(p.title)
                 } icon: {
@@ -102,17 +121,21 @@ struct SettingsView: View {
             // can be left in a state with no way back to the other panes.
             .toolbar(removing: .sidebarToggle)
         } detail: {
-            detail
-                // .principal is the supported way to center content in the
-                // title bar. navigationTitle lands centered on macOS 15 but
-                // leading on macOS 26 (the release gate runs 26), and neither
-                // setting NSWindow.title nor dropping the toolbar moved it,
-                // because the split view places its own title.
-                .toolbar {
-                    ToolbarItem(placement: .principal) {
-                        Text(pane?.title ?? "Settings").font(.headline)
-                    }
-                }
+            // The pane name is a header in the content, the way System
+            // Settings does it, rather than a .principal toolbar item.
+            // macOS 26 gives toolbar items a glass backdrop, so the centered
+            // title sat inside a visible capsule; suppressing that needs a
+            // 26-only API, and CI builds against the 15 SDK. Drawing it here
+            // is version-proof and matches the platform besides.
+            VStack(alignment: .leading, spacing: 0) {
+                Text(pane?.title ?? "Settings")
+                    .font(.title2.weight(.semibold))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Metrics.xl)
+                    .padding(.top, Metrics.lg)
+                    .padding(.bottom, Metrics.sm)
+                detail
+            }
         }
         // Still set on the window, so the title is right in Mission Control,
         // the Window menu and any screenshot of the title bar.
@@ -133,6 +156,10 @@ struct SettingsView: View {
     }
 
     private func load() {
+        // Read the real state rather than assume: the service can be turned on
+        // or off from the terminal, and a switch showing the wrong thing is
+        // worse than no switch.
+        Task { autostartOn = await Actions.autostartEnabled() }
         config = StatusModel.readConfig()
         savedEngine = (config["ml_engine"] as? String) ?? "native"
         engine = savedEngine
@@ -162,17 +189,25 @@ struct SettingsView: View {
                 LabeledContent("Immich", value: immichSummary)
             }
 
-            Section {
-                Toggle("Launch menu bar at login", isOn: $launchAtLogin)
+            // Two separate things that were one switch. The icon and the
+            // service have nothing to do with each other: quitting the app
+            // does not stop your photos being processed, and turning the
+            // service off does not remove the icon. One switch could only ever
+            // describe one of them, so it described the icon and a footnote
+            // apologised for the rest.
+            Section("Startup") {
+                Toggle("Run accelerator as a background service", isOn: $autostartOn)
+                    .onChange(of: autostartOn) { _, on in
+                        Task { await Actions.setAutostart(on) }
+                    }
+                Toggle("Show menu bar icon at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
-            } header: {
-                Text("Startup")
             } footer: {
-                // The distinction people actually get wrong: this switch is
-                // about the menu bar icon, not about whether photos get
-                // processed. The background service is brew's, and it runs
-                // whether or not anyone is logged in.
-                Text("The accelerator itself runs as a background service and is unaffected by this.")
+                // Says what it does. brew services has no "keep running but
+                // do not start next time": turning it off stops the service
+                // now as well, and a switch labelled "at login" that silently
+                // stops your processing is worse than a longer label.
+                Text("Turning this off stops the accelerator now, as well as at login.")
                     .font(.rowDetail).foregroundStyle(.secondary)
             }
 
@@ -197,9 +232,64 @@ struct SettingsView: View {
                         Button("Open Logs") { Actions.openLogs() }
                     }
                 }
+                LabeledContent("Configuration") {
+                    HStack(spacing: Metrics.md) {
+                        Button("Back Up…") { backupConfig() }
+                            .disabled(!Paths.isConfigured)
+                        Button("Restore…") { restoreConfig() }
+                    }
+                }
+                LabeledContent("Setup") {
+                    Button("Run Setup Again…") {
+                        WindowManager.shared.showOnboarding(model: model)
+                    }
+                }
+            } footer: {
+                if let configNote {
+                    Text(configNote).font(.rowDetail)
+                        .foregroundStyle(configFailed ? .red : .secondary)
+                } else {
+                    // The API key lives in this file, which is why the backup
+                    // goes wherever the user points it rather than to a fixed
+                    // path they might not think about.
+                    Text("The backup includes your API key. Keep it somewhere you would keep a password.")
+                        .font(.rowDetail).foregroundStyle(.secondary)
+                }
             }
         }
         .formStyle(.grouped)
+    }
+
+    private func backupConfig() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "immich-accelerator-config.json"
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try Actions.backupConfig(to: url)
+            configFailed = false
+            configNote = "Backed up to \(url.lastPathComponent)."
+        } catch {
+            configFailed = true
+            configNote = "Could not back up: \(error.localizedDescription)"
+        }
+    }
+
+    private func restoreConfig() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try Actions.restoreConfig(from: url)
+            config = StatusModel.readConfig()
+            load()
+            configFailed = false
+            configNote = "Restored. Restart the accelerator for it to take effect."
+        } catch {
+            configFailed = true
+            configNote = "Could not restore: \(error.localizedDescription)"
+        }
     }
 
     private var immichSummary: String {
@@ -215,11 +305,11 @@ struct SettingsView: View {
     private var componentsTab: some View {
         Form {
             Section {
-                componentToggle("worker", $workerOn, "Worker",
+                componentToggle("worker", $workerOn, "Microservices",
                                 "Thumbnails, video transcoding, metadata")
                 componentToggle("ml", $mlOn, "Machine Learning",
                                 "Search, faces, OCR")
-                componentToggle("dashboard", $dashboardOn, "Web dashboard",
+                componentToggle("dashboard", $dashboardOn, "Web Dashboard",
                                 dashboardStatus)
             } footer: {
                 // No section header. The window title already says

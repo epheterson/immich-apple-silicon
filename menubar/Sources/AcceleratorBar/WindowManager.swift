@@ -20,7 +20,7 @@ final class WindowManager: NSObject {
     func showOnboarding(model: StatusModel) {
         dismissMenuBarPanel()
         onboarding = present(onboarding, title: "Immich Accelerator Setup",
-                             view: OnboardingView(model: model))
+                             view: SetupWizard(model: model))
     }
 
     func showSettings(model: StatusModel) {

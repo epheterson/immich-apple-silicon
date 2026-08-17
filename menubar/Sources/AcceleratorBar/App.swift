@@ -17,6 +17,80 @@ struct AcceleratorBarMain {
             printStatus()
             return
         }
+        // `probe-library <path>` exposes the library check to the shell, the
+        // same reason `status` and `render` exist: the wizard's answers should
+        // be verifiable on a real machine without driving the GUI.
+        // What a re-run would prefill. Reads the config and applies the same
+        // mapping the wizard does, without building the view model: that is
+        // @MainActor and needs a running loop, which a one-shot CLI has not
+        // got, and it hung.
+        if CommandLine.arguments.contains("wizard-state") {
+            guard let cfg = Actions.existingConfig() else {
+                print("no config at \(Paths.configFile.path) — this would be a first run")
+                return
+            }
+            func str(_ k: String) -> String {
+                if let v = cfg[k] as? String { return v }
+                if let v = cfg[k] as? Int { return String(v) }
+                return ""
+            }
+            let micro = (cfg["worker"] as? Bool) ?? !((cfg["ml_only"] as? Bool) ?? false)
+            let ml = (cfg["ml"] as? Bool) ?? true
+            let url = str("immich_url")
+            print("""
+            rerun=true
+            microservices=\(micro) machineLearning=\(ml)
+            location=\(url.isEmpty ? "here" : "remote")
+            url=\(url)
+            apiKey=\(str("api_key").isEmpty ? "(blank)" : "(\(str("api_key").count) chars)")
+            db=\(str("db_username"))@\(str("db_hostname")):\(str("db_port"))/\(str("db_name"))
+            redis=\(str("redis_hostname")):\(str("redis_port"))
+            media=\(str("upload_mount"))
+            """)
+            return
+        }
+        if let i = CommandLine.arguments.firstIndex(of: "probe-port"),
+           CommandLine.arguments.count > i + 1 {
+            let parts = CommandLine.arguments[i + 1].split(separator: ":")
+            let sem = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var ok = false
+            Task {
+                ok = await Actions.probePort(
+                    host: String(parts.first ?? ""), port: String(parts.last ?? ""))
+                sem.signal()
+            }
+            while sem.wait(timeout: .now()) == .timedOut {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+            print(ok ? "OPEN" : "CLOSED")
+            return
+        }
+        if CommandLine.arguments.contains("discover-libraries") {
+            let sem = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var out: [String] = []
+            Task { out = await Actions.discoverLibraries(); sem.signal() }
+            while sem.wait(timeout: .now()) == .timedOut {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+            print(out.isEmpty ? "(none found)" : out.joined(separator: "\n"))
+            return
+        }
+        if let i = CommandLine.arguments.firstIndex(of: "probe-library"),
+           CommandLine.arguments.count > i + 1 {
+            let path = CommandLine.arguments[i + 1]
+            let sem = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var out = ""
+            Task {
+                let r = await Actions.probeLibrary(path)
+                out = "\(r.ok ? "OK" : "NO") \(r.note)"
+                sem.signal()
+            }
+            while sem.wait(timeout: .now()) == .timedOut {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+            print(out)
+            return
+        }
         if let i = CommandLine.arguments.firstIndex(of: "render"),
            CommandLine.arguments.count > i + 2 {
             renderSettings(pane: CommandLine.arguments[i + 1],
@@ -44,7 +118,23 @@ struct AcceleratorBarMain {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
-        let host = NSHostingController(rootView: SettingsView(model: .shared))
+        // "wizard" renders the setup flow instead of Settings, so the first-run
+        // experience can be looked at on the release machine too. It is the
+        // screen most users see exactly once and we see least often.
+        // "wizard:where" renders that step directly; see WizardModel.init.
+        if pane.hasPrefix("wizard:") {
+            setenv("ACCEL_WIZARD_STEP", String(pane.dropFirst("wizard:".count)), 1)
+        }
+        // "panel" renders the menu-bar popover, the surface people actually
+        // live in and the one nothing could capture until now.
+        let host: NSViewController
+        if pane == "panel" {
+            host = NSHostingController(rootView: MenuView(model: .shared))
+        } else if pane.hasPrefix("wizard") {
+            host = NSHostingController(rootView: SetupWizard(model: .shared))
+        } else {
+            host = NSHostingController(rootView: SettingsView(model: .shared))
+        }
         let window = NSWindow(contentViewController: host)
         window.styleMask = [.titled, .closable]
         window.title = "Immich Accelerator Settings"

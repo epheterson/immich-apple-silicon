@@ -1,4 +1,5 @@
 import AppKit
+import Network
 import Foundation
 import ServiceManagement
 
@@ -41,6 +42,224 @@ enum Actions {
         }
     }
 
+    /// Run a command and deliver its output line by line as it arrives.
+    ///
+    /// `run` above buffers to completion, which is fine for a status probe and
+    /// useless for setup: extracting the server and building the venv take
+    /// minutes, and a wizard that shows nothing for minutes is indistinguishable
+    /// from one that has hung. Returns the exit status once the process ends.
+    @discardableResult
+    static func stream(
+        _ tool: String, _ args: [String],
+        stdin: String? = nil,
+        onLine: @escaping @Sendable (String) -> Void
+    ) async -> Int32 {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global().async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: tool)
+                p.arguments = args
+                // No TTY here, so setup's prompts would read EOF and answer no.
+                // Callers pass --yes; this just makes sure nothing waits on a
+                // human who cannot answer.
+                //
+                // `stdin` carries secrets to `--secrets-stdin`. They go on a
+                // pipe rather than in `args` because argv is readable by every
+                // process on the machine through ps.
+                let inPipe = stdin.map { _ in Pipe() }
+                p.standardInput = inPipe ?? FileHandle.nullDevice
+                let out = Pipe()
+                p.standardOutput = out
+                p.standardError = out
+                do { try p.run() } catch {
+                    onLine("failed to launch: \(error)")
+                    cont.resume(returning: -1)
+                    return
+                }
+                if let inPipe, let text = stdin {
+                    inPipe.fileHandleForWriting.write(Data(text.utf8))
+                    try? inPipe.fileHandleForWriting.close()
+                }
+                var pending = ""
+                let handle = out.fileHandleForReading
+                while true {
+                    let chunk = handle.availableData
+                    if chunk.isEmpty { break }
+                    pending += String(data: chunk, encoding: .utf8) ?? ""
+                    while let nl = pending.firstIndex(of: "\n") {
+                        let line = String(pending[pending.startIndex..<nl])
+                        pending = String(pending[pending.index(after: nl)...])
+                        if !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                            onLine(line)
+                        }
+                    }
+                }
+                if !pending.trimmingCharacters(in: .whitespaces).isEmpty { onLine(pending) }
+                p.waitUntilExit()
+                cont.resume(returning: p.terminationStatus)
+            }
+        }
+    }
+
+    /// Install the formula, the way the README tells people to.
+    ///
+    /// `brew trust` matters and is easy to miss: Homebrew 5.1.15+ silently
+    /// skips untrusted third-party taps during `brew upgrade`, so without it
+    /// the install works and then never updates again.
+    static func installFormula(onLine: @escaping @Sendable (String) -> Void) async -> Bool {
+        onLine("Installing the accelerator with Homebrew. This takes a few minutes.")
+        let code = await stream(brew, ["install", service], onLine: onLine)
+        if code != 0 { return false }
+        onLine("Trusting the tap so future upgrades reach you...")
+        await stream(brew, ["trust", "epheterson/immich-accelerator"], onLine: onLine)
+        return Paths.isInstalled
+    }
+
+    /// Ask the CLI what Immich this Mac can see.
+    ///
+    /// The wizard needs to know whether Immich runs here in Docker or
+    /// elsewhere, and the app must not answer that itself: `cmd_setup`
+    /// dispatches on it, so a second implementation here could disagree with
+    /// the one that acts. `detect` changes nothing and prints only JSON.
+    static func detect() async -> WizardModel.Detection {
+        guard Paths.isInstalled else {
+            return .init(note: "The accelerator command line isn't installed yet, so nothing can be detected until it is.")
+        }
+        let (code, out) = await run(cli, ["detect"])
+        guard code == 0,
+              let data = out.data(using: .utf8),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            // Almost always an installed core older than this app, which has no
+            // `detect` subcommand. Say so instead of quietly guessing, because
+            // the guess used to be "remote" for everybody.
+            return .init(note: "This version of the accelerator can't report what's running on this Mac. Choose below.")
+        }
+        var d = WizardModel.Detection(askedSuccessfully: true)
+        d.dockerFound = json["docker"] is String
+        if let local = json["local"] as? [String: Any] {
+            d.immichVersion = local["version"] as? String
+            d.mediaLocation = local["media_location"] as? String
+        }
+        // The CLI's own wording, so the screen says the same thing the terminal
+        // would rather than a second guess at the cause.
+        d.note = (json["local_error"] as? String) ?? (json["docker_error"] as? String)
+        return d
+    }
+
+    /// Run setup non-interactively and stream it. `--yes` is what makes this
+    /// possible at all; without it every prompt reads EOF and answers no,
+    /// including "start now?".
+    private static func jsonSecrets(apiKey: String, db: String, redis: String) -> String {
+        let payload = ["api_key": apiKey, "db_password": db, "redis_password": redis]
+        return String(
+            data: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(),
+            encoding: .utf8) ?? "{}"
+    }
+
+    /// Put the components where the user left them. Setup turns everything on,
+    /// so a switch turned off on the first step has to be re-applied after.
+    static func applyComponents(microservices: Bool, machineLearning: Bool) async {
+        for (name, on) in [("worker", microservices), ("ml", machineLearning)] where !on {
+            _ = await run(cli, ["component", name, "off"])
+        }
+    }
+
+    static func runSetup(
+        url: String, apiKey: String, mlOnly: Bool,
+        remote: WizardModel.RemoteDetails? = nil,
+        newImmich: (photos: String, data: String)? = nil,
+        onLine: @escaping @Sendable (String) -> Void
+    ) async -> Bool {
+        var args = ["setup", "--yes"]
+        var secrets: String?
+        if mlOnly {
+            args.append("--ml-only")
+        } else if !url.isEmpty {
+            // Tested first. A URL is the user saying "my Immich is over there",
+            // and no leftover state should be able to outvote it.
+            args += ["--url", url]
+            if let r = remote {
+                args += [
+                    "--db-host", r.dbHost, "--db-port", r.dbPort,
+                    "--db-user", r.dbUser, "--db-name", r.dbName,
+                    "--redis-host", r.redisHost, "--redis-port", r.redisPort,
+                ]
+                if !r.redisUser.isEmpty { args += ["--redis-user", r.redisUser] }
+                if !r.mediaPath.isEmpty { args += ["--upload-mount", r.mediaPath] }
+            }
+            // The API key goes on the pipe with the passwords. It is a
+            // credential, and argv is readable by every process on the machine,
+            // which is the entire reason --secrets-stdin exists.
+            args.append("--secrets-stdin")
+            secrets = jsonSecrets(
+                apiKey: apiKey, db: remote?.dbPassword ?? "", redis: remote?.redisPassword ?? "")
+        } else if let fresh = newImmich, !fresh.photos.isEmpty, !fresh.data.isEmpty {
+            // Creating Immich from scratch: the two answers setup would
+            // otherwise ask for in a terminal it does not have.
+            args += ["--photos-path", fresh.photos, "--data-path", fresh.data]
+        }
+        let code = await stream(cli, args, stdin: secrets, onLine: onLine)
+        return code == 0
+    }
+
+    // MARK: - config backup
+
+    /// Copy config.json somewhere the user chooses. The API key lives in this
+    /// file, so the picker (rather than a fixed path) is deliberate: the user
+    /// decides where a secret lands.
+    static func backupConfig(to url: URL) throws {
+        try FileManager.default.copyItem(at: Paths.configFile, to: url)
+    }
+
+    /// Replace config.json from a backup, after checking it parses and looks
+    /// like ours. Restoring garbage would leave the accelerator unable to
+    /// start with no clue why.
+    static func restoreConfig(from url: URL) throws {
+        let data = try Data(contentsOf: url)
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw ConfigError.notJSON }
+        // Any real config has at least one of these. A stricter check would
+        // reject the legitimate ml-only shape, which has almost nothing in it.
+        let known = ["ml_port", "immich_url", "server_dir", "ml_only", "worker", "ml"]
+        guard known.contains(where: { obj[$0] != nil }) else { throw ConfigError.notOurs }
+        try FileManager.default.createDirectory(
+            at: Paths.dataDir, withIntermediateDirectories: true)
+
+        // Staged, not deleted-then-copied. The old order removed the live
+        // config first, so a copy that failed afterwards (the backup living on
+        // a volume that went away between the read above and the write, say)
+        // left the Mac with no config at all and no way back. Write the
+        // replacement beside it, permission it, and only then swap.
+        let staged = Paths.configFile.deletingLastPathComponent()
+            .appendingPathComponent(".config-restore-\(UUID().uuidString).json")
+        try data.write(to: staged, options: .atomic)
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: staged.path)
+        do {
+            if FileManager.default.fileExists(atPath: Paths.configFile.path) {
+                _ = try FileManager.default.replaceItemAt(Paths.configFile, withItemAt: staged)
+            } else {
+                try FileManager.default.moveItem(at: staged, to: Paths.configFile)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: staged)
+            throw error
+        }
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: Paths.configFile.path)
+    }
+
+    enum ConfigError: LocalizedError {
+        case notJSON, notOurs
+        var errorDescription: String? {
+            switch self {
+            case .notJSON: return "That file isn't JSON."
+            case .notOurs: return "That JSON isn't an accelerator config."
+            }
+        }
+    }
+
     static func startService() async { await run(brew, ["services", "start", service]) }
     static func stopService() async { await run(brew, ["services", "stop", service]) }
     static func restartService() async { await run(brew, ["services", "restart", service]) }
@@ -76,6 +295,187 @@ enum Actions {
 
     // The one-liner shown in onboarding when the accelerator isn't installed.
     static let installCommand = "brew install epheterson/immich-accelerator/immich-accelerator"
+
+    /// Whether the accelerator starts at login. Asked of the CLI, because the
+    /// answer differs by install: Homebrew uses brew services, a source
+    /// checkout uses a launch agent, and only the CLI knows which applies.
+    static func autostartEnabled() async -> Bool {
+        guard Paths.isInstalled else { return false }
+        let (code, out) = await run(cli, ["autostart"])
+        return code == 0 && out.trimmingCharacters(in: .whitespacesAndNewlines) == "on"
+    }
+
+    @discardableResult
+    static func setAutostart(_ on: Bool) async -> Bool {
+        guard Paths.isInstalled else { return false }
+        let (code, _) = await run(cli, ["autostart", on ? "on" : "off"])
+        return code == 0
+    }
+
+    /// The existing config, for prefilling a re-run.
+    ///
+    /// Re-running setup after an update is something we actively tell people to
+    /// do, so arriving at an empty form is both alarming and wrong: it looks
+    /// like the settings are gone, and anything left blank would be re-answered
+    /// from defaults. Every value here is one setup itself wrote.
+    static func existingConfig() -> [String: Any]? {
+        guard let data = try? Data(contentsOf: Paths.configFile),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return obj
+    }
+
+    /// Look for an Immich media root among the places one is actually likely
+    /// to be, so most people never type a path at all.
+    ///
+    /// A media root is recognisable: Immich puts library/, upload/, thumbs/ and
+    /// encoded-video/ side by side, and nothing else does. Scanning for that
+    /// shape is far more reliable than guessing names, and it is cheap: one
+    /// directory listing per mounted volume, two levels deep.
+    static func discoverLibraries() async -> [String] {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global().async {
+                let fm = FileManager.default
+                var roots: [String] = []
+                // The real mount table, not a guess at where mounts live.
+                // /Volumes is the usual place but not the only one: a launchd
+                // agent mounting a NAS at /nas is common, and scanning
+                // /Volumes alone would miss it. mountedVolumeURLs reports
+                // whatever is actually mounted, wherever it is.
+                roots += (fm.mountedVolumeURLs(includingResourceValuesForKeys: nil,
+                                               options: [.skipHiddenVolumes]) ?? [])
+                    .map(\.path)
+                roots += (try? fm.contentsOfDirectory(atPath: "/Volumes"))?
+                    .map { "/Volumes/\($0)" } ?? []
+                roots += [
+                    NSHomeDirectory() + "/.immich-accelerator/data",
+                    NSHomeDirectory() + "/immich",
+                    "/opt/immich",
+                ]
+
+                func looksLikeMediaRoot(_ path: String) -> Bool {
+                    guard let entries = try? fm.contentsOfDirectory(atPath: path) else { return false }
+                    let want = Set(["library", "upload", "thumbs", "encoded-video"])
+                    // Two of the four is enough: a library that has never
+                    // transcoded a video has no encoded-video yet.
+                    return want.intersection(entries).count >= 2
+                }
+
+                var found: [String] = []
+                for root in roots {
+                    var isDir: ObjCBool = false
+                    guard fm.fileExists(atPath: root, isDirectory: &isDir), isDir.boolValue
+                    else { continue }
+                    if looksLikeMediaRoot(root) { found.append(root); continue }
+                    // One level down: shares are usually mounted as the parent
+                    // of the library rather than the library itself.
+                    for child in (try? fm.contentsOfDirectory(atPath: root)) ?? [] {
+                        let candidate = "\(root)/\(child)"
+                        if looksLikeMediaRoot(candidate) { found.append(candidate) }
+                    }
+                }
+                // Same share can appear via several roots; keep first sighting.
+                var seen = Set<String>()
+                cont.resume(returning: found.filter { seen.insert($0).inserted })
+            }
+        }
+    }
+
+    /// Can this Mac open a TCP connection to host:port right now?
+    ///
+    /// The worker talks to Postgres and Redis directly, so "Immich answers"
+    /// says nothing about whether the parts that matter are reachable. Checking
+    /// in the form turns a setup that fails halfway into a field that is red
+    /// before anything is written.
+    static func probePort(host: String, port: String, timeout: TimeInterval = 3) async -> Bool {
+        guard !host.isEmpty, let portNum = UInt16(port), portNum > 0 else { return false }
+        return await withCheckedContinuation { cont in
+            let conn = NWConnection(
+                host: NWEndpoint.Host(host),
+                port: NWEndpoint.Port(rawValue: portNum)!,
+                using: .tcp)
+            // The state handler and the timeout race; a continuation resumed
+            // twice is a crash, so the first one through wins.
+            let lock = NSLock()
+            nonisolated(unsafe) var finished = false
+            func finish(_ ok: Bool) {
+                lock.lock()
+                let already = finished
+                finished = true
+                lock.unlock()
+                guard !already else { return }
+                conn.cancel()
+                cont.resume(returning: ok)
+            }
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready: finish(true)
+                case .failed, .cancelled: finish(false)
+                case .waiting: finish(false)   // refused / unroutable
+                default: break
+                }
+            }
+            conn.start(queue: .global())
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { finish(false) }
+        }
+    }
+
+    /// Is `path` present, a directory, and readable by us right now?
+    ///
+    /// Deliberately a real read rather than a `fileExists` check: an SMB share
+    /// that has gone away can leave a mount point that still stats fine, and a
+    /// path can exist while being unreadable. The distinction matters because
+    /// the fixes differ, so the note names which one it is.
+    static func probeLibrary(_ path: String) async -> (ok: Bool, note: String) {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global().async {
+                let fm = FileManager.default
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: path, isDirectory: &isDir) else {
+                    cont.resume(returning: (false,
+                        "Path not found."))
+                    return
+                }
+                guard isDir.boolValue else {
+                    cont.resume(returning: (false, "Not a folder."))
+                    return
+                }
+                guard let entries = try? fm.contentsOfDirectory(atPath: path) else {
+                    cont.resume(returning: (false,
+                        "Can't read that folder."))
+                    return
+                }
+                // Immich's media root has these beside each other. Naming what
+                // is missing beats "looks wrong": pointing at the parent of the
+                // real library is the single most common mistake here.
+                let expected = ["library", "upload", "thumbs", "encoded-video"]
+                let present = expected.filter { entries.contains($0) }
+                if present.isEmpty {
+                    cont.resume(returning: (false,
+                        "No Immich folders inside. Check the path."))
+                } else {
+                    cont.resume(returning: (true,
+                        "Media folder found."))
+                }
+            }
+        }
+    }
+
+    /// Hand off to the system's own Connect to Server flow. macOS shows its
+    /// authentication sheet and keeps credentials in the keychain, so the app
+    /// neither sees nor stores a password.
+    static func openFileServerConnect(hint: String) {
+        let host = hint.split(separator: ":").first.map(String.init) ?? hint
+        if !host.isEmpty, let url = URL(string: "smb://\(host)") {
+            NSWorkspace.shared.open(url)
+        } else {
+            // No host to guess at: open the Finder command that asks for one.
+            NSAppleScript(source: """
+            tell application "Finder" to activate
+            tell application "System Events" to keystroke "k" using command down
+            """)?.executeAndReturnError(nil)
+        }
+    }
 
     static func copyToPasteboard(_ text: String) {
         NSPasteboard.general.clearContents()
