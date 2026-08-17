@@ -191,10 +191,13 @@ class TestRemountBackoff:
         r.assert_not_called()
 
     def test_success_clears_the_backoff(self):
+        """The clock is pinned: monotonic() counts from boot, so leaving it real
+        makes this pass on a long-running Mac and fail on a fresh CI container,
+        where not enough time has elapsed to clear the backoff window."""
         state = {"attempts": 3, "last": 1.0}
         with patch.object(m, "remount", return_value=(True, "")), patch.object(
-            m, "log"
-        ):
+            m.time, "monotonic", return_value=100_000.0
+        ), patch.object(m, "log"):
             m._attempt_remount(dict(self.CFG), state)
         assert state == {}
 
