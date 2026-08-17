@@ -33,6 +33,47 @@ def _mount(output=MOUNT_OUTPUT):
     )
 
 
+def drive_watch(cfg, ready, pids=None, recipe=None, seconds_per_cycle=60.0):
+    """Run the real watch loop over a scripted sequence of probe results.
+
+    The clock advances a cycle's worth on every probe, so tests can express
+    "unreachable for two minutes" rather than counting monotonic() calls, which
+    the loop makes from several places.
+    """
+    pids = dict(pids or {})
+    clock = {"t": 1000.0}
+    results = list(ready)
+
+    def probe(_config):
+        clock["t"] += seconds_per_cycle
+        return results.pop(0) if results else True
+
+    mocks = {
+        "load_config": MagicMock(
+            side_effect=[dict(cfg)] * (len(ready) + 1) + [KeyboardInterrupt()]
+        ),
+        "media_ready_now": MagicMock(side_effect=probe),
+        "read_pid": MagicMock(side_effect=lambda n: pids.get(n)),
+        "kill_pid": MagicMock(side_effect=lambda n, **kw: pids.pop(n, None)),
+        "cmd_start": MagicMock(),
+        "cmd_stop": MagicMock(),
+        "reconcile_components": MagicMock(),
+        "cap_service_logs": MagicMock(),
+        "_upgraded_on_disk": MagicMock(return_value=False),
+        "_worker_fd_total": MagicMock(return_value=None),
+        "mount_recipe_for": MagicMock(return_value=recipe),
+        "save_config": MagicMock(),
+        "_attempt_remount": MagicMock(),
+        "diagnose_worker_log": MagicMock(return_value=None),
+        "log": MagicMock(),
+    }
+    with patch.multiple(m, **mocks), patch.object(
+        m.time, "monotonic", side_effect=lambda: clock["t"]
+    ):
+        m._watch_worker(dict(cfg))
+    return mocks
+
+
 class TestMountRecipe:
     """What we record while the mount is healthy, since it cannot be read back
     once the mount is gone."""
@@ -225,38 +266,11 @@ class TestWatchLoopPausesOnMissingLibrary:
         },
     }
 
-    def _drive(self, cfg, ready, pids=None, recipe=None, cycles=1):
-        """Run the real loop for `cycles` passes and hand back the mocks.
-
-        load_config is read once before the loop starts, so the script needs one
-        extra entry; KeyboardInterrupt is how the loop is made to end.
-        """
-        pids = pids or {}
-        mocks = {
-            "load_config": MagicMock(
-                side_effect=[dict(cfg)] * (cycles + 1) + [KeyboardInterrupt()]
-            ),
-            "media_ready_now": MagicMock(side_effect=ready),
-            "read_pid": MagicMock(side_effect=lambda n: pids.get(n)),
-            "kill_pid": MagicMock(),
-            "cmd_start": MagicMock(),
-            "cmd_stop": MagicMock(),
-            "reconcile_components": MagicMock(),
-            "cap_service_logs": MagicMock(),
-            "_upgraded_on_disk": MagicMock(return_value=False),
-            "_worker_fd_total": MagicMock(return_value=None),
-            "mount_recipe_for": MagicMock(return_value=recipe),
-            "save_config": MagicMock(),
-            "_attempt_remount": MagicMock(),
-            "diagnose_worker_log": MagicMock(return_value=None),
-            "log": MagicMock(),
-        }
-        with patch.multiple(m, **mocks):
-            m._watch_worker(dict(cfg))
-        return mocks
+    def _drive(self, cfg, ready, **kw):
+        return drive_watch(cfg, ready, **kw)
 
     def test_the_worker_is_stopped_when_the_library_disappears(self, tmp_data_dir):
-        mocks = self._drive(self.CFG, [False], pids={"worker": 4242})
+        mocks = self._drive(self.CFG, [False, False, False], pids={"worker": 4242})
         assert "worker" in [c.args[0] for c in mocks["kill_pid"].call_args_list]
 
     def test_the_worker_is_not_restarted_into_a_missing_library(self, tmp_data_dir):
@@ -296,7 +310,7 @@ class TestWatchLoopPausesOnMissingLibrary:
     def test_the_worker_starts_again_when_the_library_returns(self, tmp_data_dir):
         """Gone, then back. Nobody should have to notice this happened, which
         is the entire point of a service that runs unattended."""
-        mocks = self._drive(self.CFG, [False, True], cycles=2)
+        mocks = self._drive(self.CFG, [False, True])
         assert mocks["cmd_start"].called, "worker must come back by itself"
 
     def test_the_recipe_is_recorded_while_the_mount_is_healthy(self, tmp_data_dir):
@@ -311,9 +325,7 @@ class TestWatchLoopPausesOnMissingLibrary:
     def test_an_unchanged_recipe_is_not_rewritten_every_cycle(self, tmp_data_dir):
         """config.json would otherwise be rewritten twice a minute forever."""
         recipe = self.CFG["mount_recipe"]
-        mocks = self._drive(
-            self.CFG, [True, True], pids={"worker": 999}, recipe=recipe, cycles=2
-        )
+        mocks = self._drive(self.CFG, [True, True], pids={"worker": 999}, recipe=recipe)
         mocks["save_config"].assert_not_called()
 
     def test_an_install_without_a_media_marker_is_left_alone(self, tmp_data_dir):
@@ -365,21 +377,7 @@ class TestPauseIsVisible:
 
     def test_the_marker_is_written_when_the_library_drops(self, tmp_data_dir):
         cfg = {"worker": True, "upload_mount": "/nas/photos", "media_id": "x"}
-        mocks = {
-            "load_config": MagicMock(side_effect=[dict(cfg), dict(cfg), KeyboardInterrupt()]),
-            "media_ready_now": MagicMock(return_value=False),
-            "read_pid": MagicMock(return_value=None),
-            "kill_pid": MagicMock(),
-            "cmd_start": MagicMock(),
-            "cmd_stop": MagicMock(),
-            "reconcile_components": MagicMock(),
-            "cap_service_logs": MagicMock(),
-            "_upgraded_on_disk": MagicMock(return_value=False),
-            "_attempt_remount": MagicMock(),
-            "log": MagicMock(),
-        }
-        with patch.multiple(m, **mocks):
-            m._watch_worker(dict(cfg))
+        drive_watch(cfg, [False, False, False])
         marker = m.read_paused()
         assert marker and marker["detail"] == "/nas/photos"
 
@@ -479,3 +477,66 @@ class TestMLAdoption:
         start.assert_not_called()
         said = " ".join(str(c) for c in log.warning.call_args_list)
         assert "already served by something" not in said
+
+
+class TestPauseNeedsSustainedFailure:
+    """A slow NAS and a missing one look identical to one probe, which gets 10
+    seconds. Pausing on the first failure stops the worker mid-job and starts
+    it again 30 seconds later: the exact thrash this mechanism exists to stop.
+    """
+
+    CFG = {
+        "worker": True,
+        "ml": False,
+        "upload_mount": "/nas/photos",
+        "media_id": "abc123",
+        "mount_recipe": {"fstype": "nfs", "spec": "n:/v", "mountpoint": "/nas"},
+    }
+
+    def _drive(self, ready, pids=None):
+        return drive_watch(self.CFG, ready, pids=pids)
+
+    def test_one_slow_probe_does_not_stop_the_worker(self, tmp_data_dir):
+        """The case that matters: a Synology mid-backup, not a dead mount."""
+        mocks = self._drive(ready=[False, True], pids={"worker": 4242})
+        assert "worker" not in [c.args[0] for c in mocks["kill_pid"].call_args_list]
+
+    def test_a_remount_is_still_tried_immediately(self, tmp_data_dir):
+        """Waiting to act on the worker is not the same as waiting to fix the
+        mount. A remount that works during the grace means no pause at all."""
+        mocks = self._drive(ready=[False, True])
+        mocks["_attempt_remount"].assert_called()
+
+    def test_a_mount_that_stays_gone_still_pauses(self, tmp_data_dir):
+        """Hysteresis must not become "never acts"."""
+        mocks = self._drive(ready=[False, False, False], pids={"worker": 4242})
+        assert "worker" in [c.args[0] for c in mocks["kill_pid"].call_args_list]
+
+
+class TestNoMountStacking:
+    """macOS stacks a second mount on an occupied point without complaint."""
+
+    RECIPE = {"fstype": "nfs", "spec": "n:/v", "mountpoint": "/nas"}
+
+    def test_a_still_mounted_path_is_not_mounted_over(self):
+        with patch.object(m, "is_mounted", return_value=True), patch.object(
+            m, "remount"
+        ) as r, patch.object(m, "log"):
+            m._attempt_remount({"mount_recipe": self.RECIPE}, {})
+        r.assert_not_called()
+
+    def test_a_genuinely_missing_mount_is_remounted(self):
+        with patch.object(m, "is_mounted", return_value=False), patch.object(
+            m, "remount", return_value=(True, "")
+        ) as r, patch.object(m, "log"):
+            m._attempt_remount({"mount_recipe": self.RECIPE}, {})
+        r.assert_called_once()
+
+    def test_is_mounted_matches_the_exact_path_only(self):
+        out = "n:/v on /nas (nfs)\n/dev/d1 on /nastier (hfs, local)\n"
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(stdout=out, returncode=0)
+        ):
+            assert m.is_mounted("/nas") is True
+            assert m.is_mounted("/nastier") is True
+            assert m.is_mounted("/na") is False, "must not match a path prefix"
