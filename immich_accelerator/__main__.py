@@ -4287,6 +4287,53 @@ def _start_ml_service(config: dict):
     return pid, engine
 
 
+# Our two ML engines, as they appear in `ps`. Anything else listening on the
+# port belongs to somebody else (usually Docker's immich-machine-learning).
+_ML_CMD_RE = re.compile(r"immich-ml-native\s+serve|python[^\s]*\s+-m\s+src\.main")
+
+
+def _listener_pid(port: int) -> int | None:
+    """PID of whatever is listening on this port, or None."""
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    first = out.splitlines()[0].strip() if out else ""
+    return int(first) if first.isdigit() else None
+
+
+def adopt_live_ml(config: dict) -> int | None:
+    """Take back an ML service that is ours but has lost its pidfile.
+
+    A pidfile can go missing while the process it named is perfectly healthy: a
+    failed restart that clears it, a crash between spawn and write, a stray
+    `stop`. Before this, the watcher pinged the port, got an answer from a
+    process it no longer had a PID for, and classified its own engine as a
+    foreign listener to be left alone. It then stayed left alone: status and
+    the menu bar reported ML stopped while it was serving, and nothing would
+    have restarted it if it wedged. Found on the release Mac, four days after
+    it happened.
+    """
+    pid = _listener_pid(config.get("ml_port", 3003))
+    if pid is None:
+        return None
+    try:
+        cmd = subprocess.run(
+            ["/bin/ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not _ML_CMD_RE.search(cmd):
+        return None  # somebody else's service; the caller leaves it alone
+    write_pid("ml", pid)
+    log.info("Adopted the running ML service (PID %d); its pidfile was missing.", pid)
+    return pid
+
+
 def reconcile_ml(config: dict) -> None:
     """Make the running state match the "ml" config key, the ML counterpart to
     reconcile_dashboard. Re-resolves ml_dir first, because brew upgrade deletes
@@ -4354,6 +4401,11 @@ def reconcile_ml(config: dict) -> None:
     # watcher would relaunch it every tick forever. Immich has a working ML
     # endpoint either way, so say what is happening once and leave it alone.
     if not wedged and _ml_ping(config):
+        # It answers and we have no PID. Ours with a lost pidfile, or somebody
+        # else's service? Only the second is a reason to stand back.
+        if adopt_live_ml(config) is not None:
+            _ml_foreign_listener_warned = False
+            return
         if not _ml_foreign_listener_warned:
             log.warning(
                 "Port %s is already served by something this accelerator did not "
