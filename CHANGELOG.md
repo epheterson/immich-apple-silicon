@@ -17,7 +17,7 @@
 
 ### Changed
 - **The README is a table of contents instead of a wall.** Usage, deployment, the ML engine, known differences, troubleshooting and security are separate documents now, with a repo layout tree and a guide to the scripts. Contributed by [@lesurJ](https://github.com/lesurJ) ([#128](https://github.com/epheterson/immich-apple-silicon/pull/128)).
-- **The test suite passes on a Mac that is running the accelerator.** Tests read the real launch agent directory, scanned the machine for live worker processes, and made real HTTP calls to a running ML service, so anyone who developed on their own install saw failures that had nothing to do with their change ([#132](https://github.com/epheterson/immich-apple-silicon/pull/132)).
+- **Fewer test failures for contributors who develop on a working install.** Tests scanned the machine for live worker processes and made real HTTP calls to a running ML service, so a contributor saw failures that had nothing to do with their change ([#132](https://github.com/epheterson/immich-apple-silicon/pull/132)). This is not finished: tests that do not ask for the temporary-data fixture still use the real `~/.immich-accelerator`, so running the suite on a Mac serving a library can still disturb it.
 
 ## 1.10.0 - 2026-08-10
 
