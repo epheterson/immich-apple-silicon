@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **The native ML engine releases models it is not using.** Every model it loaded stayed in memory until the process exited, so a Mac that ran one Smart Search job held those weights all day. `ViT-SO400M-16-SigLIP2-384__webli` alone is 2.3GB in bf16. Immich's own container gets this for free by exiting after `MACHINE_LEARNING_MODEL_TTL` and letting gunicorn fork a replacement, and the Python service unloads its CLIP and face models in place; the native engine did neither. It now releases the CLIP model, the default ViT-B-32 towers and the ArcFace session once each has gone 300 seconds unused, the same default Immich uses. Models also load on first use rather than at startup, so an idle service holds none of them. `IMMICH_ACCEL_ML_MODEL_TTL` changes the timeout, or `0` keeps everything resident. A reload costs about two seconds off local disk.
+
 ## 1.11.0 - 2026-08-17
 
 ### Fixed

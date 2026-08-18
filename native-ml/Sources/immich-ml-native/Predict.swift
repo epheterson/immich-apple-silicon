@@ -53,13 +53,13 @@ func processPredict(entries: [String: Any], imageData: Data?, text: String?, mod
             if let vCfg = cfg["visual"] as? [String: Any], let cg = cg {
                 let name = Models.normalize(vCfg["modelName"] as? String ?? Models.defaultClip)
                 response["clip"] = name == Models.defaultClip
-                    ? pyListString(models.clipVisual.embed(cg))
+                    ? pyListString(models.clipVisual().embed(cg))
                     : pyListString(try models.zoo(for: name).embedVisual(cg))
                 return true
             } else if let tCfg = cfg["textual"] as? [String: Any], let t = text {
                 let name = Models.normalize(tCfg["modelName"] as? String ?? Models.defaultClip)
                 response["clip"] = name == Models.defaultClip
-                    ? pyListString(models.clipText.encode(t))
+                    ? pyListString(models.clipText().encode(t))
                     : pyListString(try models.zoo(for: name).embedTextual(t))
                 return true
             }
@@ -70,7 +70,7 @@ func processPredict(entries: [String: Any], imageData: Data?, text: String?, mod
     if let cfgAny = entries["facial-recognition"] {
         let cfg = cfgAny as? [String: Any] ?? [:]
         timed("faces") {
-            guard let data = imageData, let rgb = rgb, let ort = models.arcface else { return false }
+            guard let data = imageData, let rgb = rgb, let ort = models.arcface() else { return false }
             let minScore = optDouble(cfg, "detection", "minScore") ?? 0.7
             let faces = detectFacesWithLandmarks(imageData: data, width: W, height: H)
                 .filter { Double($0.score) >= minScore }
