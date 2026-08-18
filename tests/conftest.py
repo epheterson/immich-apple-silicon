@@ -10,6 +10,30 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def no_real_machine_reads(monkeypatch):
+    """Stop tests seeing the accelerator that is running on this machine.
+
+    The suite passed on a laptop that does not run the product and failed
+    eight ways on the Mac that does, which is the worst possible split: the
+    people most likely to run the tests are the ones actually using the thing.
+    Both outside contributors had already started writing "pre-existing
+    failures, unrelated" in their pull requests, and a suite that is red for
+    everyone who runs the product teaches everyone to ignore red.
+
+    Two routes in, both closed here. read_pid("worker") falls back to a global
+    process scan and adopts a live production worker, so "no pid file" tests
+    found one anyway. _ml_ping opens a real HTTP connection to localhost:3003
+    and the real ML service answers, so "ML is down, restart it" tests saw it
+    up. A test that wants either behaviour patches it back explicitly.
+    """
+    import immich_accelerator.__main__ as m
+
+    monkeypatch.setattr(m, "_adopt_live_worker", lambda: None)
+    monkeypatch.setattr(m, "_ml_ping", lambda *a, **k: False)
+    yield
+
+
 @pytest.fixture
 def tmp_data_dir(tmp_path):
     """Point every module-level path at a temp directory.
@@ -35,6 +59,10 @@ def tmp_data_dir(tmp_path):
     log_dir.mkdir()
     config_file = data_dir / "config.json"
     lock_file = data_dir / "start.lock"
+    pause_file = data_dir / "paused.json"
+    synthetic_conf = tmp_path / "synthetic.d" / "immich-accelerator"
+    synthetic_conf.parent.mkdir(parents=True, exist_ok=True)
+    legacy_synthetic = tmp_path / "synthetic.conf"
 
     with patch.multiple(
         "immich_accelerator.__main__",
@@ -43,6 +71,11 @@ def tmp_data_dir(tmp_path):
         PID_DIR=pid_dir,
         LOG_DIR=log_dir,
         LOCK_FILE=lock_file,
+        PAUSE_FILE=pause_file,
+        # A real install has this file, and two tests wrote to and removed the
+        # user's actual /etc/synthetic.d entry.
+        SYNTHETIC_CONF=synthetic_conf,
+        LEGACY_SYNTHETIC_CONF=legacy_synthetic,
         # reconcile_ml's "has it been quiet too long" timer. Module state, so a
         # test that leaves it set decides the outcome of the next one; patching
         # it here means every test starts from "no silence recorded yet".
@@ -54,6 +87,7 @@ def tmp_data_dir(tmp_path):
             "pid_dir": pid_dir,
             "log_dir": log_dir,
             "lock_file": lock_file,
+            "pause_file": pause_file,
         }
 
 

@@ -7,7 +7,7 @@
 - Version bump + CHANGELOG entry required for every push to main. Enforced by the `version-bump` CI job and `tests/test_release_hygiene.py`, not just convention: `auto-tag` publishes the CHANGELOG section verbatim as the release notes, so a missing bump ships silently and a missing heading makes the notes run on into every previous release.
 - Contributor PRs from forks are exempt from the bump. They merge unversioned and our own release PR carries the version and the changelog entry that credits them.
 - Tag releases as `vX.Y.Z` matching the VERSION file.
-- **After every tag push**: update the Homebrew tap (epheterson/homebrew-immich-accelerator) via `gh api` — new version, tarball URL, sha256. Verify on Mac Mini. Never skip this.
+- **After every tag push**: run the `Update Homebrew Formula` workflow with the tag (`gh workflow run update-homebrew.yml -f tag=vX.Y.Z`). It builds the native ML bundle and the menu-bar app, attaches them to the release, renders the formula and the cask, and pushes both to epheterson/homebrew-immich-accelerator. Do not hand-edit the tap. Verify on the Mac Mini afterwards. Never skip this.
 
 ## Code style
 

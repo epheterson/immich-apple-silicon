@@ -45,6 +45,10 @@ PID_DIR = DATA_DIR / "pids"
 # Advisory lock so a component toggle and the watcher cannot both run cmd_start.
 LOCK_FILE = DATA_DIR / "start.lock"
 LOG_DIR = DATA_DIR / "logs"
+# Why the worker is deliberately not running. The watch loop owns this file;
+# status and the menu bar read it so a paused worker reads as "the library is
+# gone" instead of a bare "Stopped" the user cannot explain.
+PAUSE_FILE = DATA_DIR / "paused.json"
 
 # Records the package version the running worker was started with, so the watch
 # loop can tell when a `brew upgrade` left the worker on stale code.
@@ -86,6 +90,15 @@ SUPPORTED_NODE_MAJORS = (22, 24)
 # native start loads weights before it serves, and a first-use model fetch is
 # gigabytes, so the grace has to clear the longest legitimate silence.
 ML_UNRESPONSIVE_GRACE = 300.0
+
+# How long the library has to stay unreachable before the worker is paused.
+# A slow NAS and a missing one look identical to a single probe: the probe has
+# a 10s timeout, and a Synology mid-backup or a Wi-Fi hiccup can exceed that
+# while the library is perfectly fine. Pausing on the first failure would stop
+# the worker mid-job and start it again 30s later, which is the thrash this
+# whole mechanism exists to prevent. A remount is still attempted immediately,
+# since that is cheap and may fix things before the grace ever expires.
+MEDIA_UNREACHABLE_GRACE = 120.0
 # (pid, monotonic time it first went quiet). The PID is half the state, not
 # bookkeeping: a bare timestamp belongs to no particular process, so a service
 # replaced between two ticks inherits the dead one's elapsed silence and gets
@@ -101,6 +114,11 @@ _ml_foreign_listener_warned = False
 
 
 SYNTHETIC_CONF = Path("/etc/synthetic.d/immich-accelerator")
+# Pre-1.3.3 installs put the entry here instead, and uninstall still has to
+# clean it out. A constant rather than two literals, so tests can point it
+# somewhere harmless: it is a shared system file that other software writes to,
+# and the code rewrites it through `sudo tee`.
+LEGACY_SYNTHETIC_CONF = Path("/etc/synthetic.conf")
 
 
 def _build_link_ok() -> bool:
@@ -196,7 +214,7 @@ def _ensure_build_link():
     if _build_link_ok():
         # Migrate legacy synthetic.conf entry to synthetic.d if needed
         if not SYNTHETIC_CONF.exists():
-            legacy = Path("/etc/synthetic.conf")
+            legacy = LEGACY_SYNTHETIC_CONF
             try:
                 content = legacy.read_text() if legacy.exists() else ""
             except OSError:
@@ -387,7 +405,7 @@ def _remove_build_link():
             log.warning("  Could not update %s: %s", SYNTHETIC_CONF, e)
 
     # Also clean legacy entry from /etc/synthetic.conf (pre-v1.3.3)
-    legacy_conf = Path("/etc/synthetic.conf")
+    legacy_conf = LEGACY_SYNTHETIC_CONF
     if legacy_conf.exists():
         try:
             content = legacy_conf.read_text()
@@ -2082,6 +2100,133 @@ except Exception as e:
 """
 
 
+# Network filesystems we know how to remount. Local disks are deliberately
+# excluded: if an APFS volume vanished, remounting is not our call to make.
+_REMOUNTABLE_FS = {"smbfs", "nfs", "afpfs"}
+
+# Backoff between remount attempts, in seconds. A NAS that is off overnight
+# should not be probed every 30s, and an SMB server should never be hit with a
+# tight retry loop; repeated failed auth is how accounts get locked.
+_REMOUNT_BACKOFF = (0, 60, 300, 900)
+
+
+def mount_recipe_for(root: str) -> dict | None:
+    """The mount that provides `root`, as something we could replay later.
+
+    Parsed from /sbin/mount, whose lines read `<spec> on <point> (<fs>, ...)`.
+    The spec keeps its URL encoding (`Time%20Machine`) because that is the form
+    mount_smbfs wants back.
+
+    Returns None for local disks and for a root that is not on its own mount:
+    both mean there is nothing here we should be replaying.
+    """
+    try:
+        out = subprocess.run(
+            ["/sbin/mount"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    # The mount table reports resolved paths (/private/tmp, not /tmp), so a
+    # config path that goes through a symlink would match nothing. Resolving is
+    # safe here because a recipe is only ever recorded while the mount is up.
+    try:
+        root = str(Path(root).resolve())
+    except OSError:
+        pass
+
+    best = None
+    for line in out.splitlines():
+        head, sep, tail = line.rpartition(" (")
+        if not sep or not head:
+            continue
+        fstype = tail.split(",")[0].rstrip(")").strip()
+        if fstype not in _REMOUNTABLE_FS:
+            continue
+        # Split on the FIRST " on ": the spec (//user@host/share) does not
+        # contain it, while mount points routinely do ("/Volumes/Time Machine").
+        spec, sep, point = head.partition(" on ")
+        if not sep:
+            continue
+        try:
+            covers = Path(root) == Path(point) or Path(point) in Path(root).parents
+        except (OSError, ValueError):
+            continue
+        # Longest match wins, so a share mounted inside another share is
+        # recorded as itself rather than as its parent.
+        if covers and (best is None or len(point) > len(best["mountpoint"])):
+            best = {"fstype": fstype, "spec": spec.strip(), "mountpoint": point}
+    return best
+
+
+def is_mounted(point: str) -> bool:
+    """Is something already mounted at this exact path?
+
+    macOS will happily stack a second mount on an occupied mount point, and the
+    probe can report a healthy mount as unreachable when the server is merely
+    slow. Without this check, one slow NAS could leave the path buried under a
+    pile of mounts that only a reboot fully unwinds.
+    """
+    try:
+        out = subprocess.run(
+            ["/sbin/mount"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in out.splitlines():
+        head, sep, _ = line.rpartition(" (")
+        if not sep:
+            continue
+        _, sep, existing = head.partition(" on ")
+        if sep and existing.strip() == point:
+            return True
+    return False
+
+
+def remount(recipe: dict) -> tuple[bool, str]:
+    """Replay a recorded mount. Returns (ok, reason).
+
+    reason is "auth" when the server rejected our credentials, which the caller
+    must treat as terminal: retrying a bad password in a loop locks accounts.
+
+    -N on mount_smbfs means "never prompt". There is no terminal here, so a
+    prompt would hang the watcher forever; with -N the credentials come from the
+    login keychain, which is where they already are if the share was ever
+    mounted in Finder with "remember this password".
+    """
+    fstype, spec, point = recipe["fstype"], recipe["spec"], recipe["mountpoint"]
+    if fstype == "smbfs":
+        cmd = ["/sbin/mount_smbfs", "-N", spec, point]
+    elif fstype == "nfs":
+        cmd = ["/sbin/mount_nfs", spec, point]
+    else:
+        return False, f"no non-interactive remount for {fstype}"
+
+    try:
+        Path(point).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"cannot create mount point: {exc}"
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return False, "mount timed out"
+    except OSError as exc:
+        return False, str(exc)
+
+    if proc.returncode == 0:
+        return True, ""
+    err = (proc.stderr or proc.stdout or "").strip().splitlines()
+    detail = err[-1] if err else f"exit {proc.returncode}"
+    lowered = detail.lower()
+    if any(
+        k in lowered
+        for k in ("authentication", "permission denied", "not permitted", "password")
+    ):
+        return False, "auth"
+    return False, detail
+
+
 def _media_probe(
     mode: str, root: str, media_id: str, timeout: int = 15
 ) -> tuple[bool, list[str]]:
@@ -2113,6 +2258,45 @@ def _media_probe(
         return result.returncode == 0, []
     except (subprocess.SubprocessError, OSError):
         return False, []
+
+
+def set_paused(reason: str, detail: str = "") -> None:
+    """Record why the worker is down, or clear it when reason is empty."""
+    try:
+        if not reason:
+            PAUSE_FILE.unlink(missing_ok=True)
+            return
+        PAUSE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PAUSE_FILE.write_text(
+            json.dumps({"reason": reason, "detail": detail, "since": time.time()})
+        )
+    except OSError:
+        pass  # a status nicety; never worth failing the loop over
+
+
+def read_paused() -> dict | None:
+    try:
+        return json.loads(PAUSE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def media_ready_now(config: dict) -> bool:
+    """Is the media root reachable right now? Cheap enough to ask every cycle.
+
+    ensure_media_ready does the same probe but also establishes the marker on
+    first run and prints a full explanation, which is right once at startup and
+    wrong thirty seconds later. This is the quiet version for the watch loop.
+
+    A missing media_id means the marker has not been established yet, so there
+    is nothing to verify against; leave that to ensure_media_ready at start.
+    """
+    root = config.get("upload_mount") or ""
+    media_id = config.get("media_id") or ""
+    if not root or not media_id:
+        return True
+    ok, _dangling = _media_probe("verify", root, media_id, timeout=10)
+    return ok
 
 
 def ensure_media_ready(config: dict) -> bool:
@@ -4073,6 +4257,38 @@ def _start_ml_preferred(config: dict):
     return None, None, False
 
 
+def port_in_use(port: int) -> bool:
+    """Is anything listening on this port right now?
+
+    A plain TCP connect, deliberately not /ping: the case this exists for is a
+    wedged service that still holds the socket but answers nothing, which is
+    exactly what a health check cannot see.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            return sock.connect_ex(("127.0.0.1", int(port))) == 0
+    except (OSError, ValueError):
+        return False
+
+
+def wait_for_port_free(port: int, timeout: float = 10.0) -> bool:
+    """Wait for a killed service to actually let go of its port.
+
+    Process exit and socket release are not the same instant, and the native
+    engine now exits rather than lingering when it cannot bind (#38). Starting
+    the replacement too early therefore means the native start fails, the
+    caller falls back to the Python venv, and the machine quietly runs on the
+    slow engine until somebody restarts it by hand.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not port_in_use(port):
+            return True
+        time.sleep(0.25)
+    return not port_in_use(port)
+
+
 def _ml_verify_or_fallback(config: dict, pid: int, engine: str):
     """Verify the (already-started) native engine becomes healthy; if not, kill
     it and start the Python venv. No-op for the venv engine. Returns (pid, engine).
@@ -4081,6 +4297,7 @@ def _ml_verify_or_fallback(config: dict, pid: int, engine: str):
         return pid, engine
     log.warning("  native ML did not become healthy; falling back to venv")
     kill_pid("ml")
+    wait_for_port_free(config.get("ml_port", 3003))
     venv = _venv_ml_spec(config, os.environ.copy())
     if venv is not None:
         cmd, cwd, senv = venv
@@ -4101,6 +4318,53 @@ def _start_ml_service(config: dict):
     if pid and is_native and engine:
         return _ml_verify_or_fallback(config, pid, engine)
     return pid, engine
+
+
+# Our two ML engines, as they appear in `ps`. Anything else listening on the
+# port belongs to somebody else (usually Docker's immich-machine-learning).
+_ML_CMD_RE = re.compile(r"immich-ml-native\s+serve|python[^\s]*\s+-m\s+src\.main")
+
+
+def _listener_pid(port: int) -> int | None:
+    """PID of whatever is listening on this port, or None."""
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    first = out.splitlines()[0].strip() if out else ""
+    return int(first) if first.isdigit() else None
+
+
+def adopt_live_ml(config: dict) -> int | None:
+    """Take back an ML service that is ours but has lost its pidfile.
+
+    A pidfile can go missing while the process it named is perfectly healthy: a
+    failed restart that clears it, a crash between spawn and write, a stray
+    `stop`. Before this, the watcher pinged the port, got an answer from a
+    process it no longer had a PID for, and classified its own engine as a
+    foreign listener to be left alone. It then stayed left alone: status and
+    the menu bar reported ML stopped while it was serving, and nothing would
+    have restarted it if it wedged. Found on the release Mac, four days after
+    it happened.
+    """
+    pid = _listener_pid(config.get("ml_port", 3003))
+    if pid is None:
+        return None
+    try:
+        cmd = subprocess.run(
+            ["/bin/ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not _ML_CMD_RE.search(cmd):
+        return None  # somebody else's service; the caller leaves it alone
+    write_pid("ml", pid)
+    log.info("Adopted the running ML service (PID %d); its pidfile was missing.", pid)
+    return pid
 
 
 def reconcile_ml(config: dict) -> None:
@@ -4152,6 +4416,15 @@ def reconcile_ml(config: dict) -> None:
             "ML process %d has not answered for %ds, restarting it.", pid, int(stuck)
         )
         kill_pid("ml")
+        if not wait_for_port_free(config.get("ml_port", 3003)):
+            log.warning(
+                "  Port %s is still held after stopping the wedged ML service; "
+                "leaving it for the next cycle rather than starting a second "
+                "one into a bind conflict.",
+                config.get("ml_port", 3003),
+            )
+            _ml_unresponsive_since = None
+            return
         _ml_unresponsive_since = None
         wedged = True
     # Somebody is already serving our port, and it isn't us: we have no PID.
@@ -4161,6 +4434,11 @@ def reconcile_ml(config: dict) -> None:
     # watcher would relaunch it every tick forever. Immich has a working ML
     # endpoint either way, so say what is happening once and leave it alone.
     if not wedged and _ml_ping(config):
+        # It answers and we have no PID. Ours with a lost pidfile, or somebody
+        # else's service? Only the second is a reason to stand back.
+        if adopt_live_ml(config) is not None:
+            _ml_foreign_listener_warned = False
+            return
         if not _ml_foreign_listener_warned:
             log.warning(
                 "Port %s is already served by something this accelerator did not "
@@ -5005,6 +5283,9 @@ def stop_all_fast() -> None:
 
 
 def cmd_stop(_args):
+    # An explicit stop is not a pause. Leaving the marker behind would have
+    # status blame a missing library for a worker the user turned off.
+    set_paused("")
     stopped = False
     for name in ("worker", "ml", "dashboard"):
         if kill_pid(name):
@@ -5018,6 +5299,14 @@ def cmd_status(_args):
     worker_pid = read_pid("worker")
     ml_pid = read_pid("ml")
     config = load_config() if CONFIG_FILE.exists() else {}
+
+    paused = read_paused()
+    if paused and paused.get("reason") == "library-unreachable":
+        log.warning(
+            "Worker:     paused, library is not reachable at %s",
+            paused.get("detail") or "?",
+        )
+        log.warning("            It starts again on its own when the mount is back.")
 
     if not worker_pid and not ml_pid:
         # "Disabled" and "stopped" are different facts, and a user who turned a
@@ -5245,6 +5534,60 @@ def cmd_watch(_args):
 _SWITCH = "switch"
 
 
+def _attempt_remount(config: dict, state: dict) -> None:
+    """Try to put the library mount back, on a backoff, at most until the
+    server tells us the credentials are wrong.
+
+    `state` carries attempts/last/blocked across watch cycles. Once the server
+    reports an auth failure we stop for good rather than retrying a password we
+    now know is rejected: a background loop is exactly how an account ends up
+    locked out, and unlike a network blip that is not something waiting fixes.
+    """
+    recipe = config.get("mount_recipe")
+    if not recipe or state.get("blocked"):
+        return
+
+    attempts = state.get("attempts", 0)
+    wait = _REMOUNT_BACKOFF[min(attempts, len(_REMOUNT_BACKOFF) - 1)]
+    now = time.monotonic()
+    last = state.get("last")
+    if last is not None and now - last < wait:
+        return
+
+    state["attempts"] = attempts + 1
+    state["last"] = now
+    if is_mounted(recipe.get("mountpoint", "")):
+        # The probe said unreachable but the mount is there, so this is a slow
+        # or half-dead server, not a missing one. Mounting again would stack a
+        # second mount on the same path and fix nothing.
+        log.debug("Mount point %s is still mounted; not remounting over it.",
+                  recipe.get("mountpoint"))
+        return
+
+    log.info(
+        "Trying to remount the library (%s from %s at %s)...",
+        recipe.get("fstype"),
+        recipe.get("spec"),
+        recipe.get("mountpoint"),
+    )
+    ok, reason = remount(recipe)
+    if ok:
+        log.info("Remounted the library. Checking it on the next cycle.")
+        state.clear()
+        return
+    if reason == "auth":
+        state["blocked"] = True
+        log.error(
+            "The server rejected our credentials for %s, so we will not keep "
+            "trying (repeated attempts can lock the account). Mount the share "
+            "in Finder and save the password in the keychain, then the "
+            "accelerator can do this on its own.",
+            recipe.get("spec"),
+        )
+        return
+    log.warning("  Remount failed: %s", reason)
+
+
 def _watch_worker(config: dict) -> str | None:
     """cmd_watch's worker loop. Returns _SWITCH if the worker was disabled
     mid-flight, so cmd_watch can hand over to the worker-free loop."""
@@ -5269,6 +5612,15 @@ def _watch_worker(config: dict) -> str | None:
 
     signal.signal(signal.SIGTERM, _graceful_stop)
     signal.signal(signal.SIGINT, _graceful_stop)
+
+    # Loop-local rather than module state: it cannot leak between tests, and a
+    # watcher restart is a clean slate.
+    media_paused = False
+    remount_state: dict = {}  # {attempts, last, blocked} for the remount backoff
+    media_down_since: float | None = None  # first failed probe of a run
+    # This loop's state starts clean, so any marker from a previous run is
+    # stale and would make status report a pause that is not happening.
+    set_paused("")
 
     # A detached worker survives `brew services restart`, so a freshly-launched
     # watch (new code) would otherwise adopt a worker still running the OLD code
@@ -5342,6 +5694,84 @@ def _watch_worker(config: dict) -> str | None:
             # way to turn one off) takes effect on a running install, and a
             # crashed one is restarted while it is enabled.
             reconcile_components(config)
+
+            # The library can go away while we are running, and until now
+            # nothing noticed. macOS drops network mounts on sleep or network
+            # churn; Immich stores absolute paths, so every job then fails
+            # instantly on ENOENT. The worker stayed up and shredded the queue
+            # while the logs filled with errors that never named the cause.
+            #
+            # Pause instead. A stopped worker is honest and recovers by itself
+            # the moment the mount returns, which is what a service running
+            # unattended is for.
+            if config.get("require_media_ready", True):
+                if not media_ready_now(config):
+                    if media_down_since is None:
+                        media_down_since = time.monotonic()
+                        log.warning(
+                            "Library did not respond at %s. Trying to remount it, "
+                            "and leaving the worker alone until this has lasted "
+                            "%ds, since a slow mount and a missing one look the "
+                            "same to one probe.",
+                            config.get("upload_mount") or "?",
+                            int(MEDIA_UNREACHABLE_GRACE),
+                        )
+                    # Immediately, not after the grace: a successful remount here
+                    # means the worker is never stopped at all.
+                    _attempt_remount(config, remount_state)
+                    if time.monotonic() - media_down_since < MEDIA_UNREACHABLE_GRACE:
+                        continue
+                    if not media_paused:
+                        media_paused = True
+                        log.error(
+                            "Library still not reachable at %s. Pausing the worker "
+                            "so jobs are not failed against a missing mount; it "
+                            "will start again on its own when the mount is back.",
+                            config.get("upload_mount") or "?",
+                        )
+                        set_paused("library-unreachable", config.get("upload_mount") or "")
+                    if read_pid("worker"):
+                        kill_pid("worker")
+                    # Nothing else this cycle is meaningful with no library:
+                    # the crash-check below would restart the worker straight
+                    # back into the same failure. The remount, if it worked, is
+                    # picked up by next cycle's probe.
+                    continue
+
+                # Healthy: remember how this mount is put together, while we
+                # can still see it. A recipe recorded now is what lets us
+                # rebuild the mount later, at the exact path Immich stores in
+                # its database rather than wherever Finder would land it.
+                recipe = mount_recipe_for(config.get("upload_mount") or "")
+                if recipe and recipe != config.get("mount_recipe"):
+                    config["mount_recipe"] = recipe
+                    save_config(config)
+                    log.info(
+                        "Recorded how the library is mounted (%s from %s), so it "
+                        "can be remounted automatically if it drops.",
+                        recipe["fstype"],
+                        recipe["spec"],
+                    )
+                media_down_since = None
+                if remount_state:
+                    remount_state.clear()
+
+                if media_paused:
+                    media_paused = False
+                    log.info(
+                        "Library is reachable again at %s. Starting the worker.",
+                        config.get("upload_mount") or "?",
+                    )
+                    set_paused("")
+                    # Start it here rather than falling through to the
+                    # crash-check: the worker did not crash, we stopped it, and
+                    # the log should say so.
+                    if not read_pid("worker"):
+                        try:
+                            cmd_start(argparse.Namespace(force=True))
+                        except RuntimeError:
+                            log.error("  Worker start after the library returned failed")
+                        worker_handled = True
 
             # fd-leak safety net (#89): restart the worker before a runaway
             # open-file-descriptor count (an upstream Immich leak on some media)

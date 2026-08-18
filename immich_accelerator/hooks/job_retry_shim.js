@@ -55,16 +55,29 @@
 'use strict';
 
 const ENABLED = process.env.IMMICH_ACCEL_JOB_RETRY !== '0';
-// Effectively unlimited by default — bullmq requires a finite number, and
-// this is high enough that no real job will ever exhaust it.
+// Unlimited, deliberately. A job that stops retrying needs a human to notice
+// and requeue it, and if that is required anyway then a service that runs
+// unattended has not done its job. A NAS down for a week should come back to
+// a library that catches up on its own.
+//
+// What keeps that affordable is the cap below, not a limit on attempts: a
+// permanently broken asset retries on the ceiling interval forever, which at
+// an hour is 24 quick failures a day and costs essentially nothing. Delayed
+// jobs sit in bullmq's delayed set rather than occupying a worker, so the
+// only real cost is the log line.
 const ATTEMPTS = parseInt(
     process.env.IMMICH_ACCEL_JOB_RETRY_ATTEMPTS || String(Number.MAX_SAFE_INTEGER), 10
 );
 const BASE_MS = parseInt(
     process.env.IMMICH_ACCEL_JOB_RETRY_BACKOFF_MS || '10000', 10
 );
+// An hour, not five minutes. The ceiling is what decides both halves of this:
+// how quickly a week-long outage recovers once the mount is back (within one
+// interval), and what a permanently failing job costs in the meantime (one
+// attempt per interval, forever). Five minutes made unlimited retries noisy;
+// an hour makes them cheap enough that they never need to stop.
 const MAX_MS = parseInt(
-    process.env.IMMICH_ACCEL_JOB_RETRY_BACKOFF_MAX_MS || String(5 * 60 * 1000), 10
+    process.env.IMMICH_ACCEL_JOB_RETRY_BACKOFF_MAX_MS || String(60 * 60 * 1000), 10
 );
 const BACKOFF_TYPE = 'immich-accel';
 
@@ -137,7 +150,7 @@ function patchBullmq(bullmq) {
         patchWorkerPrototype(bullmq.Worker.prototype);
     }
     process.stderr.write(
-        `[immich-accelerator] job retry enabled (attempts effectively unlimited, ` +
+        `[immich-accelerator] job retry enabled (unlimited attempts, ` +
         `backoff ${BASE_MS}ms exponential capped at ${MAX_MS}ms, resets on restart)\n`
     );
 }

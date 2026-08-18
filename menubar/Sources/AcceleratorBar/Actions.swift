@@ -20,7 +20,7 @@ enum LaunchAtLogin {
 enum MountSharesAtLogin {
     private static let key = "MountSharesAtLoginURLs"
 
-    static var isEnabled: Bool { UserDefaults.standard.array(forKey: key) != nil }
+    static var isEnabled: Bool { UserDefaults.standard.data(forKey: key) != nil }
 
     // Turning it on snapshots whichever SMB shares are mounted right now.
     // Turning it off forgets that list — re-enabling later re-snapshots
@@ -28,23 +28,49 @@ enum MountSharesAtLogin {
     static func set(_ on: Bool) async {
         if on {
             let (_, out) = await Actions.run("/sbin/mount", [])
-            UserDefaults.standard.set(smbURLs(fromMountOutput: out), forKey: key)
+            let found = shares(fromMountOutput: out)
+            let encoded = (try? JSONEncoder().encode(found)) ?? Data()
+            UserDefaults.standard.set(encoded, forKey: key)
         } else {
             UserDefaults.standard.removeObject(forKey: key)
         }
     }
 
-    // Parses `mount` for smbfs lines, e.g.
-    //   //pi@192.168.1.2/immich on /Volumes/immich (smbfs, nodev, nosuid, ...)
-    // into smb:// URLs NSWorkspace can hand back to Finder for a remount.
-    static func smbURLs(fromMountOutput out: String) -> [String] {
-        out.split(separator: "\n").compactMap { line -> String? in
-            guard line.contains("(smbfs"), let onRange = line.range(of: " on /Volumes/") else {
-                return nil
-            }
-            let remote = line[line.startIndex..<onRange.lowerBound]
-            guard remote.hasPrefix("//") else { return nil }
-            return "smb:" + remote
+    /// One remembered share: where it came from, and where it was actually
+    /// mounted. Both, because they are not derivable from each other.
+    struct Share: Codable {
+        var url: String
+        var mountPoint: String
+    }
+
+    /// Parses `mount` output into shares worth remembering.
+    ///
+    /// A real line looks like:
+    ///   //user@host/share on /Volumes/immich (smbfs, nodev, nosuid)
+    /// but mount points contain spaces, are not always under /Volumes, and
+    /// some smbfs mounts are automounts the user never asked for. Checked
+    /// against real output from the release Mac rather than an invented
+    /// sample, which is where the last two of those came from.
+    static func shares(fromMountOutput out: String) -> [Share] {
+        out.split(separator: "\n").compactMap { line -> Share? in
+            // Split on " on " once, then take the mount point up to the last
+            // " (", since the mount point itself may contain spaces.
+            guard let onRange = line.range(of: " on "),
+                  let optsRange = line.range(of: " (", options: .backwards),
+                  optsRange.lowerBound > onRange.upperBound
+            else { return nil }
+
+            let remote = String(line[line.startIndex..<onRange.lowerBound])
+            let mountPoint = String(line[onRange.upperBound..<optsRange.lowerBound])
+            let opts = String(line[optsRange.upperBound...])
+
+            guard opts.contains("smbfs"), remote.hasPrefix("//") else { return nil }
+            // Automounts: Time Machine's own SMB mount appears exactly like a
+            // user share but was never mounted by hand, and remounting it at
+            // every login is both wrong and visible.
+            guard !opts.contains("nobrowse") else { return nil }
+
+            return Share(url: "smb:" + remote, mountPoint: mountPoint)
         }
     }
 
@@ -52,12 +78,16 @@ enum MountSharesAtLogin {
     // Finder/diskarbitrationd, which only prompts for credentials if none
     // were saved to Keychain from the share's original manual mount.
     static func remountMissing() {
-        guard let urls = UserDefaults.standard.array(forKey: key) as? [String] else { return }
-        for urlString in urls {
-            guard let shareName = urlString.split(separator: "/").last else { continue }
-            let mountPoint = "/Volumes/\(shareName)"
-            guard !FileManager.default.fileExists(atPath: mountPoint),
-                  let url = URL(string: urlString) else { continue }
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let remembered = try? JSONDecoder().decode([Share].self, from: data)
+        else { return }
+        for share in remembered {
+            // The mount point we saw, not one derived from the share name.
+            // macOS appends -1 on a collision and the user can mount a share
+            // anywhere, so re-deriving it checks a path that may never have
+            // existed and remounts something already mounted.
+            guard !FileManager.default.fileExists(atPath: share.mountPoint),
+                  let url = URL(string: share.url) else { continue }
             NSWorkspace.shared.open(url)
         }
     }

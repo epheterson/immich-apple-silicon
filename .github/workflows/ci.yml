@@ -266,7 +266,9 @@ jobs:
             echo "created=true" >> "$GITHUB_OUTPUT"
             echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           fi
-      - name: Create draft release with changelog
+      # Published immediately, not a draft: gh release create has no --draft
+      # here, and the assets are attached afterwards by update-homebrew.yml.
+      - name: Create release with changelog
         if: steps.tag.outputs.created == 'true'
         env:
           GH_TOKEN: ${{ github.token }}

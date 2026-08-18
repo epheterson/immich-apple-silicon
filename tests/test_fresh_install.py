@@ -1402,6 +1402,70 @@ class TestHeicDecodeShim:
 
     SHIM = REPO_ROOT / "immich_accelerator" / "hooks" / "heic_decode_shim.js"
 
+    DRIVER = """
+const { lazyDecodedSharp } = require(process.argv[2]);
+const fake = () => {
+    const applied = [];
+    const inst = new Proxy({}, {
+        get: (_t, p) => (p === 'toBuffer'
+            ? async () => applied
+            : (...a) => { applied.push(p); return inst; }),
+    });
+    return inst;
+};
+(async () => {
+    const p = lazyDecodedSharp('/nonexistent/x.arw', {}, fake);
+    const a = p.rotate(90);
+    const b = p.clone().resize(100);
+    const out = { a: await a.toBuffer(), b: await b.toBuffer() };
+    try {
+        lazyDecodedSharp('/nonexistent/y.arw', {}, fake).pipe(process.stdout);
+        out.threw = '';
+    } catch (e) { out.threw = e.message; }
+    console.log('RESULT' + JSON.stringify(out));
+})();
+"""
+
+    def _drive(self, tmp_path):
+        """Run the proxy against a fake Sharp. The input is a RAW path that does
+        not exist, so the decode fails and falls through to the original input;
+        what is under test is the recorded chain, not the decode."""
+        import json
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        driver = tmp_path / "drive.js"
+        driver.write_text(self.DRIVER)
+        proc = subprocess.run(
+            [node, str(driver), str(self.SHIM)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        line = [x for x in proc.stdout.splitlines() if x.startswith("RESULT")]
+        assert line, f"driver produced no result:\n{proc.stdout}\n{proc.stderr}"
+        return json.loads(line[0][len("RESULT") :])
+
+    def test_clone_forks_the_chain_instead_of_sharing_it(self, tmp_path):
+        """clone() exists to send one pipeline to two outputs. Recorded as an
+        ordinary chain call it returned the same proxy, so both branches wrote
+        to one list and each output silently got the other's operations."""
+        out = self._drive(tmp_path)
+        assert out["a"] == ["rotate"], "the original must not gain the fork's calls"
+        assert out["b"] == ["rotate", "resize"], "the fork inherits, then diverges"
+
+    def test_stream_use_fails_by_name(self, tmp_path):
+        """A Sharp instance is also a stream; this proxy cannot be one, because
+        the decode it stands in for is async. Immich 3.0.2 never streams on this
+        path, so this is about the version after that failing somewhere it can
+        be recognised."""
+        out = self._drive(tmp_path)
+        assert "immich-accelerator" in out["threw"]
+        assert "pipe()" in out["threw"]
+
     def test_shim_file_exists(self):
         assert self.SHIM.exists(), "heic_decode_shim.js must ship in hooks/"
 
@@ -2181,7 +2245,7 @@ class TestPgKeepaliveShim:
 
 
 class TestJobRetryShim:
-    """The job retry shim gives BullMQ jobs an effectively unlimited attempt
+    """The job retry shim gives BullMQ jobs an unlimited attempt
     count with exponential backoff that resets whenever the accelerator
     restarts. Immich hardcodes `attempts: 1` (no retry) for every queue
     (config.repository.js), so a transient connection drop in a split
@@ -2265,7 +2329,7 @@ class TestJobRetryShim:
 
     @pytest.mark.slow
     def test_shim_raises_attempts_via_add_and_addbulk(self, tmp_path):
-        """add()/addBulk() should get an effectively unlimited attempts count
+        """add()/addBulk() should get an unlimited attempts count
         and a backoff marker injected when the caller didn't ask for
         anything explicit, the way Immich's job.repository.js calls them —
         while an explicit caller-set attempts count survives untouched."""
@@ -2308,7 +2372,10 @@ class TestJobRetryShim:
         )
         assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
         out = result.stdout
-        assert f"ATTEMPTS:{2**53 - 1}" in out, out  # Number.MAX_SAFE_INTEGER — "never expires"
+        # Unlimited on purpose: a job that stops retrying needs a human to
+        # requeue it, which defeats running unattended. The hourly ceiling is
+        # what makes that affordable, not a limit on attempts.
+        assert f"ATTEMPTS:{2**53 - 1}" in out, out
         assert "BACKOFF_TYPE:immich-accel" in out, out
         assert "EXPLICIT_ATTEMPTS:5" in out, out  # never override a real explicit choice
         assert f"BULK_A_ATTEMPTS:{2**53 - 1}" in out, out
