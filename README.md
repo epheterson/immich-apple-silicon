@@ -119,6 +119,7 @@ Everything past the quick start lives in [`docs/`](docs/):
 | [docs/troubleshooting.md](docs/troubleshooting.md)     | Symptom → cause → fix for common setup and runtime issues                                                                                               |
 | [docs/security.md](docs/security.md)                   | Safety guarantees and every network-facing surface                                                                                                      |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                     | Testing requirements and PR guidelines                                                                                                                  |
+| [CONTRIBUTORS.md](CONTRIBUTORS.md)                     | The people who have made this better                                                                                                                    |
 
 ## Repo layout
 
