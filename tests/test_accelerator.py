@@ -2953,6 +2953,13 @@ class TestReconcileML:
         ), patch.object(
             m, "kill_pid"
         ) as kill, patch.object(
+            # Real wait_for_port_free() polls time.monotonic() itself in a
+            # while loop; against this test's frozen clock the deadline is
+            # never reached and it spins forever.
+            m,
+            "wait_for_port_free",
+            return_value=True,
+        ), patch.object(
             m, "_start_ml_service", return_value=(77, "native Swift")
         ) as start:
             m.reconcile_ml({})  # first quiet pass: start the timer

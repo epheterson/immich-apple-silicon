@@ -73,7 +73,15 @@ final class ZooCLIP {
         "textual/model.onnx", "textual/tokenizer.json", "textual/tokenizer_config.json",
     ]
 
-    init(name: String) throws {
+    // forceONNX: nil (the production default) reads ZOOCLIP_FORCE_ONNX from the
+    // environment. scripts/native-ml-full-benchmark.py's `fullbench` binary mode
+    // passes an explicit true/false instead, so it can instantiate the native
+    // and onnxruntime branches of the same model side by side in one process —
+    // running a SigLIPRegistry model through the onnxruntime branch anyway
+    // measures the "before native" baseline with the exact same
+    // preprocessing/session code this file used to run for every SigLIP model,
+    // not a separately-written comparison harness. Never forced in production.
+    init(name: String, forceONNX forceONNXOverride: Bool? = nil) throws {
         // The model name arrives from the network and is used in both a cache
         // path and a download URL. Constrain it hard: the allowed charset of
         // real Immich model names, no traversal or URL metacharacters.
@@ -86,13 +94,7 @@ final class ZooCLIP {
         self.name = name
         dir = Self.zooDir.appendingPathComponent(name)
 
-        // Benchmark-only escape hatch (scripts/native-ml-siglip-benchmark.py):
-        // run a SigLIPRegistry model through the onnxruntime branch anyway, so
-        // the "before native" baseline is measured with the exact same
-        // preprocessing/session code this file used to run for every SigLIP
-        // model, not a separately-written comparison harness. Never set in
-        // production; unset behaves exactly as before.
-        let forceONNX = ProcessInfo.processInfo.environment["ZOOCLIP_FORCE_ONNX"] == "1"
+        let forceONNX = forceONNXOverride ?? (ProcessInfo.processInfo.environment["ZOOCLIP_FORCE_ONNX"] == "1")
 
         // Decided before anything is fetched, because it decides what to fetch.
         // This used to run after ensureFiles, so every native model downloaded

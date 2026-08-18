@@ -7,7 +7,7 @@ import Foundation
 // Float (not Double) accumulation and row-parallel DispatchQueue.concurrentPerform:
 // this runs on every /predict call, on the full source image resolution (not the
 // small resize target), and was measured as a real chunk of end-to-end latency on
-// realistic ~4032x3024 photos — see scripts/native-ml-siglip-benchmark.py's
+// realistic ~4032x3024 photos — see scripts/native-ml-full-benchmark.py's
 // docstring (246ms vs 552ms, small vs realistic test image). Output stays within
 // UInt8 rounding of the previous Double version; PIL itself has no stronger
 // precision guarantee than that.

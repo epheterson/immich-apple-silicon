@@ -48,6 +48,12 @@ an on-prod soak diffing search + face clusters, then hardening (shared CLIP
 weights to avoid a double load, model registry for other CLIP archs, C-shim
 error-path polish).
 
+## Benchmarks
+
+CLIP visual/textual latency, native mlx-swift vs. onnxruntime, measured on a
+real photo: [docs/native-ml-benchmarks.md](../docs/native-ml-benchmarks.md). Regenerate
+with `python3 scripts/native-ml-full-benchmark.py` (from repo root).
+
 ## Build (on Apple Silicon)
 
 ```

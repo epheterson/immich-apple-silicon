@@ -31,7 +31,7 @@ import MLXNN
 //     matmul needing to run at fp32. See ln()/embedVisual/embedTextual for
 //     where reductions are deliberately upcast back to fp32 despite that.
 //     Validated across all 17 registry models on a realistic 4032x3024 photo
-//     (scripts/native-ml-siglip-benchmark.py's synthetic image): worst-case
+//     (scripts/native-ml-full-benchmark.py's real test image): worst-case
 //     cosine similarity against this same file's previous all-fp32 output is
 //     0.9996 visual / 0.9997 textual — well inside the ~0.99 already accepted
 //     for ViT-L-16-SigLIP2-256's fp32-vs-ONNX drift below. Latency: 7-21%
