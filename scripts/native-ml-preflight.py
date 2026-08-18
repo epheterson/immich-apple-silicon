@@ -395,7 +395,7 @@ def main() -> int:
         "--mixed-image",
         default="/tmp/native-ml-bench.jpg",
         help="realistic-resolution image for the mixed clip+vision stage (see "
-        "scripts/native-ml-siglip-benchmark.py's ensure_bench_image) — a tiny image resolves "
+        "scripts/native-ml-full-benchmark.py's ensure_bench_images) — a tiny image resolves "
         "clip.visual in a few ms and closes the Metal collision window almost instantly, "
         "hiding the crash this stage exists to catch. Falls back to the tiny synthetic JPEG "
         "if the file doesn't exist.",
