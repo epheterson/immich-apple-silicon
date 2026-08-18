@@ -160,7 +160,7 @@ The native worker runs Immich's own code with the same UPSERT-safe writes, and t
 
 ## On agentic engineering
 
-This project was built iteratively across several sessions with [Claude Code](https://claude.com/claude-code) (Opus 4.6). From zero knowledge of the Immich codebase to a working native accelerator, including upstream contributions to the ML service and a feature discussion with the Immich maintainers. Inspect the code yourself, use it and share it, or don't.
+This project is built with [Claude Code](https://claude.com/claude-code), from zero knowledge of the Immich codebase to a working native accelerator, including upstream contributions to the ML service and a feature discussion with the Immich maintainers. It has since had contributions from other people too. Inspect the code yourself, use it and share it, or don't.
 
 ---
 
@@ -168,11 +168,14 @@ This project was built iteratively across several sessions with [Claude Code](ht
 
 [![Contributors](https://contrib.rocks/image?repo=epheterson/immich-apple-silicon)](https://github.com/epheterson/immich-apple-silicon/graphs/contributors)
 
----
+<!-- Star History: GitHub restricted the stargazers API in August 2026, so the
+     chart currently renders as "GitHub restricted access to star data" for
+     every repo, not just this one. Uncomment when that is resolved.
 
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=epheterson/immich-apple-silicon&type=Date)](https://star-history.com/#epheterson/immich-apple-silicon&Date)
+-->
 
 ---
 
