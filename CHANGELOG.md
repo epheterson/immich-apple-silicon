@@ -11,6 +11,7 @@
 ### Fixed
 - **A Docker install whose daemon is not running no longer crashes the accelerator.** `docker` commands were given timeouts, but a timeout raises something the callers were not catching, so instead of falling back to the API it ended in a traceback. Split deployments with Docker installed but stopped could not start. Contributed by [@RxChi1d](https://github.com/RxChi1d) ([#138](https://github.com/epheterson/immich-apple-silicon/pull/138)).
 - `CONTRIBUTING.md` pointed ML contributors at the wrong repository. The native engine is here, in `native-ml/`. It also asked contributors to edit the changelog, which the release PR does, and now warns that the test suite can stop the worker on a Mac that is serving a library.
+- **The test suite no longer writes into the home directory of the machine it runs on.** Around half of it never asked for the isolation fixture, so a run used the real `~/.immich-accelerator`: on a Mac serving a library it cleared the ML pidfile and took twenty minutes instead of twenty seconds. Not finished, a run can still restart that machine's worker, so `CONTRIBUTING.md` still says not to.
 - The star history chart is commented out. GitHub restricted the stargazers API, so it renders as an error message for every repo, not just this one.
 
 ### Thanks
