@@ -3979,6 +3979,15 @@ def _setup_remote(args):
     if args.import_server:
         server_dir = _import_server(args.import_server, version)
     else:
+        # The API already reported the exact version, so the cache can be settled
+        # before deciding how to fetch. Both fetch paths make this same check, but
+        # extract_immich_server only reaches it after `docker pull` has run.
+        bare_version = version.lstrip("v")
+        server_dir = _cached_server_if_current(
+            DATA_DIR / "server" / bare_version, bare_version
+        )
+
+    if not args.import_server and server_dir is None:
         # Try local Docker pull
         try:
             docker = _find_running_docker()
