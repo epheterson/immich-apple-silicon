@@ -80,6 +80,7 @@ struct SettingsView: View {
     @State private var applyingComponent: String?
     @State private var componentError: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
+    @State private var mountSharesAtLogin = MountSharesAtLogin.isEnabled
 
     var body: some View {
         NavigationSplitView {
@@ -165,6 +166,18 @@ struct SettingsView: View {
             Section {
                 Toggle("Launch menu bar at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
+
+                VStack(alignment: .leading, spacing: Metrics.xs) {
+                    Toggle("Mount NAS shares at login", isOn: $mountSharesAtLogin)
+                        .onChange(of: mountSharesAtLogin) { _, on in
+                            Task { await MountSharesAtLogin.set(on) }
+                        }
+                    // Turning this on remembers whatever SMB shares (e.g. a
+                    // NAS backing a split deployment) are mounted right now;
+                    // it doesn't ask which ones separately.
+                    Text("Remembers the SMB shares mounted right now and reconnects any that are missing on launch.")
+                        .font(.rowDetail).foregroundStyle(.secondary)
+                }
             } header: {
                 Text("Startup")
             } footer: {

@@ -129,6 +129,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !Paths.isConfigured {
             WindowManager.shared.showOnboarding(model: .shared)
         }
+        // No-op unless "Mount NAS shares at login" is on; cheap enough
+        // (an existence check per remembered share) to run unconditionally.
+        MountSharesAtLogin.remountMissing()
         // Keep the core in lockstep: if this (possibly Sparkle-updated) app is
         // newer than the installed core, pull the core forward, always, no
         // prompt. So a Sparkle update upgrades the whole accelerator.
