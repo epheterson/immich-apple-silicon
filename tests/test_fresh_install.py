@@ -2178,3 +2178,256 @@ class TestPgKeepaliveShim:
         )
         assert result.returncode == 0, result.stderr
         assert "KEEPALIVE:undefined" in result.stdout, result.stdout
+
+
+class TestJobRetryShim:
+    """The job retry shim gives BullMQ jobs an effectively unlimited attempt
+    count with exponential backoff that resets whenever the accelerator
+    restarts. Immich hardcodes `attempts: 1` (no retry) for every queue
+    (config.repository.js), so a transient connection drop in a split
+    deployment permanently fails the job. Immich's source is never touched —
+    the shim interposes on `bullmq` via NODE_OPTIONS=--require.
+
+    It can't wrap the `Queue`/`Worker` constructors or exports: empirically,
+    against the real installed bullmq package,
+    `Object.getOwnPropertyDescriptor(bullmq, 'Queue')` (same for `Worker`) is
+    `{ configurable: false, get: fn, set: undefined }` — tslib's
+    __exportStar re-export of a star-exported class. Both plain assignment
+    and Object.defineProperty throw against that descriptor. The fake
+    `bullmq` module below reproduces that exact non-configurable getter shape
+    so this class of bug (caught only by testing against the real package,
+    not the first version of this test) can't silently regress.
+
+    The retry *count* is set producer-side, by wrapping
+    `Queue.prototype.add`/`addBulk`. The retry *delay* has to be set
+    worker-side: `Job.shouldRetryJob()` reads
+    `this.queue.opts.settings.backoffStrategy`, and for a job being
+    processed `this.queue` is the *Worker* instance handling it (verified
+    against bullmq's source — `Worker extends QueueBase`, and
+    `Job.fromJSON(this, ...)` is called with `this` bound to the Worker), not
+    the producer Queue object `@nestjs/bullmq` originally constructed. So the
+    shim also wraps `Worker.prototype.run` to inject the backoff strategy
+    there before the worker starts processing.
+    """
+
+    SHIM_PATH = REPO_ROOT / "immich_accelerator" / "hooks" / "job_retry_shim.js"
+
+    @staticmethod
+    def _write_fake_bullmq(bullmqdir):
+        # add()/addBulk() echo back the opts they received; run() returns the
+        # backoffStrategy the shim installed, both so the test can assert on
+        # exactly what the shim injected. Real bullmq does far more (tracing,
+        # Redis calls, actual job processing); none of that matters here —
+        # this shim only touches options objects on the way in.
+        bullmqdir.mkdir(parents=True)
+        (bullmqdir / "index.js").write_text(
+            "class Queue {\n"
+            "  constructor(name, opts){ this.name = name; this.opts = opts || {}; }\n"
+            "  add(name, data, opts){ return { name, opts }; }\n"
+            "  addBulk(jobs){ return jobs.map(j => ({ name: j.name, opts: j.opts })); }\n"
+            "}\n"
+            "class Worker {\n"
+            "  constructor(name, processor, opts){ this.name = name; this.opts = opts || {}; }\n"
+            "  run(){ return this.opts.settings && this.opts.settings.backoffStrategy; }\n"
+            "}\n"
+            # Getter-only, non-configurable — matches the real installed
+            # bullmq package's compiled CJS index exactly (verified via
+            # Object.getOwnPropertyDescriptor against node_modules/bullmq).
+            "Object.defineProperty(exports, 'Queue', {\n"
+            "  get() { return Queue; }, enumerable: true, configurable: false,\n"
+            "});\n"
+            "Object.defineProperty(exports, 'Worker', {\n"
+            "  get() { return Worker; }, enumerable: true, configurable: false,\n"
+            "});\n"
+        )
+
+    def test_shim_file_exists(self):
+        assert self.SHIM_PATH.exists(), f"hook shim missing: {self.SHIM_PATH}"
+
+    def test_shim_is_referenced_by_cmd_start(self):
+        src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()
+        assert "job_retry_shim.js" in src
+        assert "NODE_OPTIONS" in src
+
+    def test_shim_syntax_valid(self):
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        result = subprocess.run(
+            [node, "--check", str(self.SHIM_PATH)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, f"shim syntax error: {result.stderr}"
+
+    @pytest.mark.slow
+    def test_shim_raises_attempts_via_add_and_addbulk(self, tmp_path):
+        """add()/addBulk() should get an effectively unlimited attempts count
+        and a backoff marker injected when the caller didn't ask for
+        anything explicit, the way Immich's job.repository.js calls them —
+        while an explicit caller-set attempts count survives untouched."""
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+
+        bullmqdir = tmp_path / "node_modules" / "bullmq"
+        self._write_fake_bullmq(bullmqdir)
+
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { Queue } = require('bullmq');\n"
+            "const q = new Queue('thumbnailGeneration', {\n"
+            "  defaultJobOptions: { attempts: 1, removeOnComplete: true, removeOnFail: false }\n"
+            "});\n"
+            # No per-call opts (Immich's actual call shape) — should pick up defaults.
+            "const r1 = q.add('metadata-extraction', {}, {});\n"
+            "console.log('ATTEMPTS:' + r1.opts.attempts);\n"
+            "console.log('BACKOFF_TYPE:' + r1.opts.backoff.type);\n"
+            # An explicit non-default attempts count must survive untouched.
+            "const r2 = q.add('x', {}, { attempts: 5 });\n"
+            "console.log('EXPLICIT_ATTEMPTS:' + r2.opts.attempts);\n"
+            # addBulk: first job gets defaults, second job's explicit count survives.
+            "const bulk = q.addBulk([\n"
+            "  { name: 'a', data: {}, opts: {} },\n"
+            "  { name: 'b', data: {}, opts: { attempts: 7 } },\n"
+            "]);\n"
+            "console.log('BULK_A_ATTEMPTS:' + bulk[0].opts.attempts);\n"
+            "console.log('BULK_B_ATTEMPTS:' + bulk[1].opts.attempts);\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+        out = result.stdout
+        assert f"ATTEMPTS:{2**53 - 1}" in out, out  # Number.MAX_SAFE_INTEGER — "never expires"
+        assert "BACKOFF_TYPE:immich-accel" in out, out
+        assert "EXPLICIT_ATTEMPTS:5" in out, out  # never override a real explicit choice
+        assert f"BULK_A_ATTEMPTS:{2**53 - 1}" in out, out
+        assert "BULK_B_ATTEMPTS:7" in out, out
+
+    @pytest.mark.slow
+    def test_shim_disabled_via_env(self, tmp_path):
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        bullmqdir = tmp_path / "node_modules" / "bullmq"
+        self._write_fake_bullmq(bullmqdir)
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { Queue } = require('bullmq');\n"
+            "const q = new Queue('x', { defaultJobOptions: { attempts: 1 } });\n"
+            "const r = q.add('x', {}, {});\n"
+            "console.log('ATTEMPTS:' + r.opts.attempts);\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            cwd=str(tmp_path),
+            env={"IMMICH_ACCEL_JOB_RETRY": "0", "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ATTEMPTS:undefined" in result.stdout, result.stdout
+
+    @pytest.mark.slow
+    def test_backoff_strategy_is_capped_exponential_per_job(self, tmp_path):
+        """Worker.prototype.run must have the shim's backoff strategy
+        installed in opts.settings. Calling it repeatedly for the same job
+        should grow exponentially from the configured base delay, capped at
+        the configured max — never bullmq's own uncapped 2^n growth — while
+        a different job id starts its own count from the base delay."""
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        bullmqdir = tmp_path / "node_modules" / "bullmq"
+        self._write_fake_bullmq(bullmqdir)
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { Worker } = require('bullmq');\n"
+            "const w = new Worker('thumbnailGeneration', null, {});\n"
+            "const strategy = w.run();\n"
+            "console.log('HAS_STRATEGY:' + (typeof strategy === 'function'));\n"
+            "const jobA = { id: '1', queueName: 'thumbnailGeneration' };\n"
+            "const jobB = { id: '2', queueName: 'thumbnailGeneration' };\n"
+            "console.log('A1:' + strategy(undefined, undefined, undefined, jobA));\n"
+            "console.log('A2:' + strategy(undefined, undefined, undefined, jobA));\n"
+            "console.log('A3:' + strategy(undefined, undefined, undefined, jobA));\n"
+            # A different job id must not inherit jobA's ramp.
+            "console.log('B1:' + strategy(undefined, undefined, undefined, jobB));\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            cwd=str(tmp_path),
+            env={
+                "IMMICH_ACCEL_JOB_RETRY_BACKOFF_MS": "1000",
+                "IMMICH_ACCEL_JOB_RETRY_BACKOFF_MAX_MS": "3000",
+                "PATH": "/usr/bin:/bin",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+        out = result.stdout
+        assert "HAS_STRATEGY:true" in out, out
+        assert "A1:1000" in out, out  # base delay
+        assert "A2:2000" in out, out  # 1000 * 2^1
+        assert "A3:3000" in out, out  # 1000 * 2^2 = 4000, capped at 3000
+        assert "B1:1000" in out, out  # independent counter, starts fresh
+
+    @pytest.mark.slow
+    def test_backoff_resets_across_process_restarts(self, tmp_path):
+        """The whole point of tracking attempts in a process-local Map
+        instead of bullmq's Redis-persisted attemptsMade: a fresh process
+        (standing in for the accelerator restarting) must ramp from the
+        short base delay again for a job id it has never seen before in
+        *this* process, even though the job may have failed many times
+        against the previous process."""
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        bullmqdir = tmp_path / "node_modules" / "bullmq"
+        self._write_fake_bullmq(bullmqdir)
+        caller = tmp_path / "caller.js"
+        caller.write_text(
+            "const { Worker } = require('bullmq');\n"
+            "const w = new Worker('q', null, {});\n"
+            "const strategy = w.run();\n"
+            "const job = { id: '42', queueName: 'q' };\n"
+            # Simulate several prior failures within one process lifetime.
+            "strategy(undefined, undefined, undefined, job);\n"
+            "strategy(undefined, undefined, undefined, job);\n"
+            "console.log('DELAY:' + strategy(undefined, undefined, undefined, job));\n"
+        )
+        env = {"IMMICH_ACCEL_JOB_RETRY_BACKOFF_MS": "1000", "PATH": "/usr/bin:/bin"}
+        run1 = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=15,
+        )
+        run2 = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(caller)],
+            cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=15,
+        )
+        assert run1.returncode == 0, run1.stderr
+        assert run2.returncode == 0, run2.stderr
+        # 3rd call for the same job id: 1000 * 2^2 = 4000, in both processes —
+        # a real "remembers across restarts" bug would show run2 continuing
+        # past where run1 left off instead of restarting at the same value.
+        assert "DELAY:4000" in run1.stdout, run1.stdout
+        assert "DELAY:4000" in run2.stdout, run2.stdout
