@@ -169,7 +169,7 @@ This project was built iteratively across several sessions with [Claude Code](ht
 
 [![Contributors](https://contrib.rocks/image?repo=epheterson/immich-apple-silicon)](https://github.com/epheterson/immich-apple-silicon/graphs/contributors)
 
-The avatars above are people who have landed code. Plenty of what this project does exists because somebody took the time to report a problem well, and those people are named in [CONTRIBUTORS.md](CONTRIBUTORS.md).
+Avatars are people who have landed code. The people whose bug reports changed it are named in [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 ---
 

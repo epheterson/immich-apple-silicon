@@ -2,4 +2,4 @@ blank_issues_enabled: true
 contact_links:
   - name: Setup and troubleshooting
     url: https://github.com/epheterson/immich-apple-silicon/blob/main/docs/troubleshooting.md
-    about: Symptom to cause to fix for the common problems, worth a look first
+    about: Symptom to cause to fix, worth a look first

@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time. A report someone can reproduce is worth as much as a patch, and several fixes in this project started as one.
+        Thanks. A report someone can reproduce is worth as much as a patch.
   - type: textarea
     id: what
     attributes:
