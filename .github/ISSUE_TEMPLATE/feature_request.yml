@@ -1,0 +1,15 @@
+name: Feature request
+description: Suggest something this should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The problem, rather than the solution you have in mind. It often turns out there is a better way in.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What did you have in mind?

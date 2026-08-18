@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.11.2 - 2026-08-18
+
+Documentation and repository housekeeping. No code changes.
+
+### Added
+- **[CONTRIBUTORS.md](CONTRIBUTORS.md)**, crediting both the people who have written code and the people whose bug reports changed it. Every issue in the second list is cited in a source comment explaining why some piece of this works the way it does.
+- **Issue templates**, so a report arrives with the Mac, the versions, whether the library is on a network share, and the logs. Those are the four things almost every diagnosis has needed.
+- **[SECURITY.md](SECURITY.md)** with a private disclosure route, and a CI badge.
+
+### Fixed
+- **CONTRIBUTING.md sent ML contributors to the wrong repository.** It said machine learning changes go upstream, but the native Swift engine lives here in `native-ml/`, which is where every native ML contribution has actually landed. It also named the wrong upstream for the Python engine, and asked contributors to edit the changelog, which only makes them conflict with each other; the release PR writes it and credits them there.
+- **The test suite warning contributors deserved.** Parts of it still use the real data directory, so running it on a Mac that is serving a library can stop that machine's worker. Said plainly until it is fixed.
+
 ## 1.11.1 - 2026-08-17
 
 ### Fixed

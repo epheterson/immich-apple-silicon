@@ -1,5 +1,6 @@
 # Immich Accelerator
 
+[![CI](https://github.com/epheterson/immich-apple-silicon/actions/workflows/ci.yml/badge.svg)](https://github.com/epheterson/immich-apple-silicon/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/epheterson/immich-apple-silicon.svg?label=release)](https://github.com/epheterson/immich-apple-silicon/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-blue.svg)]()
@@ -161,6 +162,14 @@ The native worker runs Immich's own code with the same UPSERT-safe writes, and t
 ## On agentic engineering
 
 This project was built iteratively across several sessions with [Claude Code](https://claude.com/claude-code) (Opus 4.6). From zero knowledge of the Immich codebase to a working native accelerator, including upstream contributions to the ML service and a feature discussion with the Immich maintainers. Inspect the code yourself, use it and share it, or don't.
+
+---
+
+## Contributors
+
+[![Contributors](https://contrib.rocks/image?repo=epheterson/immich-apple-silicon)](https://github.com/epheterson/immich-apple-silicon/graphs/contributors)
+
+The avatars above are people who have landed code. Plenty of what this project does exists because somebody took the time to report a problem well, and those people are named in [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 ---
 

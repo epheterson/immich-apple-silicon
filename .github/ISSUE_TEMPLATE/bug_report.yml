@@ -1,0 +1,63 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. A report someone can reproduce is worth as much as a patch, and several fixes in this project started as one.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Accelerator version
+      description: "`immich-accelerator status` reports it, or `brew list --versions immich-accelerator`"
+      placeholder: "1.11.1"
+    validations:
+      required: true
+  - type: input
+    id: immich
+    attributes:
+      label: Immich version
+      placeholder: "3.0.2"
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: Mac and macOS version
+      placeholder: "M4 Mac mini, macOS 26.3"
+    validations:
+      required: true
+  - type: dropdown
+    id: layout
+    attributes:
+      label: Where does your library live?
+      options:
+        - On this Mac, local disk
+        - Network share (NAS over SMB or NFS)
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How is this deployed?
+      options:
+        - Everything on this Mac
+        - Split, Immich elsewhere and this Mac does the work
+        - ML only, this Mac is a compute node
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "The relevant part of `immich-accelerator logs`, or the worker or ML log. Trim it to what matters."
+      render: text
