@@ -548,6 +548,40 @@ def find_docker() -> str:
     )
 
 
+def _docker_is_running(docker: str) -> bool:
+    """Report whether this Docker binary can reach a daemon.
+
+    A stopped OrbStack does not always refuse: it can wait for its daemon
+    instead, so readiness has to be judged on the timeout as well as on the
+    exit status.
+    """
+    try:
+        result = subprocess.run([docker, "info"], capture_output=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0
+
+
+def _find_running_docker() -> str:
+    """find_docker(), restricted to an installation that answers.
+
+    find_docker() only checks that a binary exists, which is what the setup
+    path wants: _ensure_docker_running() starts a stopped daemon. Every other
+    caller reads live Docker state and has a fallback for not having it, so
+    they want a daemon that is already up.
+
+    This validates the same binary find_docker() picked rather than moving on
+    to the next candidate. Falling through to another engine would swap which
+    Immich stack we inspect, which is a surprise, not a recovery.
+    """
+    docker = find_docker()
+    if not _docker_is_running(docker):
+        raise RuntimeError(
+            f"Docker is installed at {docker}, but its daemon is not running"
+        )
+    return docker
+
+
 def _node_major_version(node_path: str) -> int | None:
     """Return the major version integer of a node binary, or None.
 
@@ -644,13 +678,23 @@ def is_valid_version(version: str) -> bool:
 # --- Docker detection ---
 
 
+def _docker_capture(argv: list[str], timeout: int) -> subprocess.CompletedProcess:
+    """Run a docker command for detection, reporting a hang as RuntimeError.
+
+    Every detection call fails the same way: we could not read local Docker
+    state. A daemon that stops between _find_running_docker() and here leaves
+    the CLI waiting, and callers only catch RuntimeError.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"Docker at {argv[0]} stopped responding") from e
+
+
 def detect_immich(docker: str) -> dict:
     """Detect running Immich instance from Docker."""
-    result = subprocess.run(
-        [docker, "ps", "--format", "{{.Names}}\t{{.Image}}"],
-        capture_output=True,
-        text=True,
-        timeout=10,
+    result = _docker_capture(
+        [docker, "ps", "--format", "{{.Names}}\t{{.Image}}"], 10
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -676,11 +720,9 @@ def detect_immich(docker: str) -> dict:
 
     # Get version from package.json inside the container
     version = "unknown"
-    version_result = subprocess.run(
+    version_result = _docker_capture(
         [docker, "exec", server_container, "cat", "/usr/src/app/server/package.json"],
-        capture_output=True,
-        text=True,
-        timeout=10,
+        10,
     )
     if version_result.returncode == 0:
         try:
@@ -689,11 +731,8 @@ def detect_immich(docker: str) -> dict:
             pass
 
     if not is_valid_version(version):
-        inspect = subprocess.run(
-            [docker, "inspect", server_container, "--format", "{{.Config.Image}}"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+        inspect = _docker_capture(
+            [docker, "inspect", server_container, "--format", "{{.Config.Image}}"], 10
         )
         if inspect.returncode == 0:
             tag = inspect.stdout.strip().split(":")[-1]
@@ -701,12 +740,7 @@ def detect_immich(docker: str) -> dict:
                 version = tag
 
     # Get env vars
-    env_result = subprocess.run(
-        [docker, "exec", server_container, "env"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+    env_result = _docker_capture([docker, "exec", server_container, "env"], 10)
     env = {}
     for line in env_result.stdout.strip().split("\n"):
         if "=" in line:
@@ -784,12 +818,7 @@ def detect_immich(docker: str) -> dict:
 
 def _find_exposed_port(docker: str, container_names: list[str], default: str) -> str:
     for name in container_names:
-        result = subprocess.run(
-            [docker, "port", name, default],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        result = _docker_capture([docker, "port", name, default], 5)
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip().split(":")[-1]
     return default
@@ -857,7 +886,16 @@ def _preflight_env_health(config: dict) -> bool:
                     "upload_mount %s is not accessible — check NFS/SMB mount.",
                     upload_mount,
                 )
-            elif not os.access(upload_mount, os.W_OK):
+            # In a child, with a timeout, for the same reason the stat above is:
+            # os.access() is a bare access(2) in this process, and on a hung
+            # mount that call never returns. This one wedged the release Mac's
+            # watcher indefinitely while it held the start lock, so every later
+            # start blocked behind it too, and the timeout above bought nothing
+            # because the very next line reintroduced the hang it prevented.
+            elif (
+                subprocess.run(["/bin/test", "-w", upload_mount], timeout=5).returncode
+                != 0
+            ):
                 log.warning(
                     "upload_mount %s is not writable — thumbnails will fail.",
                     upload_mount,
@@ -2229,11 +2267,18 @@ def remount(recipe: dict) -> tuple[bool, str]:
 
 def _media_probe(
     mode: str, root: str, media_id: str, timeout: int = 15
-) -> tuple[bool, list[str]]:
+) -> tuple[bool, list[str], str]:
     """Run the marker probe in a child process with a hard timeout. Returns
-    (ok, dangling): ok is True only on a clean exit 0; any nonzero exit or
-    timeout (e.g. a hung network mount) is not-ready. `dangling` lists media
-    subdirs that are symlinks to a missing target (exit 5, see #115)."""
+    (ok, dangling, detail): ok is True only on a clean exit 0; any nonzero exit
+    or timeout (e.g. a hung network mount) is not-ready. `dangling` lists media
+    subdirs that are symlinks to a missing target (exit 5, see #115). `detail`
+    is why it failed.
+
+    detail exists because it once did not. This returned a bare False, so when
+    the probe started failing inside the running service while succeeding from
+    a shell on the same machine, the reason had already been discarded and
+    there was nothing to debug from.
+    """
     try:
         result = subprocess.run(
             [sys.executable, "-c", _MEDIA_PROBE, mode, root, media_id],
@@ -2244,7 +2289,7 @@ def _media_probe(
         err = (result.stderr or "").strip()
         if result.returncode == 5:
             paths = err.split("dangling:", 1)[-1] if "dangling:" in err else ""
-            return False, [p for p in paths.split(",") if p]
+            return False, [p for p in paths.split(",") if p], err or "dangling symlink"
         # A broken link on a non-critical subdir (profile/backups) is worth
         # saying out loud, but not worth refusing to start over.
         if "warn-dangling:" in err:
@@ -2255,9 +2300,13 @@ def _media_probe(
                         "writing there will fail.",
                         p,
                     )
-        return result.returncode == 0, []
-    except (subprocess.SubprocessError, OSError):
-        return False, []
+        if result.returncode == 0:
+            return True, [], ""
+        return False, [], err or f"probe exited {result.returncode}"
+    except subprocess.TimeoutExpired:
+        return False, [], f"probe timed out after {timeout}s"
+    except (subprocess.SubprocessError, OSError) as exc:
+        return False, [], f"could not run the probe: {exc}"
 
 
 def set_paused(reason: str, detail: str = "") -> None:
@@ -2281,22 +2330,77 @@ def read_paused() -> dict | None:
         return None
 
 
-def media_ready_now(config: dict) -> bool:
-    """Is the media root reachable right now? Cheap enough to ask every cycle.
+def _mount_covers(point: str, root: str) -> bool:
+    """Is `point` the mount that would provide `root`: the path itself, or an
+    ancestor of it?"""
+    if not point or not root:
+        return False
+    try:
+        return Path(root) == Path(point) or Path(point) in Path(root).parents
+    except (OSError, ValueError):
+        return False
 
-    ensure_media_ready does the same probe but also establishes the marker on
-    first run and prints a full explanation, which is right once at startup and
-    wrong thirty seconds later. This is the quiet version for the watch loop.
 
-    A missing media_id means the marker has not been established yet, so there
-    is nothing to verify against; leave that to ensure_media_ready at start.
+def library_mount(config: dict) -> str:
+    """The mount point recorded as serving this library, or "" if there is none
+    we can trust.
+
+    Only the recipe recorded while the library was last healthy may speak for
+    it, and only while it still covers the configured path. Both halves of that
+    matter, and review of the first version of this fix found each of them:
+
+    A recipe is written in one place and never cleared, and mount_recipe_for
+    returns None for a local disk, so the refresh cannot overwrite a stale one.
+    A library moved from a NAS to a local disk would otherwise keep pointing at
+    the old share and be paused against a mount it no longer uses, with no way
+    back.
+
+    And an ancestor is not a substitute. Asking the mount table which mount
+    covers the path *today* answers with the surviving parent once a nested
+    mount drops, which is precisely the case where the path has become a bare
+    directory that the real mount would later hide.
     """
+    recipe = config.get("mount_recipe") or {}
+    point = recipe.get("mountpoint") or ""
+    return point if _mount_covers(point, config.get("upload_mount") or "") else ""
+
+
+def library_mount_gone(config: dict) -> tuple[bool, str]:
+    """Has the library's mount actually gone away? Returns (gone, mountpoint).
+
+    Only the mount table is trusted for this. It is the one signal that means
+    "the mount is not there" and nothing else, and reading it needs no child
+    process, no timeout and no access to the mounted filesystem itself.
+
+    1.11.0 asked the marker probe instead, which reads a file on the mount and
+    is therefore also a permissions, timing and I/O question. On the release Mac
+    that probe failed for ten minutes inside the running service while the same
+    probe succeeded from a shell against the same healthy mount, and the worker
+    was stopped for it. Stopping a working machine because a read failed is a
+    much worse outcome than never noticing a mount had dropped.
+
+    A library with no trusted mount is never judged: either it lives on a local
+    disk, or it has not been seen healthy yet, and in both cases there is no
+    absence to detect.
+    """
+    point = library_mount(config)
+    if not point:
+        return False, ""
+    if is_mounted(point):
+        return False, point
+    return True, point
+
+
+def media_io_healthy(config: dict) -> tuple[bool, str]:
+    """Can we actually read the library? Advisory only, never a reason to stop
+    the worker; the caller logs the reason so a failure is diagnosable rather
+    than silent."""
     root = config.get("upload_mount") or ""
     media_id = config.get("media_id") or ""
     if not root or not media_id:
-        return True
-    ok, _dangling = _media_probe("verify", root, media_id, timeout=10)
-    return ok
+        return True, ""
+    ok, _dangling, detail = _media_probe("verify", root, media_id, timeout=10)
+    return ok, detail
 
 
 def ensure_media_ready(config: dict) -> bool:
@@ -2322,13 +2426,43 @@ def ensure_media_ready(config: dict) -> bool:
 
     media_id = config.get("media_id")
     if media_id:
-        ok, dangling = _media_probe("verify", media_root, media_id)
+        ok, dangling, detail = _media_probe("verify", media_root, media_id)
         if ok:
             return True
         if dangling:
             _report_dangling(dangling)
             return False
-        log.error("Media location not ready: %s", media_root)
+        # A probe that could not answer is not a probe that said no.
+        #
+        # This gate exists for one hazard: writing into a local placeholder
+        # directory that the real mount would later hide. If the mount is in the
+        # mount table, that hazard does not exist, whatever the probe managed to
+        # read. And the probe can fail to answer for reasons that have nothing
+        # to do with the library: on macOS a service reading a network volume
+        # can block until the timeout, with no prompt anyone can answer, which
+        # on the release Mac refused every worker start for weeks.
+        covering = mount_recipe_for(media_root) or {}
+        point = covering.get("mountpoint") or (config.get("mount_recipe") or {}).get(
+            "mountpoint", ""
+        )
+        if point and is_mounted(point):
+            log.warning(
+                "Could not verify the library marker at %s (%s), but %s is "
+                "mounted, so this is not a placeholder. Starting anyway.",
+                media_root,
+                detail or "no detail",
+                point,
+            )
+            log.warning(
+                "  If this keeps happening, give the accelerator Full Disk "
+                "Access in System Settings > Privacy & Security: a background "
+                "service reading a network volume can block without it."
+            )
+            return True
+
+        log.error(
+            "Media location not ready: %s (%s)", media_root, detail or "no detail"
+        )
         log.error("  The marker identifying your media root is missing or")
         log.error("  unreadable. Usually a network mount isn't up yet, or the")
         log.error("  media path changed. Refusing to start so the worker can't")
@@ -2338,7 +2472,7 @@ def ensure_media_ready(config: dict) -> bool:
 
     # First run: establish the marker. Requires a present, writable root.
     new_id = uuid.uuid4().hex
-    ok, dangling = _media_probe("init", media_root, new_id)
+    ok, dangling, _detail = _media_probe("init", media_root, new_id)
     if ok:
         config["media_id"] = new_id
         save_config(config)
@@ -3485,8 +3619,7 @@ def _find_docker_or_install() -> str:
     # Wait for Docker daemon
     docker = os.path.expanduser("~/.orbstack/bin/docker")
     for _ in range(30):
-        r = subprocess.run([docker, "info"], capture_output=True, timeout=5)
-        if r.returncode == 0:
+        if _docker_is_running(docker):
             log.info("  OrbStack ready")
             return docker
         time.sleep(2)
@@ -3497,8 +3630,7 @@ def _find_docker_or_install() -> str:
 
 def _ensure_docker_running(docker: str) -> None:
     """Make sure the Docker daemon is up."""
-    r = subprocess.run([docker, "info"], capture_output=True, timeout=5)
-    if r.returncode == 0:
+    if _docker_is_running(docker):
         return
     # Try starting it
     log.info("Docker not running, starting...")
@@ -3507,8 +3639,7 @@ def _ensure_docker_running(docker: str) -> None:
     else:
         subprocess.run(["open", "-a", "Docker"], timeout=10)
     for _ in range(15):
-        r = subprocess.run([docker, "info"], capture_output=True, timeout=5)
-        if r.returncode == 0:
+        if _docker_is_running(docker):
             return
         time.sleep(2)
     raise RuntimeError("Could not start Docker. Start it manually and re-run setup.")
@@ -3850,7 +3981,7 @@ def _setup_remote(args):
     else:
         # Try local Docker pull
         try:
-            docker = find_docker()
+            docker = _find_running_docker()
             image = f"ghcr.io/immich-app/immich-server:v{version}"
             log.info("Pulling %s...", image)
             subprocess.run([docker, "pull", image], check=True, timeout=300)
@@ -4330,7 +4461,9 @@ def _listener_pid(port: int) -> int | None:
     try:
         out = subprocess.run(
             ["/usr/sbin/lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
@@ -4356,7 +4489,9 @@ def adopt_live_ml(config: dict) -> int | None:
     try:
         cmd = subprocess.run(
             ["/bin/ps", "-o", "command=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
@@ -4820,7 +4955,7 @@ def _cmd_start(args):
     # Pre-flight: verify Docker config and auto-update if version changed
     immich = {}
     try:
-        docker = find_docker()
+        docker = _find_running_docker()
         immich = detect_immich(docker)
         if immich["workers_include"] != "api":
             log.error(
@@ -4863,12 +4998,21 @@ def _cmd_start(args):
             config["redis_port"] = immich["redis_port"]
             save_config(config)
     except RuntimeError as e:
-        # No local Docker — typical in split setups. We can't read
-        # IMMICH_MEDIA_LOCATION from the container env, but we CAN
-        # probe the Immich API for the Docker-side path prefix and
-        # compare it to our upload_mount. This is the exact case
-        # issue #19 hit, where a silent "proceeding anyway" let the
-        # worker start with mismatched paths and 404 all thumbnails.
+        # Only a split setup has somewhere else to look. setup --url is the
+        # only thing that writes immich_url, so its absence means Immich is
+        # meant to be in local Docker — and we just failed to read it. There
+        # is nothing left to validate against, so starting the worker would
+        # skip both checks above and feed a stack we never confirmed.
+        if not config.get("immich_url"):
+            log.error("Could not read the local Immich container: %s", e)
+            log.error("Start the Immich Docker stack, then try again.")
+            return
+
+        # Split setup: we can't read IMMICH_MEDIA_LOCATION from the container
+        # env, but we CAN probe the Immich API for the Docker-side path prefix
+        # and compare it to our upload_mount. This is the exact case issue #19
+        # hit, where a silent "proceeding anyway" let the worker start with
+        # mismatched paths and 404 all thumbnails.
         log.info("No local Docker — using API probe to validate path mapping.")
         api_key = config.get("api_key", "")
         upload_mount = config.get("upload_mount", "")
@@ -5340,7 +5484,7 @@ def cmd_logs(args):
 
 def cmd_update(_args):
     config = load_config()
-    docker = find_docker()
+    docker = _find_running_docker()
     immich = detect_immich(docker)
 
     current = config.get("version", "?")
@@ -5560,8 +5704,10 @@ def _attempt_remount(config: dict, state: dict) -> None:
         # The probe said unreachable but the mount is there, so this is a slow
         # or half-dead server, not a missing one. Mounting again would stack a
         # second mount on the same path and fix nothing.
-        log.debug("Mount point %s is still mounted; not remounting over it.",
-                  recipe.get("mountpoint"))
+        log.debug(
+            "Mount point %s is still mounted; not remounting over it.",
+            recipe.get("mountpoint"),
+        )
         return
 
     log.info(
@@ -5662,6 +5808,7 @@ def _watch_worker(config: dict) -> str | None:
     check_count = 0
     self_update_notified = False
     shown_worker_hints: set[str] = set()
+    shown_media_warnings: set[str] = set()
     # None until the fd watchdog first restarts the worker. Compared against
     # time.monotonic() (uptime), so a 0.0 sentinel would wrongly read as "just
     # restarted" for the first FD_RESTART_COOLDOWN seconds after boot.
@@ -5705,43 +5852,71 @@ def _watch_worker(config: dict) -> str | None:
             # the moment the mount returns, which is what a service running
             # unattended is for.
             if config.get("require_media_ready", True):
-                if not media_ready_now(config):
+                gone, point = library_mount_gone(config)
+                if gone:
                     if media_down_since is None:
                         media_down_since = time.monotonic()
                         log.warning(
-                            "Library did not respond at %s. Trying to remount it, "
-                            "and leaving the worker alone until this has lasted "
-                            "%ds, since a slow mount and a missing one look the "
-                            "same to one probe.",
-                            config.get("upload_mount") or "?",
+                            "The mount at %s that holds the library is no longer "
+                            "mounted. Trying to put it back, and leaving the "
+                            "worker alone until this has lasted %ds.",
+                            point,
                             int(MEDIA_UNREACHABLE_GRACE),
                         )
-                    # Immediately, not after the grace: a successful remount here
-                    # means the worker is never stopped at all.
+                    # Immediately, not after the grace: a successful remount
+                    # here means the worker is never stopped at all.
                     _attempt_remount(config, remount_state)
                     if time.monotonic() - media_down_since < MEDIA_UNREACHABLE_GRACE:
                         continue
                     if not media_paused:
                         media_paused = True
                         log.error(
-                            "Library still not reachable at %s. Pausing the worker "
-                            "so jobs are not failed against a missing mount; it "
+                            "The mount at %s is still gone. Pausing the worker so "
+                            "jobs are not failed against a missing library; it "
                             "will start again on its own when the mount is back.",
-                            config.get("upload_mount") or "?",
+                            point,
                         )
-                        set_paused("library-unreachable", config.get("upload_mount") or "")
+                        set_paused(
+                            "library-unreachable", config.get("upload_mount") or ""
+                        )
                     if read_pid("worker"):
                         kill_pid("worker")
-                    # Nothing else this cycle is meaningful with no library:
-                    # the crash-check below would restart the worker straight
-                    # back into the same failure. The remount, if it worked, is
-                    # picked up by next cycle's probe.
                     continue
 
-                # Healthy: remember how this mount is put together, while we
-                # can still see it. A recipe recorded now is what lets us
-                # rebuild the mount later, at the exact path Immich stores in
-                # its database rather than wherever Finder would land it.
+                # Mounted. Whether we can actually read it is a separate
+                # question, and deliberately not one that stops the worker: a
+                # read can fail for permissions, a stalled server or a timeout,
+                # and 1.11.0 stopped a healthy machine over exactly that. Say it
+                # once so it can be diagnosed, then carry on.
+                if media_down_since is not None or media_paused:
+                    media_down_since = None
+                    if media_paused:
+                        media_paused = False
+                        log.info("The mount at %s is back. Starting the worker.", point)
+                        set_paused("")
+                        if not read_pid("worker"):
+                            try:
+                                cmd_start(argparse.Namespace(force=True))
+                            except RuntimeError:
+                                log.error(
+                                    "  Worker start after the mount returned failed"
+                                )
+                            worker_handled = True
+
+                healthy, detail = media_io_healthy(config)
+                if not healthy and detail and detail not in shown_media_warnings:
+                    shown_media_warnings.add(detail)
+                    log.warning(
+                        "The library at %s is mounted but did not read cleanly: "
+                        "%s. Leaving the worker running; jobs that touch it may "
+                        "fail until this clears.",
+                        config.get("upload_mount") or "?",
+                        detail,
+                    )
+
+                # Record how the mount is put together while we can still see
+                # it: this cannot be read back once it is gone, and it is what
+                # tells us later that an absence is an absence.
                 recipe = mount_recipe_for(config.get("upload_mount") or "")
                 if recipe and recipe != config.get("mount_recipe"):
                     config["mount_recipe"] = recipe
@@ -5752,26 +5927,8 @@ def _watch_worker(config: dict) -> str | None:
                         recipe["fstype"],
                         recipe["spec"],
                     )
-                media_down_since = None
                 if remount_state:
                     remount_state.clear()
-
-                if media_paused:
-                    media_paused = False
-                    log.info(
-                        "Library is reachable again at %s. Starting the worker.",
-                        config.get("upload_mount") or "?",
-                    )
-                    set_paused("")
-                    # Start it here rather than falling through to the
-                    # crash-check: the worker did not crash, we stopped it, and
-                    # the log should say so.
-                    if not read_pid("worker"):
-                        try:
-                            cmd_start(argparse.Namespace(force=True))
-                        except RuntimeError:
-                            log.error("  Worker start after the library returned failed")
-                        worker_handled = True
 
             # fd-leak safety net (#89): restart the worker before a runaway
             # open-file-descriptor count (an upstream Immich leak on some media)
@@ -5844,7 +6001,7 @@ def _watch_worker(config: dict) -> str | None:
 
                     # Try local Docker first, fall back to Immich API
                     try:
-                        docker = find_docker()
+                        docker = _find_running_docker()
                         immich = detect_immich(docker)
                         running = immich["version"].lstrip("v")
                     except RuntimeError:
@@ -5866,7 +6023,7 @@ def _watch_worker(config: dict) -> str | None:
                         cmd_stop(None)
                         # Re-extract server — try Docker, fall back to ghcr.io download
                         try:
-                            docker = find_docker()
+                            docker = _find_running_docker()
                             immich = detect_immich(docker)
                             server_dir = extract_immich_server(
                                 docker, immich["container"], running

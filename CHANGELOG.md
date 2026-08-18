@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## 1.11.1 - 2026-08-17
 
-### Added
-- **The native ML engine releases models it is not using.** Every model it loaded stayed in memory until the process exited, so a Mac that ran one Smart Search job held those weights all day. `ViT-SO400M-16-SigLIP2-384__webli` alone is 2.3GB in bf16. Immich's own container gets this for free by exiting after `MACHINE_LEARNING_MODEL_TTL` and letting gunicorn fork a replacement, and the Python service unloads its CLIP and face models in place; the native engine did neither. It now releases the CLIP model, the default ViT-B-32 towers and the ArcFace session once each has gone 300 seconds unused, the same default Immich uses. Models also load on first use rather than at startup, so an idle service holds none of them. `IMMICH_ACCEL_ML_MODEL_TTL` changes the timeout, or `0` keeps everything resident. A reload costs about two seconds off local disk.
+### Fixed
+- **1.11.0 could stop the worker on a perfectly healthy machine.** Its new library check decided the library was gone whenever it could not read the marker file on it. On macOS a background service reading a network volume can block until that read times out, with no prompt anyone is there to answer, so a mounted and healthy NAS library looked exactly like one that had been unplugged. Whether the mount is present is now read from the mount table, which is kernel state: it cannot hang, cannot be denied, and answers only the question being asked. A read that fails is reported, with its reason, and never stops the worker.
+- **A hung network mount could wedge the accelerator completely.** The startup checks tested the library path with `os.access` in the watcher's own process. On a mount whose server has stopped responding that call never returns, and it was made while holding the start lock, so the watcher froze and every later start blocked behind it: the service could not be recovered without killing the process. Seen for real when a NAS stopped serving NFS while still answering ping and HTTP. Every check that touches the library path now runs in a child process with a timeout, and the periodic check reads the mount table instead, which never touches the filesystem at all.
+- **A NAS library could refuse to start the worker indefinitely, with no usable explanation.** The startup check refused whenever it could not verify the marker, including when it merely timed out, and printed the same four lines whatever the cause. It now says what actually went wrong, and proceeds when the mount is present: the check exists to stop the worker writing into a local placeholder that a later mount would hide, and a mounted path is not a placeholder. The release Mac had logged this 1833 times.
 
 ## 1.11.0 - 2026-08-17
 
