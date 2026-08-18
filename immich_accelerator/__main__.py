@@ -4863,12 +4863,21 @@ def _cmd_start(args):
             config["redis_port"] = immich["redis_port"]
             save_config(config)
     except RuntimeError as e:
-        # No local Docker — typical in split setups. We can't read
-        # IMMICH_MEDIA_LOCATION from the container env, but we CAN
-        # probe the Immich API for the Docker-side path prefix and
-        # compare it to our upload_mount. This is the exact case
-        # issue #19 hit, where a silent "proceeding anyway" let the
-        # worker start with mismatched paths and 404 all thumbnails.
+        # Only a split setup has somewhere else to look. setup --url is the
+        # only thing that writes immich_url, so its absence means Immich is
+        # meant to be in local Docker — and we just failed to read it. There
+        # is nothing left to validate against, so starting the worker would
+        # skip both checks above and feed a stack we never confirmed.
+        if not config.get("immich_url"):
+            log.error("Could not read the local Immich container: %s", e)
+            log.error("Start the Immich Docker stack, then try again.")
+            return
+
+        # Split setup: we can't read IMMICH_MEDIA_LOCATION from the container
+        # env, but we CAN probe the Immich API for the Docker-side path prefix
+        # and compare it to our upload_mount. This is the exact case issue #19
+        # hit, where a silent "proceeding anyway" let the worker start with
+        # mismatched paths and 404 all thumbnails.
         log.info("No local Docker — using API probe to validate path mapping.")
         api_key = config.get("api_key", "")
         upload_mount = config.get("upload_mount", "")

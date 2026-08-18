@@ -2621,6 +2621,10 @@ def _worker_env_for(overrides: dict) -> dict:
         "server_dir": "/srv",
         "node": "/usr/bin/node",
         "ml_dir": "/ml",
+        # find_docker is stubbed to fail below, and only a split install may
+        # start without reading its container. Without this the run stops at
+        # the preflight and never builds the env we came for.
+        "immich_url": "http://immich.example:2283",
     }
     config.update(overrides)
     captured = {}
@@ -2659,6 +2663,74 @@ def _worker_env_for(overrides: dict) -> dict:
         with pytest.raises(RuntimeError):
             m.cmd_start(argparse.Namespace(force=True))
     return captured
+
+
+class TestStartWithoutAValidatedDocker:
+    """cmd_start validates IMMICH_WORKERS_INCLUDE and IMMICH_MEDIA_LOCATION
+    against the running container. When detection fails, both are skipped, and
+    what happens next has to depend on whether anything else can answer.
+    """
+
+    def _run(self, config):
+        import immich_accelerator.__main__ as m
+
+        base = {
+            "db_hostname": "localhost",
+            "db_port": "5432",
+            "db_username": "postgres",
+            "db_password": "pw",
+            "db_name": "immich",
+            "redis_hostname": "localhost",
+            "redis_port": "6379",
+            "ml_port": 3003,
+            "version": "3.0.1",
+            "server_dir": "/srv",
+            "node": "/usr/bin/node",
+        }
+        base.update(config)
+        started = MagicMock()
+
+        with patch.object(m, "load_config", return_value=base), patch.object(
+            m, "save_config"
+        ), patch.object(m, "_kill_stale_processes"), patch.object(
+            m, "find_docker", side_effect=RuntimeError("no docker")
+        ), patch.object(
+            m, "read_pid", return_value=None
+        ), patch.object(
+            m, "find_node", return_value="/usr/bin/node"
+        ), patch.object(
+            m, "_check_node_engines_compat", return_value=(True, "")
+        ), patch.object(
+            m, "_verify_sharp_loads", return_value=(True, "")
+        ), patch.object(
+            m, "_build_link_ok", return_value=True
+        ), patch.object(
+            m, "_preflight_env_health", return_value=True
+        ), patch.object(
+            m, "ensure_media_ready", return_value=True
+        ), patch.object(
+            m, "_find_ml_dir", return_value=None
+        ), patch.object(
+            m, "_start_ml_preferred", return_value=(0, None, False)
+        ), patch.object(
+            m, "kill_pid"
+        ), patch.object(
+            m, "start_service", started
+        ):
+            m.cmd_start(argparse.Namespace(force=True))
+        return started
+
+    def test_a_local_install_does_not_start(self, tmp_data_dir):
+        """No immich_url means Immich is supposed to be in local Docker. We
+        could not read it, so there is nothing left to validate against and
+        the worker would be feeding an unconfirmed stack."""
+        assert not self._run({}).called
+
+    def test_a_split_install_still_starts(self, tmp_data_dir):
+        """A split install is expected to have no local Docker; the API probe
+        below covers the path check."""
+        started = self._run({"immich_url": "http://immich.example:2283"})
+        assert started.called
 
 
 class TestWorkerFreeWatchDoesNotStrandTheInstall:
