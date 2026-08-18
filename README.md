@@ -120,7 +120,6 @@ Everything past the quick start lives in [`docs/`](docs/):
 | [docs/troubleshooting.md](docs/troubleshooting.md)     | Symptom → cause → fix for common setup and runtime issues                                                                                               |
 | [docs/security.md](docs/security.md)                   | Safety guarantees and every network-facing surface                                                                                                      |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                     | Testing requirements and PR guidelines                                                                                                                  |
-| [CONTRIBUTORS.md](CONTRIBUTORS.md)                     | The people who have made this better                                                                                                                    |
 
 ## Repo layout
 
@@ -168,8 +167,6 @@ This project was built iteratively across several sessions with [Claude Code](ht
 ## Contributors
 
 [![Contributors](https://contrib.rocks/image?repo=epheterson/immich-apple-silicon)](https://github.com/epheterson/immich-apple-silicon/graphs/contributors)
-
-Avatars are people who have landed code. The people whose bug reports changed it are named in [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 ---
 

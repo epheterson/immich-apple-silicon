@@ -4,8 +4,10 @@
 
 Docs only.
 
+### Thanks
+Code so far from [@lesurJ](https://github.com/lesurJ), [@pl4za](https://github.com/pl4za) and [@RxChi1d](https://github.com/RxChi1d). And for the bug reports that changed the code: [@shtefko](https://github.com/shtefko), [@jhoogeboom](https://github.com/jhoogeboom), [@flsabourin](https://github.com/flsabourin), [@Rustymage](https://github.com/Rustymage), [@KoenM9264](https://github.com/KoenM9264), [@goldhandconsultancy](https://github.com/goldhandconsultancy), [@xobust](https://github.com/xobust), [@exkuretrol](https://github.com/exkuretrol), [@pwnmeow](https://github.com/pwnmeow), [@Amoyblack](https://github.com/Amoyblack) and [@kg6kvq](https://github.com/kg6kvq). Every one of those is cited in a source comment somewhere in here.
+
 ### Added
-- `CONTRIBUTORS.md`, crediting both code and the bug reports that changed the code.
 - Issue templates, asking for the Mac, the versions, where the library lives, and the logs.
 - `SECURITY.md` with a private disclosure route, and a CI badge.
 
