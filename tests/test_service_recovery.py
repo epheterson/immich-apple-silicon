@@ -193,6 +193,16 @@ class TestRemountBackoff:
     """Retrying is fine. Retrying a password we already know is wrong, every
     thirty seconds, forever, is how an account gets locked."""
 
+    @pytest.fixture(autouse=True)
+    def _mount_is_gone(self):
+        """These tests are about the backoff, so the mount must read as absent.
+        Without this they consult the real mount table and pass or fail
+        depending on whether the developer's machine happens to have the
+        recipe's mount point mounted, which is how they passed on a laptop and
+        failed on the Mac serving a library."""
+        with patch.object(m, "is_mounted", return_value=False):
+            yield
+
     CFG = {
         "mount_recipe": {
             "fstype": "smbfs",

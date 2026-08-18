@@ -34,7 +34,7 @@ def no_real_machine_reads(monkeypatch):
     yield
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def tmp_data_dir(tmp_path):
     """Point every module-level path at a temp directory.
 
