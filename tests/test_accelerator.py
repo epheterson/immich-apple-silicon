@@ -23,6 +23,8 @@ from immich_accelerator.__main__ import (
     read_pid,
     kill_pid,
     detect_immich,
+    _docker_is_running,
+    _find_running_docker,
     _find_exposed_port,
     _read_version,
     _build_link_ok,
@@ -2663,6 +2665,65 @@ def _worker_env_for(overrides: dict) -> dict:
         with pytest.raises(RuntimeError):
             m.cmd_start(argparse.Namespace(force=True))
     return captured
+
+
+class TestDockerLiveness:
+    """find_docker only checks that a binary exists. OrbStack's CLI waits for
+    its daemon instead of refusing, so an installed-but-stopped runtime is
+    found and then never answers.
+    """
+
+    def test_a_hang_is_not_running(self):
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="docker", timeout=5),
+        ):
+            assert _docker_is_running("/usr/local/bin/docker") is False
+
+    def test_a_refusal_is_not_running(self):
+        with patch("subprocess.run", return_value=MagicMock(returncode=1)):
+            assert _docker_is_running("/usr/local/bin/docker") is False
+
+    def test_a_missing_binary_is_not_running(self):
+        with patch("subprocess.run", side_effect=OSError("no such file")):
+            assert _docker_is_running("/usr/local/bin/docker") is False
+
+    def test_an_answering_daemon_is_running(self):
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)):
+            assert _docker_is_running("/usr/local/bin/docker") is True
+
+    def test_discovery_rejects_a_stopped_daemon(self):
+        """The callers of _find_running_docker read live Docker state and all
+        catch RuntimeError. Returning a path that hangs turns that into an
+        uncaught TimeoutExpired several calls later."""
+        with patch(
+            "immich_accelerator.__main__.find_docker",
+            return_value="/usr/local/bin/docker",
+        ), patch(
+            "immich_accelerator.__main__._docker_is_running", return_value=False
+        ):
+            with pytest.raises(RuntimeError, match="daemon is not running"):
+                _find_running_docker()
+
+    def test_discovery_returns_an_answering_daemon(self):
+        with patch(
+            "immich_accelerator.__main__.find_docker",
+            return_value="/usr/local/bin/docker",
+        ), patch(
+            "immich_accelerator.__main__._docker_is_running", return_value=True
+        ):
+            assert _find_running_docker() == "/usr/local/bin/docker"
+
+    def test_detection_reports_a_hang_as_runtime_error(self):
+        """A daemon that stops after discovery leaves the CLI waiting mid
+        detection, and every caller of detect_immich catches RuntimeError only.
+        """
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="docker", timeout=10),
+        ):
+            with pytest.raises(RuntimeError, match="stopped responding"):
+                detect_immich("/usr/local/bin/docker")
 
 
 class TestStartWithoutAValidatedDocker:
