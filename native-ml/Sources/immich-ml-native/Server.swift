@@ -95,9 +95,9 @@ private func handle(_ conn: NWConnection, method: String, path: String, ctype: S
     case "/ping":
         respond(conn, status: "200 OK", body: Data("pong".utf8), ctype: "text/plain")
     case "/health":
-        let face = models.arcface != nil ? "ok" : "error: model not loaded"
+        let face = models.arcfaceAvailable ? "ok" : "error: model not found"
         var health: [String: Any] = [
-            "status": models.arcface != nil ? "healthy" : "degraded",
+            "status": models.arcfaceAvailable ? "healthy" : "degraded",
             "stub_mode": false,
             "checks": ["clip": "ok", "face_recognition": face, "vision_framework": "ok"],
         ]

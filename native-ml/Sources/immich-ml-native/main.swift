@@ -176,7 +176,7 @@ let ARCFACE = ProcessInfo.processInfo.environment["ML_ARCFACE"]
 if CommandLine.arguments.contains("serve") {
     let port = UInt16(CommandLine.arguments.last.flatMap { UInt16($0) } ?? 3999)
     let models = Models(clipDir: MODEL, arcfacePath: ARCFACE)
-    print("[native-ml] models loaded (clip=\(MODEL), arcface=\(models.arcface != nil ? "ok" : "MISSING"))")
+    print("[native-ml] models ready (clip=\(MODEL), arcface=\(models.arcfaceAvailable ? "ok" : "MISSING"))")
     // The "listening" line comes from startServer's state handler once the port
     // is actually bound. Announcing it here instead printed a service that was
     // up even when the bind had failed, which is how a log full of "serving on
