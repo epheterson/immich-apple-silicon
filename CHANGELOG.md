@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.11.0 - 2026-08-16
+## 1.11.0 - 2026-08-17
 
 ### Fixed
 - **A library on a network mount that goes away no longer shreds the queue.** macOS drops SMB and NFS mounts on sleep, on network churn, and when a NAS reboots. Immich stores absolute paths, so every job then failed instantly on ENOENT: nothing crashed, jobs drained into failures, and no log line named the cause. The worker is now paused while the library is unreachable and starts again by itself when it returns. A single slow probe is not enough to stop it: a busy NAS and a missing one look the same to one check, so the library has to stay unreachable for two minutes first, while a remount is attempted immediately. Diagnosed on real hardware by [@pl4za](https://github.com/pl4za) ([#130](https://github.com/epheterson/immich-apple-silicon/pull/130)).
