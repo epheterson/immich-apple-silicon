@@ -2292,6 +2292,41 @@ def read_paused() -> dict | None:
         return None
 
 
+def _mount_covers(point: str, root: str) -> bool:
+    """Is `point` the mount that would provide `root`: the path itself, or an
+    ancestor of it?"""
+    if not point or not root:
+        return False
+    try:
+        return Path(root) == Path(point) or Path(point) in Path(root).parents
+    except (OSError, ValueError):
+        return False
+
+
+def library_mount(config: dict) -> str:
+    """The mount point recorded as serving this library, or "" if there is none
+    we can trust.
+
+    Only the recipe recorded while the library was last healthy may speak for
+    it, and only while it still covers the configured path. Both halves of that
+    matter, and review of the first version of this fix found each of them:
+
+    A recipe is written in one place and never cleared, and mount_recipe_for
+    returns None for a local disk, so the refresh cannot overwrite a stale one.
+    A library moved from a NAS to a local disk would otherwise keep pointing at
+    the old share and be paused against a mount it no longer uses, with no way
+    back.
+
+    And an ancestor is not a substitute. Asking the mount table which mount
+    covers the path *today* answers with the surviving parent once a nested
+    mount drops, which is precisely the case where the path has become a bare
+    directory that the real mount would later hide.
+    """
+    recipe = config.get("mount_recipe") or {}
+    point = recipe.get("mountpoint") or ""
+    return point if _mount_covers(point, config.get("upload_mount") or "") else ""
+
+
 def library_mount_gone(config: dict) -> tuple[bool, str]:
     """Has the library's mount actually gone away? Returns (gone, mountpoint).
 
@@ -2306,12 +2341,11 @@ def library_mount_gone(config: dict) -> tuple[bool, str]:
     was stopped for it. Stopping a working machine because a read failed is a
     much worse outcome than never noticing a mount had dropped.
 
-    A library with no recorded mount recipe is never judged: either it lives on
-    a local disk, or it has not been seen healthy yet, and in both cases there
-    is no absence to detect.
+    A library with no trusted mount is never judged: either it lives on a local
+    disk, or it has not been seen healthy yet, and in both cases there is no
+    absence to detect.
     """
-    recipe = config.get("mount_recipe") or {}
-    point = recipe.get("mountpoint") or ""
+    point = library_mount(config)
     if not point:
         return False, ""
     if is_mounted(point):
@@ -2388,7 +2422,9 @@ def ensure_media_ready(config: dict) -> bool:
             )
             return True
 
-        log.error("Media location not ready: %s (%s)", media_root, detail or "no detail")
+        log.error(
+            "Media location not ready: %s (%s)", media_root, detail or "no detail"
+        )
         log.error("  The marker identifying your media root is missing or")
         log.error("  unreadable. Usually a network mount isn't up yet, or the")
         log.error("  media path changed. Refusing to start so the worker can't")
@@ -4390,7 +4426,9 @@ def _listener_pid(port: int) -> int | None:
     try:
         out = subprocess.run(
             ["/usr/sbin/lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
@@ -4416,7 +4454,9 @@ def adopt_live_ml(config: dict) -> int | None:
     try:
         cmd = subprocess.run(
             ["/bin/ps", "-o", "command=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
@@ -5620,8 +5660,10 @@ def _attempt_remount(config: dict, state: dict) -> None:
         # The probe said unreachable but the mount is there, so this is a slow
         # or half-dead server, not a missing one. Mounting again would stack a
         # second mount on the same path and fix nothing.
-        log.debug("Mount point %s is still mounted; not remounting over it.",
-                  recipe.get("mountpoint"))
+        log.debug(
+            "Mount point %s is still mounted; not remounting over it.",
+            recipe.get("mountpoint"),
+        )
         return
 
     log.info(
@@ -5790,7 +5832,9 @@ def _watch_worker(config: dict) -> str | None:
                             "will start again on its own when the mount is back.",
                             point,
                         )
-                        set_paused("library-unreachable", config.get("upload_mount") or "")
+                        set_paused(
+                            "library-unreachable", config.get("upload_mount") or ""
+                        )
                     if read_pid("worker"):
                         kill_pid("worker")
                     continue
@@ -5804,15 +5848,15 @@ def _watch_worker(config: dict) -> str | None:
                     media_down_since = None
                     if media_paused:
                         media_paused = False
-                        log.info(
-                            "The mount at %s is back. Starting the worker.", point
-                        )
+                        log.info("The mount at %s is back. Starting the worker.", point)
                         set_paused("")
                         if not read_pid("worker"):
                             try:
                                 cmd_start(argparse.Namespace(force=True))
                             except RuntimeError:
-                                log.error("  Worker start after the mount returned failed")
+                                log.error(
+                                    "  Worker start after the mount returned failed"
+                                )
                             worker_handled = True
 
                 healthy, detail = media_io_healthy(config)

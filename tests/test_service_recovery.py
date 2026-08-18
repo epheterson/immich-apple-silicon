@@ -342,14 +342,21 @@ class TestWatchLoopPausesOnMissingLibrary:
         assert m.library_mount_gone({"upload_mount": "/nas"}) == (False, "")
 
     def test_a_recorded_mount_that_is_present_is_not_gone(self, tmp_data_dir):
-        cfg = {"mount_recipe": {"mountpoint": "/nas"}}
+        cfg = {"upload_mount": "/nas/immich", "mount_recipe": {"mountpoint": "/nas"}}
         with patch.object(m, "is_mounted", return_value=True):
             assert m.library_mount_gone(cfg) == (False, "/nas")
 
     def test_a_recorded_mount_missing_from_the_table_is_gone(self, tmp_data_dir):
-        cfg = {"mount_recipe": {"mountpoint": "/nas"}}
+        cfg = {"upload_mount": "/nas/immich", "mount_recipe": {"mountpoint": "/nas"}}
         with patch.object(m, "is_mounted", return_value=False):
             assert m.library_mount_gone(cfg) == (True, "/nas")
+
+    def test_a_recipe_without_a_library_path_is_not_judged(self, tmp_data_dir):
+        """A recipe that cannot be shown to cover the configured library says
+        nothing about it."""
+        cfg = {"mount_recipe": {"mountpoint": "/nas"}}
+        with patch.object(m, "is_mounted", return_value=False):
+            assert m.library_mount_gone(cfg) == (False, "")
 
 
 class TestPauseIsVisible:
@@ -630,3 +637,95 @@ class TestAReadFailureNeverStopsTheWorker:
         mocks = self._drive((True, ""))
         said = " ".join(str(c) for c in mocks["log"].warning.call_args_list)
         assert "did not read cleanly" not in said
+
+
+class TestOnlyTheLibrarysOwnMountMaySpeakForIt:
+    """Three ways a mount that is not the library's own was allowed to vouch
+    for it, all found in review of the 1.11.1 fix.
+
+    The rule they share: the mount recorded while the library was last healthy
+    is the only one that may answer, and only while it still covers the
+    configured path.
+    """
+
+    def test_a_surviving_parent_does_not_vouch_for_a_dropped_nested_mount(self):
+        """/nas and /nas/inner are separate mounts and the inner one drops.
+        Asking which mount covers the path today answers with the parent, and
+        the library path is now a bare directory on it: exactly the placeholder
+        the startup gate exists to refuse."""
+        cfg = {
+            "upload_mount": "/nas/inner/photos",
+            "media_id": "x",
+            "mount_recipe": {"fstype": "nfs", "spec": "n:/i", "mountpoint": "/nas/inner"},
+        }
+        # the parent is up, the library's own mount is not
+        with patch.object(m, "is_mounted", side_effect=lambda p: p == "/nas"):
+            gone, point = m.library_mount_gone(cfg)
+        assert gone is True and point == "/nas/inner"
+
+    def test_a_recipe_for_another_path_never_vouches(self):
+        """cmd_update rewrites upload_mount from Docker detection and leaves
+        mount_recipe untouched, so a recipe can outlive the library it
+        described. An unrelated share being mounted says nothing."""
+        cfg = {
+            "upload_mount": "/srv/photos",
+            "media_id": "x",
+            "mount_recipe": {"fstype": "smbfs", "spec": "//h/old", "mountpoint": "/Volumes/old"},
+        }
+        assert m.library_mount(cfg) == ""
+        with patch.object(m, "is_mounted", return_value=True) as mounted:
+            assert m.library_mount_gone(cfg) == (False, "")
+        mounted.assert_not_called(), "a stale recipe must not even be asked about"
+
+    def test_a_library_moved_to_a_local_disk_is_not_paused_forever(self):
+        """mount_recipe_for returns None for a local disk, so the refresh guard
+        can never overwrite the old recipe. Judging it would pause the worker
+        for a mount the library no longer uses, with no way back."""
+        cfg = {
+            "upload_mount": "/Users/elp/Pictures/immich",
+            "media_id": "x",
+            "mount_recipe": {"fstype": "nfs", "spec": "n:/v", "mountpoint": "/nas"},
+        }
+        with patch.object(m, "is_mounted", return_value=False):
+            assert m.library_mount_gone(cfg) == (False, "")
+
+    def test_the_libraries_own_mount_still_answers_normally(self):
+        cfg = {
+            "upload_mount": "/nas/immich",
+            "media_id": "x",
+            "mount_recipe": {"fstype": "nfs", "spec": "n:/v", "mountpoint": "/nas"},
+        }
+        with patch.object(m, "is_mounted", return_value=True):
+            assert m.library_mount_gone(cfg) == (False, "/nas")
+        with patch.object(m, "is_mounted", return_value=False):
+            assert m.library_mount_gone(cfg) == (True, "/nas")
+
+    def test_the_startup_gate_refuses_when_the_recorded_mount_is_gone(self, tmp_data_dir):
+        """The gate may only wave a timed-out probe through on evidence that
+        the library's own mount is present."""
+        cfg = {
+            "upload_mount": "/nas/immich",
+            "media_id": "x",
+            "mount_recipe": {"fstype": "nfs", "spec": "n:/v", "mountpoint": "/nas"},
+        }
+        with patch.object(
+            m, "_media_probe", return_value=(False, [], "probe timed out after 15s")
+        ), patch.object(m, "is_mounted", return_value=False), patch.object(m, "log"):
+            assert m.ensure_media_ready(cfg) is False
+
+    def test_the_startup_gate_proceeds_when_the_recorded_mount_is_present(
+        self, tmp_data_dir
+    ):
+        """The 1.11.1 fix itself: a probe that could not answer is not a probe
+        that said no, when the library's mount is demonstrably there."""
+        cfg = {
+            "upload_mount": "/nas/immich",
+            "media_id": "x",
+            "mount_recipe": {"fstype": "nfs", "spec": "n:/v", "mountpoint": "/nas"},
+        }
+        with patch.object(
+            m, "_media_probe", return_value=(False, [], "probe timed out after 15s")
+        ), patch.object(m, "is_mounted", return_value=True), patch.object(m, "log") as log:
+            assert m.ensure_media_ready(cfg) is True
+        said = " ".join(str(c) for c in log.warning.call_args_list)
+        assert "probe timed out after 15s" in said
