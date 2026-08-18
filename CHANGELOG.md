@@ -15,6 +15,7 @@ Code so far from [@lesurJ](https://github.com/lesurJ), [@pl4za](https://github.c
 - `CONTRIBUTING.md` pointed ML contributors at the wrong repository. The native engine is here, in `native-ml/`.
 - It also asked contributors to edit the changelog. The release PR does that, and credits them.
 - It now warns that the test suite can stop the worker on a Mac that is serving a library.
+- The star history chart is commented out. GitHub restricted the stargazers API, so it renders as an error message for every repo, not just this one.
 
 ## 1.11.1 - 2026-08-17
 
