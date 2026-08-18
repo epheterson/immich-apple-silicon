@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.11.1 - 2026-08-17
+
+### Fixed
+- **1.11.0 could stop the worker on a perfectly healthy machine.** Its new library check decided the library was gone whenever it could not read the marker file on it. On macOS a background service reading a network volume can block until that read times out, with no prompt anyone is there to answer, so a mounted and healthy NAS library looked exactly like one that had been unplugged. Whether the mount is present is now read from the mount table, which is kernel state: it cannot hang, cannot be denied, and answers only the question being asked. A read that fails is reported, with its reason, and never stops the worker.
+- **A NAS library could refuse to start the worker indefinitely, with no usable explanation.** The startup check refused whenever it could not verify the marker, including when it merely timed out, and printed the same four lines whatever the cause. It now says what actually went wrong, and proceeds when the mount is present: the check exists to stop the worker writing into a local placeholder that a later mount would hide, and a mounted path is not a placeholder. The release Mac had logged this 1833 times.
+
 ## 1.11.0 - 2026-08-17
 
 ### Fixed
