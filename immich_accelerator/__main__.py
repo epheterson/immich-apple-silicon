@@ -548,6 +548,40 @@ def find_docker() -> str:
     )
 
 
+def _docker_is_running(docker: str) -> bool:
+    """Report whether this Docker binary can reach a daemon.
+
+    A stopped OrbStack does not always refuse: it can wait for its daemon
+    instead, so readiness has to be judged on the timeout as well as on the
+    exit status.
+    """
+    try:
+        result = subprocess.run([docker, "info"], capture_output=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0
+
+
+def _find_running_docker() -> str:
+    """find_docker(), restricted to an installation that answers.
+
+    find_docker() only checks that a binary exists, which is what the setup
+    path wants: _ensure_docker_running() starts a stopped daemon. Every other
+    caller reads live Docker state and has a fallback for not having it, so
+    they want a daemon that is already up.
+
+    This validates the same binary find_docker() picked rather than moving on
+    to the next candidate. Falling through to another engine would swap which
+    Immich stack we inspect, which is a surprise, not a recovery.
+    """
+    docker = find_docker()
+    if not _docker_is_running(docker):
+        raise RuntimeError(
+            f"Docker is installed at {docker}, but its daemon is not running"
+        )
+    return docker
+
+
 def _node_major_version(node_path: str) -> int | None:
     """Return the major version integer of a node binary, or None.
 
@@ -644,13 +678,23 @@ def is_valid_version(version: str) -> bool:
 # --- Docker detection ---
 
 
+def _docker_capture(argv: list[str], timeout: int) -> subprocess.CompletedProcess:
+    """Run a docker command for detection, reporting a hang as RuntimeError.
+
+    Every detection call fails the same way: we could not read local Docker
+    state. A daemon that stops between _find_running_docker() and here leaves
+    the CLI waiting, and callers only catch RuntimeError.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"Docker at {argv[0]} stopped responding") from e
+
+
 def detect_immich(docker: str) -> dict:
     """Detect running Immich instance from Docker."""
-    result = subprocess.run(
-        [docker, "ps", "--format", "{{.Names}}\t{{.Image}}"],
-        capture_output=True,
-        text=True,
-        timeout=10,
+    result = _docker_capture(
+        [docker, "ps", "--format", "{{.Names}}\t{{.Image}}"], 10
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -676,11 +720,9 @@ def detect_immich(docker: str) -> dict:
 
     # Get version from package.json inside the container
     version = "unknown"
-    version_result = subprocess.run(
+    version_result = _docker_capture(
         [docker, "exec", server_container, "cat", "/usr/src/app/server/package.json"],
-        capture_output=True,
-        text=True,
-        timeout=10,
+        10,
     )
     if version_result.returncode == 0:
         try:
@@ -689,11 +731,8 @@ def detect_immich(docker: str) -> dict:
             pass
 
     if not is_valid_version(version):
-        inspect = subprocess.run(
-            [docker, "inspect", server_container, "--format", "{{.Config.Image}}"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+        inspect = _docker_capture(
+            [docker, "inspect", server_container, "--format", "{{.Config.Image}}"], 10
         )
         if inspect.returncode == 0:
             tag = inspect.stdout.strip().split(":")[-1]
@@ -701,12 +740,7 @@ def detect_immich(docker: str) -> dict:
                 version = tag
 
     # Get env vars
-    env_result = subprocess.run(
-        [docker, "exec", server_container, "env"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+    env_result = _docker_capture([docker, "exec", server_container, "env"], 10)
     env = {}
     for line in env_result.stdout.strip().split("\n"):
         if "=" in line:
@@ -784,12 +818,7 @@ def detect_immich(docker: str) -> dict:
 
 def _find_exposed_port(docker: str, container_names: list[str], default: str) -> str:
     for name in container_names:
-        result = subprocess.run(
-            [docker, "port", name, default],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        result = _docker_capture([docker, "port", name, default], 5)
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip().split(":")[-1]
     return default
@@ -3590,8 +3619,7 @@ def _find_docker_or_install() -> str:
     # Wait for Docker daemon
     docker = os.path.expanduser("~/.orbstack/bin/docker")
     for _ in range(30):
-        r = subprocess.run([docker, "info"], capture_output=True, timeout=5)
-        if r.returncode == 0:
+        if _docker_is_running(docker):
             log.info("  OrbStack ready")
             return docker
         time.sleep(2)
@@ -3602,8 +3630,7 @@ def _find_docker_or_install() -> str:
 
 def _ensure_docker_running(docker: str) -> None:
     """Make sure the Docker daemon is up."""
-    r = subprocess.run([docker, "info"], capture_output=True, timeout=5)
-    if r.returncode == 0:
+    if _docker_is_running(docker):
         return
     # Try starting it
     log.info("Docker not running, starting...")
@@ -3612,8 +3639,7 @@ def _ensure_docker_running(docker: str) -> None:
     else:
         subprocess.run(["open", "-a", "Docker"], timeout=10)
     for _ in range(15):
-        r = subprocess.run([docker, "info"], capture_output=True, timeout=5)
-        if r.returncode == 0:
+        if _docker_is_running(docker):
             return
         time.sleep(2)
     raise RuntimeError("Could not start Docker. Start it manually and re-run setup.")
@@ -3955,7 +3981,7 @@ def _setup_remote(args):
     else:
         # Try local Docker pull
         try:
-            docker = find_docker()
+            docker = _find_running_docker()
             image = f"ghcr.io/immich-app/immich-server:v{version}"
             log.info("Pulling %s...", image)
             subprocess.run([docker, "pull", image], check=True, timeout=300)
@@ -4929,7 +4955,7 @@ def _cmd_start(args):
     # Pre-flight: verify Docker config and auto-update if version changed
     immich = {}
     try:
-        docker = find_docker()
+        docker = _find_running_docker()
         immich = detect_immich(docker)
         if immich["workers_include"] != "api":
             log.error(
@@ -4972,12 +4998,21 @@ def _cmd_start(args):
             config["redis_port"] = immich["redis_port"]
             save_config(config)
     except RuntimeError as e:
-        # No local Docker — typical in split setups. We can't read
-        # IMMICH_MEDIA_LOCATION from the container env, but we CAN
-        # probe the Immich API for the Docker-side path prefix and
-        # compare it to our upload_mount. This is the exact case
-        # issue #19 hit, where a silent "proceeding anyway" let the
-        # worker start with mismatched paths and 404 all thumbnails.
+        # Only a split setup has somewhere else to look. setup --url is the
+        # only thing that writes immich_url, so its absence means Immich is
+        # meant to be in local Docker — and we just failed to read it. There
+        # is nothing left to validate against, so starting the worker would
+        # skip both checks above and feed a stack we never confirmed.
+        if not config.get("immich_url"):
+            log.error("Could not read the local Immich container: %s", e)
+            log.error("Start the Immich Docker stack, then try again.")
+            return
+
+        # Split setup: we can't read IMMICH_MEDIA_LOCATION from the container
+        # env, but we CAN probe the Immich API for the Docker-side path prefix
+        # and compare it to our upload_mount. This is the exact case issue #19
+        # hit, where a silent "proceeding anyway" let the worker start with
+        # mismatched paths and 404 all thumbnails.
         log.info("No local Docker — using API probe to validate path mapping.")
         api_key = config.get("api_key", "")
         upload_mount = config.get("upload_mount", "")
@@ -5449,7 +5484,7 @@ def cmd_logs(args):
 
 def cmd_update(_args):
     config = load_config()
-    docker = find_docker()
+    docker = _find_running_docker()
     immich = detect_immich(docker)
 
     current = config.get("version", "?")
@@ -5966,7 +6001,7 @@ def _watch_worker(config: dict) -> str | None:
 
                     # Try local Docker first, fall back to Immich API
                     try:
-                        docker = find_docker()
+                        docker = _find_running_docker()
                         immich = detect_immich(docker)
                         running = immich["version"].lstrip("v")
                     except RuntimeError:
@@ -5988,7 +6023,7 @@ def _watch_worker(config: dict) -> str | None:
                         cmd_stop(None)
                         # Re-extract server — try Docker, fall back to ghcr.io download
                         try:
-                            docker = find_docker()
+                            docker = _find_running_docker()
                             immich = detect_immich(docker)
                             server_dir = extract_immich_server(
                                 docker, immich["container"], running
