@@ -729,3 +729,49 @@ class TestOnlyTheLibrarysOwnMountMaySpeakForIt:
             assert m.ensure_media_ready(cfg) is True
         said = " ".join(str(c) for c in log.warning.call_args_list)
         assert "probe timed out after 15s" in said
+
+
+class TestNothingTouchesAHungMountInProcess:
+    """A hung NFS mount blocks access(2) in the calling thread, uninterruptibly
+    and forever. Anything that touches the library path from the watcher's own
+    process can therefore wedge the whole service.
+
+    On the release Mac it did exactly that, while holding the start lock, so
+    every later start blocked behind it too and the machine could not be
+    recovered without killing the process.
+    """
+
+    def test_the_writability_check_runs_in_a_child_with_a_timeout(self):
+        """The stat above it is already a subprocess for this reason, and the
+        next line used to undo that with a bare os.access()."""
+        import inspect
+
+        import immich_accelerator.__main__ as mod
+
+        src = inspect.getsource(mod)
+        block = src[src.index("# NFS mount reachable") : src.index("# DB connectivity")]
+        # Code only: the comment above the fix names the call it replaced.
+        code = "\n".join(
+            ln for ln in block.splitlines() if not ln.strip().startswith("#")
+        )
+        assert "os.access(" not in code, (
+            "os.access on the library path blocks forever on a hung mount; "
+            "use a child process with a timeout"
+        )
+        assert "timeout=" in code
+
+    def test_no_bare_filesystem_call_on_the_library_path_in_the_watch_loop(self):
+        """The loop's own liveness check must stay off the mounted filesystem:
+        the mount table answers the question without touching it."""
+        import inspect
+
+        import immich_accelerator.__main__ as mod
+
+        raw = inspect.getsource(mod.library_mount_gone) + inspect.getsource(
+            mod.library_mount
+        )
+        src = "\n".join(
+            ln for ln in raw.splitlines() if not ln.strip().startswith("#")
+        )
+        for banned in ("os.access", "os.stat", "os.listdir", ".exists()", ".is_dir()"):
+            assert banned not in src, f"{banned} can hang forever on a stale mount"

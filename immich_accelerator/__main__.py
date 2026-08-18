@@ -857,7 +857,16 @@ def _preflight_env_health(config: dict) -> bool:
                     "upload_mount %s is not accessible — check NFS/SMB mount.",
                     upload_mount,
                 )
-            elif not os.access(upload_mount, os.W_OK):
+            # In a child, with a timeout, for the same reason the stat above is:
+            # os.access() is a bare access(2) in this process, and on a hung
+            # mount that call never returns. This one wedged the release Mac's
+            # watcher indefinitely while it held the start lock, so every later
+            # start blocked behind it too, and the timeout above bought nothing
+            # because the very next line reintroduced the hang it prevented.
+            elif (
+                subprocess.run(["/bin/test", "-w", upload_mount], timeout=5).returncode
+                != 0
+            ):
                 log.warning(
                     "upload_mount %s is not writable — thumbnails will fail.",
                     upload_mount,
