@@ -34,9 +34,22 @@ nas:/volume1/media on /nas (nfs, nodev)
 
 
 def _mount(output=MOUNT_OUTPUT):
-    return patch.object(
-        m.subprocess, "run", return_value=MagicMock(stdout=output, returncode=0)
-    )
+    """Answer /sbin/mount with the table, and let a resolve child resolve.
+
+    The two are different questions and used to share one mock, so the child
+    that resolves symlinks was handed the mount table as its answer.
+    """
+
+    def run(argv, **kw):
+        if argv and str(argv[0]).endswith("mount"):
+            return MagicMock(stdout=output, returncode=0)
+        if len(argv) >= 3 and "resolve" in str(argv[2]):
+            import pathlib as _p
+
+            return MagicMock(stdout=str(_p.Path(argv[3]).resolve()), returncode=0)
+        return MagicMock(stdout="", returncode=1)
+
+    return patch.object(m.subprocess, "run", side_effect=run)
 
 
 def drive_watch(cfg, ready, pids=None, recipe=None, seconds_per_cycle=60.0):
@@ -1118,3 +1131,48 @@ class TestPortChecksSurviveAnUnusableLsof:
             m.subprocess, "run", side_effect=run
         ), patch.object(m, "log"):
             assert m.adopt_live_ml({"ml_port": 3003}) == 64933
+
+
+class TestADeadMountCannotWedgeTheWatcher:
+    """Every path check the watch loop makes has to survive a mount whose
+    server has gone away. Those calls do not fail, and they do not time out;
+    they never return.
+
+    This has now happened twice on the release Mac, in two different calls.
+    os.access in the start path took the watcher down while it held the start
+    lock. Path.resolve() in mount_recipe_for took it down when the NAS went off
+    for the night, at the moment its whole job was to notice that.
+    """
+
+    def test_the_recipe_lookup_does_not_resolve_in_this_process(self):
+        """resolve() lstats every component of the path."""
+        import inspect
+
+        src = "\n".join(
+            ln
+            for ln in inspect.getsource(m.mount_recipe_for).splitlines()
+            if not ln.strip().startswith("#")
+        )
+        assert ".resolve()" not in src, (
+            "resolve() on the library path never returns on a dead mount; "
+            "use _resolve_offthread"
+        )
+
+    def test_a_plain_match_needs_no_resolving_at_all(self):
+        """The common case, and the one that matters when the mount is dead:
+        /nas/immich under a mount at /nas matches without touching the disk."""
+        out = "10.0.0.14:/volume1/ELP NAS on /nas (nfs)\n"
+        with patch.object(m.subprocess, "run") as run:
+            run.side_effect = lambda argv, **kw: (
+                MagicMock(stdout=out, returncode=0)
+                if str(argv[0]).endswith("mount")
+                else (_ for _ in ()).throw(AssertionError("must not resolve"))
+            )
+            r = m.mount_recipe_for("/nas/immich")
+        assert r and r["mountpoint"] == "/nas"
+
+    def test_a_resolver_that_hangs_is_bounded(self):
+        with patch.object(
+            m.subprocess, "run", side_effect=subprocess.TimeoutExpired("py", 5)
+        ):
+            assert m._resolve_offthread("/nas/immich") is None

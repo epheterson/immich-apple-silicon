@@ -2179,13 +2179,46 @@ def mount_recipe_for(root: str) -> dict | None:
         return None
 
     # The mount table reports resolved paths (/private/tmp, not /tmp), so a
-    # config path that goes through a symlink would match nothing. Resolving is
-    # safe here because a recipe is only ever recorded while the mount is up.
-    try:
-        root = str(Path(root).resolve())
-    except OSError:
-        pass
+    # config path that goes through a symlink would match nothing.
+    #
+    # But resolve() lstats every component, and a component on a mount whose
+    # server has gone away never returns: not a timeout, a wedge. This is called
+    # from the watch loop, so it took the whole watcher down with the NAS on the
+    # release Mac, at exactly the moment its job was to notice that. Resolving
+    # is therefore a fallback, tried only when the plain path matches nothing,
+    # and done where a hang cannot reach this process.
+    candidates = [root]
 
+    best = None
+    for want in candidates:
+        best = _best_mount_for(want, out)
+        if best:
+            return best
+    resolved = _resolve_offthread(root)
+    return _best_mount_for(resolved, out) if resolved and resolved != root else None
+
+
+def _resolve_offthread(path: str, timeout: int = 5) -> str | None:
+    """Resolve symlinks in a child process, so a dead mount cannot wedge us.
+
+    resolve() lstats every component. On a mount whose server has gone away
+    that call does not time out, it never returns, and the caller is the watch
+    loop.
+    """
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys,pathlib;print(pathlib.Path(sys.argv[1]).resolve())", path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = r.stdout.strip()
+    return out if r.returncode == 0 and out else None
+
+
+def _best_mount_for(root: str, out: str) -> dict | None:
+    """Longest mount in `out` that covers `root`, or None."""
     best = None
     for line in out.splitlines():
         head, sep, tail = line.rpartition(" (")
