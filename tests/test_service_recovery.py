@@ -899,15 +899,15 @@ class TestMlPortState:
     not on its own an answer."""
 
     def test_a_real_listener_reads_as_occupied(self):
-        # The only check here that runs the real binary. The accelerator is
-        # macOS-only and hardcodes this path, so on the Linux lint runner there
-        # is nothing to exercise and every port would read as unknown.
-        if not os.access("/usr/sbin/lsof", os.X_OK):
-            pytest.skip("/usr/sbin/lsof not present")
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            sock.listen(1)
-            port = sock.getsockname()[1]
+        """Binds its own socket rather than probing whatever the host happens
+        to be running: the previous version consulted the real machine, so it
+        failed on exactly the Mac this hardening is for."""
+        import socket as _s
+
+        with _s.socket(_s.AF_INET, _s.SOCK_STREAM) as srv:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen()
+            port = srv.getsockname()[1]
             assert REAL_ML_PORT_STATE(port) == m.PORT_OCCUPIED
         assert REAL_ML_PORT_STATE(port) == m.PORT_FREE
 
@@ -1022,26 +1022,49 @@ class TestSpawnedServicesLeadTheirOwnSession:
 
 
 class TestTheGroupIsSignalledOnlyWhenWeLeadTheSession:
-    """start_service and start_dashboard pass start_new_session, so everything
-    this supervisor spawns is a session leader and only its own descendants can
-    join its process group. A process started from a shell leads its job's
-    process group but not the session, so an adopted one is signalled alone."""
+    """start_service and start_dashboard pass start_new_session, so a group we
+    created has its leader as the session leader, and only our descendants can
+    join it. A process started from a shell leads its job's group but not the
+    session, so an adopted one is signalled alone.
+
+    The test is on the group, not on the pid. Asking whether this pid is itself
+    the session leader is false for the pid the worker adoption path returns:
+    _find_live_worker_pid hands back a child, not the leader. The group then
+    went unsignalled and ffmpeg and exiftool survived a stop, because
+    _kill_all_worker_processes matches only immich and node.
+    """
 
     def test_a_session_leader_takes_the_group(self, tmp_data_dir):
         (tmp_data_dir["pid_dir"] / "ml.pid").write_text("4242\n")
         with patch.object(m.os, "getsid", return_value=4242), patch.object(
-            m.os, "killpg"
-        ) as killpg, patch.object(
+            m.os, "getpgid", return_value=4242
+        ), patch.object(m.os, "killpg") as killpg, patch.object(
             m.os, "kill", side_effect=OSError()
         ), patch.object(m, "read_pid", return_value=4242):
             m.kill_pid("ml")
         assert killpg.call_args_list[0][0][0] == 4242
 
+    def test_an_adopted_child_of_ours_still_takes_the_group(self, tmp_data_dir):
+        """The regression this class exists for. The pid is not the leader, but
+        its group was made by setsid, so the group is ours and the worker's
+        ffmpeg and exiftool children have to go with it."""
+        (tmp_data_dir["pid_dir"] / "worker.pid").write_text("4242\n")
+        with patch.object(m.os, "getsid", return_value=900), patch.object(
+            m.os, "getpgid", return_value=900
+        ), patch.object(m.os, "killpg") as killpg, patch.object(
+            m.os, "kill", side_effect=OSError()
+        ), patch.object(m, "read_pid", return_value=4242), patch.object(
+            m, "_kill_all_worker_processes"
+        ):
+            m.kill_pid("worker")
+        assert killpg.call_args_list[0][0][0] == 900
+
     def test_a_pid_inside_somebody_elses_session_is_signalled_alone(self, tmp_data_dir):
+        """A shell job: its group leader is not the session leader."""
         (tmp_data_dir["pid_dir"] / "ml.pid").write_text("4242\n")
         with patch.object(m.os, "getsid", return_value=900), patch.object(
-            m.os, "killpg"
-        ) as killpg, patch.object(
+            m.os, "getpgid", return_value=4242
+        ), patch.object(m.os, "killpg") as killpg, patch.object(
             m.os, "kill", side_effect=[None, OSError()]
         ) as kill, patch.object(m, "read_pid", return_value=4242):
             m.kill_pid("ml")
@@ -1053,10 +1076,12 @@ class TestTheGroupIsSignalledOnlyWhenWeLeadTheSession:
         descendants that outlive their parent."""
         (tmp_data_dir["pid_dir"] / "worker.pid").write_text("4242\n")
         with patch.object(m.os, "getsid", return_value=900), patch.object(
-            m.os, "killpg"
-        ), patch.object(m.os, "kill", side_effect=OSError()), patch.object(
-            m, "read_pid", return_value=4242
-        ), patch.object(m, "_kill_all_worker_processes") as sweep:
+            m.os, "getpgid", return_value=4242
+        ), patch.object(m.os, "killpg"), patch.object(
+            m.os, "kill", side_effect=OSError()
+        ), patch.object(m, "read_pid", return_value=4242), patch.object(
+            m, "_kill_all_worker_processes"
+        ) as sweep:
             m.kill_pid("worker")
         sweep.assert_called_once()
 
@@ -1108,7 +1133,9 @@ class TestPortChecksSurviveAnUnusableLsof:
 
     def test_nothing_is_adopted_when_the_port_is_not_even_held(self, tmp_data_dir):
         """The process scan says an engine of ours is running, not that it owns
-        the port, so the port has to be established first."""
+        the port, so the port has to be established first. The subprocess
+        side_effect is what makes this non-vacuous: reaching it at all is the
+        failure."""
         with patch.object(m, "port_in_use", return_value=False), patch.object(
             m.subprocess, "run", side_effect=AssertionError("must not be reached")
         ), patch.object(m, "log"):
@@ -1262,3 +1289,41 @@ class TestTheWorkerWaitsWhenItsDatabaseIsGone:
             m.cmd_status(None)
         said = " ".join(str(c) for c in log.warning.call_args_list)
         assert "Postgres, Redis" in said and "not answering" in said
+
+
+class TestWeOnlyAdoptTheEngineHoldingOurPort:
+    """"Something holds ml_port" and "an engine of ours is running somewhere"
+    are not the same fact. Treating them as one adopts the wrong process.
+
+    Both halves happen on the release Mac at once: Docker's own ML container is
+    a real holder of 3003, and the preflight gate, which policy says to run on
+    that same Mac, starts an engine of ours on a different port.
+    """
+
+    NATIVE_3003 = "/opt/homebrew/.../native-ml/immich-ml-native serve 3003"
+    NATIVE_3998 = "/opt/homebrew/.../native-ml/immich-ml-native serve 3998"
+
+    def _ps(self, cmd):
+        def run(argv, **kw):
+            if argv[0].endswith("lsof"):
+                raise subprocess.TimeoutExpired("lsof", 10)
+            if "-axo" in argv:
+                return MagicMock(stdout=f"64933 {cmd}\n1 /sbin/launchd\n")
+            return MagicMock(stdout=cmd)
+
+        return patch.object(m.subprocess, "run", side_effect=run)
+
+    def test_an_engine_on_another_port_is_not_adopted(self, tmp_data_dir):
+        """The preflight gate's own server, while Docker holds 3003. Adopting it
+        meant the watcher could later signal a process it never started, and
+        fail the one gate that protects releases."""
+        with self._ps(self.NATIVE_3998), patch.object(
+            m, "port_in_use", return_value=True
+        ), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) is None
+
+    def test_the_engine_on_our_port_is_adopted(self, tmp_data_dir):
+        with self._ps(self.NATIVE_3003), patch.object(
+            m, "port_in_use", return_value=True
+        ), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) == 64933

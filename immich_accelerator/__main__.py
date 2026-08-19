@@ -1889,13 +1889,24 @@ def _signal_service(pid: int, sig: int) -> None:
 
     A pid can also be one we adopted rather than spawned — read_pid falls back
     to a process scan for the worker, adopt_live_ml and start_dashboard adopt a
-    live listener. Session leadership is what separates the two: a process
-    started from a shell leads its job's process group but not the session, and
-    that group is not ours to signal.
+    live listener. What separates the two is whether the process group's leader
+    is the session leader: only setsid makes that true, so a process started
+    from a shell leads its job's group but not the session, and that group is
+    not ours to signal.
     """
     try:
-        if os.getsid(pid) == pid:
-            os.killpg(pid, sig)
+        pgid = os.getpgid(pid)
+        # The group is ours when its leader is also the session leader, which is
+        # the shape start_new_session produces and a shell job never has.
+        #
+        # Testing getsid(pid) == pid instead asks whether this pid is itself the
+        # leader, which is false for the pid the worker adoption path hands back:
+        # _find_live_worker_pid returns a child, not the leader. The group then
+        # went unsignalled, and _kill_all_worker_processes only matches immich
+        # and node, so ffmpeg and exiftool kept running and writing into the
+        # library after "Worker stopped".
+        if os.getsid(pid) == pgid:
+            os.killpg(pgid, sig)
             return
     except OSError:
         pass
@@ -4589,7 +4600,7 @@ def _start_ml_service(config: dict):
 _ML_CMD_RE = re.compile(r"immich-ml-native\s+serve|python[^\s]*\s+-m\s+src\.main")
 
 
-def _our_ml_process() -> int | None:
+def _our_ml_process(port: int) -> int | None:
     """PID of an ML engine of ours that is running, found by process table.
 
     The fallback for when lsof cannot answer. It walks every descriptor on the
@@ -4607,9 +4618,16 @@ def _our_ml_process() -> int | None:
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
+    # The port matters. The native engine takes it in argv, so require it:
+    # otherwise any engine of ours anywhere is treated as the holder of this
+    # port. The preflight gate runs one on another port on this same Mac, and
+    # Docker's own ML container is a real holder of 3003, so the combination
+    # adopted the wrong process and would later have signalled it.
+    native = re.compile(rf"immich-ml-native\s+serve\s+{int(port)}(\s|$)")
+    venv = re.compile(r"python[^\s]*\s+-m\s+src\.main")
     for line in out.splitlines():
         pid, _, cmd = line.strip().partition(" ")
-        if pid.isdigit() and _ML_CMD_RE.search(cmd):
+        if pid.isdigit() and (native.search(cmd) or venv.search(cmd)):
             return int(pid)
     return None
 
@@ -4629,11 +4647,11 @@ def _listener_pid(port: int) -> int | None:
             timeout=10,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError, ValueError):
-        return _our_ml_process() if port_in_use(port) else None
+        return _our_ml_process(port) if port_in_use(port) else None
     first = out.splitlines()[0].strip() if out else ""
     if first.isdigit():
         return int(first)
-    return _our_ml_process() if port_in_use(port) else None
+    return _our_ml_process(port) if port_in_use(port) else None
 
 
 # Three answers, not two. "Cannot tell" blocks a start as firmly as "occupied":
@@ -4706,7 +4724,7 @@ def adopt_live_ml(config: dict) -> int | None:
     # function actually asks, costs nothing, and skips lsof entirely in the
     # common case; lsof is only needed to recognise a holder that is not ours,
     # and it can take ten seconds to say so on a Mac with a network mount.
-    pid = _our_ml_process() or _listener_pid(port)
+    pid = _our_ml_process(int(port)) or _listener_pid(port)
     if pid is None:
         return None
     try:
