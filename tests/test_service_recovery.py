@@ -960,3 +960,71 @@ class TestAdoptionRunsBeforeStarting:
             m._watch_without_worker({"ml_port": 3003, "ml": False})
         adopt.assert_not_called()
         start.assert_called_once()
+
+
+class TestSpawnedServicesLeadTheirOwnSession:
+    """_signal_service decides by session leadership, so everything we spawn has
+    to be a session leader or its children stop going with it. Checked on a live
+    install for worker, ml and dashboard; this keeps start_new_session from
+    being dropped from start_service without anything noticing."""
+
+    def test_start_service_leaves_a_session_leader(self, tmp_data_dir):
+        with patch.object(m.time, "sleep"):  # skip the liveness pause
+            pid = m.start_service("ml", ["/bin/sleep", "30"], dict(os.environ), "/tmp")
+        try:
+            assert os.getsid(pid) == pid
+        finally:
+            os.kill(pid, 9)
+
+
+class TestTheGroupIsSignalledOnlyWhenWeLeadTheSession:
+    """start_service and start_dashboard pass start_new_session, so everything
+    this supervisor spawns is a session leader and only its own descendants can
+    join its process group. A process started from a shell leads its job's
+    process group but not the session, so an adopted one is signalled alone."""
+
+    def test_a_session_leader_takes_the_group(self, tmp_data_dir):
+        (tmp_data_dir["pid_dir"] / "ml.pid").write_text("4242\n")
+        with patch.object(m.os, "getsid", return_value=4242), patch.object(
+            m.os, "killpg"
+        ) as killpg, patch.object(
+            m.os, "kill", side_effect=OSError()
+        ), patch.object(m, "read_pid", return_value=4242):
+            m.kill_pid("ml")
+        assert killpg.call_args_list[0][0][0] == 4242
+
+    def test_a_pid_inside_somebody_elses_session_is_signalled_alone(self, tmp_data_dir):
+        (tmp_data_dir["pid_dir"] / "ml.pid").write_text("4242\n")
+        with patch.object(m.os, "getsid", return_value=900), patch.object(
+            m.os, "killpg"
+        ) as killpg, patch.object(
+            m.os, "kill", side_effect=[None, OSError()]
+        ) as kill, patch.object(m, "read_pid", return_value=4242):
+            m.kill_pid("ml")
+        killpg.assert_not_called()
+        assert kill.call_args_list[0][0][0] == 4242
+
+    def test_the_worker_sweep_still_runs(self, tmp_data_dir):
+        """The worker keeps its own sweep either way: it is the one service with
+        descendants that outlive their parent."""
+        (tmp_data_dir["pid_dir"] / "worker.pid").write_text("4242\n")
+        with patch.object(m.os, "getsid", return_value=900), patch.object(
+            m.os, "killpg"
+        ), patch.object(m.os, "kill", side_effect=OSError()), patch.object(
+            m, "read_pid", return_value=4242
+        ), patch.object(m, "_kill_all_worker_processes") as sweep:
+            m.kill_pid("worker")
+        sweep.assert_called_once()
+
+
+class TestOneVenvWorker:
+    def test_web_concurrency_is_pinned(self, tmp_path):
+        """Uvicorn reads WEB_CONCURRENCY and the supervisor passes its own
+        environment through, so an inherited value would fork a second copy of
+        the service, each loading its own multi-gigabyte model."""
+        venv = tmp_path / "venv" / "bin"
+        venv.mkdir(parents=True)
+        (venv / "python3").write_text("")
+        spec = m._venv_ml_spec({"ml_dir": str(tmp_path)}, {"WEB_CONCURRENCY": "4"})
+        assert spec is not None
+        assert spec[2]["WEB_CONCURRENCY"] == "1"
