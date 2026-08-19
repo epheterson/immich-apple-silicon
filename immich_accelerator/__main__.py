@@ -4526,12 +4526,15 @@ def port_in_use(port: int) -> bool:
     IPv6-only would be invisible to an AF_INET connect alone, and "nothing is
     listening" is the answer that lets a second engine start on top of it.
     """
-    for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    # create_connection rather than connect_ex: on a socket with a timeout,
+    # connect_ex can report EINPROGRESS instead of success, which reads as
+    # "nothing is listening" and lets a second engine start on top of a live
+    # one. create_connection either returns a connected socket or raises, and
+    # it is what check_port has always used here.
+    for host in ("127.0.0.1", "::1"):
         try:
-            with socket.socket(family, socket.SOCK_STREAM) as sock:
-                sock.settimeout(0.5)
-                if sock.connect_ex((host, int(port))) == 0:
-                    return True
+            with socket.create_connection((host, int(port)), timeout=0.5):
+                return True
         except (OSError, ValueError):
             continue
     return False
