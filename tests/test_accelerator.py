@@ -2293,6 +2293,48 @@ class TestCachedServerIfCurrent:
             assert m._cached_server_if_current(server_dir, "3.0.1") == server_dir
 
 
+class TestRemoteSetupUsesTheCache:
+    """setup --url learns the exact version from the API before it fetches
+    anything, so a warm cache is knowable up front. Both fetch paths check it,
+    but extract_immich_server only reaches its check after `docker pull` has run.
+    """
+
+    def _run(self, cached):
+        import immich_accelerator.__main__ as m
+
+        args = argparse.Namespace(
+            url="http://immich.example:2283", api_key="k", import_server=None
+        )
+        fetched = MagicMock()
+        with patch("builtins.input", return_value=""), patch(
+            "getpass.getpass", return_value="pw"
+        ), patch.object(
+            m, "_query_immich_api", return_value={"version": "3.0.1"}
+        ), patch.object(
+            m, "_detect_docker_media_prefix", return_value=None
+        ), patch.object(
+            m, "_validate_connectivity", return_value=True
+        ), patch.object(
+            m, "_check_local_tools", return_value=("/usr/bin/node", "/ffmpeg", None)
+        ), patch.object(
+            m, "_cached_server_if_current", return_value=cached
+        ), patch.object(
+            m, "find_docker", side_effect=RuntimeError("no docker")
+        ), patch.object(
+            m, "download_immich_server", fetched
+        ), patch.object(
+            m, "_finalize_config"
+        ):
+            m._setup_remote(args)
+        return fetched
+
+    def test_a_warm_cache_skips_the_fetch(self, tmp_data_dir):
+        assert not self._run(Path("/srv/3.0.1")).called
+
+    def test_a_cold_cache_still_fetches(self, tmp_data_dir):
+        assert self._run(None).called
+
+
 class TestFinalizeBuildData:
     """Stamping is the trust signal, so it must only fire when build-data is
     genuinely complete for the version."""
