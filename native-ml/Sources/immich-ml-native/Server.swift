@@ -12,13 +12,23 @@ import Network
 //
 // 64 KiB of headers is orders of magnitude above Immich's own requests and far
 // below what threatens an 8 GB Mac. 64 MiB of body covers the largest preview
-// Immich sends. The header deadline ends a peer that opens a connection and
-// then says nothing; the connection deadline is generous enough for a first-use
-// model fetch, which legitimately holds a /predict open for minutes.
+// Immich sends.
+//
+// The two deadlines do different jobs. The header one ends a peer that opens a
+// connection and then says nothing, which is the attack; ten seconds is plenty,
+// because Immich sends its headers in one packet.
+//
+// The connection budget only bounds total duration, and a first-use model fetch
+// legitimately holds a /predict open while gigabytes download: models now load
+// on first use rather than at startup, so this is the common path for a model
+// the machine has not seen. Five minutes does not cover a 2.3 GB checkpoint on
+// an ordinary connection, and cancelling it mid-fetch fails the job and makes
+// the retry start the download again. Thirty minutes still releases a
+// descriptor held by something that has gone away, which is what it is for.
 private let maxHeaderBytes = 64 * 1024
 private let maxBodyBytes = 64 * 1024 * 1024
 private let headerDeadlineSeconds: TimeInterval = 10
-private let connectionDeadlineSeconds: TimeInterval = 300
+private let connectionDeadlineSeconds: TimeInterval = 1800
 
 // A connection, and the one place that ends one.
 //

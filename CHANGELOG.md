@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.13.0 - 2026-08-19
+
+### Fixed
+- **One packet could kill the machine learning service.** A request with an empty `Content-Length` header ended the process, with no authentication needed, and the service listens on every interface, so on a split deployment any host on the network could do it. Confirmed against 1.12.0 on a real install. Reported and fixed by [@RxChi1d](https://github.com/RxChi1d) ([#147](https://github.com/epheterson/immich-apple-silicon/pull/147)), along with a descriptor leak on abandoned connections that stopped the service accepting anything new, and ceilings on how much one connection can cost.
+- **Stopping the worker left ffmpeg running.** When the worker's process id had been adopted rather than started here, only that one process was signalled, so a transcode kept running and writing into the library while the command reported the worker stopped. Restarting then queued the same asset again. Groundwork by [@RxChi1d](https://github.com/RxChi1d) ([#149](https://github.com/epheterson/immich-apple-silicon/pull/149)).
+- **A second ML engine could be started on top of a healthy one.** Nothing asked whether the port was already held, so a lost pidfile produced a loop of failed starts. Reported with logs and fixed by [@RxChi1d](https://github.com/RxChi1d) ([#148](https://github.com/epheterson/immich-apple-silicon/pull/148)).
+- **A library on an unresponsive network mount could freeze the accelerator.** Deciding whether a mount was present, or which process held a port, used calls that never return when a server has gone away rather than failing. The watcher froze at the moment its job was to notice, and could not restart anything. Both questions are now answered without touching the mount.
+- **A Docker installation whose daemon is not running no longer ends in a traceback**, and says why it fell back. Contributed by [@RxChi1d](https://github.com/RxChi1d) ([#145](https://github.com/epheterson/immich-apple-silicon/pull/145), [#146](https://github.com/epheterson/immich-apple-silicon/pull/146)).
+- **The test suite no longer writes into the home directory of the machine it runs on**, so running it on a Mac that is serving a library is less disruptive. Not finished: it can still restart that machine's worker.
+
+### Added
+- **The worker waits instead of spinning when its database is gone.** On a split install Postgres and Redis usually live on the same box as the library, so when that box goes away the worker could do nothing but reconnect all night, filling its log, while `status` reported it running. It now stops after two minutes of silence, `status` names which service is missing, and it starts again by itself when they return. Machine learning keeps serving throughout. Verified against a real overnight outage.
+
 ## 1.12.0 - 2026-08-18
 
 ### Added
