@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,21 +22,28 @@ def no_real_machine_reads(monkeypatch):
     failures, unrelated" in their pull requests, and a suite that is red for
     everyone who runs the product teaches everyone to ignore red.
 
-    Two routes in, both closed here. read_pid("worker") falls back to a global
+    Four routes in, all closed here. read_pid("worker") falls back to a global
     process scan and adopts a live production worker, so "no pid file" tests
     found one anyway. _ml_ping opens a real HTTP connection to localhost:3003
     and the real ML service answers, so "ML is down, restart it" tests saw it
-    up. A test that wants either behaviour patches it back explicitly.
+    up. ml_port_state runs lsof against the configured port and the real ML
+    service is listening on it, so "start the engine" tests were refused a start
+    on the grounds that the machine's own production service was in the way.
+    port_in_use opens a TCP connection to the same port and gets one, so
+    wait_for_port_free never returned true and anything gated on it declined to
+    act. A test that wants any of these behaviours patches it back explicitly.
     """
     import immich_accelerator.__main__ as m
 
     monkeypatch.setattr(m, "_adopt_live_worker", lambda: None)
     monkeypatch.setattr(m, "_ml_ping", lambda *a, **k: False)
+    monkeypatch.setattr(m, "ml_port_state", lambda *a, **k: m.PORT_FREE)
+    monkeypatch.setattr(m, "port_in_use", lambda *a, **k: False)
     yield
 
 
 @pytest.fixture(autouse=True)
-def tmp_data_dir(tmp_path):
+def tmp_data_dir(tmp_path, monkeypatch):
     """Point every module-level path at a temp directory.
 
     Every one of these is bound at import time off the real home, so anything
@@ -81,6 +89,15 @@ def tmp_data_dir(tmp_path):
         # it here means every test starts from "no silence recorded yet".
         _ml_unresponsive_since=None,
     ):
+        # dashboard.py binds its own CONFIG_FILE off the real home, and its
+        # request handlers re-read it, so they answer from the user's live
+        # install. test_api_requeue_no_api_key builds an app with no API key and
+        # asserts a 400: on a Mac whose config.json has one, the handler read
+        # that file, found a key, and returned 200. Green everywhere except on
+        # the machines of the people using the product, again.
+        dashboard = sys.modules.get("immich_accelerator.dashboard")
+        if dashboard is not None:
+            monkeypatch.setattr(dashboard, "CONFIG_FILE", config_file)
         yield {
             "data_dir": data_dir,
             "config_file": config_file,

@@ -1140,7 +1140,12 @@ class TestWatchMlOnly:
     def test_starts_when_not_already_running(self, tmp_data_dir):
         import immich_accelerator.__main__ as m
 
+        # Adoption runs before concluding ML is absent, so it has to say "not
+        # ours" here: on a machine actually running the accelerator it would
+        # otherwise adopt the live service and there would be nothing to start.
         with patch.object(m, "read_pid", return_value=None), patch.object(
+            m, "adopt_live_ml", return_value=None
+        ), patch.object(
             m, "reconcile_dashboard"
         ), patch.object(m, "_start_without_worker") as start_no_worker, patch(
             "signal.signal"
@@ -3199,9 +3204,9 @@ class TestReconcileML:
 
         with patch.object(m, "read_pid", return_value=None), patch.object(
             m, "_ml_ping", return_value=True
-        ), patch.object(m, "_find_ml_dir", return_value=None), patch.object(
-            m, "_start_ml_service"
-        ) as start, patch.object(
+        ), patch.object(m, "adopt_live_ml", return_value=None), patch.object(
+            m, "_find_ml_dir", return_value=None
+        ), patch.object(m, "_start_ml_service") as start, patch.object(
             m, "log"
         ) as log:
             m.reconcile_ml({})
