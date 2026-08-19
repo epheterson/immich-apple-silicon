@@ -360,6 +360,8 @@ class TestPidManagement:
             "immich_accelerator.__main__.read_pid", return_value=current_pid
         ), patch("os.getsid", return_value=current_pid), patch(
             "os.getpgid", return_value=current_pid
+        ), patch(
+            "immich_accelerator.__main__._group_leader_is_ours", return_value=True
         ), patch("os.killpg") as mock_killpg, patch(
             "os.kill", side_effect=OSError
         ):  # process "gone" immediately
@@ -2072,6 +2074,8 @@ class TestStopAllFast:
             "immich_accelerator.__main__.read_pid", side_effect=lambda n: pids.get(n)
         ), patch("os.getsid", side_effect=lambda pid: pid), patch(
             "os.getpgid", side_effect=lambda pid: pid
+        ), patch(
+            "immich_accelerator.__main__._group_leader_is_ours", return_value=True
         ), patch("os.killpg", side_effect=fake_killpg), patch(
             "os.kill", side_effect=fake_kill
         ), patch(

@@ -1878,7 +1878,31 @@ def _kill_all_worker_processes():
             pass
 
 
-def _signal_service(pid: int, sig: int) -> None:
+def _group_leader_is_ours(pgid: int, name: str) -> bool:
+    """Does this process group's leader look like a service of ours?
+
+    ps only, so it stays off the filesystem, which is what lets this run in the
+    watcher on a machine whose mount has gone away.
+    """
+    if not name:
+        return False
+    try:
+        cmd = subprocess.run(
+            ["/bin/ps", "-p", str(pgid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if name == "worker":
+        return bool(_WORKER_CMD_RE.search(cmd))
+    if name == "ml":
+        return bool(_ML_CMD_RE.search(cmd))
+    if name == "dashboard":
+        return "immich_accelerator" in cmd and "dashboard" in cmd
+    return False
+
+
+def _signal_service(pid: int, sig: int, name: str = "") -> None:
     """Signal one tracked service, by group only where the group is ours.
 
     Services have children that must go with them: the worker runs several
@@ -1896,6 +1920,17 @@ def _signal_service(pid: int, sig: int) -> None:
     """
     try:
         pgid = os.getpgid(pid)
+        # Signalling a group reaches everything in it, so the group has to be
+        # attributable to us before we do. Leader-is-session-leader is what
+        # setsid produces, but it is also true of plenty of processes nobody
+        # here started: measured on one Mac, 15 more processes satisfy it than
+        # satisfy "is itself the leader", among them another supervisor and its
+        # children. Adopted pids are the ones that reach this, and the worker
+        # scan matches a worker-shaped process anywhere on the machine with no
+        # ownership check, so an adopted stranger would have taken its whole
+        # group with it.
+        if not _group_leader_is_ours(pgid, name):
+            raise OSError("group leader is not one of ours")
         # The group is ours when its leader is also the session leader, which is
         # the shape start_new_session produces and a shell job never has.
         #
@@ -1920,7 +1955,7 @@ def kill_pid(name: str) -> bool:
     pid = read_pid(name)
     if pid is None:
         return False
-    _signal_service(pid, signal.SIGTERM)
+    _signal_service(pid, signal.SIGTERM, name)
 
     # Also kill any orphaned immich processes not in the same group
     if name == "worker":
@@ -1934,7 +1969,7 @@ def kill_pid(name: str) -> bool:
         except OSError:
             break
     else:
-        _signal_service(pid, signal.SIGKILL)
+        _signal_service(pid, signal.SIGKILL, name)
 
     (PID_DIR / f"{name}.pid").unlink(missing_ok=True)
     return True
@@ -4630,9 +4665,30 @@ def _our_ml_process(port: int) -> int | None:
     venv = re.compile(r"python[^\s]*\s+-m\s+src\.main")
     for line in out.splitlines():
         pid, _, cmd = line.strip().partition(" ")
-        if pid.isdigit() and (native.search(cmd) or venv.search(cmd)):
+        if not pid.isdigit():
+            continue
+        if native.search(cmd):
+            return int(pid)
+        # The venv engine gets its port from ML_PORT, not argv, so its command
+        # line cannot tell this port from another. Without checking, the
+        # preflight gate's own engine on a different port was a match, which is
+        # the case requiring the port was added for.
+        if venv.search(cmd) and _venv_ml_port(int(pid)) == int(port):
             return int(pid)
     return None
+
+
+def _venv_ml_port(pid: int) -> int | None:
+    """The port a running venv engine was given, read from its environment."""
+    try:
+        env = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-Eww", "-o", "command="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    hit = re.search(r"\bML_PORT=(\d+)", env)
+    return int(hit.group(1)) if hit else 3003
 
 
 def _listener_pid(port: int) -> int | None:
@@ -5634,7 +5690,7 @@ def stop_all_fast() -> None:
         if not pid:
             continue
         pids[name] = pid
-        _signal_service(pid, signal.SIGTERM)
+        _signal_service(pid, signal.SIGTERM, name)
     _kill_all_worker_processes()  # sweep orphaned immich procs too
 
     # Short, PARALLEL wait (not 5s-per-service) so we stay well under launchd's
@@ -5645,7 +5701,7 @@ def stop_all_fast() -> None:
         time.sleep(0.1)
     for pid in pids.values():
         if alive(pid):
-            _signal_service(pid, signal.SIGKILL)
+            _signal_service(pid, signal.SIGKILL, name)
     for name in pids:
         (PID_DIR / f"{name}.pid").unlink(missing_ok=True)
     if pids:
@@ -6132,14 +6188,32 @@ def _watch_worker(config: dict) -> str | None:
                 backend_down_since = None
                 if backend_paused:
                     backend_paused = False
-                    log.info("Postgres and Redis are back. Starting the worker.")
-                    set_paused("")
-                    if not read_pid("worker"):
-                        try:
-                            cmd_start(argparse.Namespace(force=True))
-                        except RuntimeError:
-                            log.error("  Worker start after the database returned failed")
-                        worker_handled = True
+                    if media_paused:
+                        # Two reasons to pause, one marker file. The library is
+                        # still gone, so hand the marker back rather than delete
+                        # it, and leave the worker down: the block below stops it
+                        # again in this same cycle. Clearing it here left status
+                        # saying "stopped" with no reason, for the whole
+                        # remaining outage, which is the exact failure the marker
+                        # exists to prevent.
+                        log.info(
+                            "Postgres and Redis are back, but the library mount "
+                            "is still gone. Keeping the worker paused."
+                        )
+                        set_paused(
+                            "library-unreachable", config.get("upload_mount") or ""
+                        )
+                    else:
+                        log.info("Postgres and Redis are back. Starting the worker.")
+                        set_paused("")
+                        if not read_pid("worker"):
+                            try:
+                                cmd_start(argparse.Namespace(force=True))
+                            except RuntimeError:
+                                log.error(
+                                    "  Worker start after the database returned failed"
+                                )
+                            worker_handled = True
 
             if config.get("require_media_ready", True):
                 gone, point = library_mount_gone(config)

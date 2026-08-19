@@ -1047,6 +1047,8 @@ class TestTheGroupIsSignalledOnlyWhenWeLeadTheSession:
         (tmp_data_dir["pid_dir"] / "ml.pid").write_text("4242\n")
         with patch.object(m.os, "getsid", return_value=4242), patch.object(
             m.os, "getpgid", return_value=4242
+        ), patch.object(
+            m, "_group_leader_is_ours", return_value=True
         ), patch.object(m.os, "killpg") as killpg, patch.object(
             m.os, "kill", side_effect=OSError()
         ), patch.object(m, "read_pid", return_value=4242):
@@ -1060,6 +1062,8 @@ class TestTheGroupIsSignalledOnlyWhenWeLeadTheSession:
         (tmp_data_dir["pid_dir"] / "worker.pid").write_text("4242\n")
         with patch.object(m.os, "getsid", return_value=900), patch.object(
             m.os, "getpgid", return_value=900
+        ), patch.object(
+            m, "_group_leader_is_ours", return_value=True
         ), patch.object(m.os, "killpg") as killpg, patch.object(
             m.os, "kill", side_effect=OSError()
         ), patch.object(m, "read_pid", return_value=4242), patch.object(
@@ -1067,6 +1071,26 @@ class TestTheGroupIsSignalledOnlyWhenWeLeadTheSession:
         ):
             m.kill_pid("worker")
         assert killpg.call_args_list[0][0][0] == 900
+
+    def test_a_group_led_by_a_stranger_is_never_group_killed(self, tmp_data_dir):
+        """The predicate is satisfied by plenty of processes nobody here
+        started: on one Mac, fifteen more than satisfy "is itself the leader",
+        including another supervisor and its children. Worker adoption matches
+        a worker-shaped process anywhere with no ownership check, so without
+        this an adopted stranger took its whole group with it."""
+        (tmp_data_dir["pid_dir"] / "worker.pid").write_text("4242\n")
+        with patch.object(m.os, "getsid", return_value=900), patch.object(
+            m.os, "getpgid", return_value=900
+        ), patch.object(
+            m, "_group_leader_is_ours", return_value=False
+        ), patch.object(m.os, "killpg") as killpg, patch.object(
+            m.os, "kill", side_effect=[None, OSError()]
+        ) as kill, patch.object(m, "read_pid", return_value=4242), patch.object(
+            m, "_kill_all_worker_processes"
+        ):
+            m.kill_pid("worker")
+        killpg.assert_not_called()
+        assert kill.call_args_list[0][0][0] == 4242
 
     def test_a_pid_inside_somebody_elses_session_is_signalled_alone(self, tmp_data_dir):
         """A shell job: its group leader is not the session leader."""
@@ -1336,3 +1360,88 @@ class TestWeOnlyAdoptTheEngineHoldingOurPort:
             m, "port_in_use", return_value=True
         ), patch.object(m, "log"):
             assert m.adopt_live_ml({"ml_port": 3003}) == 64933
+
+
+class TestTwoPauseReasonsShareOneMarker:
+    """The library pause and the database pause stop the same worker and write
+    the same marker file, and a NAS going away triggers both: the mount drops
+    and the Postgres and Redis on that box stop answering.
+
+    Postgres answers again the moment the box is back. The mount often does not,
+    which is why the remount exists. So the database resume routinely arrives
+    while the library pause is still in force.
+    """
+
+    CFG = {
+        "worker": True,
+        "ml": False,
+        "upload_mount": "/nas/immich",
+        "media_id": "abc",
+        "mount_recipe": {"fstype": "nfs", "spec": "n:/v", "mountpoint": "/nas"},
+        "db_hostname": "10.0.0.14", "db_port": 15432,
+        "redis_hostname": "10.0.0.14", "redis_port": 16379,
+    }
+
+    def _drive(self, gone_seq, down_seq, pids=None):
+        """A worker is running to begin with, so the only cmd_start that can
+        appear is a resume: the pre-loop start fires when no pid is found."""
+        pids = dict(pids if pids is not None else {"worker": 4242})
+        clock = {"t": 1000.0}
+        gone, down = list(gone_seq), list(down_seq)
+        n = max(len(gone_seq), len(down_seq))
+
+        def mount_gone(_cfg):
+            clock["t"] += 60
+            return (gone.pop(0), "/nas") if gone else (False, "/nas")
+
+        mocks = {
+            "load_config": MagicMock(
+                side_effect=[dict(self.CFG)] * (n + 1) + [KeyboardInterrupt()]
+            ),
+            "library_mount_gone": MagicMock(side_effect=mount_gone),
+            "backends_down": MagicMock(
+                side_effect=lambda _c: down.pop(0) if down else []
+            ),
+            "media_io_healthy": MagicMock(return_value=(True, "")),
+            "is_mounted": MagicMock(return_value=True),
+            "read_pid": MagicMock(side_effect=lambda n: pids.get(n)),
+            "kill_pid": MagicMock(side_effect=lambda n, **k: pids.pop(n, None)),
+            "cmd_start": MagicMock(),
+            "cmd_stop": MagicMock(),
+            "reconcile_components": MagicMock(),
+            "cap_service_logs": MagicMock(),
+            "_upgraded_on_disk": MagicMock(return_value=False),
+            "_worker_fd_total": MagicMock(return_value=None),
+            "mount_recipe_for": MagicMock(return_value=None),
+            "save_config": MagicMock(),
+            "_attempt_remount": MagicMock(),
+            "diagnose_worker_log": MagicMock(return_value=None),
+            "log": MagicMock(),
+        }
+        with patch.multiple(m, **mocks), patch.object(
+            m.time, "monotonic", side_effect=lambda: clock["t"]
+        ):
+            m._watch_worker(dict(self.CFG))
+        return mocks
+
+    def test_the_database_coming_back_does_not_erase_a_library_pause(
+        self, tmp_data_dir
+    ):
+        """The whole box goes, then returns, but the share is not remounted yet.
+        Clearing the marker here left status saying "stopped" with no reason for
+        the rest of the outage, which is the failure the marker prevents."""
+        mocks = self._drive(
+            gone_seq=[True] * 8,                       # mount gone throughout
+            down_seq=[[], [], ["Postgres"], ["Postgres"], ["Postgres"], [], [], []],
+        )
+        marker = m.read_paused()
+        assert marker, "a worker held down must say why"
+        assert marker["reason"] == "library-unreachable"
+        mocks["cmd_start"].assert_not_called()
+
+    def test_both_clearing_starts_the_worker_once(self, tmp_data_dir):
+        mocks = self._drive(
+            gone_seq=[True, True, True, False, False],
+            down_seq=[["Postgres"]] * 3 + [[], []],
+        )
+        assert not m.read_paused(), "marker cleared once both are back"
