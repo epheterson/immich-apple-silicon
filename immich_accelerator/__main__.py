@@ -2985,18 +2985,7 @@ def _validate_connectivity(config: dict) -> bool:
 # deliberate: each setup path states whether it establishes a worker, so
 # re-running a full `setup` on an ml-only box is how you turn the worker back
 # on. `setup --ml-only` writes "worker": false itself.
-# immich_url is in here because it is what marks an install as split: it is
-# written only by the remote setup path, and everything that has to tell a
-# split install from a local one reads it. Dropping it on a re-run silently
-# converted a split install into a local one.
-_PRESERVED_CONFIG_KEYS = (
-    "api_key",
-    "ml_url",
-    "dashboard_port",
-    "dashboard",
-    "ml",
-    "immich_url",
-)
+_PRESERVED_CONFIG_KEYS = ("api_key", "ml_url", "dashboard_port", "dashboard", "ml")
 
 
 def _finalize_config(config: dict) -> None:
@@ -5188,43 +5177,26 @@ def _cmd_start(args):
     try:
         docker = _find_running_docker()
         immich = detect_immich(docker)
-        if config.get("immich_url"):
-            # A split install answers to the Immich at immich_url. detect_immich
-            # returns the first local container whose name or image looks like
-            # Immich, which on a Mac that also runs an unrelated stack is a
-            # different server entirely: its settings were then compared against
-            # this config and the start refused over a mismatch that did not
-            # exist. Local Docker stays useful as a place to fetch server files
-            # from, and says nothing about how this install is configured.
-            log.debug(
-                "Split install (immich_url=%s): not reading configuration from "
-                "the local Docker container.",
-                config["immich_url"],
+        if immich["workers_include"] != "api":
+            log.error(
+                "Docker is still running microservices. Two workers will conflict."
             )
-        else:
-            if immich["workers_include"] != "api":
-                log.error(
-                    "Docker is still running microservices. Two workers will conflict."
-                )
-                log.error("Set IMMICH_WORKERS_INCLUDE=api in docker-compose.yml first.")
-                log.error(
-                    "Run 'python -m immich_accelerator setup' for full instructions."
-                )
-                return
-            if (
-                config.get("upload_mount")
-                and immich["media_location"] != config["upload_mount"]
-            ):
-                log.error(
-                    "IMMICH_MEDIA_LOCATION mismatch — Docker has '%s', we expect '%s'.",
-                    immich["media_location"] or "(not set)",
-                    config["upload_mount"],
-                )
-                log.error(
-                    "This WILL corrupt file paths in the database. "
-                    "Fix docker-compose.yml first."
-                )
-                return
+            log.error("Set IMMICH_WORKERS_INCLUDE=api in docker-compose.yml first.")
+            log.error("Run 'python -m immich_accelerator setup' for full instructions.")
+            return
+        if (
+            config.get("upload_mount")
+            and immich["media_location"] != config["upload_mount"]
+        ):
+            log.error(
+                "IMMICH_MEDIA_LOCATION mismatch — Docker has '%s', we expect '%s'.",
+                immich["media_location"] or "(not set)",
+                config["upload_mount"],
+            )
+            log.error(
+                "This WILL corrupt file paths in the database. Fix docker-compose.yml first."
+            )
+            return
 
         # Auto-update: if Docker image version changed, re-extract
         running_version = immich["version"].lstrip("v")

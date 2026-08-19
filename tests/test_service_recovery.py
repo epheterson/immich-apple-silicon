@@ -1178,69 +1178,6 @@ class TestADeadMountCannotWedgeTheWatcher:
             assert m._resolve_offthread("/nas/immich") is None
 
 
-class TestASplitInstallAnswersToItsOwnImmich:
-    """immich_url is what marks an install as split, and a split install's
-    configuration comes from the Immich it points at.
-
-    detect_immich returns the first local container whose name or image looks
-    like Immich. On a Mac that also runs an unrelated stack that is a different
-    server, and its settings were compared against this config, so the start
-    refused over a mismatch that did not exist (#139).
-    """
-
-    # A config complete enough to reach the Docker preflight: cmd_start refuses
-    # earlier than that if the worker configuration is incomplete.
-    SPLIT = dict(
-        {k: "x" for k in m._WORKER_CONFIG_KEYS},
-        immich_url="http://10.0.0.14:2283",
-        upload_mount="/nas/immich",
-        worker=True,
-    )
-    OTHER_CONTAINER = {
-        "workers_include": "microservices",  # would fail the local check
-        "media_location": "/somewhere/else",  # and so would this
-        "version": "3.0.2",
-        "container": "other-immich",
-        "db_password": "x", "db_username": "x", "db_name": "x",
-        "db_port": 5432, "redis_port": 6379,
-    }
-
-    def _start(self, cfg):
-        mocks = {
-            "load_config": MagicMock(return_value=dict(cfg)),
-            "_find_running_docker": MagicMock(return_value="/usr/bin/docker"),
-            "detect_immich": MagicMock(return_value=dict(self.OTHER_CONTAINER)),
-            "_kill_stale_processes": MagicMock(),
-            "read_pid": MagicMock(return_value=None),
-            "ensure_media_ready": MagicMock(return_value=True),
-            "find_node": MagicMock(return_value="/opt/homebrew/bin/node"),
-            "log": MagicMock(),
-        }
-        with patch.multiple(m, **mocks):
-            try:
-                m.cmd_start(argparse.Namespace(force=True))
-            except Exception:
-                pass  # it will stop later for unrelated reasons; we read the log
-        return mocks["log"]
-
-    def test_an_unrelated_container_does_not_block_a_split_start(self, tmp_data_dir):
-        log = self._start(self.SPLIT)
-        said = " ".join(str(c) for c in log.error.call_args_list)
-        assert "still running microservices" not in said
-        assert "MEDIA_LOCATION mismatch" not in said
-
-    def test_a_local_install_still_gets_the_check(self, tmp_data_dir):
-        """The check is right when the container really is this install's."""
-        local = {k: v for k, v in self.SPLIT.items() if k != "immich_url"}
-        log = self._start(local)
-        said = " ".join(str(c) for c in log.error.call_args_list)
-        assert "still running microservices" in said
-
-    def test_immich_url_survives_a_setup_rerun(self):
-        """Dropping it converted a split install into a local one, silently."""
-        assert "immich_url" in m._PRESERVED_CONFIG_KEYS
-
-
 class TestTheWorkerWaitsWhenItsDatabaseIsGone:
     """On a split install Postgres and Redis live on the same box as the
     library, so when that box goes away the worker can do nothing at all. It
