@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.12.0 - 2026-08-18
+
+### Added
+- **The native ML engine lets go of models it is not using.** Anything it loaded stayed in memory until the process exited, so a Mac that ran one Smart Search job held those weights all day, and `ViT-SO400M-16-SigLIP2-384__webli` alone is 2.3GB. Models now load on first use and are released after 300 seconds unused, the same default Immich's own container uses. `IMMICH_ACCEL_ML_MODEL_TTL` changes it, `0` keeps everything resident. A reload costs about two seconds. Contributed by [@RxChi1d](https://github.com/RxChi1d) ([#137](https://github.com/epheterson/immich-apple-silicon/pull/137)).
+- **A benchmark across the whole SigLIP registry**, native against onnxruntime, on real photos rather than synthetic noise. Contributed by [@lesurJ](https://github.com/lesurJ) ([#143](https://github.com/epheterson/immich-apple-silicon/pull/143)).
+- Issue templates, asking for the Mac, the versions, where the library lives, and the logs.
+- `SECURITY.md` with a private disclosure route, and a CI badge.
+
+### Fixed
+- **A Docker install whose daemon is not running no longer crashes the accelerator.** `docker` commands were given timeouts, but a timeout raises something the callers were not catching, so instead of falling back to the API it ended in a traceback. Split deployments with Docker installed but stopped could not start. Contributed by [@RxChi1d](https://github.com/RxChi1d) ([#138](https://github.com/epheterson/immich-apple-silicon/pull/138)).
+- `CONTRIBUTING.md` pointed ML contributors at the wrong repository. The native engine is here, in `native-ml/`. It also asked contributors to edit the changelog, which the release PR does, and now warns that the test suite can stop the worker on a Mac that is serving a library.
+- **The test suite no longer writes into the home directory of the machine it runs on.** Around half of it never asked for the isolation fixture, so a run used the real `~/.immich-accelerator`: on a Mac serving a library it cleared the ML pidfile and took twenty minutes instead of twenty seconds. Not finished, a run can still restart that machine's worker, so `CONTRIBUTING.md` still says not to.
+- The star history chart is commented out. GitHub restricted the stargazers API, so it renders as an error message for every repo, not just this one.
+
+### Thanks
+Code so far from [@lesurJ](https://github.com/lesurJ), [@pl4za](https://github.com/pl4za) and [@RxChi1d](https://github.com/RxChi1d). And for the bug reports that changed the code: [@shtefko](https://github.com/shtefko), [@jhoogeboom](https://github.com/jhoogeboom), [@flsabourin](https://github.com/flsabourin), [@Rustymage](https://github.com/Rustymage), [@KoenM9264](https://github.com/KoenM9264), [@goldhandconsultancy](https://github.com/goldhandconsultancy), [@xobust](https://github.com/xobust), [@exkuretrol](https://github.com/exkuretrol), [@pwnmeow](https://github.com/pwnmeow), [@Amoyblack](https://github.com/Amoyblack) and [@kg6kvq](https://github.com/kg6kvq). Every one of those is cited in a source comment somewhere in here.
+
 ## 1.11.1 - 2026-08-17
 
 ### Fixed
