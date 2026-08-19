@@ -1239,3 +1239,89 @@ class TestASplitInstallAnswersToItsOwnImmich:
     def test_immich_url_survives_a_setup_rerun(self):
         """Dropping it converted a split install into a local one, silently."""
         assert "immich_url" in m._PRESERVED_CONFIG_KEYS
+
+
+class TestTheWorkerWaitsWhenItsDatabaseIsGone:
+    """On a split install Postgres and Redis live on the same box as the
+    library, so when that box goes away the worker can do nothing at all. It
+    used to sit reconnecting all night, filling its log with one error, while
+    status reported it running.
+
+    A TCP connect decides this. That is the distinction 1.11.1 was about: a
+    connect answers in milliseconds and cannot hang, unlike the file read that
+    stopped a healthy machine.
+    """
+
+    CFG = {
+        "worker": True,
+        "ml": False,
+        "db_hostname": "10.0.0.14", "db_port": 15432,
+        "redis_hostname": "10.0.0.14", "redis_port": 16379,
+    }
+
+    def _drive(self, down_seq, pids=None, cycles=None):
+        pids = dict(pids or {})
+        clock = {"t": 1000.0}
+        seq = list(down_seq)
+
+        def backends(_cfg):
+            clock["t"] += 60
+            return seq.pop(0) if seq else []
+
+        n = cycles or len(down_seq)
+        mocks = {
+            "load_config": MagicMock(
+                side_effect=[dict(self.CFG)] * (n + 1) + [KeyboardInterrupt()]
+            ),
+            "backends_down": MagicMock(side_effect=backends),
+            "library_mount_gone": MagicMock(return_value=(False, "")),
+            "media_io_healthy": MagicMock(return_value=(True, "")),
+            "is_mounted": MagicMock(return_value=True),
+            "read_pid": MagicMock(side_effect=lambda x: pids.get(x)),
+            "kill_pid": MagicMock(side_effect=lambda x, **k: pids.pop(x, None)),
+            "cmd_start": MagicMock(),
+            "cmd_stop": MagicMock(),
+            "reconcile_components": MagicMock(),
+            "cap_service_logs": MagicMock(),
+            "_upgraded_on_disk": MagicMock(return_value=False),
+            "_worker_fd_total": MagicMock(return_value=None),
+            "mount_recipe_for": MagicMock(return_value=None),
+            "save_config": MagicMock(),
+            "_attempt_remount": MagicMock(),
+            "diagnose_worker_log": MagicMock(return_value=None),
+            "log": MagicMock(),
+        }
+        with patch.multiple(m, **mocks), patch.object(
+            m.time, "monotonic", side_effect=lambda: clock["t"]
+        ):
+            m._watch_worker(dict(self.CFG))
+        return mocks
+
+    def test_a_brief_blip_does_not_stop_the_worker(self, tmp_data_dir):
+        """One missed connect is a network hiccup, not an outage."""
+        mocks = self._drive([["Postgres"], []], pids={"worker": 4242})
+        assert "worker" not in [c.args[0] for c in mocks["kill_pid"].call_args_list]
+        assert not m.read_paused()
+
+    def test_a_real_outage_pauses_the_worker(self, tmp_data_dir):
+        mocks = self._drive([["Postgres", "Redis"]] * 4, pids={"worker": 4242})
+        assert "worker" in [c.args[0] for c in mocks["kill_pid"].call_args_list]
+        marker = m.read_paused()
+        assert marker and marker["reason"] == "backend-unreachable"
+        assert "Postgres" in marker["detail"]
+
+    def test_it_starts_again_when_they_come_back(self, tmp_data_dir):
+        mocks = self._drive([["Postgres", "Redis"]] * 3 + [[], []], pids={"worker": 4242})
+        assert mocks["cmd_start"].called, "must come back without anyone helping"
+        assert not m.read_paused(), "and the marker must be cleared"
+
+    def test_an_ml_only_node_is_never_judged(self, tmp_data_dir):
+        """It has no database configured and does not want one."""
+        assert m.backends_down({"ml_only": True}) == []
+
+    def test_status_says_which_service_is_missing(self, tmp_data_dir):
+        m.set_paused("backend-unreachable", "Postgres, Redis")
+        with patch.object(m, "read_pid", return_value=None), patch.object(m, "log") as log:
+            m.cmd_status(None)
+        said = " ".join(str(c) for c in log.warning.call_args_list)
+        assert "Postgres, Redis" in said and "not answering" in said

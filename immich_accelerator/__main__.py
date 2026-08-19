@@ -2411,6 +2411,32 @@ def library_mount(config: dict) -> str:
     return point if _mount_covers(point, config.get("upload_mount") or "") else ""
 
 
+def backends_down(config: dict) -> list[str]:
+    """Which of the worker's backing services are not answering.
+
+    Postgres and Redis, by TCP connect. Deliberately not a query: a connect
+    either completes or is refused, in milliseconds, and cannot be delayed by a
+    filesystem. That distinction is the whole lesson of 1.11.1, where a check
+    that could hang was used to decide whether to stop the worker.
+
+    An ml-only node has neither configured and is never judged.
+    """
+    down = []
+    for label, host_key, port_key, default in (
+        ("Postgres", "db_hostname", "db_port", 5432),
+        ("Redis", "redis_hostname", "redis_port", 6379),
+    ):
+        host = config.get(host_key)
+        if not host:
+            continue
+        try:
+            with socket.create_connection((host, int(config.get(port_key, default))), timeout=2):
+                pass
+        except (OSError, ValueError):
+            down.append(label)
+    return down
+
+
 def library_mount_gone(config: dict) -> tuple[bool, str]:
     """Has the library's mount actually gone away? Returns (gone, mountpoint).
 
@@ -5652,7 +5678,12 @@ def cmd_status(_args):
     config = load_config() if CONFIG_FILE.exists() else {}
 
     paused = read_paused()
-    if paused and paused.get("reason") == "library-unreachable":
+    if paused and paused.get("reason") == "backend-unreachable":
+        log.warning(
+            "Worker:     paused, %s not answering", paused.get("detail") or "?"
+        )
+        log.warning("            It starts again on its own when they are back.")
+    elif paused and paused.get("reason") == "library-unreachable":
         log.warning(
             "Worker:     paused, library is not reachable at %s",
             paused.get("detail") or "?",
@@ -5980,6 +6011,8 @@ def _watch_worker(config: dict) -> str | None:
     media_paused = False
     remount_state: dict = {}  # {attempts, last, blocked} for the remount backoff
     media_down_since: float | None = None  # first failed probe of a run
+    backend_down_since: float | None = None  # first cycle Postgres/Redis went quiet
+    backend_paused = False
     # This loop's state starts clean, so any marker from a previous run is
     # stale and would make status report a pause that is not happening.
     set_paused("")
@@ -6071,6 +6104,50 @@ def _watch_worker(config: dict) -> str | None:
             # Pause instead. A stopped worker is honest and recovers by itself
             # the moment the mount returns, which is what a service running
             # unattended is for.
+            # The worker cannot do anything without Postgres and Redis, and on
+            # a split install those live on the same box as the library. When
+            # that box goes away the worker used to sit there reconnecting all
+            # night, filling its log with the same error, while status happily
+            # reported it running.
+            #
+            # A connect is the right question to decide this on: it answers in
+            # milliseconds and cannot hang, unlike the file read that made
+            # 1.11.0 stop a healthy machine.
+            down = backends_down(config)
+            if down:
+                if backend_down_since is None:
+                    backend_down_since = time.monotonic()
+                    log.warning(
+                        "%s not answering. Leaving the worker alone until this "
+                        "has lasted %ds.",
+                        " and ".join(down),
+                        int(MEDIA_UNREACHABLE_GRACE),
+                    )
+                if time.monotonic() - backend_down_since >= MEDIA_UNREACHABLE_GRACE:
+                    if not backend_paused:
+                        backend_paused = True
+                        log.error(
+                            "%s still not answering. Pausing the worker; it will "
+                            "start again on its own when they are back.",
+                            " and ".join(down),
+                        )
+                        set_paused("backend-unreachable", ", ".join(down))
+                    if read_pid("worker"):
+                        kill_pid("worker")
+                    continue
+            elif backend_down_since is not None:
+                backend_down_since = None
+                if backend_paused:
+                    backend_paused = False
+                    log.info("Postgres and Redis are back. Starting the worker.")
+                    set_paused("")
+                    if not read_pid("worker"):
+                        try:
+                            cmd_start(argparse.Namespace(force=True))
+                        except RuntimeError:
+                            log.error("  Worker start after the database returned failed")
+                        worker_handled = True
+
             if config.get("require_media_ready", True):
                 gone, point = library_mount_gone(config)
                 if gone:
