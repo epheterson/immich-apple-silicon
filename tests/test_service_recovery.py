@@ -23,6 +23,7 @@ import immich_accelerator.__main__ as m
 # Captured at import, before no_real_machine_reads replaces it: the tests below
 # are the ones that want the real thing.
 REAL_ML_PORT_STATE = m.ml_port_state
+REAL_PORT_IN_USE = m.port_in_use
 
 MOUNT_OUTPUT = """/dev/disk2s4s1 on / (apfs, sealed, local, read-only, journaled)
 devfs on /dev (devfs, local, nobrowse)
@@ -899,17 +900,25 @@ class TestMlPortState:
     not on its own an answer."""
 
     def test_a_real_listener_reads_as_occupied(self):
-        """Binds its own socket rather than probing whatever the host happens
-        to be running: the previous version consulted the real machine, so it
-        failed on exactly the Mac this hardening is for."""
+        """End to end against a socket this test binds itself, rather than
+        against whatever the host happens to be running.
+
+        conftest stubs port_in_use for every test, so that a machine serving a
+        library does not answer these questions, and this is one of the tests
+        its docstring means when it says to patch the behaviour back. Without
+        that, the real classifier never runs: it falls through to lsof, which
+        finds the listener on a Mac and is absent on the Linux runner, so the
+        test passed here and failed there.
+        """
         import socket as _s
 
-        with _s.socket(_s.AF_INET, _s.SOCK_STREAM) as srv:
-            srv.bind(("127.0.0.1", 0))
-            srv.listen()
-            port = srv.getsockname()[1]
-            assert REAL_ML_PORT_STATE(port) == m.PORT_OCCUPIED
-        assert REAL_ML_PORT_STATE(port) == m.PORT_FREE
+        with patch.object(m, "port_in_use", REAL_PORT_IN_USE):
+            with _s.socket(_s.AF_INET, _s.SOCK_STREAM) as srv:
+                srv.bind(("127.0.0.1", 0))
+                srv.listen()
+                port = srv.getsockname()[1]
+                assert REAL_ML_PORT_STATE(port) == m.PORT_OCCUPIED
+            assert REAL_ML_PORT_STATE(port) == m.PORT_FREE
 
     def test_a_listening_port_is_occupied_without_consulting_lsof(self):
         """The network stack answers this in microseconds and cannot be stalled
