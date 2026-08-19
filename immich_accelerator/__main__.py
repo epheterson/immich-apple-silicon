@@ -4391,7 +4391,29 @@ def _start_ml_preferred(config: dict):
     if venv is not None:
         attempts.append(("Python venv", venv, False))
 
+    if not attempts:
+        # Said here rather than by the callers: they see only "no pid", which is
+        # also what a refused start returns, and cannot tell the two apart.
+        log.warning("ML service will not start (no native bundle, no venv).")
+        log.warning(
+            "  If you installed via Homebrew, try: brew reinstall immich-accelerator"
+        )
+        return None, None, False
+
+    port = int(config.get("ml_port", 3003))
     for label, (cmd, cwd, senv), is_native in attempts:
+        # Re-checked before every attempt rather than once for the batch. The
+        # native engine exits on a bind conflict, and the fallback below starts
+        # the venv on any RuntimeError without knowing which failure it was, so
+        # the second engine needs its own answer about the port.
+        state = ml_port_state(port)
+        if state != PORT_FREE:
+            log.warning(
+                "Not starting the %s ML engine: port %d is %s.",
+                label, port, "already in use" if state == PORT_OCCUPIED
+                else "in an unknown state (could not inspect it)",
+            )
+            return None, None, False
         log.info("Starting ML service (%s)...", label)
         try:
             pid = start_service("ml", cmd, senv, cwd)
@@ -4442,7 +4464,17 @@ def _ml_verify_or_fallback(config: dict, pid: int, engine: str):
         return pid, engine
     log.warning("  native ML did not become healthy; falling back to venv")
     kill_pid("ml")
-    wait_for_port_free(config.get("ml_port", 3003))
+    if not wait_for_port_free(config.get("ml_port", 3003)):
+        # The return value used to be discarded and the venv started anyway,
+        # into a port the engine we just killed had not let go of. Do not start
+        # a second engine while the port is still occupied; the next cycle can
+        # try again, for as many cycles as the port stays held.
+        log.warning(
+            "  port %s is still held; leaving the restart for the next cycle "
+            "rather than starting a second engine into a bind conflict.",
+            config.get("ml_port", 3003),
+        )
+        return None, None
     venv = _venv_ml_spec(config, os.environ.copy())
     if venv is not None:
         cmd, cwd, senv = venv
@@ -4483,6 +4515,44 @@ def _listener_pid(port: int) -> int | None:
         return None
     first = out.splitlines()[0].strip() if out else ""
     return int(first) if first.isdigit() else None
+
+
+# Three answers, not two. "Cannot tell" blocks a start as firmly as "occupied":
+# what a start must never do is race a process that already holds the port, and
+# an inspection that failed says nothing about whether one does. Reporting a
+# failed inspection as free would put back exactly the behaviour this replaces.
+PORT_FREE = "free"
+PORT_OCCUPIED = "occupied"
+PORT_UNKNOWN = "unknown"
+
+
+def ml_port_state(port: int) -> str:
+    """Whether anything holds this port, or whether we could not find out.
+
+    lsof exits 0 with the pid when something holds the port, and 1 when nothing
+    matches. It also exits 1 on its own errors, so "free" needs a clean stderr
+    as well. Anything else — lsof is missing, it hung, it answered in a shape we
+    do not recognise — is unknown, never "free".
+    """
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return PORT_UNKNOWN
+    out = result.stdout.strip()
+    if result.returncode == 0 and out.splitlines() and out.splitlines()[0].strip().isdigit():
+        return PORT_OCCUPIED
+    # Exit 1 is also how lsof reports its own errors, so an empty stdout alone
+    # does not mean "nothing matched". -t selects -w (lsof(8)), which suppresses
+    # the warnings lsof prints for unreadable mounts, so anything left on stderr
+    # is a real error and must not read as free.
+    if result.returncode == 1 and not out and not result.stderr.strip():
+        return PORT_FREE
+    return PORT_UNKNOWN
 
 
 def adopt_live_ml(config: dict) -> int | None:
@@ -4896,10 +4966,7 @@ def _start_without_worker(config: dict, args) -> None:
 
     ml_pid, ml_engine = _start_ml_service(config)
     if not ml_pid:
-        log.warning("ML service will not start (no native bundle, no venv).")
-        log.warning(
-            "  If you installed via Homebrew, try: brew reinstall immich-accelerator"
-        )
+        log.warning("ML service did not start; the reason is above.")
         return
     log.info("  ML service ready (PID %d, %s)", ml_pid, ml_engine)
 
@@ -5336,10 +5403,7 @@ def _cmd_start(args):
             ml_started_here = True
             log.info("  ML service starting (PID %d, %s)", ml_pid, ml_engine)
         else:
-            log.warning("ML service will not start (no native bundle, no venv).")
-            log.warning(
-                "  If you installed via Homebrew, try: brew reinstall immich-accelerator"
-            )
+            log.warning("ML service did not start; the reason is above.")
     elif ml_pid:
         log.info("ML service already running (PID %d)", ml_pid)
     elif not config.get("ml_dir"):
@@ -5610,7 +5674,16 @@ def _watch_without_worker(config: dict) -> str | None:
     signal.signal(signal.SIGTERM, _graceful_stop)
     signal.signal(signal.SIGINT, _graceful_stop)
 
-    if not read_pid("ml"):
+    if not read_pid("ml") and (
+        not _component_enabled("ml", config) or adopt_live_ml(config) is None
+    ):
+        # Adoption first: a pidfile can be missing while the engine it named is
+        # perfectly healthy, and starting a replacement in that state is how the
+        # bind-conflict loop begins. reconcile_ml already knows this; the startup
+        # path did not, so every watcher launch re-created the problem that
+        # reconcile_ml then had to survive. Only when ML is enabled, matching
+        # _watch_worker: with ML off, _start_without_worker is what stops a
+        # leftover engine, and adopting one instead just delays that.
         log.info("Service not running, starting...")
         _start_without_worker(config, argparse.Namespace(force=True))
     else:
@@ -5806,7 +5879,11 @@ def _watch_worker(config: dict) -> str | None:
     # were already up (avoids a double-start race on the dashboard). A missing
     # ML pid only counts when ML is enabled: otherwise every watcher restart
     # would read "ML is down" and bounce a perfectly healthy worker.
-    ml_missing = _component_enabled("ml", config) and not read_pid("ml")
+    ml_missing = (
+        _component_enabled("ml", config)
+        and not read_pid("ml")
+        and adopt_live_ml(config) is None
+    )
     if not read_pid("worker") or ml_missing:
         log.info("Services not running, starting...")
         cmd_start(argparse.Namespace(force=True))
