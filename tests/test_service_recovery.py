@@ -11,12 +11,18 @@ starting again.
 """
 
 import argparse
+import os
+import socket
 import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import immich_accelerator.__main__ as m
+
+# Captured at import, before no_real_machine_reads replaces it: the tests below
+# are the ones that want the real thing.
+REAL_ML_PORT_STATE = m.ml_port_state
 
 MOUNT_OUTPUT = """/dev/disk2s4s1 on / (apfs, sealed, local, read-only, journaled)
 devfs on /dev (devfs, local, nobrowse)
@@ -785,3 +791,172 @@ class TestNothingTouchesAHungMountInProcess:
         )
         for banned in ("os.access", "os.stat", "os.listdir", ".exists()", ".is_dir()"):
             assert banned not in src, f"{banned} can hang forever on a stale mount"
+
+
+class TestPortIsAskedBeforeStarting:
+    """A start must not race a process that already holds the port.
+
+    The state to keep out of: a pidfile goes missing while the engine it named
+    is still serving, the supervisor reads that as ML being absent, and starts a
+    replacement that cannot bind. The native engine then exits, and the venv
+    fallback goes into the same port.
+    """
+
+    CFG = {"ml_port": 3003, "ml_dir": "/tmp", "ml_engine": "native"}
+
+    def _specs(self, mod):
+        """Both engines available, so `attempts` is never empty and the port is
+        the only thing that can stop a start."""
+        return patch.object(
+            mod, "_native_ml_spec", lambda cfg, env: (["/usr/bin/true"], "/tmp", env)
+        ), patch.object(
+            mod, "_venv_ml_spec", lambda cfg, env: (["/usr/bin/true"], "/tmp", env)
+        )
+
+    def test_an_occupied_port_stops_the_start(self, tmp_data_dir):
+        native, venv = self._specs(m)
+        with native, venv, patch.object(
+            m, "ml_port_state", return_value=m.PORT_OCCUPIED
+        ), patch.object(m, "start_service") as start, patch.object(m, "log"):
+            pid, engine, _ = m._start_ml_preferred(dict(self.CFG))
+        start.assert_not_called()
+        assert pid is None and engine is None
+
+    def test_a_port_we_cannot_inspect_stops_it_too(self, tmp_data_dir):
+        """Not knowing is not the same as knowing it is free."""
+        native, venv = self._specs(m)
+        with native, venv, patch.object(
+            m, "ml_port_state", return_value=m.PORT_UNKNOWN
+        ), patch.object(m, "start_service") as start, patch.object(m, "log"):
+            pid, _, _ = m._start_ml_preferred(dict(self.CFG))
+        start.assert_not_called()
+        assert pid is None
+
+    def test_a_free_port_still_starts(self, tmp_data_dir):
+        """The gate must not swallow the ordinary case."""
+        native, venv = self._specs(m)
+        with native, venv, patch.object(
+            m, "ml_port_state", return_value=m.PORT_FREE
+        ), patch.object(m, "start_service", return_value=4321), patch.object(m, "log"):
+            pid, engine, is_native = m._start_ml_preferred(dict(self.CFG))
+        assert pid == 4321 and is_native
+
+    def test_the_port_is_asked_again_before_the_fallback(self, tmp_data_dir):
+        """Asked once for the batch, the venv was started immediately after the
+        native engine had just failed to bind the very same port."""
+        seen = []
+
+        def state(port):
+            seen.append(port)
+            return m.PORT_FREE if len(seen) == 1 else m.PORT_OCCUPIED
+
+        native, venv = self._specs(m)
+        with native, venv, patch.object(
+            m, "ml_port_state", side_effect=state
+        ), patch.object(
+            m, "start_service", side_effect=RuntimeError
+        ) as start, patch.object(m, "log"):
+            pid, _, _ = m._start_ml_preferred(dict(self.CFG))
+        assert len(seen) == 2, "the port must be re-checked before the second engine"
+        # Only the native attempt. Counting the state calls alone would pass even
+        # if the second answer were read and ignored.
+        assert start.call_count == 1
+        assert pid is None
+
+
+
+class TestMlPortState:
+    """The classifier itself, against real lsof rather than a stub. lsof exits 1
+    both when nothing matched and when lsof itself failed, so an empty stdout is
+    not on its own an answer."""
+
+    def test_a_real_listener_reads_as_occupied(self):
+        # The only check here that runs the real binary. The accelerator is
+        # macOS-only and hardcodes this path, so on the Linux lint runner there
+        # is nothing to exercise and every port would read as unknown.
+        if not os.access("/usr/sbin/lsof", os.X_OK):
+            pytest.skip("/usr/sbin/lsof not present")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            port = sock.getsockname()[1]
+            assert REAL_ML_PORT_STATE(port) == m.PORT_OCCUPIED
+        assert REAL_ML_PORT_STATE(port) == m.PORT_FREE
+
+    def test_lsof_that_cannot_run_is_unknown(self):
+        with patch.object(m.subprocess, "run", side_effect=OSError):
+            assert REAL_ML_PORT_STATE(3003) == m.PORT_UNKNOWN
+
+    def test_lsof_reporting_its_own_error_is_not_free(self):
+        """Exit 1 with nothing on stdout, which is also how "no match" looks."""
+        failed = MagicMock(returncode=1, stdout="", stderr="lsof: no pwd entry\n")
+        with patch.object(m.subprocess, "run", return_value=failed):
+            assert REAL_ML_PORT_STATE(3003) == m.PORT_UNKNOWN
+
+
+class TestFallbackHonoursTheWait:
+    def test_a_port_still_held_cancels_the_fallback(self, tmp_data_dir):
+        """wait_for_port_free's answer used to be discarded, and the venv was
+        started into a port the engine just killed had not let go of."""
+        with patch.object(m, "_ml_healthy", return_value=False), patch.object(
+            m, "kill_pid"
+        ), patch.object(m, "wait_for_port_free", return_value=False), patch.object(
+            m, "_venv_ml_spec"
+        ) as venv, patch.object(m, "log"):
+            pid, engine = m._ml_verify_or_fallback(
+                {"ml_port": 3003}, 111, "native Swift"
+            )
+        venv.assert_not_called()
+        assert pid is None and engine is None
+
+    def test_a_released_port_still_falls_back(self, tmp_data_dir):
+        with patch.object(m, "_ml_healthy", return_value=False), patch.object(
+            m, "kill_pid"
+        ), patch.object(m, "wait_for_port_free", return_value=True), patch.object(
+            m, "_venv_ml_spec", return_value=(["/usr/bin/true"], "/tmp", {})
+        ), patch.object(m, "start_service", return_value=222), patch.object(m, "log"):
+            pid, engine = m._ml_verify_or_fallback(
+                {"ml_port": 3003}, 111, "native Swift"
+            )
+        assert pid == 222 and engine == "Python venv"
+
+
+class TestAdoptionRunsBeforeStarting:
+    """Both watcher entry points concluded ML was absent from the pidfile alone,
+    so a launch while the pidfile was missing started a second engine into the
+    port the first one was still serving."""
+
+    def test_watch_worker_adopts_instead_of_starting(self, tmp_data_dir):
+        """The worker loop too: a live worker plus a missing ml.pid used to run
+        a full cmd_start, which restarted the worker as well."""
+        with patch.object(m, "adopt_live_ml", return_value=64933):
+            mocks = drive_watch(
+                {"worker": True, "ml": True}, ready=[True], pids={"worker": 111}
+            )
+        mocks["cmd_start"].assert_not_called()
+
+    def test_watch_without_worker_adopts_instead_of_starting(self, tmp_data_dir):
+        with patch.object(m, "read_pid", return_value=None), patch.object(
+            m, "adopt_live_ml", return_value=64933
+        ), patch.object(m, "reconcile_dashboard"), patch.object(
+            m, "_start_without_worker"
+        ) as start, patch("signal.signal"), patch(
+            "time.sleep", side_effect=KeyboardInterrupt
+        ):
+            m._watch_without_worker({"ml_port": 3003, "ml": True})
+        start.assert_not_called()
+
+    def test_ml_switched_off_is_not_adopted(self, tmp_data_dir):
+        """With ML off, _start_without_worker is what stops a leftover engine.
+        Adopting one instead would leave it running until the next cycle, and
+        report it as ours in the meantime."""
+        with patch.object(m, "read_pid", return_value=None), patch.object(
+            m, "adopt_live_ml", return_value=64933
+        ) as adopt, patch.object(m, "reconcile_dashboard"), patch.object(
+            m, "_start_without_worker"
+        ) as start, patch("signal.signal"), patch(
+            "time.sleep", side_effect=KeyboardInterrupt
+        ):
+            m._watch_without_worker({"ml_port": 3003, "ml": False})
+        adopt.assert_not_called()
+        start.assert_called_once()
