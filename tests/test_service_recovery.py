@@ -1445,3 +1445,18 @@ class TestTwoPauseReasonsShareOneMarker:
             down_seq=[["Postgres"]] * 3 + [[], []],
         )
         assert not m.read_paused(), "marker cleared once both are back"
+
+    def test_a_local_disk_library_never_forks_a_resolver(self):
+        """Most installs keep the library on the internal disk, where no
+        remountable mount can ever match. Falling through to the child resolver
+        anyway spawned an interpreter every cycle, thousands a day, for a result
+        that is discarded."""
+        local_only = "/dev/disk2s4s1 on / (apfs, sealed, local)\n"
+
+        def run(argv, **kw):
+            if str(argv[0]).endswith("mount"):
+                return MagicMock(stdout=local_only, returncode=0)
+            raise AssertionError("must not spawn a resolver for a local library")
+
+        with patch.object(m.subprocess, "run", side_effect=run):
+            assert m.mount_recipe_for("/Users/elp/Pictures/immich") is None

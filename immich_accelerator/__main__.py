@@ -2240,6 +2240,16 @@ def mount_recipe_for(root: str) -> dict | None:
         best = _best_mount_for(want, out)
         if best:
             return best
+    # Resolving is only worth a child process if some remountable mount could
+    # plausibly be the answer. A library on the internal disk matches nothing
+    # here whatever the path resolves to, and that is most installs, so without
+    # this the watcher forked an interpreter every cycle for a result it then
+    # discarded.
+    if not any(
+        line.rpartition(" (")[2].split(",")[0].rstrip(")").strip() in _REMOUNTABLE_FS
+        for line in out.splitlines()
+    ):
+        return None
     resolved = _resolve_offthread(root)
     return _best_mount_for(resolved, out) if resolved and resolved != root else None
 
