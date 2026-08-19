@@ -359,8 +359,10 @@ class TestPidManagement:
         with patch(
             "immich_accelerator.__main__.read_pid", return_value=current_pid
         ), patch("os.getsid", return_value=current_pid), patch(
-            "os.killpg"
-        ) as mock_killpg, patch(
+            "os.getpgid", return_value=current_pid
+        ), patch(
+            "immich_accelerator.__main__._group_leader_is_ours", return_value=True
+        ), patch("os.killpg") as mock_killpg, patch(
             "os.kill", side_effect=OSError
         ):  # process "gone" immediately
             kill_pid("worker")
@@ -2071,8 +2073,10 @@ class TestStopAllFast:
         with patch(
             "immich_accelerator.__main__.read_pid", side_effect=lambda n: pids.get(n)
         ), patch("os.getsid", side_effect=lambda pid: pid), patch(
-            "os.killpg", side_effect=fake_killpg
+            "os.getpgid", side_effect=lambda pid: pid
         ), patch(
+            "immich_accelerator.__main__._group_leader_is_ours", return_value=True
+        ), patch("os.killpg", side_effect=fake_killpg), patch(
             "os.kill", side_effect=fake_kill
         ), patch(
             "immich_accelerator.__main__._kill_all_worker_processes"
@@ -2081,9 +2085,9 @@ class TestStopAllFast:
 
         termed = {pid for pid, sig in sent if sig == signal.SIGTERM}
         assert termed == {111, 222, 333}  # all signalled before any wait
-        # getsid is the identity here, so all three lead their own session,
-        # which is what start_new_session gives everything we spawn. Checked on
-        # a live install: worker, ml and dashboard all satisfy getsid(pid)==pid.
+        # getsid and getpgid are the identity here, so each leads a group whose
+        # leader is the session leader, which is what start_new_session gives
+        # everything we spawn.
         assert sorted(by_group) == [111, 222, 333]
 
     def test_a_service_inside_another_group_is_signalled_alone(self):
@@ -2103,6 +2107,8 @@ class TestStopAllFast:
             "immich_accelerator.__main__.read_pid",
             side_effect=lambda n: {"ml": 222}.get(n),
         ), patch("os.getsid", return_value=900), patch(
+            "os.getpgid", return_value=222  # a shell job: group leader is not the session leader
+        ), patch(
             "os.killpg", side_effect=lambda pgid, sig: by_group.append(pgid)
         ), patch(
             "os.kill", side_effect=fake_kill

@@ -1878,7 +1878,31 @@ def _kill_all_worker_processes():
             pass
 
 
-def _signal_service(pid: int, sig: int) -> None:
+def _group_leader_is_ours(pgid: int, name: str) -> bool:
+    """Does this process group's leader look like a service of ours?
+
+    ps only, so it stays off the filesystem, which is what lets this run in the
+    watcher on a machine whose mount has gone away.
+    """
+    if not name:
+        return False
+    try:
+        cmd = subprocess.run(
+            ["/bin/ps", "-p", str(pgid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if name == "worker":
+        return bool(_WORKER_CMD_RE.search(cmd))
+    if name == "ml":
+        return bool(_ML_CMD_RE.search(cmd))
+    if name == "dashboard":
+        return "immich_accelerator" in cmd and "dashboard" in cmd
+    return False
+
+
+def _signal_service(pid: int, sig: int, name: str = "") -> None:
     """Signal one tracked service, by group only where the group is ours.
 
     Services have children that must go with them: the worker runs several
@@ -1889,13 +1913,35 @@ def _signal_service(pid: int, sig: int) -> None:
 
     A pid can also be one we adopted rather than spawned — read_pid falls back
     to a process scan for the worker, adopt_live_ml and start_dashboard adopt a
-    live listener. Session leadership is what separates the two: a process
-    started from a shell leads its job's process group but not the session, and
-    that group is not ours to signal.
+    live listener. What separates the two is whether the process group's leader
+    is the session leader: only setsid makes that true, so a process started
+    from a shell leads its job's group but not the session, and that group is
+    not ours to signal.
     """
     try:
-        if os.getsid(pid) == pid:
-            os.killpg(pid, sig)
+        pgid = os.getpgid(pid)
+        # Signalling a group reaches everything in it, so the group has to be
+        # attributable to us before we do. Leader-is-session-leader is what
+        # setsid produces, but it is also true of plenty of processes nobody
+        # here started: measured on one Mac, 15 more processes satisfy it than
+        # satisfy "is itself the leader", among them another supervisor and its
+        # children. Adopted pids are the ones that reach this, and the worker
+        # scan matches a worker-shaped process anywhere on the machine with no
+        # ownership check, so an adopted stranger would have taken its whole
+        # group with it.
+        if not _group_leader_is_ours(pgid, name):
+            raise OSError("group leader is not one of ours")
+        # The group is ours when its leader is also the session leader, which is
+        # the shape start_new_session produces and a shell job never has.
+        #
+        # Testing getsid(pid) == pid instead asks whether this pid is itself the
+        # leader, which is false for the pid the worker adoption path hands back:
+        # _find_live_worker_pid returns a child, not the leader. The group then
+        # went unsignalled, and _kill_all_worker_processes only matches immich
+        # and node, so ffmpeg and exiftool kept running and writing into the
+        # library after "Worker stopped".
+        if os.getsid(pid) == pgid:
+            os.killpg(pgid, sig)
             return
     except OSError:
         pass
@@ -1909,7 +1955,7 @@ def kill_pid(name: str) -> bool:
     pid = read_pid(name)
     if pid is None:
         return False
-    _signal_service(pid, signal.SIGTERM)
+    _signal_service(pid, signal.SIGTERM, name)
 
     # Also kill any orphaned immich processes not in the same group
     if name == "worker":
@@ -1923,7 +1969,7 @@ def kill_pid(name: str) -> bool:
         except OSError:
             break
     else:
-        _signal_service(pid, signal.SIGKILL)
+        _signal_service(pid, signal.SIGKILL, name)
 
     (PID_DIR / f"{name}.pid").unlink(missing_ok=True)
     return True
@@ -2179,13 +2225,56 @@ def mount_recipe_for(root: str) -> dict | None:
         return None
 
     # The mount table reports resolved paths (/private/tmp, not /tmp), so a
-    # config path that goes through a symlink would match nothing. Resolving is
-    # safe here because a recipe is only ever recorded while the mount is up.
-    try:
-        root = str(Path(root).resolve())
-    except OSError:
-        pass
+    # config path that goes through a symlink would match nothing.
+    #
+    # But resolve() lstats every component, and a component on a mount whose
+    # server has gone away never returns: not a timeout, a wedge. This is called
+    # from the watch loop, so it took the whole watcher down with the NAS on the
+    # release Mac, at exactly the moment its job was to notice that. Resolving
+    # is therefore a fallback, tried only when the plain path matches nothing,
+    # and done where a hang cannot reach this process.
+    candidates = [root]
 
+    best = None
+    for want in candidates:
+        best = _best_mount_for(want, out)
+        if best:
+            return best
+    # Resolving is only worth a child process if some remountable mount could
+    # plausibly be the answer. A library on the internal disk matches nothing
+    # here whatever the path resolves to, and that is most installs, so without
+    # this the watcher forked an interpreter every cycle for a result it then
+    # discarded.
+    if not any(
+        line.rpartition(" (")[2].split(",")[0].rstrip(")").strip() in _REMOUNTABLE_FS
+        for line in out.splitlines()
+    ):
+        return None
+    resolved = _resolve_offthread(root)
+    return _best_mount_for(resolved, out) if resolved and resolved != root else None
+
+
+def _resolve_offthread(path: str, timeout: int = 5) -> str | None:
+    """Resolve symlinks in a child process, so a dead mount cannot wedge us.
+
+    resolve() lstats every component. On a mount whose server has gone away
+    that call does not time out, it never returns, and the caller is the watch
+    loop.
+    """
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys,pathlib;print(pathlib.Path(sys.argv[1]).resolve())", path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = r.stdout.strip()
+    return out if r.returncode == 0 and out else None
+
+
+def _best_mount_for(root: str, out: str) -> dict | None:
+    """Longest mount in `out` that covers `root`, or None."""
     best = None
     for line in out.splitlines():
         head, sep, tail = line.rpartition(" (")
@@ -2376,6 +2465,32 @@ def library_mount(config: dict) -> str:
     recipe = config.get("mount_recipe") or {}
     point = recipe.get("mountpoint") or ""
     return point if _mount_covers(point, config.get("upload_mount") or "") else ""
+
+
+def backends_down(config: dict) -> list[str]:
+    """Which of the worker's backing services are not answering.
+
+    Postgres and Redis, by TCP connect. Deliberately not a query: a connect
+    either completes or is refused, in milliseconds, and cannot be delayed by a
+    filesystem. That distinction is the whole lesson of 1.11.1, where a check
+    that could hang was used to decide whether to stop the worker.
+
+    An ml-only node has neither configured and is never judged.
+    """
+    down = []
+    for label, host_key, port_key, default in (
+        ("Postgres", "db_hostname", "db_port", 5432),
+        ("Redis", "redis_hostname", "redis_port", 6379),
+    ):
+        host = config.get(host_key)
+        if not host:
+            continue
+        try:
+            with socket.create_connection((host, int(config.get(port_key, default))), timeout=2):
+                pass
+        except (OSError, ValueError):
+            down.append(label)
+    return down
 
 
 def library_mount_gone(config: dict) -> tuple[bool, str]:
@@ -4450,13 +4565,24 @@ def port_in_use(port: int) -> bool:
     A plain TCP connect, deliberately not /ping: the case this exists for is a
     wedged service that still holds the socket but answers nothing, which is
     exactly what a health check cannot see.
+
+    Both stacks are tried. The native engine binds IPv6, and while macOS maps
+    an IPv4 loopback connect onto a dual-stack listener, a listener that is
+    IPv6-only would be invisible to an AF_INET connect alone, and "nothing is
+    listening" is the answer that lets a second engine start on top of it.
     """
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(0.5)
-            return sock.connect_ex(("127.0.0.1", int(port))) == 0
-    except (OSError, ValueError):
-        return False
+    # create_connection rather than connect_ex: on a socket with a timeout,
+    # connect_ex can report EINPROGRESS instead of success, which reads as
+    # "nothing is listening" and lets a second engine start on top of a live
+    # one. create_connection either returns a connected socket or raises, and
+    # it is what check_port has always used here.
+    for host in ("127.0.0.1", "::1"):
+        try:
+            with socket.create_connection((host, int(port)), timeout=0.5):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def wait_for_port_free(port: int, timeout: float = 10.0) -> bool:
@@ -4522,8 +4648,66 @@ def _start_ml_service(config: dict):
 _ML_CMD_RE = re.compile(r"immich-ml-native\s+serve|python[^\s]*\s+-m\s+src\.main")
 
 
+def _our_ml_process(port: int) -> int | None:
+    """PID of an ML engine of ours that is running, found by process table.
+
+    The fallback for when lsof cannot answer. It walks every descriptor on the
+    machine, so one unresponsive network mount stalls it past any timeout, and
+    the release Mac is exactly that machine. ps does not touch the filesystem.
+
+    This says "an engine of ours is running", not "it owns the port", so the
+    caller must have established that something holds the port first. Together
+    those are the same conclusion, since our engine binds that port or exits.
+    """
+    try:
+        out = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,command="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # The port matters. The native engine takes it in argv, so require it:
+    # otherwise any engine of ours anywhere is treated as the holder of this
+    # port. The preflight gate runs one on another port on this same Mac, and
+    # Docker's own ML container is a real holder of 3003, so the combination
+    # adopted the wrong process and would later have signalled it.
+    native = re.compile(rf"immich-ml-native\s+serve\s+{int(port)}(\s|$)")
+    venv = re.compile(r"python[^\s]*\s+-m\s+src\.main")
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if not pid.isdigit():
+            continue
+        if native.search(cmd):
+            return int(pid)
+        # The venv engine gets its port from ML_PORT, not argv, so its command
+        # line cannot tell this port from another. Without checking, the
+        # preflight gate's own engine on a different port was a match, which is
+        # the case requiring the port was added for.
+        if venv.search(cmd) and _venv_ml_port(int(pid)) == int(port):
+            return int(pid)
+    return None
+
+
+def _venv_ml_port(pid: int) -> int | None:
+    """The port a running venv engine was given, read from its environment."""
+    try:
+        env = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-Eww", "-o", "command="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    hit = re.search(r"\bML_PORT=(\d+)", env)
+    return int(hit.group(1)) if hit else 3003
+
+
 def _listener_pid(port: int) -> int | None:
-    """PID of whatever is listening on this port, or None."""
+    """PID of whatever is listening on this port, or None.
+
+    lsof is the precise answer and the one that can identify a process that is
+    not ours, so it is tried first, but it cannot be relied on: see
+    _our_ml_process for why it stalls on the release Mac.
+    """
     try:
         out = subprocess.run(
             ["/usr/sbin/lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
@@ -4532,9 +4716,11 @@ def _listener_pid(port: int) -> int | None:
             timeout=10,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError, ValueError):
-        return None
+        return _our_ml_process(port) if port_in_use(port) else None
     first = out.splitlines()[0].strip() if out else ""
-    return int(first) if first.isdigit() else None
+    if first.isdigit():
+        return int(first)
+    return _our_ml_process(port) if port_in_use(port) else None
 
 
 # Three answers, not two. "Cannot tell" blocks a start as firmly as "occupied":
@@ -4554,6 +4740,18 @@ def ml_port_state(port: int) -> str:
     as well. Anything else — lsof is missing, it hung, it answered in a shape we
     do not recognise — is unknown, never "free".
     """
+    # Ask the network stack first. A connect either succeeds or is refused, in
+    # microseconds, and it cannot be delayed by anything on disk.
+    #
+    # lsof can: it walks every open descriptor on the machine, so a single
+    # unresponsive network mount stalls it until the timeout. On the release
+    # Mac, with the library on NFS, connect answers in 0.000s while lsof times
+    # out after 10. Deciding this question with lsof there meant the port was
+    # permanently "unknown", and an engine that is never allowed to start is a
+    # worse failure than the double-start this guard exists to prevent.
+    if port_in_use(port):
+        return PORT_OCCUPIED
+
     try:
         result = subprocess.run(
             ["/usr/sbin/lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
@@ -4562,7 +4760,8 @@ def ml_port_state(port: int) -> str:
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
-        return PORT_UNKNOWN
+        # connect said nothing is listening. lsof was only going to confirm it.
+        return PORT_FREE
     out = result.stdout.strip()
     if result.returncode == 0 and out.splitlines() and out.splitlines()[0].strip().isdigit():
         return PORT_OCCUPIED
@@ -4587,7 +4786,14 @@ def adopt_live_ml(config: dict) -> int | None:
     have restarted it if it wedged. Found on the release Mac, four days after
     it happened.
     """
-    pid = _listener_pid(config.get("ml_port", 3003))
+    port = config.get("ml_port", 3003)
+    if not port_in_use(port):
+        return None
+    # Ours first, from the process table. That answers the question this
+    # function actually asks, costs nothing, and skips lsof entirely in the
+    # common case; lsof is only needed to recognise a holder that is not ours,
+    # and it can take ten seconds to say so on a Mac with a network mount.
+    pid = _our_ml_process(int(port)) or _listener_pid(port)
     if pid is None:
         return None
     try:
@@ -5494,7 +5700,7 @@ def stop_all_fast() -> None:
         if not pid:
             continue
         pids[name] = pid
-        _signal_service(pid, signal.SIGTERM)
+        _signal_service(pid, signal.SIGTERM, name)
     _kill_all_worker_processes()  # sweep orphaned immich procs too
 
     # Short, PARALLEL wait (not 5s-per-service) so we stay well under launchd's
@@ -5505,7 +5711,7 @@ def stop_all_fast() -> None:
         time.sleep(0.1)
     for pid in pids.values():
         if alive(pid):
-            _signal_service(pid, signal.SIGKILL)
+            _signal_service(pid, signal.SIGKILL, name)
     for name in pids:
         (PID_DIR / f"{name}.pid").unlink(missing_ok=True)
     if pids:
@@ -5531,7 +5737,12 @@ def cmd_status(_args):
     config = load_config() if CONFIG_FILE.exists() else {}
 
     paused = read_paused()
-    if paused and paused.get("reason") == "library-unreachable":
+    if paused and paused.get("reason") == "backend-unreachable":
+        log.warning(
+            "Worker:     paused, %s not answering", paused.get("detail") or "?"
+        )
+        log.warning("            It starts again on its own when they are back.")
+    elif paused and paused.get("reason") == "library-unreachable":
         log.warning(
             "Worker:     paused, library is not reachable at %s",
             paused.get("detail") or "?",
@@ -5859,6 +6070,8 @@ def _watch_worker(config: dict) -> str | None:
     media_paused = False
     remount_state: dict = {}  # {attempts, last, blocked} for the remount backoff
     media_down_since: float | None = None  # first failed probe of a run
+    backend_down_since: float | None = None  # first cycle Postgres/Redis went quiet
+    backend_paused = False
     # This loop's state starts clean, so any marker from a previous run is
     # stale and would make status report a pause that is not happening.
     set_paused("")
@@ -5950,6 +6163,68 @@ def _watch_worker(config: dict) -> str | None:
             # Pause instead. A stopped worker is honest and recovers by itself
             # the moment the mount returns, which is what a service running
             # unattended is for.
+            # The worker cannot do anything without Postgres and Redis, and on
+            # a split install those live on the same box as the library. When
+            # that box goes away the worker used to sit there reconnecting all
+            # night, filling its log with the same error, while status happily
+            # reported it running.
+            #
+            # A connect is the right question to decide this on: it answers in
+            # milliseconds and cannot hang, unlike the file read that made
+            # 1.11.0 stop a healthy machine.
+            down = backends_down(config)
+            if down:
+                if backend_down_since is None:
+                    backend_down_since = time.monotonic()
+                    log.warning(
+                        "%s not answering. Leaving the worker alone until this "
+                        "has lasted %ds.",
+                        " and ".join(down),
+                        int(MEDIA_UNREACHABLE_GRACE),
+                    )
+                if time.monotonic() - backend_down_since >= MEDIA_UNREACHABLE_GRACE:
+                    if not backend_paused:
+                        backend_paused = True
+                        log.error(
+                            "%s still not answering. Pausing the worker; it will "
+                            "start again on its own when they are back.",
+                            " and ".join(down),
+                        )
+                        set_paused("backend-unreachable", ", ".join(down))
+                    if read_pid("worker"):
+                        kill_pid("worker")
+                    continue
+            elif backend_down_since is not None:
+                backend_down_since = None
+                if backend_paused:
+                    backend_paused = False
+                    if media_paused:
+                        # Two reasons to pause, one marker file. The library is
+                        # still gone, so hand the marker back rather than delete
+                        # it, and leave the worker down: the block below stops it
+                        # again in this same cycle. Clearing it here left status
+                        # saying "stopped" with no reason, for the whole
+                        # remaining outage, which is the exact failure the marker
+                        # exists to prevent.
+                        log.info(
+                            "Postgres and Redis are back, but the library mount "
+                            "is still gone. Keeping the worker paused."
+                        )
+                        set_paused(
+                            "library-unreachable", config.get("upload_mount") or ""
+                        )
+                    else:
+                        log.info("Postgres and Redis are back. Starting the worker.")
+                        set_paused("")
+                        if not read_pid("worker"):
+                            try:
+                                cmd_start(argparse.Namespace(force=True))
+                            except RuntimeError:
+                                log.error(
+                                    "  Worker start after the database returned failed"
+                                )
+                            worker_handled = True
+
             if config.get("require_media_ready", True):
                 gone, point = library_mount_gone(config)
                 if gone:

@@ -23,6 +23,7 @@ import immich_accelerator.__main__ as m
 # Captured at import, before no_real_machine_reads replaces it: the tests below
 # are the ones that want the real thing.
 REAL_ML_PORT_STATE = m.ml_port_state
+REAL_PORT_IN_USE = m.port_in_use
 
 MOUNT_OUTPUT = """/dev/disk2s4s1 on / (apfs, sealed, local, read-only, journaled)
 devfs on /dev (devfs, local, nobrowse)
@@ -34,9 +35,22 @@ nas:/volume1/media on /nas (nfs, nodev)
 
 
 def _mount(output=MOUNT_OUTPUT):
-    return patch.object(
-        m.subprocess, "run", return_value=MagicMock(stdout=output, returncode=0)
-    )
+    """Answer /sbin/mount with the table, and let a resolve child resolve.
+
+    The two are different questions and used to share one mock, so the child
+    that resolves symlinks was handed the mount table as its answer.
+    """
+
+    def run(argv, **kw):
+        if argv and str(argv[0]).endswith("mount"):
+            return MagicMock(stdout=output, returncode=0)
+        if len(argv) >= 3 and "resolve" in str(argv[2]):
+            import pathlib as _p
+
+            return MagicMock(stdout=str(_p.Path(argv[3]).resolve()), returncode=0)
+        return MagicMock(stdout="", returncode=1)
+
+    return patch.object(m.subprocess, "run", side_effect=run)
 
 
 def drive_watch(cfg, ready, pids=None, recipe=None, seconds_per_cycle=60.0):
@@ -476,13 +490,28 @@ class TestMLAdoption:
     VENV = "/opt/homebrew/Cellar/immich-accelerator/1.10.0/libexec/ml/venv/bin/python3.11 -m src.main"
     DOCKER = "/usr/local/bin/com.docker.backend -watchdog -native-api"
 
-    def _ps(self, cmd):
+    def _ps(self, cmd, lsof_works=True):
+        """Model the two shapes of ps this uses, plus lsof.
+
+        `ps -axo pid=,command=` lists every process, which is how an engine of
+        ours is found without lsof; `ps -o command= -p PID` identifies one.
+        lsof_works=False is the release Mac, where a network mount stalls it.
+        """
+
         def run(argv, **kw):
             if argv[0].endswith("lsof"):
+                if not lsof_works:
+                    raise subprocess.TimeoutExpired("lsof", 10)
                 return MagicMock(stdout="64933\n")
+            if "-axo" in argv:
+                return MagicMock(stdout=f"64933 {cmd}\n1 /sbin/launchd\n")
             return MagicMock(stdout=cmd)
 
-        return patch.object(m.subprocess, "run", side_effect=run)
+        return patch.multiple(
+            m,
+            subprocess=MagicMock(run=MagicMock(side_effect=run), TimeoutExpired=subprocess.TimeoutExpired, SubprocessError=subprocess.SubprocessError),
+            port_in_use=MagicMock(return_value=True),
+        )
 
     def test_our_native_engine_is_adopted(self, tmp_data_dir):
         with self._ps(self.NATIVE), patch.object(m, "log"):
@@ -871,21 +900,45 @@ class TestMlPortState:
     not on its own an answer."""
 
     def test_a_real_listener_reads_as_occupied(self):
-        # The only check here that runs the real binary. The accelerator is
-        # macOS-only and hardcodes this path, so on the Linux lint runner there
-        # is nothing to exercise and every port would read as unknown.
-        if not os.access("/usr/sbin/lsof", os.X_OK):
-            pytest.skip("/usr/sbin/lsof not present")
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            sock.listen(1)
-            port = sock.getsockname()[1]
-            assert REAL_ML_PORT_STATE(port) == m.PORT_OCCUPIED
-        assert REAL_ML_PORT_STATE(port) == m.PORT_FREE
+        """End to end against a socket this test binds itself, rather than
+        against whatever the host happens to be running.
 
-    def test_lsof_that_cannot_run_is_unknown(self):
-        with patch.object(m.subprocess, "run", side_effect=OSError):
-            assert REAL_ML_PORT_STATE(3003) == m.PORT_UNKNOWN
+        conftest stubs port_in_use for every test, so that a machine serving a
+        library does not answer these questions, and this is one of the tests
+        its docstring means when it says to patch the behaviour back. Without
+        that, the real classifier never runs: it falls through to lsof, which
+        finds the listener on a Mac and is absent on the Linux runner, so the
+        test passed here and failed there.
+        """
+        import socket as _s
+
+        with patch.object(m, "port_in_use", REAL_PORT_IN_USE):
+            with _s.socket(_s.AF_INET, _s.SOCK_STREAM) as srv:
+                srv.bind(("127.0.0.1", 0))
+                srv.listen()
+                port = srv.getsockname()[1]
+                assert REAL_ML_PORT_STATE(port) == m.PORT_OCCUPIED
+            assert REAL_ML_PORT_STATE(port) == m.PORT_FREE
+
+    def test_a_listening_port_is_occupied_without_consulting_lsof(self):
+        """The network stack answers this in microseconds and cannot be stalled
+        by anything on disk. lsof can: it walks every descriptor on the machine,
+        so one unresponsive network mount hangs it. On the release Mac, connect
+        answers in 0.000s where lsof times out after 10."""
+        with patch.object(m, "port_in_use", return_value=True), patch.object(
+            m.subprocess, "run", side_effect=AssertionError("must not run lsof")
+        ):
+            assert REAL_ML_PORT_STATE(3003) == m.PORT_OCCUPIED
+
+    def test_lsof_that_cannot_run_is_free_when_nothing_is_listening(self):
+        """A refused connect is evidence, not absence of evidence. Reporting
+        unknown here meant an engine could never start on a Mac where lsof
+        stalls, and a service that never starts is worse than the double start
+        this guard prevents."""
+        with patch.object(m, "port_in_use", return_value=False), patch.object(
+            m.subprocess, "run", side_effect=OSError
+        ):
+            assert REAL_ML_PORT_STATE(3003) == m.PORT_FREE
 
     def test_lsof_reporting_its_own_error_is_not_free(self):
         """Exit 1 with nothing on stdout, which is also how "no match" looks."""
@@ -978,26 +1031,73 @@ class TestSpawnedServicesLeadTheirOwnSession:
 
 
 class TestTheGroupIsSignalledOnlyWhenWeLeadTheSession:
-    """start_service and start_dashboard pass start_new_session, so everything
-    this supervisor spawns is a session leader and only its own descendants can
-    join its process group. A process started from a shell leads its job's
-    process group but not the session, so an adopted one is signalled alone."""
+    """start_service and start_dashboard pass start_new_session, so a group we
+    created has its leader as the session leader, and only our descendants can
+    join it. A process started from a shell leads its job's group but not the
+    session, so an adopted one is signalled alone.
+
+    The test is on the group, not on the pid. Asking whether this pid is itself
+    the session leader is false for the pid the worker adoption path returns:
+    _find_live_worker_pid hands back a child, not the leader. The group then
+    went unsignalled and ffmpeg and exiftool survived a stop, because
+    _kill_all_worker_processes matches only immich and node.
+    """
 
     def test_a_session_leader_takes_the_group(self, tmp_data_dir):
         (tmp_data_dir["pid_dir"] / "ml.pid").write_text("4242\n")
         with patch.object(m.os, "getsid", return_value=4242), patch.object(
-            m.os, "killpg"
-        ) as killpg, patch.object(
+            m.os, "getpgid", return_value=4242
+        ), patch.object(
+            m, "_group_leader_is_ours", return_value=True
+        ), patch.object(m.os, "killpg") as killpg, patch.object(
             m.os, "kill", side_effect=OSError()
         ), patch.object(m, "read_pid", return_value=4242):
             m.kill_pid("ml")
         assert killpg.call_args_list[0][0][0] == 4242
 
+    def test_an_adopted_child_of_ours_still_takes_the_group(self, tmp_data_dir):
+        """The regression this class exists for. The pid is not the leader, but
+        its group was made by setsid, so the group is ours and the worker's
+        ffmpeg and exiftool children have to go with it."""
+        (tmp_data_dir["pid_dir"] / "worker.pid").write_text("4242\n")
+        with patch.object(m.os, "getsid", return_value=900), patch.object(
+            m.os, "getpgid", return_value=900
+        ), patch.object(
+            m, "_group_leader_is_ours", return_value=True
+        ), patch.object(m.os, "killpg") as killpg, patch.object(
+            m.os, "kill", side_effect=OSError()
+        ), patch.object(m, "read_pid", return_value=4242), patch.object(
+            m, "_kill_all_worker_processes"
+        ):
+            m.kill_pid("worker")
+        assert killpg.call_args_list[0][0][0] == 900
+
+    def test_a_group_led_by_a_stranger_is_never_group_killed(self, tmp_data_dir):
+        """The predicate is satisfied by plenty of processes nobody here
+        started: on one Mac, fifteen more than satisfy "is itself the leader",
+        including another supervisor and its children. Worker adoption matches
+        a worker-shaped process anywhere with no ownership check, so without
+        this an adopted stranger took its whole group with it."""
+        (tmp_data_dir["pid_dir"] / "worker.pid").write_text("4242\n")
+        with patch.object(m.os, "getsid", return_value=900), patch.object(
+            m.os, "getpgid", return_value=900
+        ), patch.object(
+            m, "_group_leader_is_ours", return_value=False
+        ), patch.object(m.os, "killpg") as killpg, patch.object(
+            m.os, "kill", side_effect=[None, OSError()]
+        ) as kill, patch.object(m, "read_pid", return_value=4242), patch.object(
+            m, "_kill_all_worker_processes"
+        ):
+            m.kill_pid("worker")
+        killpg.assert_not_called()
+        assert kill.call_args_list[0][0][0] == 4242
+
     def test_a_pid_inside_somebody_elses_session_is_signalled_alone(self, tmp_data_dir):
+        """A shell job: its group leader is not the session leader."""
         (tmp_data_dir["pid_dir"] / "ml.pid").write_text("4242\n")
         with patch.object(m.os, "getsid", return_value=900), patch.object(
-            m.os, "killpg"
-        ) as killpg, patch.object(
+            m.os, "getpgid", return_value=4242
+        ), patch.object(m.os, "killpg") as killpg, patch.object(
             m.os, "kill", side_effect=[None, OSError()]
         ) as kill, patch.object(m, "read_pid", return_value=4242):
             m.kill_pid("ml")
@@ -1009,10 +1109,12 @@ class TestTheGroupIsSignalledOnlyWhenWeLeadTheSession:
         descendants that outlive their parent."""
         (tmp_data_dir["pid_dir"] / "worker.pid").write_text("4242\n")
         with patch.object(m.os, "getsid", return_value=900), patch.object(
-            m.os, "killpg"
-        ), patch.object(m.os, "kill", side_effect=OSError()), patch.object(
-            m, "read_pid", return_value=4242
-        ), patch.object(m, "_kill_all_worker_processes") as sweep:
+            m.os, "getpgid", return_value=4242
+        ), patch.object(m.os, "killpg"), patch.object(
+            m.os, "kill", side_effect=OSError()
+        ), patch.object(m, "read_pid", return_value=4242), patch.object(
+            m, "_kill_all_worker_processes"
+        ) as sweep:
             m.kill_pid("worker")
         sweep.assert_called_once()
 
@@ -1028,3 +1130,333 @@ class TestOneVenvWorker:
         spec = m._venv_ml_spec({"ml_dir": str(tmp_path)}, {"WEB_CONCURRENCY": "4"})
         assert spec is not None
         assert spec[2]["WEB_CONCURRENCY"] == "1"
+
+
+class TestPortChecksSurviveAnUnusableLsof:
+    """lsof walks every open descriptor on the machine, so a single
+    unresponsive network mount stalls it past any timeout. The release Mac is
+    that machine: a TCP connect answers there in 0.000s while lsof times out
+    after 10.
+
+    Both of these were decided with lsof, and on that Mac the result was an
+    engine that could never start and a running engine that could never be
+    adopted, which is worse than either problem they were added to solve.
+    """
+
+    NATIVE = "/opt/homebrew/opt/immich-accelerator/libexec/native-ml/immich-ml-native serve 3003"
+
+    def test_a_held_port_reads_as_occupied_when_lsof_cannot_answer(self):
+        with patch.object(m, "port_in_use", return_value=True), patch.object(
+            m.subprocess, "run", side_effect=subprocess.TimeoutExpired("lsof", 10)
+        ):
+            assert REAL_ML_PORT_STATE(3003) == m.PORT_OCCUPIED
+
+    def test_our_engine_is_still_adopted_when_lsof_cannot_answer(self, tmp_data_dir):
+        def run(argv, **kw):
+            if argv[0].endswith("lsof"):
+                raise subprocess.TimeoutExpired("lsof", 10)
+            if "-axo" in argv:
+                return MagicMock(stdout=f"64933 {self.NATIVE}\n1 /sbin/launchd\n")
+            return MagicMock(stdout=self.NATIVE)
+
+        with patch.object(m, "port_in_use", return_value=True), patch.object(
+            m.subprocess, "run", side_effect=run
+        ), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) == 64933
+
+    def test_nothing_is_adopted_when_the_port_is_not_even_held(self, tmp_data_dir):
+        """The process scan says an engine of ours is running, not that it owns
+        the port, so the port has to be established first. The subprocess
+        side_effect is what makes this non-vacuous: reaching it at all is the
+        failure."""
+        with patch.object(m, "port_in_use", return_value=False), patch.object(
+            m.subprocess, "run", side_effect=AssertionError("must not be reached")
+        ), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) is None
+
+    def test_the_common_case_never_waits_on_lsof(self):
+        """Ours-first, from the process table. Asking lsof first cost ten
+        seconds per call on the release Mac before falling back to exactly this
+        answer, and the watcher makes this call on a timer."""
+        native = TestPortChecksSurviveAnUnusableLsof.NATIVE
+
+        def run(argv, **kw):
+            if argv[0].endswith("lsof"):
+                raise AssertionError("lsof must not be consulted for our own engine")
+            if "-axo" in argv:
+                return MagicMock(stdout=f"64933 {native}\n")
+            return MagicMock(stdout=native)
+
+        with patch.object(m, "port_in_use", return_value=True), patch.object(
+            m.subprocess, "run", side_effect=run
+        ), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) == 64933
+
+
+class TestADeadMountCannotWedgeTheWatcher:
+    """Every path check the watch loop makes has to survive a mount whose
+    server has gone away. Those calls do not fail, and they do not time out;
+    they never return.
+
+    This has now happened twice on the release Mac, in two different calls.
+    os.access in the start path took the watcher down while it held the start
+    lock. Path.resolve() in mount_recipe_for took it down when the NAS went off
+    for the night, at the moment its whole job was to notice that.
+    """
+
+    def test_the_recipe_lookup_does_not_resolve_in_this_process(self):
+        """resolve() lstats every component of the path."""
+        import inspect
+
+        src = "\n".join(
+            ln
+            for ln in inspect.getsource(m.mount_recipe_for).splitlines()
+            if not ln.strip().startswith("#")
+        )
+        assert ".resolve()" not in src, (
+            "resolve() on the library path never returns on a dead mount; "
+            "use _resolve_offthread"
+        )
+
+    def test_a_plain_match_needs_no_resolving_at_all(self):
+        """The common case, and the one that matters when the mount is dead:
+        /nas/immich under a mount at /nas matches without touching the disk."""
+        out = "10.0.0.14:/volume1/ELP NAS on /nas (nfs)\n"
+        with patch.object(m.subprocess, "run") as run:
+            run.side_effect = lambda argv, **kw: (
+                MagicMock(stdout=out, returncode=0)
+                if str(argv[0]).endswith("mount")
+                else (_ for _ in ()).throw(AssertionError("must not resolve"))
+            )
+            r = m.mount_recipe_for("/nas/immich")
+        assert r and r["mountpoint"] == "/nas"
+
+    def test_a_resolver_that_hangs_is_bounded(self):
+        with patch.object(
+            m.subprocess, "run", side_effect=subprocess.TimeoutExpired("py", 5)
+        ):
+            assert m._resolve_offthread("/nas/immich") is None
+
+
+class TestTheWorkerWaitsWhenItsDatabaseIsGone:
+    """On a split install Postgres and Redis live on the same box as the
+    library, so when that box goes away the worker can do nothing at all. It
+    used to sit reconnecting all night, filling its log with one error, while
+    status reported it running.
+
+    A TCP connect decides this. That is the distinction 1.11.1 was about: a
+    connect answers in milliseconds and cannot hang, unlike the file read that
+    stopped a healthy machine.
+    """
+
+    CFG = {
+        "worker": True,
+        "ml": False,
+        "db_hostname": "10.0.0.14", "db_port": 15432,
+        "redis_hostname": "10.0.0.14", "redis_port": 16379,
+    }
+
+    def _drive(self, down_seq, pids=None, cycles=None):
+        pids = dict(pids or {})
+        clock = {"t": 1000.0}
+        seq = list(down_seq)
+
+        def backends(_cfg):
+            clock["t"] += 60
+            return seq.pop(0) if seq else []
+
+        n = cycles or len(down_seq)
+        mocks = {
+            "load_config": MagicMock(
+                side_effect=[dict(self.CFG)] * (n + 1) + [KeyboardInterrupt()]
+            ),
+            "backends_down": MagicMock(side_effect=backends),
+            "library_mount_gone": MagicMock(return_value=(False, "")),
+            "media_io_healthy": MagicMock(return_value=(True, "")),
+            "is_mounted": MagicMock(return_value=True),
+            "read_pid": MagicMock(side_effect=lambda x: pids.get(x)),
+            "kill_pid": MagicMock(side_effect=lambda x, **k: pids.pop(x, None)),
+            "cmd_start": MagicMock(),
+            "cmd_stop": MagicMock(),
+            "reconcile_components": MagicMock(),
+            "cap_service_logs": MagicMock(),
+            "_upgraded_on_disk": MagicMock(return_value=False),
+            "_worker_fd_total": MagicMock(return_value=None),
+            "mount_recipe_for": MagicMock(return_value=None),
+            "save_config": MagicMock(),
+            "_attempt_remount": MagicMock(),
+            "diagnose_worker_log": MagicMock(return_value=None),
+            "log": MagicMock(),
+        }
+        with patch.multiple(m, **mocks), patch.object(
+            m.time, "monotonic", side_effect=lambda: clock["t"]
+        ):
+            m._watch_worker(dict(self.CFG))
+        return mocks
+
+    def test_a_brief_blip_does_not_stop_the_worker(self, tmp_data_dir):
+        """One missed connect is a network hiccup, not an outage."""
+        mocks = self._drive([["Postgres"], []], pids={"worker": 4242})
+        assert "worker" not in [c.args[0] for c in mocks["kill_pid"].call_args_list]
+        assert not m.read_paused()
+
+    def test_a_real_outage_pauses_the_worker(self, tmp_data_dir):
+        mocks = self._drive([["Postgres", "Redis"]] * 4, pids={"worker": 4242})
+        assert "worker" in [c.args[0] for c in mocks["kill_pid"].call_args_list]
+        marker = m.read_paused()
+        assert marker and marker["reason"] == "backend-unreachable"
+        assert "Postgres" in marker["detail"]
+
+    def test_it_starts_again_when_they_come_back(self, tmp_data_dir):
+        mocks = self._drive([["Postgres", "Redis"]] * 3 + [[], []], pids={"worker": 4242})
+        assert mocks["cmd_start"].called, "must come back without anyone helping"
+        assert not m.read_paused(), "and the marker must be cleared"
+
+    def test_an_ml_only_node_is_never_judged(self, tmp_data_dir):
+        """It has no database configured and does not want one."""
+        assert m.backends_down({"ml_only": True}) == []
+
+    def test_status_says_which_service_is_missing(self, tmp_data_dir):
+        m.set_paused("backend-unreachable", "Postgres, Redis")
+        with patch.object(m, "read_pid", return_value=None), patch.object(m, "log") as log:
+            m.cmd_status(None)
+        said = " ".join(str(c) for c in log.warning.call_args_list)
+        assert "Postgres, Redis" in said and "not answering" in said
+
+
+class TestWeOnlyAdoptTheEngineHoldingOurPort:
+    """"Something holds ml_port" and "an engine of ours is running somewhere"
+    are not the same fact. Treating them as one adopts the wrong process.
+
+    Both halves happen on the release Mac at once: Docker's own ML container is
+    a real holder of 3003, and the preflight gate, which policy says to run on
+    that same Mac, starts an engine of ours on a different port.
+    """
+
+    NATIVE_3003 = "/opt/homebrew/.../native-ml/immich-ml-native serve 3003"
+    NATIVE_3998 = "/opt/homebrew/.../native-ml/immich-ml-native serve 3998"
+
+    def _ps(self, cmd):
+        def run(argv, **kw):
+            if argv[0].endswith("lsof"):
+                raise subprocess.TimeoutExpired("lsof", 10)
+            if "-axo" in argv:
+                return MagicMock(stdout=f"64933 {cmd}\n1 /sbin/launchd\n")
+            return MagicMock(stdout=cmd)
+
+        return patch.object(m.subprocess, "run", side_effect=run)
+
+    def test_an_engine_on_another_port_is_not_adopted(self, tmp_data_dir):
+        """The preflight gate's own server, while Docker holds 3003. Adopting it
+        meant the watcher could later signal a process it never started, and
+        fail the one gate that protects releases."""
+        with self._ps(self.NATIVE_3998), patch.object(
+            m, "port_in_use", return_value=True
+        ), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) is None
+
+    def test_the_engine_on_our_port_is_adopted(self, tmp_data_dir):
+        with self._ps(self.NATIVE_3003), patch.object(
+            m, "port_in_use", return_value=True
+        ), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) == 64933
+
+
+class TestTwoPauseReasonsShareOneMarker:
+    """The library pause and the database pause stop the same worker and write
+    the same marker file, and a NAS going away triggers both: the mount drops
+    and the Postgres and Redis on that box stop answering.
+
+    Postgres answers again the moment the box is back. The mount often does not,
+    which is why the remount exists. So the database resume routinely arrives
+    while the library pause is still in force.
+    """
+
+    CFG = {
+        "worker": True,
+        "ml": False,
+        "upload_mount": "/nas/immich",
+        "media_id": "abc",
+        "mount_recipe": {"fstype": "nfs", "spec": "n:/v", "mountpoint": "/nas"},
+        "db_hostname": "10.0.0.14", "db_port": 15432,
+        "redis_hostname": "10.0.0.14", "redis_port": 16379,
+    }
+
+    def _drive(self, gone_seq, down_seq, pids=None):
+        """A worker is running to begin with, so the only cmd_start that can
+        appear is a resume: the pre-loop start fires when no pid is found."""
+        pids = dict(pids if pids is not None else {"worker": 4242})
+        clock = {"t": 1000.0}
+        gone, down = list(gone_seq), list(down_seq)
+        n = max(len(gone_seq), len(down_seq))
+
+        def mount_gone(_cfg):
+            clock["t"] += 60
+            return (gone.pop(0), "/nas") if gone else (False, "/nas")
+
+        mocks = {
+            "load_config": MagicMock(
+                side_effect=[dict(self.CFG)] * (n + 1) + [KeyboardInterrupt()]
+            ),
+            "library_mount_gone": MagicMock(side_effect=mount_gone),
+            "backends_down": MagicMock(
+                side_effect=lambda _c: down.pop(0) if down else []
+            ),
+            "media_io_healthy": MagicMock(return_value=(True, "")),
+            "is_mounted": MagicMock(return_value=True),
+            "read_pid": MagicMock(side_effect=lambda n: pids.get(n)),
+            "kill_pid": MagicMock(side_effect=lambda n, **k: pids.pop(n, None)),
+            "cmd_start": MagicMock(),
+            "cmd_stop": MagicMock(),
+            "reconcile_components": MagicMock(),
+            "cap_service_logs": MagicMock(),
+            "_upgraded_on_disk": MagicMock(return_value=False),
+            "_worker_fd_total": MagicMock(return_value=None),
+            "mount_recipe_for": MagicMock(return_value=None),
+            "save_config": MagicMock(),
+            "_attempt_remount": MagicMock(),
+            "diagnose_worker_log": MagicMock(return_value=None),
+            "log": MagicMock(),
+        }
+        with patch.multiple(m, **mocks), patch.object(
+            m.time, "monotonic", side_effect=lambda: clock["t"]
+        ):
+            m._watch_worker(dict(self.CFG))
+        return mocks
+
+    def test_the_database_coming_back_does_not_erase_a_library_pause(
+        self, tmp_data_dir
+    ):
+        """The whole box goes, then returns, but the share is not remounted yet.
+        Clearing the marker here left status saying "stopped" with no reason for
+        the rest of the outage, which is the failure the marker prevents."""
+        mocks = self._drive(
+            gone_seq=[True] * 8,                       # mount gone throughout
+            down_seq=[[], [], ["Postgres"], ["Postgres"], ["Postgres"], [], [], []],
+        )
+        marker = m.read_paused()
+        assert marker, "a worker held down must say why"
+        assert marker["reason"] == "library-unreachable"
+        mocks["cmd_start"].assert_not_called()
+
+    def test_both_clearing_starts_the_worker_once(self, tmp_data_dir):
+        mocks = self._drive(
+            gone_seq=[True, True, True, False, False],
+            down_seq=[["Postgres"]] * 3 + [[], []],
+        )
+        assert not m.read_paused(), "marker cleared once both are back"
+
+    def test_a_local_disk_library_never_forks_a_resolver(self):
+        """Most installs keep the library on the internal disk, where no
+        remountable mount can ever match. Falling through to the child resolver
+        anyway spawned an interpreter every cycle, thousands a day, for a result
+        that is discarded."""
+        local_only = "/dev/disk2s4s1 on / (apfs, sealed, local)\n"
+
+        def run(argv, **kw):
+            if str(argv[0]).endswith("mount"):
+                return MagicMock(stdout=local_only, returncode=0)
+            raise AssertionError("must not spawn a resolver for a local library")
+
+        with patch.object(m.subprocess, "run", side_effect=run):
+            assert m.mount_recipe_for("/Users/elp/Pictures/immich") is None
