@@ -358,7 +358,7 @@ class TestPidManagement:
         current_pid = os.getpid()
         with patch(
             "immich_accelerator.__main__.read_pid", return_value=current_pid
-        ), patch("os.getpgid", return_value=current_pid), patch(
+        ), patch("os.getsid", return_value=current_pid), patch(
             "os.killpg"
         ) as mock_killpg, patch(
             "os.kill", side_effect=OSError
@@ -2057,14 +2057,21 @@ class TestStopAllFast:
         pids = {"worker": 111, "ml": 222, "dashboard": 333}
         sent = []
 
+        by_group = []
+
         def fake_kill(pid, sig):
             if sig == 0:
                 raise OSError()  # report dead so the wait loop exits immediately
+            sent.append((pid, sig))
+
+        def fake_killpg(pgid, sig):
+            by_group.append(pgid)
+            sent.append((pgid, sig))
 
         with patch(
             "immich_accelerator.__main__.read_pid", side_effect=lambda n: pids.get(n)
-        ), patch("os.getpgid", side_effect=lambda pid: pid), patch(
-            "os.killpg", side_effect=lambda pgid, sig: sent.append((pgid, sig))
+        ), patch("os.getsid", side_effect=lambda pid: pid), patch(
+            "os.killpg", side_effect=fake_killpg
         ), patch(
             "os.kill", side_effect=fake_kill
         ), patch(
@@ -2072,8 +2079,40 @@ class TestStopAllFast:
         ):
             stop_all_fast()
 
-        termed = {pgid for pgid, sig in sent if sig == signal.SIGTERM}
+        termed = {pid for pid, sig in sent if sig == signal.SIGTERM}
         assert termed == {111, 222, 333}  # all signalled before any wait
+        # getsid is the identity here, so all three lead their own session,
+        # which is what start_new_session gives everything we spawn. Checked on
+        # a live install: worker, ml and dashboard all satisfy getsid(pid)==pid.
+        assert sorted(by_group) == [111, 222, 333]
+
+    def test_a_service_inside_another_group_is_signalled_alone(self):
+        """An adopted pid need not lead its group. Signalling that group would
+        reach processes this supervisor never started."""
+        from immich_accelerator.__main__ import stop_all_fast
+
+        by_group = []
+        killed = []
+
+        def fake_kill(pid, sig):
+            if sig == 0:
+                raise OSError()
+            killed.append(pid)
+
+        with patch(
+            "immich_accelerator.__main__.read_pid",
+            side_effect=lambda n: {"ml": 222}.get(n),
+        ), patch("os.getsid", return_value=900), patch(
+            "os.killpg", side_effect=lambda pgid, sig: by_group.append(pgid)
+        ), patch(
+            "os.kill", side_effect=fake_kill
+        ), patch(
+            "immich_accelerator.__main__._kill_all_worker_processes"
+        ):
+            stop_all_fast()
+
+        assert by_group == []
+        assert killed == [222]
 
 
 class TestBuildHasCorePlugin:
