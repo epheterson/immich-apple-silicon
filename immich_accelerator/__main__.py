@@ -3999,9 +3999,14 @@ def _setup_remote(args):
                 subprocess.run(
                     [docker, "rm", container], capture_output=True, timeout=10
                 )
-        except (RuntimeError, subprocess.SubprocessError, FileNotFoundError, OSError):
-            # No local Docker — download directly from ghcr.io
-            log.info("  No local Docker — downloading server from ghcr.io...")
+        except (
+            RuntimeError,
+            subprocess.SubprocessError,
+            FileNotFoundError,
+            OSError,
+        ) as err:
+            log.info("  Local Docker extraction failed (%s)", err)
+            log.info("  Downloading server from ghcr.io instead...")
             try:
                 server_dir = download_immich_server(version)
             except RuntimeError as e:
