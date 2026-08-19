@@ -1460,3 +1460,64 @@ class TestTwoPauseReasonsShareOneMarker:
 
         with patch.object(m.subprocess, "run", side_effect=run):
             assert m.mount_recipe_for("/Users/elp/Pictures/immich") is None
+
+
+class TestASplitInstallDoesNotReadAStrangersContainer:
+    """immich_url marks a split install, and the Immich it names is the one this
+    install answers to.
+
+    A Mac can also be running an unrelated Immich in Docker. detect_immich
+    returns the first container whose name or image looks like Immich, so
+    reading configuration out of one compared this install against a stranger:
+    it refused to start over a mismatch that did not exist, and copied that
+    stranger's database credentials and version into this config and saved them.
+    """
+
+    SPLIT = {"immich_url": "http://10.0.0.14:2283", "upload_mount": "/nas/immich"}
+    LOCAL = {"upload_mount": "/data/immich"}
+    STRANGER = {
+        "workers_include": "microservices",   # would fail the local check
+        "media_location": "/somewhere/else",  # and so would this
+        "version": "9.9.9",
+        "container": "someone-elses-immich",
+        "db_password": "THEIR-SECRET", "db_username": "them", "db_name": "theirs",
+        "db_port": 1111, "redis_port": 2222,
+    }
+
+    def test_a_split_install_never_touches_the_local_container(self, tmp_data_dir):
+        with patch.object(m, "_find_running_docker") as docker, patch.object(
+            m, "detect_immich", return_value=dict(self.STRANGER)
+        ) as detect, patch.object(
+            m, "_warn_on_path_mismatch", return_value=False
+        ), patch.object(m, "log"):
+            assert m._preflight_split(dict(self.SPLIT)) is True
+        docker.assert_not_called()
+        detect.assert_not_called()
+
+    def test_a_strangers_credentials_are_never_saved(self, tmp_data_dir):
+        """The part that made the first attempt at this worse than the bug."""
+        cfg = dict(self.SPLIT)
+        with patch.object(m, "_warn_on_path_mismatch", return_value=False), patch.object(
+            m, "save_config"
+        ) as save, patch.object(m, "log"):
+            m._preflight_split(cfg)
+        save.assert_not_called()
+        assert "db_password" not in cfg
+
+    def test_a_split_install_still_checks_its_path_mapping(self, tmp_data_dir):
+        """Skipping the container checks must not mean checking nothing: a
+        broken upload path 404s every thumbnail."""
+        with patch.object(
+            m, "_warn_on_path_mismatch", return_value=True
+        ) as probe, patch.object(m, "log"):
+            assert m._preflight_split(dict(self.SPLIT, api_key="k")) is False
+        probe.assert_called_once()
+
+    def test_a_local_install_still_gets_the_container_checks(self, tmp_data_dir):
+        """Where the container really is the server, both guards still apply."""
+        with patch.object(m, "_find_running_docker", return_value="/usr/bin/docker"), \
+             patch.object(m, "detect_immich", return_value=dict(self.STRANGER)), \
+             patch.object(m, "log") as log:
+            assert m._preflight_local(dict(self.LOCAL)) is False
+        said = " ".join(str(c) for c in log.error.call_args_list)
+        assert "still running microservices" in said

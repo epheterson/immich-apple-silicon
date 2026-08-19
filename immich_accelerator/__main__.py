@@ -5234,6 +5234,96 @@ def _require_worker_config(config: dict) -> None:
         )
 
 
+def _preflight_local(config: dict) -> bool:
+    """Check this install against the Immich container on this Mac.
+
+    Only for a local install, where that container really is the server.
+    Returns False to refuse the start.
+    """
+    try:
+        docker = _find_running_docker()
+        immich = detect_immich(docker)
+        if immich["workers_include"] != "api":
+            log.error(
+                "Docker is still running microservices. Two workers will conflict."
+            )
+            log.error("Set IMMICH_WORKERS_INCLUDE=api in docker-compose.yml first.")
+            log.error("Run 'python -m immich_accelerator setup' for full instructions.")
+            return False
+        if (
+            config.get("upload_mount")
+            and immich["media_location"] != config["upload_mount"]
+        ):
+            log.error(
+                "IMMICH_MEDIA_LOCATION mismatch — Docker has '%s', we expect '%s'.",
+                immich["media_location"] or "(not set)",
+                config["upload_mount"],
+            )
+            log.error(
+                "This WILL corrupt file paths in the database. Fix docker-compose.yml first."
+            )
+            return False
+
+        # Auto-update: if Docker image version changed, re-extract
+        running_version = immich["version"].lstrip("v")
+        cached_version = config.get("version", "").lstrip("v")
+        if is_valid_version(immich["version"]) and running_version != cached_version:
+            log.info(
+                "Immich updated: %s -> %s. Re-extracting server...",
+                cached_version,
+                running_version,
+            )
+            server_dir = extract_immich_server(
+                docker, immich["container"], immich["version"]
+            )
+            config["version"] = immich["version"]
+            config["server_dir"] = str(server_dir)
+            # Refresh connection info in case it changed
+            config["db_password"] = immich["db_password"]
+            config["db_port"] = immich["db_port"]
+            config["redis_port"] = immich["redis_port"]
+            save_config(config)
+    except RuntimeError as e:
+        log.error("Could not read the local Immich container: %s", e)
+        log.error("Start the Immich Docker stack, then try again.")
+        return False
+    return True
+
+
+def _preflight_split(config: dict) -> bool:
+    """Check a split install against the Immich it is configured to use.
+
+    immich_url is what marks an install as split: setup --url is the only thing
+    that writes it. A container on this Mac is not necessarily that server, so
+    nothing here reads configuration out of one. Reading it compared this
+    install against a stranger, refused the start over a mismatch that did not
+    exist, and copied that stranger's database credentials into this config.
+    Local Docker stays useful as a place to fetch server files from, and the
+    version comes from the configured Immich's own API.
+
+    The path mapping still has to be right, and the API can answer that. Returns
+    False to refuse.
+    """
+    log.info("Split install: validating path mapping against %s", config.get("immich_url"))
+    api_key = config.get("api_key", "")
+    upload_mount = config.get("upload_mount", "")
+    if api_key and upload_mount:
+        if _warn_on_path_mismatch(
+            config.get("immich_url", ""), api_key, upload_mount
+        ):
+            log.error(
+                "Refusing to start with a broken path mapping. Fix and retry."
+            )
+        return False
+    else:
+        log.warning(
+            "Cannot check the path mapping: this split install has no api_key "
+            "or no upload_mount set. Starting anyway; if thumbnails 404, that "
+            "is the first thing to look at."
+        )
+    return True
+
+
 def cmd_start(args):
     """Bring up the components this install has enabled.
 
@@ -5259,84 +5349,14 @@ def _cmd_start(args):
     # Kill any stale processes before starting
     _kill_stale_processes()
 
-    # Pre-flight: verify Docker config and auto-update if version changed
-    immich = {}
-    try:
-        docker = _find_running_docker()
-        immich = detect_immich(docker)
-        if immich["workers_include"] != "api":
-            log.error(
-                "Docker is still running microservices. Two workers will conflict."
-            )
-            log.error("Set IMMICH_WORKERS_INCLUDE=api in docker-compose.yml first.")
-            log.error("Run 'python -m immich_accelerator setup' for full instructions.")
+    # immich_url marks a split install: the Immich it names is authoritative,
+    # and a container on this Mac is a different server that must not describe
+    # this one. See docs/deployment.md.
+    if config.get("immich_url"):
+        if not _preflight_split(config):
             return
-        if (
-            config.get("upload_mount")
-            and immich["media_location"] != config["upload_mount"]
-        ):
-            log.error(
-                "IMMICH_MEDIA_LOCATION mismatch — Docker has '%s', we expect '%s'.",
-                immich["media_location"] or "(not set)",
-                config["upload_mount"],
-            )
-            log.error(
-                "This WILL corrupt file paths in the database. Fix docker-compose.yml first."
-            )
-            return
-
-        # Auto-update: if Docker image version changed, re-extract
-        running_version = immich["version"].lstrip("v")
-        cached_version = config.get("version", "").lstrip("v")
-        if is_valid_version(immich["version"]) and running_version != cached_version:
-            log.info(
-                "Immich updated: %s -> %s. Re-extracting server...",
-                cached_version,
-                running_version,
-            )
-            server_dir = extract_immich_server(
-                docker, immich["container"], immich["version"]
-            )
-            config["version"] = immich["version"]
-            config["server_dir"] = str(server_dir)
-            # Refresh connection info in case it changed
-            config["db_password"] = immich["db_password"]
-            config["db_port"] = immich["db_port"]
-            config["redis_port"] = immich["redis_port"]
-            save_config(config)
-    except RuntimeError as e:
-        # Only a split setup has somewhere else to look. setup --url is the
-        # only thing that writes immich_url, so its absence means Immich is
-        # meant to be in local Docker — and we just failed to read it. There
-        # is nothing left to validate against, so starting the worker would
-        # skip both checks above and feed a stack we never confirmed.
-        if not config.get("immich_url"):
-            log.error("Could not read the local Immich container: %s", e)
-            log.error("Start the Immich Docker stack, then try again.")
-            return
-
-        # Split setup: we can't read IMMICH_MEDIA_LOCATION from the container
-        # env, but we CAN probe the Immich API for the Docker-side path prefix
-        # and compare it to our upload_mount. This is the exact case issue #19
-        # hit, where a silent "proceeding anyway" let the worker start with
-        # mismatched paths and 404 all thumbnails.
-        log.info("No local Docker — using API probe to validate path mapping.")
-        api_key = config.get("api_key", "")
-        upload_mount = config.get("upload_mount", "")
-        if api_key and upload_mount:
-            if _warn_on_path_mismatch(
-                config.get("immich_url", ""), api_key, upload_mount
-            ):
-                log.error(
-                    "Refusing to start with a broken path mapping. Fix and retry."
-                )
-                return
-        else:
-            log.warning(
-                "Could not verify Docker config (%s) — proceeding without API probe "
-                "because no api_key or upload_mount is set in config.",
-                e,
-            )
+    elif not _preflight_local(config):
+        return
 
     worker_pid = read_pid("worker")
     if worker_pid:
