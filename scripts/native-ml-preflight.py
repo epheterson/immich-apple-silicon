@@ -39,6 +39,8 @@ import base64
 import json
 import os
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -312,6 +314,191 @@ def check_bind_conflict(
     return None
 
 
+# Ceilings and deadlines enforced by Server.swift. Duplicated here on purpose:
+# this gate drives the binary over a socket and has no way to read them out of
+# it. Keep in sync if they change there.
+HEADER_LIMIT = 64 * 1024
+HEADER_DEADLINE = 10
+BODY_LIMIT = 64 * 1024 * 1024
+
+# A bare `Content-Length:` used to abort the process, so the first of these
+# variants killed the server outright. The rest are the shapes around it that a
+# hand-rolled parser gets wrong: nothing, blanks, text, negative, past Int, and
+# a value that is only separators.
+BAD_LENGTHS = [b"", b"   ", b" abc", b" -1", b" 99999999999999999999999", b"::"]
+
+
+def http_status(raw: bytes) -> str:
+    """The status code of a response, or "" if the peer said nothing usable."""
+    first = raw.split(b"\r\n", 1)[0].decode(errors="replace").split(" ")
+    return first[1] if len(first) > 1 else ""
+
+
+def speak(
+    port: int,
+    request: bytes,
+    half_close: bool = False,
+    timeout: int = 30,
+    chunk: int = 0,
+) -> bytes:
+    """Send one raw request and read the answer to EOF.
+
+    Sends are allowed to fail: the server answers an oversized request as soon
+    as it has seen enough of it, so the rest of the write can land on a socket
+    it has already closed.
+    """
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        try:
+            if chunk:
+                for i in range(0, len(request), chunk):
+                    s.sendall(request[i : i + chunk])
+                    time.sleep(0.01)
+            else:
+                s.sendall(request)
+            if half_close:
+                s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        out = b""
+        while True:
+            try:
+                chunk = s.recv(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        return out
+    finally:
+        s.close()
+
+
+def abort_connection(port: int, speak_first: bool = True) -> None:
+    """A client that goes away: half a request then a reset, or a reset on a
+    connection it never said anything on. The silent form arrives while the
+    server is still setting the connection up, which is a different race."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        if speak_first:
+            s.sendall(b"GET /ping HTTP/1.1\r\nHost: x")
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+
+def open_fds(pid: int) -> int | None:
+    """Descriptors the process holds, or None where lsof cannot say."""
+    r = subprocess.run(["lsof", "-p", str(pid)], capture_output=True, text=True)
+    lines = r.stdout.splitlines()
+    return max(0, len(lines) - 1) if lines else None
+
+
+def check_request_bounds(
+    port: int, proc: subprocess.Popen, aborts: int = 300, fd_slack: int = 25
+) -> str | None:
+    """Malformed, oversized and abandoned requests: answered or dropped, never
+    fatal and never accumulating. Returns None on success, else a reason.
+
+    Runs before the model stages because none of it needs a model, and because a
+    build that dies on a malformed header should fail this gate in seconds
+    rather than after a multi-gigabyte first fetch. Everything here is reachable
+    by anything able to open a TCP connection to the port: in a split
+    deployment the listener binds all interfaces, since the API server calls
+    this service for search embeddings.
+    """
+    def problem(what: str, detail: str) -> str:
+        """Name the failure, telling a crash apart from a wrong answer. A trap
+        lands a moment after the connection resets, so the answer — or the
+        absence of one — arrives before the exit status does."""
+        time.sleep(1)
+        if proc.poll() is not None:
+            return f"the service died on {what}"
+        return f"{what} {detail}"
+
+    for bad in BAD_LENGTHS:
+        req = b"GET /ping HTTP/1.1\r\nHost: x\r\nContent-Length:" + bad + b"\r\n\r\n"
+        status = http_status(speak(port, req))
+        if status != "400":
+            return problem(
+                f"Content-Length:{bad.decode()!r}",
+                f"answered {status or 'nothing'}, expected 400",
+            )
+
+    # Headers past the ceiling, in both shapes: one block that never ends (the
+    # receive maximum in Server.swift is per callback, not cumulative, so
+    # without a ceiling this grows for as long as the peer keeps typing), and
+    # one whose terminator arrives together with the oversized block.
+    pad = b"GET /ping HTTP/1.1\r\nX-Pad: " + b"a" * (HEADER_LIMIT + 4096)
+    for ending, shape in ((b"\r\n", "unterminated"), (b"\r\n\r\n", "terminated")):
+        # In 8 KiB writes, so the ceiling has to hold across callbacks rather
+        # than only against one oversized delivery.
+        status = http_status(speak(port, pad + ending, chunk=8192))
+        if status != "431":
+            return problem(
+                f"{len(pad) + len(ending)} bytes of {shape} headers",
+                f"answered {status or 'nothing'}, expected 431",
+            )
+
+    declared = BODY_LIMIT + 1
+    req = f"POST /predict HTTP/1.1\r\nHost: x\r\nContent-Length: {declared}\r\n\r\n".encode()
+    status = http_status(speak(port, req))
+    if status != "413":
+        return problem(
+            f"a declared body of {declared} bytes",
+            f"answered {status or 'nothing'}, expected 413",
+        )
+
+    # Ends before the declared length. This used to be handled as though the
+    # body had arrived complete: /ping answered 200 on five bytes of a hundred.
+    req = b"POST /ping HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nshort"
+    status = http_status(speak(port, req, half_close=True))
+    if status != "400":
+        return problem(
+            "a truncated body", f"answered {status or 'nothing'}, expected 400"
+        )
+
+    # Connect and say nothing: the header deadline has to end it, or a peer
+    # that never speaks holds a descriptor for as long as it likes.
+    waited = HEADER_DEADLINE + 5
+    s = socket.create_connection(("127.0.0.1", port), timeout=waited)
+    try:
+        # A read timeout means the server is still holding the connection, and
+        # is the answer this check exists to catch. Any other error is the peer
+        # going away, which is what should happen.
+        closed = s.recv(1) == b""
+    except TimeoutError:
+        closed = False
+    except OSError:
+        closed = True
+    finally:
+        s.close()
+    if not closed:
+        return problem("a silent client", f"was still connected after {waited}s")
+
+    # Abandoned connections must not cost descriptors. Every terminal path used
+    # to be a bare return, and the one taken when the peer had already gone left
+    # the connection alive holding its descriptor.
+    before = open_fds(proc.pid)
+    for i in range(aborts):
+        abort_connection(port, speak_first=i % 2 == 0)
+    time.sleep(2)
+    after = open_fds(proc.pid)
+    if before is None or after is None:
+        return "lsof could not count this process's descriptors, so the leak check did not run"
+    if after - before > fd_slack:
+        return (
+            f"{aborts} aborted requests left {after - before} descriptors behind "
+            f"({before} -> {after}); this is the leak"
+        )
+
+    if http_status(speak(port, b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")) != "200":
+        return problem("the service", "stopped answering /ping after all of this")
+    return None
+
+
 def wait_healthy(base: str, proc: subprocess.Popen, timeout: int) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -479,6 +666,18 @@ def main() -> int:
 
     try:
         wait_healthy(base, proc, args.startup_timeout)
+
+        print(
+            "[preflight] request bounds: malformed, oversized and abandoned "
+            "requests ...",
+            flush=True,
+        )
+        reason = check_request_bounds(args.port, proc)
+        if reason:
+            print(f"[preflight] FAIL — {reason}")
+            died_with_abort("on a malformed or abandoned request")
+            return 1
+        print("[preflight] request bounds: OK")
         image = tiny_jpeg()
         text = "a photo of a cat"
 
