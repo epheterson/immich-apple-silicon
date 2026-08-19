@@ -1878,18 +1878,38 @@ def _kill_all_worker_processes():
             pass
 
 
+def _signal_service(pid: int, sig: int) -> None:
+    """Signal one tracked service, by group only where the group is ours.
+
+    Services have children that must go with them: the worker runs several
+    processes and spawns ffmpeg and exiftool, and a uvicorn engine can fork
+    workers. start_service and start_dashboard pass start_new_session, so
+    everything this supervisor spawns is a session leader, and a session
+    leader's process group can only be joined by its own descendants.
+
+    A pid can also be one we adopted rather than spawned — read_pid falls back
+    to a process scan for the worker, adopt_live_ml and start_dashboard adopt a
+    live listener. Session leadership is what separates the two: a process
+    started from a shell leads its job's process group but not the session, and
+    that group is not ours to signal.
+    """
+    try:
+        if os.getsid(pid) == pid:
+            os.killpg(pid, sig)
+            return
+    except OSError:
+        pass
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+
+
 def kill_pid(name: str) -> bool:
     pid = read_pid(name)
     if pid is None:
         return False
-    try:
-        pgid = os.getpgid(pid)
-        os.killpg(pgid, signal.SIGTERM)
-    except OSError:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+    _signal_service(pid, signal.SIGTERM)
 
     # Also kill any orphaned immich processes not in the same group
     if name == "worker":
@@ -1903,14 +1923,7 @@ def kill_pid(name: str) -> bool:
         except OSError:
             break
     else:
-        try:
-            pgid = os.getpgid(pid)
-            os.killpg(pgid, signal.SIGKILL)
-        except OSError:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+        _signal_service(pid, signal.SIGKILL)
 
     (PID_DIR / f"{name}.pid").unlink(missing_ok=True)
     return True
@@ -4312,7 +4325,14 @@ def _venv_ml_spec(config: dict, env: dict):
         # it into ml.log), which is where uvicorn's access log and any print()
         # output live. Without this, `logs ml` sits blank and then dumps a stale
         # chunk instead of streaming in real time.
-        env = dict(env, PYTHONUNBUFFERED="1")
+        # WEB_CONCURRENCY is inherited from whatever launched the supervisor,
+        # and uvicorn's Config reads it when workers is None, which is how
+        # src.main calls uvicorn.run. A value above one forks that many copies of
+        # the ML service, each loading its own multi-gigabyte model, on a Mac
+        # chosen for this work precisely because memory is the scarce resource.
+        # It also leaves several processes on the port under a master that
+        # ml.pid does not name, and nothing here is written to expect that.
+        env = dict(env, PYTHONUNBUFFERED="1", WEB_CONCURRENCY="1")
         return [str(ml_python), "-m", "src.main"], str(ml_dir), env
     return None
 
@@ -5460,13 +5480,7 @@ def stop_all_fast() -> None:
         if not pid:
             continue
         pids[name] = pid
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except OSError:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
+        _signal_service(pid, signal.SIGTERM)
     _kill_all_worker_processes()  # sweep orphaned immich procs too
 
     # Short, PARALLEL wait (not 5s-per-service) so we stay well under launchd's
@@ -5475,15 +5489,9 @@ def stop_all_fast() -> None:
         if all(not alive(p) for p in pids.values()):
             break
         time.sleep(0.1)
-    for name, pid in pids.items():
+    for pid in pids.values():
         if alive(pid):
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-            except OSError:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+            _signal_service(pid, signal.SIGKILL)
     for name in pids:
         (PID_DIR / f"{name}.pid").unlink(missing_ok=True)
     if pids:
