@@ -4450,13 +4450,21 @@ def port_in_use(port: int) -> bool:
     A plain TCP connect, deliberately not /ping: the case this exists for is a
     wedged service that still holds the socket but answers nothing, which is
     exactly what a health check cannot see.
+
+    Both stacks are tried. The native engine binds IPv6, and while macOS maps
+    an IPv4 loopback connect onto a dual-stack listener, a listener that is
+    IPv6-only would be invisible to an AF_INET connect alone, and "nothing is
+    listening" is the answer that lets a second engine start on top of it.
     """
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(0.5)
-            return sock.connect_ex(("127.0.0.1", int(port))) == 0
-    except (OSError, ValueError):
-        return False
+    for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.5)
+                if sock.connect_ex((host, int(port))) == 0:
+                    return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def wait_for_port_free(port: int, timeout: float = 10.0) -> bool:
@@ -4522,8 +4530,38 @@ def _start_ml_service(config: dict):
 _ML_CMD_RE = re.compile(r"immich-ml-native\s+serve|python[^\s]*\s+-m\s+src\.main")
 
 
+def _our_ml_process() -> int | None:
+    """PID of an ML engine of ours that is running, found by process table.
+
+    The fallback for when lsof cannot answer. It walks every descriptor on the
+    machine, so one unresponsive network mount stalls it past any timeout, and
+    the release Mac is exactly that machine. ps does not touch the filesystem.
+
+    This says "an engine of ours is running", not "it owns the port", so the
+    caller must have established that something holds the port first. Together
+    those are the same conclusion, since our engine binds that port or exits.
+    """
+    try:
+        out = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,command="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if pid.isdigit() and _ML_CMD_RE.search(cmd):
+            return int(pid)
+    return None
+
+
 def _listener_pid(port: int) -> int | None:
-    """PID of whatever is listening on this port, or None."""
+    """PID of whatever is listening on this port, or None.
+
+    lsof is the precise answer and the one that can identify a process that is
+    not ours, so it is tried first, but it cannot be relied on: see
+    _our_ml_process for why it stalls on the release Mac.
+    """
     try:
         out = subprocess.run(
             ["/usr/sbin/lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
@@ -4532,9 +4570,11 @@ def _listener_pid(port: int) -> int | None:
             timeout=10,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError, ValueError):
-        return None
+        return _our_ml_process() if port_in_use(port) else None
     first = out.splitlines()[0].strip() if out else ""
-    return int(first) if first.isdigit() else None
+    if first.isdigit():
+        return int(first)
+    return _our_ml_process() if port_in_use(port) else None
 
 
 # Three answers, not two. "Cannot tell" blocks a start as firmly as "occupied":
@@ -4554,6 +4594,18 @@ def ml_port_state(port: int) -> str:
     as well. Anything else — lsof is missing, it hung, it answered in a shape we
     do not recognise — is unknown, never "free".
     """
+    # Ask the network stack first. A connect either succeeds or is refused, in
+    # microseconds, and it cannot be delayed by anything on disk.
+    #
+    # lsof can: it walks every open descriptor on the machine, so a single
+    # unresponsive network mount stalls it until the timeout. On the release
+    # Mac, with the library on NFS, connect answers in 0.000s while lsof times
+    # out after 10. Deciding this question with lsof there meant the port was
+    # permanently "unknown", and an engine that is never allowed to start is a
+    # worse failure than the double-start this guard exists to prevent.
+    if port_in_use(port):
+        return PORT_OCCUPIED
+
     try:
         result = subprocess.run(
             ["/usr/sbin/lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
@@ -4562,7 +4614,8 @@ def ml_port_state(port: int) -> str:
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
-        return PORT_UNKNOWN
+        # connect said nothing is listening. lsof was only going to confirm it.
+        return PORT_FREE
     out = result.stdout.strip()
     if result.returncode == 0 and out.splitlines() and out.splitlines()[0].strip().isdigit():
         return PORT_OCCUPIED
@@ -4587,7 +4640,14 @@ def adopt_live_ml(config: dict) -> int | None:
     have restarted it if it wedged. Found on the release Mac, four days after
     it happened.
     """
-    pid = _listener_pid(config.get("ml_port", 3003))
+    port = config.get("ml_port", 3003)
+    if not port_in_use(port):
+        return None
+    # Ours first, from the process table. That answers the question this
+    # function actually asks, costs nothing, and skips lsof entirely in the
+    # common case; lsof is only needed to recognise a holder that is not ours,
+    # and it can take ten seconds to say so on a Mac with a network mount.
+    pid = _our_ml_process() or _listener_pid(port)
     if pid is None:
         return None
     try:

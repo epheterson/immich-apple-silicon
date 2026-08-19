@@ -476,13 +476,28 @@ class TestMLAdoption:
     VENV = "/opt/homebrew/Cellar/immich-accelerator/1.10.0/libexec/ml/venv/bin/python3.11 -m src.main"
     DOCKER = "/usr/local/bin/com.docker.backend -watchdog -native-api"
 
-    def _ps(self, cmd):
+    def _ps(self, cmd, lsof_works=True):
+        """Model the two shapes of ps this uses, plus lsof.
+
+        `ps -axo pid=,command=` lists every process, which is how an engine of
+        ours is found without lsof; `ps -o command= -p PID` identifies one.
+        lsof_works=False is the release Mac, where a network mount stalls it.
+        """
+
         def run(argv, **kw):
             if argv[0].endswith("lsof"):
+                if not lsof_works:
+                    raise subprocess.TimeoutExpired("lsof", 10)
                 return MagicMock(stdout="64933\n")
+            if "-axo" in argv:
+                return MagicMock(stdout=f"64933 {cmd}\n1 /sbin/launchd\n")
             return MagicMock(stdout=cmd)
 
-        return patch.object(m.subprocess, "run", side_effect=run)
+        return patch.multiple(
+            m,
+            subprocess=MagicMock(run=MagicMock(side_effect=run), TimeoutExpired=subprocess.TimeoutExpired, SubprocessError=subprocess.SubprocessError),
+            port_in_use=MagicMock(return_value=True),
+        )
 
     def test_our_native_engine_is_adopted(self, tmp_data_dir):
         with self._ps(self.NATIVE), patch.object(m, "log"):
@@ -883,9 +898,25 @@ class TestMlPortState:
             assert REAL_ML_PORT_STATE(port) == m.PORT_OCCUPIED
         assert REAL_ML_PORT_STATE(port) == m.PORT_FREE
 
-    def test_lsof_that_cannot_run_is_unknown(self):
-        with patch.object(m.subprocess, "run", side_effect=OSError):
-            assert REAL_ML_PORT_STATE(3003) == m.PORT_UNKNOWN
+    def test_a_listening_port_is_occupied_without_consulting_lsof(self):
+        """The network stack answers this in microseconds and cannot be stalled
+        by anything on disk. lsof can: it walks every descriptor on the machine,
+        so one unresponsive network mount hangs it. On the release Mac, connect
+        answers in 0.000s where lsof times out after 10."""
+        with patch.object(m, "port_in_use", return_value=True), patch.object(
+            m.subprocess, "run", side_effect=AssertionError("must not run lsof")
+        ):
+            assert REAL_ML_PORT_STATE(3003) == m.PORT_OCCUPIED
+
+    def test_lsof_that_cannot_run_is_free_when_nothing_is_listening(self):
+        """A refused connect is evidence, not absence of evidence. Reporting
+        unknown here meant an engine could never start on a Mac where lsof
+        stalls, and a service that never starts is worse than the double start
+        this guard prevents."""
+        with patch.object(m, "port_in_use", return_value=False), patch.object(
+            m.subprocess, "run", side_effect=OSError
+        ):
+            assert REAL_ML_PORT_STATE(3003) == m.PORT_FREE
 
     def test_lsof_reporting_its_own_error_is_not_free(self):
         """Exit 1 with nothing on stdout, which is also how "no match" looks."""
@@ -1028,3 +1059,62 @@ class TestOneVenvWorker:
         spec = m._venv_ml_spec({"ml_dir": str(tmp_path)}, {"WEB_CONCURRENCY": "4"})
         assert spec is not None
         assert spec[2]["WEB_CONCURRENCY"] == "1"
+
+
+class TestPortChecksSurviveAnUnusableLsof:
+    """lsof walks every open descriptor on the machine, so a single
+    unresponsive network mount stalls it past any timeout. The release Mac is
+    that machine: a TCP connect answers there in 0.000s while lsof times out
+    after 10.
+
+    Both of these were decided with lsof, and on that Mac the result was an
+    engine that could never start and a running engine that could never be
+    adopted, which is worse than either problem they were added to solve.
+    """
+
+    NATIVE = "/opt/homebrew/opt/immich-accelerator/libexec/native-ml/immich-ml-native serve 3003"
+
+    def test_a_held_port_reads_as_occupied_when_lsof_cannot_answer(self):
+        with patch.object(m, "port_in_use", return_value=True), patch.object(
+            m.subprocess, "run", side_effect=subprocess.TimeoutExpired("lsof", 10)
+        ):
+            assert REAL_ML_PORT_STATE(3003) == m.PORT_OCCUPIED
+
+    def test_our_engine_is_still_adopted_when_lsof_cannot_answer(self, tmp_data_dir):
+        def run(argv, **kw):
+            if argv[0].endswith("lsof"):
+                raise subprocess.TimeoutExpired("lsof", 10)
+            if "-axo" in argv:
+                return MagicMock(stdout=f"64933 {self.NATIVE}\n1 /sbin/launchd\n")
+            return MagicMock(stdout=self.NATIVE)
+
+        with patch.object(m, "port_in_use", return_value=True), patch.object(
+            m.subprocess, "run", side_effect=run
+        ), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) == 64933
+
+    def test_nothing_is_adopted_when_the_port_is_not_even_held(self, tmp_data_dir):
+        """The process scan says an engine of ours is running, not that it owns
+        the port, so the port has to be established first."""
+        with patch.object(m, "port_in_use", return_value=False), patch.object(
+            m.subprocess, "run", side_effect=AssertionError("must not be reached")
+        ), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) is None
+
+    def test_the_common_case_never_waits_on_lsof(self):
+        """Ours-first, from the process table. Asking lsof first cost ten
+        seconds per call on the release Mac before falling back to exactly this
+        answer, and the watcher makes this call on a timer."""
+        native = TestPortChecksSurviveAnUnusableLsof.NATIVE
+
+        def run(argv, **kw):
+            if argv[0].endswith("lsof"):
+                raise AssertionError("lsof must not be consulted for our own engine")
+            if "-axo" in argv:
+                return MagicMock(stdout=f"64933 {native}\n")
+            return MagicMock(stdout=native)
+
+        with patch.object(m, "port_in_use", return_value=True), patch.object(
+            m.subprocess, "run", side_effect=run
+        ), patch.object(m, "log"):
+            assert m.adopt_live_ml({"ml_port": 3003}) == 64933
