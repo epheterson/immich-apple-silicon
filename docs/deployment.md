@@ -17,6 +17,14 @@ You need one absolute path that resolves to the same files on both sides. See "T
 
 If you only want remote ML compute — not the worker — you don't need any of this: see [ML-only network node](#ml-only-network-node) below instead.
 
+### What makes an install "split"
+
+The `immich_url` key in `~/.immich-accelerator/config.json`. It is written by the split setup path and by nothing else, and it means the Immich at that address is authoritative for this install.
+
+That matters if the Mac also runs Immich in Docker for some unrelated reason. The accelerator will still use a local Docker image as a place to fetch server files from, but it does not read configuration out of it: the container is not necessarily the server this install answers to. On a local install, where there is no `immich_url`, the local container is the server, and its `IMMICH_WORKERS_INCLUDE` and `IMMICH_MEDIA_LOCATION` are checked before the worker starts.
+
+Re-running `setup` keeps `immich_url`, so a split install stays split.
+
 ### Topology
 
 1. **On the NAS (or wherever Docker lives)**: Immich Docker runs server (API-only), Postgres, and Redis. Expose Postgres and Redis on the LAN (not just localhost).
