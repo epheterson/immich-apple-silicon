@@ -7,13 +7,30 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # native-ml/
 export PATH=/opt/homebrew/bin:$PATH
 
-OUT="${1:-bundle}"
+DEST="${1:-bundle}"; DEST="${DEST%/}"
+# Stage the bundle beside the destination and promote it only once every check
+# below has passed. Building straight into $DEST meant a run that failed after
+# the copy left $DEST holding a bundle this script had just rejected, and a run
+# that failed before it left the previous bundle sitting there. Callers hand
+# $DEST to something that runs it (install_native.sh points it at
+# ~/.immich-accelerator/native-ml), so neither state is distinguishable from a
+# good build.
+OUT="$DEST.staging"
+trap 'rm -rf "$OUT"' EXIT
 ORT="$(brew --prefix onnxruntime)"
 METALLIB="${MLX_METALLIB:-$(find /opt/homebrew -name mlx.metallib 2>/dev/null | head -1)}"
 [ -n "$METALLIB" ] || { echo "mlx.metallib not found (set MLX_METALLIB)"; exit 1; }
 
 echo "building release..."
-swift build -c release >/dev/null
+# swift build reports compile errors on stdout, not stderr, so `>/dev/null`
+# discarded the diagnostics along with the progress lines and a broken build
+# failed without printing anything at all. Both callers redirect this script's
+# stdout to /dev/null as well, so nothing downstream could show them either.
+# Keep the quiet happy path; print the build output when the build fails.
+if ! build_log="$(swift build -c release 2>&1)"; then
+    printf '%s\n' "$build_log" >&2
+    echo "ERROR: swift build -c release failed; $DEST not updated" >&2; exit 1
+fi
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 cp .build/release/immich-ml-native "$OUT/"
@@ -101,7 +118,6 @@ for f in "$OUT/immich-ml-native" "$OUT"/*.dylib; do
     codesign --verify "$f" 2>/dev/null || { echo "ERROR: codesign --verify failed on $(basename "$f")"; exit 1; }
 done
 
-echo "bundle -> $OUT"
 ls -la "$OUT"
 
 # Fail the build unless the bundle is genuinely self-contained. The original
@@ -129,3 +145,6 @@ for f in "$OUT/immich-ml-native" "$OUT"/*.dylib; do
 done
 [ "$leak" = 0 ] || { echo "ERROR: bundle is not self-contained"; exit 1; }
 echo "OK: self-contained ($(ls "$OUT"/*.dylib | wc -l | tr -d ' ') vendored dylibs; no brew load deps, no brew/toolchain rpaths, no unresolved @rpath deps)"
+
+rm -rf "$DEST"; mv "$OUT" "$DEST"
+echo "bundle -> $DEST"
