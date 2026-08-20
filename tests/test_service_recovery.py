@@ -1561,3 +1561,72 @@ class TestTheKillEscalationKnowsWhichServiceItIsKilling:
         escalated = [n for n, sig in seen if sig == signal.SIGKILL]
         assert "worker" in escalated, f"escalated as {escalated}"
         assert "dashboard" not in escalated
+class TestSettingsReachableOnAHomebrewInstall:
+    """The IMMICH_ACCEL* variables are documented, and on the standard install
+    there was no supported way to set any of them: brew services generates the
+    plist, it carries no EnvironmentVariables, launchctl setenv does not reach
+    the agent, and a hand edit is undone by the next restart. The only way
+    through was wrapping the binary in a script. Reported by RxChi1d on #137.
+    """
+
+    def test_a_setting_in_config_reaches_a_spawned_service(self, tmp_data_dir):
+        cfg = {"env": {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "3"}}
+        with patch.object(m, "load_config", return_value=cfg), patch.object(
+            m.subprocess, "Popen"
+        ) as popen, patch.object(m, "write_pid"), patch.object(
+            m.time, "sleep"
+        ), patch.object(m, "log"):
+            popen.return_value = MagicMock(pid=4242, poll=MagicMock(return_value=None))
+            m.start_service("worker", ["/bin/true"], {"PATH": "/usr/bin"}, "/tmp")
+        passed = popen.call_args.kwargs["env"]
+        assert passed["IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY"] == "3"
+        assert passed["PATH"] == "/usr/bin", "the rest of the environment survives"
+
+    def test_only_our_own_variables_can_be_set_there(self, tmp_data_dir):
+        """Everything else a service needs is worked out here. A config file
+        that could override the database or the port would be a way to break an
+        install from a place nobody thinks to look."""
+        cfg = {"env": {"DB_PASSWORD": "nope", "PATH": "/evil", "IMMICH_ACCEL_X": "1"}}
+        with patch.object(m, "log"):
+            got = m.config_env(cfg)
+        assert got == {"IMMICH_ACCEL_X": "1"}
+
+    def test_no_config_at_all_is_not_an_error(self, tmp_data_dir):
+        """start_service runs before setup has written anything."""
+        with patch.object(m, "load_config", side_effect=RuntimeError("not set up")):
+            assert m.config_env() == {}
+
+    def test_the_watcher_reads_its_own_knobs_from_config(self, tmp_data_dir):
+        """These are bound at import, so a value in config could never reach
+        them however it was set."""
+        cfg = {"env": {"IMMICH_ACCEL_FD_RESTART_THRESHOLD": "500"}}
+        assert m.int_setting("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000, cfg) == 500
+
+    def test_a_value_that_is_not_a_number_falls_back(self, tmp_data_dir):
+        cfg = {"env": {"IMMICH_ACCEL_FD_RESTART_THRESHOLD": "lots"}}
+        with patch.object(m, "log"):
+            assert m.int_setting("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000, cfg) == 10000
+
+    def test_a_real_environment_variable_beats_the_config_file(self, tmp_data_dir):
+        """The file exists because the environment cannot be reached on a
+        Homebrew install, not to outrank it. Someone exporting one in a shell
+        and running this by hand means it."""
+        cfg = {"env": {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "3"}}
+        with patch.object(m, "load_config", return_value=cfg), patch.object(
+            m.subprocess, "Popen"
+        ) as popen, patch.object(m, "write_pid"), patch.object(
+            m.time, "sleep"
+        ), patch.object(m, "log"):
+            popen.return_value = MagicMock(pid=1, poll=MagicMock(return_value=None))
+            m.start_service(
+                "worker", ["/bin/true"],
+                {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "8"}, "/tmp",
+            )
+        assert popen.call_args.kwargs["env"][
+            "IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY"
+        ] == "8"
+
+    def test_the_same_holds_for_the_watcher_s_own_knobs(self, tmp_data_dir):
+        cfg = {"env": {"IMMICH_ACCEL_FD_RESTART_THRESHOLD": "500"}}
+        with patch.dict(m.os.environ, {"IMMICH_ACCEL_FD_RESTART_THRESHOLD": "900"}):
+            assert m.int_setting("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000, cfg) == 900

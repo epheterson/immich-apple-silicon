@@ -156,6 +156,27 @@ The cap is close to free, because the parallelism saturates early. On an M4 with
 
 ## Configuration details
 
+### Setting `IMMICH_ACCEL*` variables
+
+Put them in the `env` block of `~/.immich-accelerator/config.json`:
+
+```json
+{
+  "env": {
+    "IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "2",
+    "IMMICH_ACCEL_ML_THREADS": "4"
+  }
+}
+```
+
+They are passed to the worker and the ML service, and the accelerator reads its own from there too. Restart with `brew services restart immich-accelerator` to apply.
+
+A real environment variable still wins, so running the accelerator by hand with one exported does what you would expect. The config block exists because the environment cannot be reached on a Homebrew install, not to outrank it.
+
+Setting them in the shell environment does not work on a Homebrew install, which is why this exists: `brew services` generates the launch agent, it carries no environment, `launchctl setenv` does not reach it, and editing the plist is undone the next time the service restarts.
+
+Only `IMMICH_ACCEL*` names are accepted. Everything else a service needs is worked out at startup, and anything else in that block is ignored with a warning.
+
 ### Understanding `IMMICH_MEDIA_LOCATION`
 
 This is the directory Immich uses as its media root. It contains these subdirectories: `upload/`, `thumbs/`, `encoded-video/`, `library/`, `profile/`, `backups/`. Both Docker and the native worker must see this directory at the same absolute path. Setup handles this automatically for same-machine installs.

@@ -2614,8 +2614,59 @@ def ensure_media_ready(config: dict) -> bool:
     return False
 
 
+# Only our own variables can be set this way. Everything else a service needs
+# is worked out here (ports, database settings, the model directory), and a
+# config file that could quietly override those would be a way to break an
+# install from a place nobody thinks to look.
+_CONFIG_ENV_PREFIX = "IMMICH_ACCEL"
+
+
+def config_env(config: dict | None = None) -> dict:
+    """The IMMICH_ACCEL* variables set in config.json.
+
+    They are documented, and until now there was no supported way to set them on
+    the standard Homebrew install: brew services generates the plist, it carries
+    no EnvironmentVariables, launchctl setenv does not reach the agent, and any
+    hand edit is undone the next time the service restarts. The only way through
+    was to wrap the binary in a script. config.json survives upgrades and
+    restarts and is already where settings live. Reported by RxChi1d.
+    """
+    if config is None:
+        # start_service runs before setup has written anything, and on a machine
+        # with no config at all. No config simply means nothing set here.
+        try:
+            config = load_config()
+        except (RuntimeError, OSError, ValueError):
+            return {}
+    raw = config.get("env")
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key, value in raw.items():
+        name = str(key)
+        if name.startswith(_CONFIG_ENV_PREFIX):
+            out[name] = str(value)
+        else:
+            log.warning(
+                "Ignoring %s in the config \"env\" block: only %s* variables can "
+                "be set there.",
+                name,
+                _CONFIG_ENV_PREFIX,
+            )
+    return out
+
+
 def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
     """Start a background service and track its PID. Returns PID."""
+    # Applied here rather than at each caller, so every service gets them and a
+    # service added later does not have to remember.
+    #
+    # config first, so a real environment variable still wins. The file exists
+    # because the environment cannot be reached on a Homebrew install, not to
+    # outrank it: someone who exports one in a shell and runs the accelerator by
+    # hand means it, and having a file quietly beat them is the opposite of what
+    # everything else on a Unix box does.
+    env = {**config_env(), **env}
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"{name}.log"
     cap_log(log_file)  # don't inherit a giant log across a (re)start
@@ -5845,6 +5896,26 @@ def cmd_update(_args):
     log.info("Updated to %s. Run: python -m immich_accelerator start", running)
 
 
+def int_setting(name: str, default: int, config: dict | None = None) -> int:
+    """An integer knob, from config.json first and the environment second.
+
+    The module-level constants below are bound at import, so a value in
+    config.json could never reach them. On a Homebrew install the environment
+    cannot be set at all (see config_env), which left these documented and
+    unreachable.
+    """
+    # Same order as start_service: a real environment variable wins.
+    if os.environ.get(name) is not None:
+        return _int_env(name, default)
+    raw = config_env(config).get(name)
+    if raw is not None:
+        try:
+            return int(raw)
+        except ValueError:
+            log.warning("Ignoring %s=%r in config: not a whole number.", name, raw)
+    return _int_env(name, default)
+
+
 def _int_env(name: str, default: int) -> int:
     """Parse an int env var, falling back to default on a missing/bad value.
 
@@ -6071,7 +6142,9 @@ def _watch_worker(config: dict) -> str | None:
     mid-flight, so cmd_watch can hand over to the worker-free loop."""
     log.info("Watching services (Ctrl+C to stop)...")
 
-    if FD_RESTART_THRESHOLD > 0 and _LIBPROC is None:
+    fd_threshold = int_setting("IMMICH_ACCEL_FD_RESTART_THRESHOLD", FD_RESTART_THRESHOLD, config)
+    fd_cooldown = int_setting("IMMICH_ACCEL_FD_RESTART_COOLDOWN", FD_RESTART_COOLDOWN, config)
+    if fd_threshold > 0 and _LIBPROC is None:
         log.warning(
             "fd-leak watchdog (#89) inactive: libproc unavailable, cannot read "
             "worker fd counts on this system."
@@ -6335,12 +6408,12 @@ def _watch_worker(config: dict) -> str | None:
             # exhausts the table and crashes it with `spawn EBADF`. Sum fds
             # across all worker processes (the leak may be in a sibling), and
             # cool down between restarts so a fast leak can't thrash.
-            if FD_RESTART_THRESHOLD > 0:
+            if fd_threshold > 0:
                 fd_total = _worker_fd_total()
-                if fd_total is not None and fd_total >= FD_RESTART_THRESHOLD:
+                if fd_total is not None and fd_total >= fd_threshold:
                     cooled = (
                         last_fd_restart is None
-                        or time.monotonic() - last_fd_restart >= FD_RESTART_COOLDOWN
+                        or time.monotonic() - last_fd_restart >= fd_cooldown
                     )
                     if cooled:
                         last_fd_restart = time.monotonic()
@@ -6349,7 +6422,7 @@ def _watch_worker(config: dict) -> str | None:
                             "handles on some media (#89). Restarting the worker "
                             "before it exhausts the fd table and crashes.",
                             fd_total,
-                            FD_RESTART_THRESHOLD,
+                            fd_threshold,
                         )
                         kill_pid("worker")
                         try:
@@ -6368,7 +6441,7 @@ def _watch_worker(config: dict) -> str | None:
                             "Worker fd count %d high but within restart "
                             "cooldown (%ds); not restarting yet.",
                             fd_total,
-                            FD_RESTART_COOLDOWN,
+                            fd_cooldown,
                         )
 
             # Check worker
