@@ -972,7 +972,7 @@ class TestStartMlService:
 
         started = []
 
-        def fake_start(name, cmd, env, cwd):
+        def fake_start(name, cmd, env, cwd, **kwargs):
             started.append(cmd[0])
             return 222
 

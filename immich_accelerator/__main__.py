@@ -1908,9 +1908,14 @@ def _signal_service(pid: int, sig: int, name: str = "") -> None:
 
     Services have children that must go with them: the worker runs several
     processes and spawns ffmpeg and exiftool, and a uvicorn engine can fork
-    workers. start_service and start_dashboard pass start_new_session, so
-    everything this supervisor spawns is a session leader, and a session
-    leader's process group can only be joined by its own descendants.
+    workers. start_service and start_dashboard pass start_new_session, so a
+    service that owns its session is a session leader, and a session leader's
+    process group can only be joined by its own descendants.
+
+    An ML service started by the watcher is the exception: it shares the
+    watcher's process group on purpose, so both tests below fail for it and it
+    is signalled by pid. That is what we want: it has no children to sweep,
+    and its group is the watcher's own.
 
     A pid can also be one we adopted rather than spawned — read_pid falls back
     to a process scan for the worker, adopt_live_ml and start_dashboard adopt a
@@ -2665,8 +2670,29 @@ def config_env(config: dict | None = None) -> dict:
     return out
 
 
-def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
-    """Start a background service and track its PID. Returns PID."""
+# True only inside `immich-accelerator watch`. The watcher supervises the ML
+# service it starts, so ML stays in the watcher's process group and ends with
+# it. Every other entry point starts ML to outlive the command that asked for
+# it, which is why `start` from a terminal keeps its own session. Set once, at
+# the top of cmd_watch, and never cleared: a process runs one command.
+_SUPERVISING_ML = False
+
+
+def start_service(
+    name: str, cmd: list[str], env: dict, cwd: str, *, own_session: bool = True
+) -> int:
+    """Start a background service and track its PID. Returns PID.
+
+    own_session=True gives the service its own session, so it outlives the
+    command that started it. `immich-accelerator start` needs that: measured on
+    macOS 26.3, a service left in the caller's process group dies when the
+    terminal that ran the command closes, while one in its own session does not.
+
+    Pass own_session=False only for a service whose lifetime belongs to its
+    supervisor. It then shares the supervisor's process group, which is what
+    lets launchd's job cleanup, and a terminal hangup for a watcher run by
+    hand, reach the service as well as the supervisor.
+    """
     # Applied here rather than at each caller, so every service gets them and a
     # service added later does not have to remember.
     #
@@ -2687,7 +2713,7 @@ def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
             env=env,
             stdout=fh,
             stderr=subprocess.STDOUT,
-            start_new_session=True,
+            start_new_session=own_session,
         )
     except Exception:
         fh.close()
@@ -4616,7 +4642,7 @@ def _start_ml_preferred(config: dict):
             return None, None, False
         log.info("Starting ML service (%s)...", label)
         try:
-            pid = start_service("ml", cmd, senv, cwd)
+            pid = start_service("ml", cmd, senv, cwd, own_session=not _SUPERVISING_ML)
             return pid, label, is_native
         except RuntimeError:
             log.warning("  %s failed to start", label)
@@ -4691,7 +4717,10 @@ def _ml_verify_or_fallback(config: dict, pid: int, engine: str):
         cmd, cwd, senv = venv
         log.info("Starting ML service (Python venv)...")
         try:
-            return start_service("ml", cmd, senv, cwd), "Python venv"
+            return (
+                start_service("ml", cmd, senv, cwd, own_session=not _SUPERVISING_ML),
+                "Python venv",
+            )
         except RuntimeError:
             log.warning("  Python venv failed to start")
     return None, None
@@ -5995,9 +6024,12 @@ def _watch_without_worker(config: dict) -> str | None:
     """
     log.info("Watching ML-only service (Ctrl+C to stop)...")
 
-    # `brew services stop`/`restart` send SIGTERM to this watcher, but ml/
-    # dashboard run detached (own session) and would survive — trap the
-    # signal and stop them before exiting, matching cmd_watch's behavior.
+    # `brew services stop`/`restart` send SIGTERM to this watcher. The
+    # dashboard runs detached (own session) and would survive; an ML this
+    # watcher started shares its process group and would be swept by launchd,
+    # but only after this process exits, and an adopted ML is detached like the
+    # dashboard. Trap the signal and stop them before exiting, matching
+    # cmd_watch's behavior.
     def _graceful_stop(signum, _frame):
         log.info("Received signal %d, stopping services...", signum)
         try:
@@ -6085,6 +6117,8 @@ def cmd_watch(_args):
     hands back here when the "worker" component is toggled, so switching it
     takes effect on a running watcher instead of at the next restart.
     """
+    global _SUPERVISING_ML
+    _SUPERVISING_ML = True
     while True:
         config = load_config()
         if _component_enabled("worker", config):
@@ -6173,9 +6207,12 @@ def _watch_worker(config: dict) -> str | None:
         )
 
     # `brew services stop`/`restart` send SIGTERM to this watcher, but the
-    # worker/ML/dashboard run detached (own session) and would survive — so a
-    # plain stop/restart left them running (#81). Trap the signal and stop the
-    # children before exiting, so the service lifecycle works as expected.
+    # worker and dashboard run detached (own session) and would survive — so a
+    # plain stop/restart left them running (#81). An ML this watcher started
+    # shares its process group, but launchd only sweeps that group after this
+    # process exits, and an adopted ML is detached like the rest. Trap the
+    # signal and stop the children before exiting, so the service lifecycle
+    # works as expected.
     def _graceful_stop(signum, _frame):
         log.info("Received signal %d, stopping services...", signum)
         try:
