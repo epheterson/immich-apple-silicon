@@ -2153,6 +2153,95 @@ class TestFfmpegWrapperQuickLookFallback:
         assert "libx264" not in received
         assert "-preset" not in received, "software presets must be stripped for VideoToolbox"
 
+    def _capture_ffmpeg_args(self, tmp_path, args):
+        """Run the wrapper against a stub ffmpeg that records its argv."""
+        ffmpeg = tmp_path / "ffmpeg"
+        seen_args = tmp_path / "seen_args"
+        self._bash_stub(ffmpeg, f'printf "%s\\n" "$@" > {seen_args}\nexit 0\n')
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        return seen_args.read_text().splitlines()
+
+    def _quality_value(self, received):
+        assert received.count("-q:v") == 1, received
+        return received[received.index("-q:v") + 1]
+
+    # Immich's quality setting is a CRF number, 0-51, lower is better. The
+    # VideoToolbox encoders ignore -crf outright and read -q:v on a 0-100
+    # scale where higher is better, so the wrapper translates the number.
+    # CRF 23 (Immich's default) maps to 59; the median matched quality
+    # measured across six clips and five metrics at CRF 23 was 58.9.
+    def test_crf_is_translated_for_videotoolbox(self, tmp_path):
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
+             "-preset", "ultrafast", "-crf", "23", str(tmp_path / "out.mp4")],
+        )
+        assert "-crf" not in received, "-crf means nothing to h264_videotoolbox"
+        assert self._quality_value(received) == "59"
+
+        # A leading zero must not be read as octal.
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
+             "-preset", "ultrafast", "-crf", "08", str(tmp_path / "out.mp4")],
+        )
+        assert self._quality_value(received) == "88"
+
+    def test_incoming_quality_flag_is_rewritten_to_the_encoder_scale(self, tmp_path):
+        """With CQ mode set to CQP, Immich sends `-q:v N` carrying the same
+        CRF-scale number. Passed through untouched it inverts the setting:
+        CRF 23 would execute as quality 23 out of 100."""
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
+             "-q:v", "23", str(tmp_path / "out.mp4")],
+        )
+        assert self._quality_value(received) == "59"
+
+        # The stream-specific spelling carries the same number.
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
+             "-q:v:0", "23", str(tmp_path / "out.mp4")],
+        )
+        assert self._quality_value(received) == "59"
+
+    def test_translated_quality_stays_inside_the_encoder_scale(self, tmp_path):
+        """VideoToolbox rejects a quality outside 0-100. Values outside the
+        0-51 range Immich's UI offers clamp to the ends of the scale."""
+        best = self._capture_ffmpeg_args(
+            tmp_path,
+            ["-i", str(tmp_path / "in.mov"), "-c:v", "hevc",
+             "-crf", "0", str(tmp_path / "out.mp4")],
+        )
+        assert self._quality_value(best) == "100"
+        worst = self._capture_ffmpeg_args(
+            tmp_path,
+            ["-i", str(tmp_path / "in.mov"), "-c:v", "hevc",
+             "-crf", "63", str(tmp_path / "out.mp4")],
+        )
+        assert self._quality_value(worst) == "1"
+
+    def test_software_encode_keeps_its_own_crf(self, tmp_path):
+        """The translation is only correct for VideoToolbox. An encoder the
+        wrapper doesn't remap keeps the arguments Immich sent."""
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            ["-i", str(tmp_path / "in.mov"), "-c:v", "libvpx-vp9",
+             "-crf", "23", str(tmp_path / "out.webm")],
+        )
+        assert "-hwaccel" not in received
+        assert "-q:v" not in received
+        assert received[received.index("-crf") + 1] == "23"
+
 
 class TestPgKeepaliveShim:
     """The pg keepalive shim sets keepAlive on Immich's Postgres connections so
