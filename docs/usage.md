@@ -156,6 +156,14 @@ The cap is close to free, because the parallelism saturates early. On an M4 with
 
 ## Configuration details
 
+### Hardware video encoding
+
+On by default. Set `IMMICH_ACCEL_HW_VIDEO=0` to keep Immich's own software encoder instead.
+
+Worth knowing what the switch trades, because "hardware" does not simply mean "faster". Immich asks ffmpeg for `preset ultrafast`, which is genuinely quick, so on an idle Mac the software encoder often finishes a single file sooner. What VideoToolbox buys is the rest of the machine: measured on an M4 encoding a 4K clip, software kept nearly nine cores busy for one second, while the hardware encoder used about half a core for four. On a Mac also running Immich's other jobs and the machine learning engine, that is usually the trade you want.
+
+`immich-accelerator encode-compare <video>` runs both on a file of yours and prints the numbers, including which hardware quality setting lands closest to what Immich would have produced on its own.
+
 ### Understanding `IMMICH_MEDIA_LOCATION`
 
 This is the directory Immich uses as its media root. It contains these subdirectories: `upload/`, `thumbs/`, `encoded-video/`, `library/`, `profile/`, `backups/`. Both Docker and the native worker must see this directory at the same absolute path. Setup handles this automatically for same-machine installs.
