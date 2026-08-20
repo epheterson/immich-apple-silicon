@@ -32,6 +32,18 @@ else
     VIPS_BIN="/usr/local/bin/vips"
 fi
 
+# Two switches, both on by default, both meaning "use the hardware".
+#
+# Hardware encoding is not a free win and the naming should not pretend it is:
+# on an idle Mac the software encoder often finishes one file sooner, because
+# Immich asks for preset ultrafast. What the hardware buys is the machine, using
+# roughly one core where software uses every core it can reach, which is what
+# matters when the worker is running several jobs and the ML engine at once.
+# `immich-accelerator encode-compare` measures both on your own footage.
+_off() { [[ "$1" == "0" || "$1" == "false" || "$1" == "no" ]]; }
+HW_VIDEO=true
+_off "${IMMICH_ACCEL_HW_VIDEO:-1}" && HW_VIDEO=false
+
 ARGS=("$@")
 USE_HW=false
 USE_HEVC=false
@@ -46,12 +58,18 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
         next="${ARGS[$((i+1))]:-}"
         case "$next" in
             h264|libx264|libx264rgb)
+                if [[ "$HW_VIDEO" != true ]]; then
+                    NEW_ARGS+=("$arg" "$next"); ((i++)); continue
+                fi
                 NEW_ARGS+=("$arg" "h264_videotoolbox")
                 ((i++))
                 USE_HW=true
                 continue
                 ;;
             hevc|libx265)
+                if [[ "$HW_VIDEO" != true ]]; then
+                    NEW_ARGS+=("$arg" "$next"); ((i++)); continue
+                fi
                 NEW_ARGS+=("$arg" "hevc_videotoolbox")
                 ((i++))
                 USE_HW=true
