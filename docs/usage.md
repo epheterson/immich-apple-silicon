@@ -171,6 +171,8 @@ Put them in the `env` block of `~/.immich-accelerator/config.json`:
 
 They are passed to the worker and the ML service, and the accelerator reads its own from there too. Restart with `brew services restart immich-accelerator` to apply.
 
+A real environment variable still wins, so running the accelerator by hand with one exported does what you would expect. The config block exists because the environment cannot be reached on a Homebrew install, not to outrank it.
+
 Setting them in the shell environment does not work on a Homebrew install, which is why this exists: `brew services` generates the launch agent, it carries no environment, `launchctl setenv` does not reach it, and editing the plist is undone the next time the service restarts.
 
 Only `IMMICH_ACCEL*` names are accepted. Everything else a service needs is worked out at startup, and anything else in that block is ignored with a warning.

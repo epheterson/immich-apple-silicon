@@ -2660,7 +2660,13 @@ def start_service(name: str, cmd: list[str], env: dict, cwd: str) -> int:
     """Start a background service and track its PID. Returns PID."""
     # Applied here rather than at each caller, so every service gets them and a
     # service added later does not have to remember.
-    env = {**env, **config_env()}
+    #
+    # config first, so a real environment variable still wins. The file exists
+    # because the environment cannot be reached on a Homebrew install, not to
+    # outrank it: someone who exports one in a shell and runs the accelerator by
+    # hand means it, and having a file quietly beat them is the opposite of what
+    # everything else on a Unix box does.
+    env = {**config_env(), **env}
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"{name}.log"
     cap_log(log_file)  # don't inherit a giant log across a (re)start
@@ -5872,6 +5878,9 @@ def int_setting(name: str, default: int, config: dict | None = None) -> int:
     cannot be set at all (see config_env), which left these documented and
     unreachable.
     """
+    # Same order as start_service: a real environment variable wins.
+    if os.environ.get(name) is not None:
+        return _int_env(name, default)
     raw = config_env(config).get(name)
     if raw is not None:
         try:

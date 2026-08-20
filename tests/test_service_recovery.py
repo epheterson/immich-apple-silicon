@@ -1507,3 +1507,27 @@ class TestSettingsReachableOnAHomebrewInstall:
         cfg = {"env": {"IMMICH_ACCEL_FD_RESTART_THRESHOLD": "lots"}}
         with patch.object(m, "log"):
             assert m.int_setting("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000, cfg) == 10000
+
+    def test_a_real_environment_variable_beats_the_config_file(self, tmp_data_dir):
+        """The file exists because the environment cannot be reached on a
+        Homebrew install, not to outrank it. Someone exporting one in a shell
+        and running this by hand means it."""
+        cfg = {"env": {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "3"}}
+        with patch.object(m, "load_config", return_value=cfg), patch.object(
+            m.subprocess, "Popen"
+        ) as popen, patch.object(m, "write_pid"), patch.object(
+            m.time, "sleep"
+        ), patch.object(m, "log"):
+            popen.return_value = MagicMock(pid=1, poll=MagicMock(return_value=None))
+            m.start_service(
+                "worker", ["/bin/true"],
+                {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "8"}, "/tmp",
+            )
+        assert popen.call_args.kwargs["env"][
+            "IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY"
+        ] == "8"
+
+    def test_the_same_holds_for_the_watcher_s_own_knobs(self, tmp_data_dir):
+        cfg = {"env": {"IMMICH_ACCEL_FD_RESTART_THRESHOLD": "500"}}
+        with patch.dict(m.os.environ, {"IMMICH_ACCEL_FD_RESTART_THRESHOLD": "900"}):
+            assert m.int_setting("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000, cfg) == 900
