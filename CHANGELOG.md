@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.14.0 - 2026-08-20
+
+### Added
+- **Hardware video encoding can be turned off.** `IMMICH_ACCEL_HW_VIDEO=0` keeps Immich's own encoder. On by default, so nothing changes unless you set it. Asked for by [@RxChi1d](https://github.com/RxChi1d) ([#155](https://github.com/epheterson/immich-apple-silicon/issues/155)).
+- **`immich-accelerator encode-compare <video>`** transcodes one of your own files the way Immich would and the way this Mac would, and reports size, wall time, cpu time and measured quality for each, then names the hardware setting that lands closest to the software encode. It exists because "is the hardware better" has no general answer: it depends on your Mac, your footage, and what else is running.
+- **`IMMICH_ACCEL*` settings can be set in `config.json`.** They are documented, and on a Homebrew install there was no supported way to set any of them: the generated launch agent carries no environment, `launchctl setenv` does not reach it, and editing the plist is undone by the next restart. They go in an `env` block now. A real environment variable still wins. Reported by [@RxChi1d](https://github.com/RxChi1d).
+
+### Fixed
+- **A worker that ignored the first stop signal left its ffmpeg running.** The escalation named every service as the dashboard, so the check that decides whether a process group is ours refused, and the worker was killed alone while its transcode carried on writing into the library. Introduced in 1.13.0.
+- **A split install no longer reads its configuration out of an unrelated Docker container.** On a Mac also running some other Immich, this one was compared against that one: it refused to start over a mismatch that did not exist, and copied that container's database credentials and version into this config. `immich_url` is what marks an install as split, and that is now documented and enforced. Reported by [@RxChi1d](https://github.com/RxChi1d) ([#139](https://github.com/epheterson/immich-apple-silicon/issues/139)).
+
+### Changed
+- The documentation no longer implies hardware encoding is simply faster. Immich asks for `preset ultrafast`, so on an idle Mac software often finishes one file sooner; what the hardware buys is the machine, about half a core against nearly nine on a 4K clip. That is the trade, and `encode-compare` measures it on your own footage.
+
 ## 1.13.0 - 2026-08-19
 
 ### Fixed
