@@ -290,6 +290,19 @@ final class StatusModel: ObservableObject {
         return true
     }
 
+    /// Whether an encoding switch reads as on, from the config `env` block.
+    ///
+    /// Mirrors the CLI's bool_setting: unset means on, and only these three
+    /// spellings mean off. A real environment variable also wins at read time,
+    /// but that is the background service's environment rather than this app's,
+    /// so it cannot be checked from here; the CLI says so when it applies one.
+    nonisolated static func encodingSwitchOn(_ name: String, _ config: [String: Any]) -> Bool {
+        guard let env = config["env"] as? [String: Any],
+              let raw = env[name] else { return true }
+        let value = String(describing: raw).trimmingCharacters(in: .whitespaces).lowercased()
+        return !["0", "false", "no"].contains(value)
+    }
+
     // Blocking pidfile/ps/config probes, gathered off the main actor. Confirms
     // the ML engine and that the tracked dashboard pid is really ours (not a
     // foreign process a mis-adopted pidfile points at, e.g. OrbStack).

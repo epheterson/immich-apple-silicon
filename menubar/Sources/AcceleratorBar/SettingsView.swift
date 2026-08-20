@@ -1,4 +1,6 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// The settings window: a sidebar and a grouped `Form`, which is what a macOS
 /// settings window has looked like since Ventura replaced System Preferences.
@@ -22,7 +24,7 @@ struct SettingsView: View {
     /// thing that makes a sidebar read as macOS settings rather than as a
     /// generic list, and System Settings gives every pane one.
     private enum Pane: String, Hashable, CaseIterable, Identifiable {
-        case general, components, ml, diagnostics
+        case general, components, encoding, ml, diagnostics
 
         // Identity is the case itself, so List's selection binding is a Pane?
         // rather than the String? an id-of-String would demand. Getting this
@@ -34,6 +36,7 @@ struct SettingsView: View {
             switch self {
             case .general: return "General"
             case .components: return "Components"
+            case .encoding: return "Encoding"
             case .ml: return "Machine Learning"
             case .diagnostics: return "Diagnostics"
             }
@@ -42,6 +45,7 @@ struct SettingsView: View {
             switch self {
             case .general: return "gearshape.fill"
             case .components: return "square.stack.3d.up.fill"
+            case .encoding: return "film.stack"
             case .ml: return "brain.head.profile"
             case .diagnostics: return "stethoscope"
             }
@@ -50,6 +54,7 @@ struct SettingsView: View {
             switch self {
             case .general: return .gray
             case .components: return .blue
+            case .encoding: return .indigo
             case .ml: return .purple
             case .diagnostics: return .teal
             }
@@ -79,6 +84,11 @@ struct SettingsView: View {
     // into a contradictory config.
     @State private var applyingComponent: String?
     @State private var componentError: String?
+    @State private var hardwareVideoOn = true
+    @State private var applyingSwitch: String?
+    @State private var encodingError: String?
+    @State private var comparing = false
+    @State private var compareResult: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
     @State private var mountSharesAtLogin = MountSharesAtLogin.isEnabled
 
@@ -127,6 +137,7 @@ struct SettingsView: View {
     private var detail: some View {
         switch pane {
         case .components: componentsTab
+        case .encoding: encodingTab
         case .ml: mlTab
         case .diagnostics: diagnosticsTab
         default: generalTab
@@ -147,6 +158,7 @@ struct SettingsView: View {
         workerOn = StatusModel.componentEnabled("worker", config)
         mlOn = StatusModel.componentEnabled("ml", config)
         dashboardOn = StatusModel.componentEnabled("dashboard", config)
+        hardwareVideoOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_VIDEO", config)
     }
 
     // MARK: - General
@@ -311,6 +323,110 @@ struct SettingsView: View {
         if !model.snap.dashboardEnabled { return "Off" }
         return model.snap.dashboardUp
             ? "Running on localhost:\(model.snap.dashboardPort)" : "Starting…"
+    }
+
+    // MARK: - Encoding
+
+    /// How video gets transcoded. Separate from Components because it is not
+    /// about which processes run: the worker runs either way, this is what it
+    /// hands ffmpeg.
+    private var encodingTab: some View {
+        Form {
+            Section {
+                encodingToggle(
+                    "hardware-video", $hardwareVideoOn, "Hardware video encoding",
+                    "Encode H.264 and HEVC with VideoToolbox")
+            } footer: {
+                // The honest version. Saying "hardware is faster" would be
+                // wrong on an idle Mac and would make the switch look broken
+                // to the first person who timed it.
+                Text("Hardware uses roughly two cores where software uses every core it can reach, so it leaves the Mac free for thumbnails and machine learning. Software often finishes a single file sooner, because Immich asks for preset ultrafast. Which is better depends on your Mac and your footage.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
+            }
+
+            Section {
+                LabeledContent("Compare on your own video") {
+                    Button(comparing ? "Comparing…" : "Choose Video…") { compareEncoders() }
+                        .disabled(comparing)
+                }
+                if let compareResult {
+                    ScrollView {
+                        Text(compareResult)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: Metrics.compareResultHeight)
+                }
+            } footer: {
+                Text("Transcodes one file both ways and reports speed, size and measured quality. Quality is content dependent, so a file of your own is worth more than any table.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
+            }
+
+            if let encodingError {
+                Section {
+                    Label(encodingError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.rowDetail)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    /// Same optimistic-write-then-revert shape as componentToggle, and for the
+    /// same reason: the switch must never be left claiming something the
+    /// accelerator did not do.
+    private func encodingToggle(
+        _ name: String, _ binding: Binding<Bool>, _ title: String, _ caption: String
+    ) -> some View {
+        let action = Binding<Bool>(
+            get: { binding.wrappedValue },
+            set: { on in
+                guard applyingSwitch == nil else { return }
+                binding.wrappedValue = on
+                applyingSwitch = name
+                Task {
+                    let result = await Actions.setEncodingSwitch(name, on)
+                    if !result.ok {
+                        encodingError = result.message
+                        binding.wrappedValue = !on
+                    } else {
+                        encodingError = nil
+                        config = StatusModel.readConfig()
+                    }
+                    applyingSwitch = nil
+                }
+            })
+
+        return Toggle(isOn: action) {
+            VStack(alignment: .leading, spacing: Metrics.xs) {
+                HStack(spacing: Metrics.md) {
+                    Text(title)
+                    if applyingSwitch == name {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                Text(caption).font(.rowDetail).foregroundStyle(.secondary)
+            }
+        }
+        .toggleStyle(.switch)
+        .disabled(applyingSwitch != nil)
+    }
+
+    private func compareEncoders() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.movie, .video, .quickTimeMovie, .mpeg4Movie]
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Compare"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        comparing = true
+        compareResult = nil
+        Task {
+            compareResult = await Actions.encodeCompare(url.path)
+            comparing = false
+        }
     }
 
     // MARK: - Machine Learning

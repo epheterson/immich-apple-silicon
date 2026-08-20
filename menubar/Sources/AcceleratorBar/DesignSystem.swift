@@ -48,6 +48,9 @@ enum Metrics {
     /// window, so labels form one vertical edge whether or not a given row has
     /// an icon and regardless of how wide that icon's glyph happens to be.
     static let iconColumn: CGFloat = 20
+    // Tall enough for a full encode-compare report without the settings window
+    // growing past its fixed height.
+    static let compareResultHeight: CGFloat = 260
 
     /// Inset from the panel edge to content. Dividers use the same value so
     /// they start and end where the text does instead of floating.
