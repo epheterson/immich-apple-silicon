@@ -156,6 +156,7 @@ The cap is close to free, because the parallelism saturates early. On an M4 with
 
 ## Configuration details
 
+<<<<<<< HEAD
 ### Setting `IMMICH_ACCEL*` variables
 
 Put them in the `env` block of `~/.immich-accelerator/config.json`:
@@ -176,6 +177,15 @@ A real environment variable still wins, so running the accelerator by hand with 
 Setting them in the shell environment does not work on a Homebrew install, which is why this exists: `brew services` generates the launch agent, it carries no environment, `launchctl setenv` does not reach it, and editing the plist is undone the next time the service restarts.
 
 Only `IMMICH_ACCEL*` names are accepted. Everything else a service needs is worked out at startup, and anything else in that block is ignored with a warning.
+=======
+### Hardware video encoding
+
+On by default. Set `IMMICH_ACCEL_HW_VIDEO=0` to keep Immich's own software encoder instead.
+
+Worth knowing what the switch trades, because "hardware" does not simply mean "faster". Immich asks ffmpeg for `preset ultrafast`, which is genuinely quick, so on an idle Mac the software encoder often finishes a single file sooner. What VideoToolbox buys is the rest of the machine: measured on an M4 encoding a 4K clip, software kept nearly nine cores busy for one second, while the hardware encoder used about half a core for four. On a Mac also running Immich's other jobs and the machine learning engine, that is usually the trade you want.
+
+`immich-accelerator encode-compare <video>` runs both on a file of yours and prints the numbers, including which hardware quality setting lands closest to what Immich would have produced on its own.
+>>>>>>> feat/encoder-toggles
 
 ### Understanding `IMMICH_MEDIA_LOCATION`
 

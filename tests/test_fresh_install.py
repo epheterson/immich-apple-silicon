@@ -1918,6 +1918,74 @@ const fake = () => {
         ), "raising concurrency to 2 should let two decodes run at once"
 
 
+class TestHardwareEncodingCanBeTurnedOff:
+    """Hardware encoding is a choice, not a law.
+
+    On an idle Mac the software encoder often finishes one file sooner, because
+    Immich asks for preset ultrafast; what the hardware buys is the machine,
+    roughly one core against every core software can reach. Which of those a
+    person wants depends on their Mac and what else it is doing, so there has to
+    be a way to say. Asked for in #155.
+    """
+
+    WRAPPER = REPO_ROOT / "immich_accelerator" / "ffmpeg-wrapper.sh"
+
+    def _run(self, tmp_path, args, env=None):
+        import os
+
+        echo = tmp_path / "ffmpeg"
+        echo.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\n')
+        echo.chmod(0o755)
+        w = tmp_path / "w.sh"
+        w.write_text(
+            self.WRAPPER.read_text().replace(
+                'REAL_FFMPEG="/opt/homebrew/bin/ffmpeg"', f'REAL_FFMPEG="{echo}"'
+            )
+        )
+        w.chmod(0o755)
+        r = subprocess.run(
+            ["/bin/bash", str(w), *args],
+            capture_output=True, text=True, env={**os.environ, **(env or {})},
+        )
+        return r.stdout.split("\n")
+
+    def test_hardware_is_the_default(self, tmp_path):
+        out = self._run(tmp_path, ["-i", "in.mov", "-c:v", "h264", "out.mp4"])
+        assert "h264_videotoolbox" in out
+
+    def test_it_can_be_turned_off(self, tmp_path):
+        out = self._run(
+            tmp_path, ["-i", "in.mov", "-c:v", "h264", "out.mp4"],
+            env={"IMMICH_ACCEL_HW_VIDEO": "0"},
+        )
+        assert "h264" in out and "h264_videotoolbox" not in out
+
+    def test_hevc_too(self, tmp_path):
+        out = self._run(
+            tmp_path, ["-i", "in.mov", "-c:v", "hevc", "out.mp4"],
+            env={"IMMICH_ACCEL_HW_VIDEO": "0"},
+        )
+        assert "hevc" in out and "hevc_videotoolbox" not in out
+
+    def test_the_words_people_actually_type_all_work(self, tmp_path):
+        for value in ("0", "false", "no"):
+            out = self._run(
+                tmp_path, ["-i", "in.mov", "-c:v", "h264", "out.mp4"],
+                env={"IMMICH_ACCEL_HW_VIDEO": value},
+            )
+            assert "h264_videotoolbox" not in out, f"{value!r} should turn it off"
+
+    def test_anything_else_leaves_it_on(self, tmp_path):
+        """An unset or unrecognised value must not silently disable the
+        hardware path on every install."""
+        for value in ("1", "true", "yes", ""):
+            out = self._run(
+                tmp_path, ["-i", "in.mov", "-c:v", "h264", "out.mp4"],
+                env={"IMMICH_ACCEL_HW_VIDEO": value},
+            )
+            assert "h264_videotoolbox" in out, f"{value!r} should leave it on"
+
+
 class TestFfmpegWrapperQuickLookFallback:
     """ffmpeg's own HEVC decoder can hard-reject a stream (e.g. real HDR10/
     BT.2020 phone footage) that macOS's native AVFoundation decodes fine.
