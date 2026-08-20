@@ -12,6 +12,7 @@ starting again.
 
 import argparse
 import os
+import signal
 import socket
 import subprocess
 from unittest.mock import MagicMock, patch
@@ -1504,6 +1505,15 @@ class TestASplitInstallDoesNotReadAStrangersContainer:
         save.assert_not_called()
         assert "db_password" not in cfg
 
+    def test_a_correctly_configured_split_install_starts(self, tmp_data_dir):
+        """The case every real split install is in, and the one my own tests
+        missed: api_key and upload_mount both set, and the probe finds nothing
+        wrong. A misplaced return here refused every one of them."""
+        with patch.object(
+            m, "_warn_on_path_mismatch", return_value=False
+        ), patch.object(m, "log"):
+            assert m._preflight_split(dict(self.SPLIT, api_key="k")) is True
+
     def test_a_split_install_still_checks_its_path_mapping(self, tmp_data_dir):
         """Skipping the container checks must not mean checking nothing: a
         broken upload path 404s every thumbnail."""
@@ -1521,3 +1531,33 @@ class TestASplitInstallDoesNotReadAStrangersContainer:
             assert m._preflight_local(dict(self.LOCAL)) is False
         said = " ".join(str(c) for c in log.error.call_args_list)
         assert "still running microservices" in said
+
+
+class TestTheKillEscalationKnowsWhichServiceItIsKilling:
+    """stop_all_fast signals everything, waits, then SIGKILLs whatever is left.
+
+    The escalation loop iterated values() and passed a `name` left bound by the
+    loop above it, so every service was escalated as "dashboard". The ownership
+    check then compared the worker's command line against the dashboard's,
+    concluded the group was not ours, and killed the worker by pid alone,
+    leaving its ffmpeg running after the stop reported success.
+    """
+
+    def test_a_worker_that_survives_sigterm_is_escalated_as_the_worker(self):
+        seen = []
+        alive_pids = {111}
+
+        with patch.object(
+            m, "read_pid", side_effect=lambda n: {"worker": 111, "ml": 222}.get(n)
+        ), patch.object(
+            m, "_signal_service", side_effect=lambda p, s, n="": seen.append((n, s))
+        ), patch.object(
+            m.os, "kill", side_effect=lambda p, s: None if p in alive_pids else (_ for _ in ()).throw(OSError())
+        ), patch.object(m, "_kill_all_worker_processes"), patch.object(
+            m.time, "sleep"
+        ), patch.object(m, "log"):
+            m.stop_all_fast()
+
+        escalated = [n for n, sig in seen if sig == signal.SIGKILL]
+        assert "worker" in escalated, f"escalated as {escalated}"
+        assert "dashboard" not in escalated

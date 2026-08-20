@@ -5314,7 +5314,7 @@ def _preflight_split(config: dict) -> bool:
             log.error(
                 "Refusing to start with a broken path mapping. Fix and retry."
             )
-        return False
+            return False
     else:
         log.warning(
             "Cannot check the path mapping: this split install has no api_key "
@@ -5729,7 +5729,13 @@ def stop_all_fast() -> None:
         if all(not alive(p) for p in pids.values()):
             break
         time.sleep(0.1)
-    for pid in pids.values():
+    # items(), not values(): `name` would otherwise be whatever the loop above
+    # left bound, which is always "dashboard". The ownership check then compares
+    # the worker's node command line against the dashboard's, decides the group
+    # is not ours, and kills the worker by pid alone. Its ffmpeg and exiftool
+    # survive the stop, which is the regression _signal_service exists to
+    # prevent, on the escalation path rather than the first signal.
+    for name, pid in pids.items():
         if alive(pid):
             _signal_service(pid, signal.SIGKILL, name)
     for name in pids:
