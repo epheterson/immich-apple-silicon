@@ -6863,6 +6863,10 @@ ENCODING_SWITCHES = {
         "IMMICH_ACCEL_HW_VIDEO",
         "Encode H.264 and HEVC with VideoToolbox",
     ),
+    "hardware-decode": (
+        "IMMICH_ACCEL_HW_DECODE",
+        "Decode with VideoToolbox, including thumbnails and previews",
+    ),
 }
 
 # The wrapper treats exactly these as off, and anything else (including an unset

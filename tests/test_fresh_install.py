@@ -2057,27 +2057,64 @@ class TestEncodingSwitches:
         m.cmd_encoding(self._args())
         assert m.load_config() == before
 
-    # The one that actually protects the feature. cmd_encoding writes a value
+    def test_the_decode_switch_persists_too(self, tmp_data_dir):
+        m.save_config({})
+        m.cmd_encoding(self._args("hardware-decode", "off"))
+        assert m.load_config()["env"]["IMMICH_ACCEL_HW_DECODE"] == "0"
+        assert m.encoding_switch_on("hardware-decode") is False
+
+    def test_the_two_switches_are_independent(self, tmp_data_dir):
+        """Turning decode off must not disturb encoding, and the reverse. They
+        gate different halves of the wrapper."""
+        m.save_config({})
+        m.cmd_encoding(self._args("hardware-decode", "off"))
+        assert m.encoding_switch_on("hardware-video") is True
+        m.cmd_encoding(self._args("hardware-video", "off"))
+        assert m.encoding_switch_on("hardware-decode") is False
+        m.cmd_encoding(self._args("hardware-decode", "on"))
+        assert m.encoding_switch_on("hardware-video") is False
+
+    # The one that actually protects the feature. cmd_encoding writes values
     # that ffmpeg-wrapper.sh reads, and the two decide "off" in different
     # languages: Python's bool_setting and the wrapper's _off(). If they ever
-    # disagree, the switch reports off in the UI while the wrapper carries on
-    # using the hardware, which is invisible until someone compares file sizes.
-    def test_the_cli_and_the_wrapper_agree_on_what_off_means(self, tmp_path):
+    # disagree, a switch reports off in the UI while the wrapper carries on
+    # using the hardware, which is invisible until someone compares output.
+    #
+    # Every switch is checked, so adding one to ENCODING_SWITCHES without a
+    # wrapper probe here fails rather than going quietly uncovered.
+    PROBES = {
+        # variable -> (args to run, marker that means "hardware is in use")
+        "IMMICH_ACCEL_HW_VIDEO": (
+            ["-i", "in.mov", "-c:v", "h264", "out.mp4"],
+            "h264_videotoolbox",
+        ),
+        "IMMICH_ACCEL_HW_DECODE": (
+            ["-i", "in.mov", "-frames:v", "1", "out.jpg"],
+            "-hwaccel",
+        ),
+    }
+
+    def test_every_switch_means_the_same_thing_to_the_cli_and_the_wrapper(
+        self, tmp_path
+    ):
         wrapper = TestHardwareEncodingCanBeTurnedOff()
-        for value in ("0", "false", "no", "1", "true", "yes", "", "off", "banana"):
-            python_says_on = m.bool_setting(
-                "IMMICH_ACCEL_HW_VIDEO", True, {"env": {"IMMICH_ACCEL_HW_VIDEO": value}}
+        for _, (variable, _description) in m.ENCODING_SWITCHES.items():
+            assert variable in self.PROBES, (
+                f"{variable} has no wrapper probe, so nothing checks that the "
+                f"switch and the wrapper agree"
             )
-            out = wrapper._run(
-                tmp_path,
-                ["-i", "in.mov", "-c:v", "h264", "out.mp4"],
-                env={"IMMICH_ACCEL_HW_VIDEO": value},
-            )
-            wrapper_says_on = "h264_videotoolbox" in out
-            assert python_says_on == wrapper_says_on, (
-                f"{value!r}: the CLI says {'on' if python_says_on else 'off'} but "
-                f"the wrapper says {'on' if wrapper_says_on else 'off'}"
-            )
+            args, marker = self.PROBES[variable]
+            for value in ("0", "false", "no", "1", "true", "yes", "", "off", "banana"):
+                python_says_on = m.bool_setting(
+                    variable, True, {"env": {variable: value}}
+                )
+                out = wrapper._run(tmp_path, args, env={variable: value})
+                wrapper_says_on = marker in out
+                assert python_says_on == wrapper_says_on, (
+                    f"{variable}={value!r}: the CLI says "
+                    f"{'on' if python_says_on else 'off'} but the wrapper says "
+                    f"{'on' if wrapper_says_on else 'off'}"
+                )
 
 
 class TestFfmpegWrapperQuickLookFallback:
@@ -2369,12 +2406,15 @@ class TestFfmpegWrapperQuickLookFallback:
         )
         assert result.returncode == 0, result.stderr
         received = seen_args.read_text().splitlines()
-        assert received[:2] == ["-hwaccel", "videotoolbox"], (
-            f"-hwaccel must be injected as an input option, before -i; got {received}"
-        )
+        assert received[:2] == [
+            "-hwaccel",
+            "videotoolbox",
+        ], f"-hwaccel must be injected as an input option, before -i; got {received}"
         # Nothing else may change: no encoder was requested, so none is invented.
         assert not any(a.endswith("_videotoolbox") for a in received[2:])
-        assert received[2:] == args, "the remaining arguments must pass through verbatim"
+        assert (
+            received[2:] == args
+        ), "the remaining arguments must pass through verbatim"
 
     def _capture_ffmpeg_args(self, tmp_path, args):
         """Run the wrapper against a stub ffmpeg that records its argv."""
@@ -2404,8 +2444,17 @@ class TestFfmpegWrapperQuickLookFallback:
     def test_crf_is_translated_for_videotoolbox(self, tmp_path):
         received = self._capture_ffmpeg_args(
             tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
-             "-preset", "ultrafast", "-crf", "23", str(tmp_path / "out.mp4")],
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "h264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "23",
+                str(tmp_path / "out.mp4"),
+            ],
         )
         assert "-crf" not in received, "-crf means nothing to h264_videotoolbox"
         assert self._quality_value(received) == "59"
@@ -2413,8 +2462,17 @@ class TestFfmpegWrapperQuickLookFallback:
         # A leading zero must not be read as octal.
         received = self._capture_ffmpeg_args(
             tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
-             "-preset", "ultrafast", "-crf", "08", str(tmp_path / "out.mp4")],
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "h264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "08",
+                str(tmp_path / "out.mp4"),
+            ],
         )
         assert self._quality_value(received) == "88"
 
@@ -2424,16 +2482,30 @@ class TestFfmpegWrapperQuickLookFallback:
         CRF 23 would execute as quality 23 out of 100."""
         received = self._capture_ffmpeg_args(
             tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
-             "-q:v", "23", str(tmp_path / "out.mp4")],
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "h264",
+                "-q:v",
+                "23",
+                str(tmp_path / "out.mp4"),
+            ],
         )
         assert self._quality_value(received) == "59"
 
         # The stream-specific spelling carries the same number.
         received = self._capture_ffmpeg_args(
             tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
-             "-q:v:0", "23", str(tmp_path / "out.mp4")],
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "h264",
+                "-q:v:0",
+                "23",
+                str(tmp_path / "out.mp4"),
+            ],
         )
         assert self._quality_value(received) == "59"
 
@@ -2442,14 +2514,28 @@ class TestFfmpegWrapperQuickLookFallback:
         0-51 range Immich's UI offers clamp to the ends of the scale."""
         best = self._capture_ffmpeg_args(
             tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "hevc",
-             "-crf", "0", str(tmp_path / "out.mp4")],
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "hevc",
+                "-crf",
+                "0",
+                str(tmp_path / "out.mp4"),
+            ],
         )
         assert self._quality_value(best) == "100"
         worst = self._capture_ffmpeg_args(
             tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "hevc",
-             "-crf", "63", str(tmp_path / "out.mp4")],
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "hevc",
+                "-crf",
+                "63",
+                str(tmp_path / "out.mp4"),
+            ],
         )
         assert self._quality_value(worst) == "1"
 
@@ -2458,10 +2544,22 @@ class TestFfmpegWrapperQuickLookFallback:
         wrapper doesn't remap keeps the arguments Immich sent."""
         received = self._capture_ffmpeg_args(
             tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "libvpx-vp9",
-             "-crf", "23", str(tmp_path / "out.webm")],
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "libvpx-vp9",
+                "-crf",
+                "23",
+                str(tmp_path / "out.webm"),
+            ],
         )
-        assert "-hwaccel" not in received
+        # No assertion about -hwaccel. This test arrived (#154) when hardware
+        # decode was still tied to the encoder remap, so "not remapped" and
+        # "no -hwaccel" were the same statement. #153 separated them: decode
+        # is now requested for every input, including the ones encoded in
+        # software, which is the entire point of it. Whether -hwaccel is
+        # present is covered by the decode switch's own tests.
         assert "-q:v" not in received
         assert received[received.index("-crf") + 1] == "23"
 

@@ -85,6 +85,7 @@ struct SettingsView: View {
     @State private var applyingComponent: String?
     @State private var componentError: String?
     @State private var hardwareVideoOn = true
+    @State private var hardwareDecodeOn = true
     @State private var applyingSwitch: String?
     @State private var encodingError: String?
     @State private var comparing = false
@@ -159,6 +160,7 @@ struct SettingsView: View {
         mlOn = StatusModel.componentEnabled("ml", config)
         dashboardOn = StatusModel.componentEnabled("dashboard", config)
         hardwareVideoOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_VIDEO", config)
+        hardwareDecodeOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_DECODE", config)
     }
 
     // MARK: - General
@@ -336,11 +338,14 @@ struct SettingsView: View {
                 encodingToggle(
                     "hardware-video", $hardwareVideoOn, "Hardware video encoding",
                     "Encode H.264 and HEVC with VideoToolbox")
+                encodingToggle(
+                    "hardware-decode", $hardwareDecodeOn, "Hardware decoding",
+                    "Decode with VideoToolbox, including thumbnails and previews")
             } footer: {
                 // The honest version. Saying "hardware is faster" would be
                 // wrong on an idle Mac and would make the switch look broken
                 // to the first person who timed it.
-                Text("Hardware uses roughly two cores where software uses every core it can reach, so it leaves the Mac free for thumbnails and machine learning. Software often finishes a single file sooner, because Immich asks for preset ultrafast. Which is better depends on your Mac and your footage.")
+                Text("Encoding: hardware uses roughly two cores where software uses every core it can reach, so it leaves the Mac free for thumbnails and machine learning. Software often finishes a single file sooner, because Immich asks for preset ultrafast.\n\nDecoding: about a quarter less CPU on thumbnail and preview jobs. It is also the only setting here that changes output, and only for 10-bit video, where a thumbnail comes out visually identical but not byte-identical to Docker's. Turn it off if you want Docker's exact bytes.")
                     .font(.rowDetail).foregroundStyle(.secondary)
             }
 

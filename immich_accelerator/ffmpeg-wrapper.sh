@@ -109,7 +109,7 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
     # inverted scale. Both become a -q:v value that means what the CRF
     # setting asked for. Matched as prefixes so the stream-specific spellings
     # (-crf:v, -q:v:0) are translated too.
-    if [[ ( "$arg" == -crf* || "$arg" == -q:v* ) && "$USE_HW" == true ]]; then
+    if [[ ( "$arg" == -crf* || "$arg" == -q:v* ) && "$USE_HW_ENCODER" == true ]]; then
         next="${ARGS[$((i+1))]:-}"
         if [[ "$next" =~ ^[0-9]+$ ]]; then
             NEW_ARGS+=("-q:v" "$(_crf_to_quality "$next")")
