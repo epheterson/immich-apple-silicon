@@ -1460,3 +1460,52 @@ class TestTwoPauseReasonsShareOneMarker:
 
         with patch.object(m.subprocess, "run", side_effect=run):
             assert m.mount_recipe_for("/Users/elp/Pictures/immich") is None
+
+
+class TestEncodeCompare:
+    """Encoding the same input both ways is how the quality question gets
+    answered with numbers instead of opinions: what the hardware encoder costs
+    in quality, what it saves in time, and which setting makes its output match
+    what Immich would have produced on its own.
+    """
+
+    def test_ffprobe_is_found_next_to_ffmpeg(self, tmp_path):
+        """The shipped path is .../jellyfin-ffmpeg/ffmpeg, so replacing every
+        occurrence of the name points at a directory that does not exist."""
+        d = tmp_path / "jellyfin-ffmpeg"
+        d.mkdir()
+        (d / "ffmpeg").write_text("")
+        probe = d / "ffprobe"
+        probe.write_text("")
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(stdout="12.5\n")
+        ) as run:
+            assert m._ffprobe_duration(str(d / "ffmpeg"), "/x.mov") == 12.5
+        assert run.call_args.args[0][0] == str(probe)
+
+    def test_a_missing_ffprobe_is_not_fatal(self, tmp_path):
+        (tmp_path / "ffmpeg").write_text("")
+        assert m._ffprobe_duration(str(tmp_path / "ffmpeg"), "/x.mov") == 0.0
+
+    def test_a_failed_encode_reports_no_bytes(self, tmp_path):
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(returncode=1, stderr="boom")
+        ), patch.object(m, "log"):
+            secs, size, cpu = m._encode_once(
+                "/bin/ffmpeg", "/in.mov", str(tmp_path / "o.mp4"), []
+            )
+        assert size == 0
+
+    def test_the_mean_ssim_is_the_last_one_reported(self):
+        """ffmpeg prints a line per frame and the summary last."""
+        out = "n:1 All:0.9 \nn:2 All:0.8 \nSSIM All:0.997649 (26.3)\n"
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(stdout=out, stderr="")
+        ):
+            assert m._ssim_against("/bin/ffmpeg", "/a.mp4", "/b.mp4") == 0.997649
+
+    def test_unreadable_ssim_output_is_not_a_number(self):
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(stdout="", stderr="")
+        ):
+            assert m._ssim_against("/bin/ffmpeg", "/a.mp4", "/b.mp4") is None

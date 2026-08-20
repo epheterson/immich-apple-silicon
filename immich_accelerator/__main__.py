@@ -21,6 +21,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import sys
 import time
 import uuid
@@ -6621,6 +6622,181 @@ def cmd_dashboard(args):
     dashboard_mod.run_dashboard(config, port=args.port)
 
 
+# Immich's own transcode settings, so "stock" here means what a Docker Immich
+# would have produced from the same input. preset ultrafast is what Immich sends,
+# not veryfast: calibrating against the wrong preset is how a mapping ends up
+# looking correct and measuring worse.
+_STOCK_PRESET = "ultrafast"
+
+
+def _ffprobe_duration(ffmpeg: str, path: str) -> float:
+    # Only the last component. The shipped path is .../jellyfin-ffmpeg/ffmpeg,
+    # so replacing every occurrence names a directory that does not exist.
+    probe = str(Path(ffmpeg).with_name(Path(ffmpeg).name.replace("ffmpeg", "ffprobe")))
+    if not Path(probe).exists():
+        return 0.0
+    try:
+        out = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        return float(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0.0
+
+
+def _encode_once(
+    ffmpeg: str, src: str, dest: str, args: list[str]
+) -> tuple[float, int, float]:
+    """Encode and return (wall seconds, output bytes, cpu seconds).
+
+    CPU time is the number that actually decides this. Wall time says which
+    finishes one file first; CPU time says what the encode costs the rest of the
+    machine, and this Mac is running Immich's other jobs and the ML engine at the
+    same time. Zero bytes means it failed.
+    """
+    import resource
+
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    start = time.monotonic()
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", src, *args, dest, "-y"],
+            capture_output=True, text=True, timeout=1800,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0.0, 0, 0.0
+    elapsed = time.monotonic() - start
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+    if r.returncode != 0:
+        log.debug("encode failed: %s", (r.stderr or "").strip()[:300])
+        return elapsed, 0, cpu
+    try:
+        return elapsed, Path(dest).stat().st_size, cpu
+    except OSError:
+        return elapsed, 0, cpu
+
+
+def _ssim_against(ffmpeg: str, candidate: str, reference: str) -> float | None:
+    """Mean SSIM of candidate against reference, or None if it could not be read."""
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", candidate,
+             "-i", reference, "-lavfi", "[0:v][1:v]ssim=stats_file=-", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=1800,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    hit = re.findall(r"All:([0-9.]+)", r.stdout + r.stderr)
+    return float(hit[-1]) if hit else None
+
+
+def cmd_encode_compare(args):
+    """Transcode one file the way Immich would, and the way this Mac would.
+
+    The point is to answer two questions with numbers from your own footage
+    rather than from someone else's: how much faster the hardware encoder is,
+    and what quality setting makes its output match what Immich would have
+    produced on its own.
+    """
+    src = str(Path(args.video).expanduser())
+    if not Path(src).is_file():
+        log.error("No such file: %s", src)
+        return
+    config = load_config() if CONFIG_FILE.exists() else {}
+    ffmpeg = config.get("ffmpeg_path") or shutil.which("ffmpeg")
+    if not ffmpeg or not Path(ffmpeg).exists():
+        log.error("No ffmpeg found. Run setup, or pass one on PATH.")
+        return
+
+    duration = _ffprobe_duration(ffmpeg, src)
+    log.info("Comparing encoders on %s", Path(src).name)
+    if duration:
+        log.info("  %.1fs of video, CRF %d", duration, args.crf)
+    log.info("")
+
+    with tempfile.TemporaryDirectory(prefix="immich-encode-compare-") as tmp:
+        stock = str(Path(tmp) / "stock.mp4")
+        secs, size, cpu = _encode_once(
+            ffmpeg, src, stock,
+            ["-c:v", "libx264", "-preset", _STOCK_PRESET, "-crf", str(args.crf),
+             "-pix_fmt", "yuv420p", "-an"],
+        )
+        if not size:
+            log.error("The software encode failed, so there is nothing to compare against.")
+            return
+        stock_ssim = _ssim_against(ffmpeg, stock, src)
+        log.info("Software, as Immich would do it")
+        log.info("  x264 preset %s, CRF %d", _STOCK_PRESET, args.crf)
+        _report(secs, size, stock_ssim, duration, cpu)
+        stock_cpu, stock_wall = cpu, secs
+        log.info("")
+
+        log.info("Hardware, VideoToolbox")
+        best = None
+        hw_cpu = hw_wall = 0.0
+        for q in args.quality:
+            dest = str(Path(tmp) / f"vt{q}.mp4")
+            secs, size, cpu = _encode_once(
+                ffmpeg, src, dest, ["-c:v", "h264_videotoolbox", "-q:v", str(q), "-an"]
+            )
+            if not size:
+                log.warning("  q:v %-3d encode failed", q)
+                continue
+            ssim = _ssim_against(ffmpeg, dest, src)
+            log.info("  q:v %d", q)
+            _report(secs, size, ssim, duration, cpu)
+            hw_cpu, hw_wall = cpu, secs
+            if ssim is not None and stock_ssim is not None:
+                gap = abs(ssim - stock_ssim)
+                if best is None or gap < best[0]:
+                    best = (gap, q, ssim)
+
+        log.info("")
+        if best:
+            log.info(
+                "Closest to the software encode: q:v %d (SSIM %.6f against %.6f).",
+                best[1], best[2], stock_ssim,
+            )
+            log.info(
+                "  Quality is content dependent, so run this on footage of your own "
+                "before trusting one number."
+            )
+            log.info("")
+            # The tradeoff is rarely the one people expect. Immich's preset is
+            # ultrafast, which is genuinely quick, so software often finishes one
+            # file sooner. What hardware buys is the machine: it leaves the cores
+            # for the other jobs and for the ML engine running beside it.
+            if stock_wall and hw_wall:
+                faster = "software" if stock_wall < hw_wall else "hardware"
+                log.info(
+                    "On this file %s finished sooner (%.1fs against %.1fs).",
+                    faster, min(stock_wall, hw_wall), max(stock_wall, hw_wall),
+                )
+            if stock_cpu and hw_cpu:
+                log.info(
+                    "Hardware used %.1fs of cpu against %.1fs, so it leaves the "
+                    "machine free for the other jobs and for machine learning.",
+                    hw_cpu, stock_cpu,
+                )
+        else:
+            log.warning("No hardware encode completed, so there is nothing to compare.")
+
+
+def _report(
+    secs: float, size: int, ssim: float | None, duration: float, cpu: float = 0.0
+) -> None:
+    speed = f", {duration / secs:.1f}x realtime" if duration and secs else ""
+    log.info("    %6.1fs wall   %7.1f MB%s", secs, size / (1024 * 1024), speed)
+    if cpu:
+        cores = f" ({cpu / secs:.1f} cores busy)" if secs else ""
+        log.info("    %6.1fs cpu%s", cpu, cores)
+    if ssim is not None:
+        log.info("    SSIM %.6f against the original", ssim)
+
+
 def cmd_ml_test(_args):
     """End-to-end diagnostic for the native ML service.
 
@@ -6976,6 +7152,19 @@ def main():
         "ml-test",
         help="Diagnose the ML service (health + CLIP + OCR round-trip)",
     )
+    cmp_p = sub.add_parser(
+        "encode-compare",
+        help="Transcode one video both ways and report speed, size and quality",
+    )
+    cmp_p.add_argument("video", help="a video file to test with, ideally your own")
+    cmp_p.add_argument(
+        "--crf", type=int, default=23,
+        help="the CRF Immich is set to (default 23, Immich's own default)",
+    )
+    cmp_p.add_argument(
+        "--quality", type=int, nargs="+", default=[59, 65, 75, 85],
+        help="VideoToolbox q:v values to try",
+    )
     sub.add_parser("uninstall", help="Remove services, data, and launchd config")
 
     args = parser.parse_args()
@@ -6995,6 +7184,7 @@ def main():
             "dashboard": cmd_dashboard,
             "component": cmd_component,
             "ml-test": cmd_ml_test,
+            "encode-compare": cmd_encode_compare,
             "uninstall": cmd_uninstall,
         }[args.command](args)
     except RuntimeError as e:
