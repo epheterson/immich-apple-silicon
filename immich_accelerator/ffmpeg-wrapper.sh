@@ -23,6 +23,21 @@ _ql_timeout() {
     return $rc
 }
 
+# Immich's quality setting is a CRF number (0-51, lower is better).
+# VideoToolbox ignores -crf, and reads -q:v on a 0-100 scale where higher is
+# better, so the number has to be translated when an encoder is remapped.
+# The slope comes from matching x264 veryfast against h264_videotoolbox over
+# six clips and five quality metrics (SSIM, MS-SSIM, LPIPS, DISTS):
+# q ~= 104 - 1.96*CRF. Bash has no floats, so scale by two and add half the
+# divisor to round to nearest over the 0-51 range Immich offers. 10# keeps a
+# leading zero from being read as octal.
+_crf_to_quality() {
+    local q=$(( ((51 - 10#$1) * 200 + 51) / 102 + 4 ))
+    (( q < 1 )) && q=1
+    (( q > 100 )) && q=100
+    echo "$q"
+}
+
 # Used by the QuickLook fallback below to convert its PNG output to whatever
 # format Immich asked for.
 if [[ -n "${IMMICH_ACCELERATOR_VIPS:-}" ]]; then
@@ -86,6 +101,21 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
     if [[ "$arg" == "-preset" && "$USE_HW_ENCODER" == true ]]; then
         ((i++))
         continue
+    fi
+
+    # Translate the quality setting for VideoToolbox. Immich sends -crf N
+    # (CQ mode Auto) or -q:v N (CQ mode CQP) carrying the same CRF-scale
+    # number: -crf is ignored by these encoders, and -q:v is read on an
+    # inverted scale. Both become a -q:v value that means what the CRF
+    # setting asked for. Matched as prefixes so the stream-specific spellings
+    # (-crf:v, -q:v:0) are translated too.
+    if [[ ( "$arg" == -crf* || "$arg" == -q:v* ) && "$USE_HW" == true ]]; then
+        next="${ARGS[$((i+1))]:-}"
+        if [[ "$next" =~ ^[0-9]+$ ]]; then
+            NEW_ARGS+=("-q:v" "$(_crf_to_quality "$next")")
+            ((i++))
+            continue
+        fi
     fi
 
     # Track if -tag:v is already specified (including stream-specific -tag:v:0 etc.)
