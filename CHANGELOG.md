@@ -12,7 +12,7 @@
 - **A split install no longer reads its configuration out of an unrelated Docker container.** On a Mac also running some other Immich, this one was compared against that one: it refused to start over a mismatch that did not exist, and copied that container's database credentials and version into this config. `immich_url` is what marks an install as split, and that is now documented and enforced. Reported by [@RxChi1d](https://github.com/RxChi1d) ([#139](https://github.com/epheterson/immich-apple-silicon/issues/139)).
 
 ### Changed
-- The documentation no longer implies hardware encoding is simply faster. Immich asks for `preset ultrafast`, so on an idle Mac software often finishes one file sooner; what the hardware buys is the machine, about half a core against nearly nine on a 4K clip. That is the trade, and `encode-compare` measures it on your own footage.
+- The documentation no longer implies hardware encoding is simply faster. Immich asks for `preset ultrafast`, so on an idle Mac software often finishes one file sooner; what the hardware buys is the machine. Measured on an M4 over 20 seconds of 1080p camera footage, software spent 12.5 seconds of CPU across about eight cores against 5 seconds across about two. Quality went the other way from the assumption: SSIM 0.980 for hardware against 0.961 for software, in half the size. `encode-compare` measures all of it on your own footage.
 
 ## 1.13.0 - 2026-08-19
 
