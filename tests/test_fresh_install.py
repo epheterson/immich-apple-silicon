@@ -2351,6 +2351,31 @@ class TestFfmpegWrapperQuickLookFallback:
             "-preset" not in received
         ), "software presets must be stripped for VideoToolbox"
 
+    def test_thumbnail_job_gets_hardware_decode(self, tmp_path):
+        """Immich's thumbnail and preview jobs send no -c:v at all, so there is
+        no encoder to remap. Hardware decode still has to be injected."""
+        ffmpeg = tmp_path / "ffmpeg"
+        seen_args = tmp_path / "seen_args"
+        self._bash_stub(ffmpeg, f'printf "%s\\n" "$@" > {seen_args}\nexit 0\n')
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        args = self._thumbnail_args(tmp_path / "in.mov", tmp_path / "out.jpg")
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        received = seen_args.read_text().splitlines()
+        assert received[:2] == ["-hwaccel", "videotoolbox"], (
+            f"-hwaccel must be injected as an input option, before -i; got {received}"
+        )
+        # Nothing else may change: no encoder was requested, so none is invented.
+        assert not any(a.endswith("_videotoolbox") for a in received[2:])
+        assert received[2:] == args, "the remaining arguments must pass through verbatim"
+
 
 class TestPgKeepaliveShim:
     """The pg keepalive shim sets keepAlive on Immich's Postgres connections so
