@@ -44,6 +44,8 @@ fi
 _off() { [[ "$1" == "0" || "$1" == "false" || "$1" == "no" ]]; }
 HW_VIDEO=true
 _off "${IMMICH_ACCEL_HW_VIDEO:-1}" && HW_VIDEO=false
+HW_DECODE=true
+_off "${IMMICH_ACCEL_HW_DECODE:-1}" && HW_DECODE=false
 
 ARGS=("$@")
 USE_HW_ENCODER=false
@@ -107,7 +109,17 @@ fi
 # tying hardware decode to the encoder remap left those decoding in software.
 # -hwaccel is a hint: ffmpeg falls back to the software decoder for anything
 # VideoToolbox will not take.
-RUN_ARGS=(-hwaccel videotoolbox "${NEW_ARGS[@]}")
+#
+# Switchable because it is the one part of the wrapper that changes output:
+# hardware decode hands back 10-bit frames as p010le where software decode
+# gives yuv420p10le, so a thumbnail from a 10-bit source is not byte-identical
+# to Docker's (measured at 55.3 dB PSNR). 8-bit sources are unaffected. Anyone
+# who wants Docker's exact bytes needs a way to say so.
+if [[ "$HW_DECODE" == true ]]; then
+    RUN_ARGS=(-hwaccel videotoolbox "${NEW_ARGS[@]}")
+else
+    RUN_ARGS=("${NEW_ARGS[@]}")
+fi
 
 # Run ffmpeg with stderr captured, so the fallback below can tell a decoder
 # rejection (what it is for) from a broken file or bad arguments (what it must
