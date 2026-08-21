@@ -251,9 +251,31 @@ struct SettingsView: View {
                 .labelsHidden()
                 .disabled(applyingSwitch != nil)
 
-                Text(presetDetail)
-                    .font(.rowDetail).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: Metrics.md) {
+                    if let engine = presetEngine {
+                        HStack(spacing: Metrics.md) {
+                            Text("Machine learning")
+                                .font(.rowDetail).foregroundStyle(.secondary)
+                            BadgeLabel(text: engine,
+                                       tint: engine == "NATIVE" ? .green : .orange)
+                        }
+                    }
+                    // Changing position changes the face detector, and the two
+                    // detectors do not agree on where faces are. Existing faces
+                    // stay as they were detected, so this belongs at the moment
+                    // of choosing rather than in a release note nobody reads.
+                    if pendingDetectorChange {
+                        Label(
+                            "Changes the face detector. Faces already found keep their old boxes until you re-run Face Detection in Immich.",
+                            systemImage: "exclamationmark.triangle.fill")
+                            .font(.rowDetail)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(presetDetail)
+                        .font(.rowDetail).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } header: {
                 Text("Output")
             }
@@ -352,15 +374,34 @@ struct SettingsView: View {
     /// The named positions, plus the one the segmented control shows when the
     /// switches spell none of them. "Custom" is only offered as a tag when it
     /// is the current state; picking it would mean nothing.
-    private static let presets: [(name: String, title: String, detail: String)] = [
-        ("stock", "Stock", "Output identical to Docker. Nothing runs on the video hardware."),
-        ("balanced", "Balanced", "Video encoded and decoded on the hardware. Audio stays identical to Docker."),
-        ("maximum", "Maximum", "Hardware everywhere it measured faster. Audio is re-encoded, so files differ from Docker."),
-        ("custom", "Custom", "Switches set individually."),
+    /// The named positions. `engine` is the machine learning engine a position
+    /// requires, shown as a pill so switching is never a surprise: Stock needs
+    /// Immich's own ONNX models, which only the Python engine carries.
+    private static let presets: [(name: String, title: String, engine: String?, detail: String)] = [
+        ("stock", "Stock", "PYTHON",
+         "Every output identical to Docker: video, thumbnails, faces and text. A library built here can move back to a Docker install without reprocessing."),
+        ("balanced", "Balanced", "NATIVE",
+         "Video encoded and decoded on the hardware. Thumbnails from 10-bit video differ slightly from Docker; everything else matches."),
+        ("maximum", "Maximum", "NATIVE",
+         "Hardware wherever it measured faster, which leaves the most CPU for other jobs. Audio is re-encoded, so those files differ from Docker."),
+        ("custom", "Custom", nil, "Switches set individually."),
     ]
 
     private var presetDetail: String {
         Self.presets.first { $0.name == currentPreset }?.detail ?? ""
+    }
+
+    private var presetEngine: String? {
+        Self.presets.first { $0.name == currentPreset }?.engine
+    }
+
+    /// True while the selected position uses a different face detector from
+    /// the one that produced the faces already in the library.
+    private var pendingDetectorChange: Bool {
+        guard let engine = presetEngine else { return false }
+        let running = model.snap.mlEngine
+        guard running != .unknown else { return false }
+        return (engine == "PYTHON") != (running == .python)
     }
 
     private var currentPreset: String { StatusModel.encodingPreset(config) }

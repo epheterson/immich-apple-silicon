@@ -2126,6 +2126,49 @@ class TestEncodingSwitches:
         m.save_config({})
         assert m.encoding_switch_on("hardware-audio") is False
 
+    def test_stock_selects_the_engine_that_can_actually_do_it(self, tmp_data_dir):
+        """The whole failure this guards against: Stock writes the ffmpeg
+        switches, leaves the native engine in place, and the label claims
+        Docker-identical output while faces, text and search are still Apple
+        Vision and mlx."""
+        config = m.apply_encoding_preset("stock", {})
+        assert config["ml_engine"] == "python"
+        assert config["stock_ml"] is True
+
+    def test_the_other_positions_keep_the_native_engine(self, tmp_data_dir):
+        for name in ("balanced", "maximum"):
+            config = m.apply_encoding_preset(name, {})
+            assert config["ml_engine"] == "native", name
+            assert config["stock_ml"] is False, name
+
+    def test_stock_video_with_accelerated_ml_is_not_stock(self, tmp_data_dir):
+        """An install with the Stock switches but the native engine must report
+        custom. Reporting "stock" there is the one lie this must never tell."""
+        config = m.apply_encoding_preset("stock", {})
+        config["ml_engine"] = "native"
+        config["stock_ml"] = False
+        assert m.encoding_preset(config) == "custom"
+
+    def test_every_preset_names_the_ml_side(self, tmp_data_dir):
+        """A position added to one table and not the other would apply half of
+        itself and then report as custom immediately afterwards."""
+        assert set(m.ENCODING_PRESETS) == set(m.PRESET_ML)
+        assert set(m.ENCODING_PRESETS) == set(m.PRESET_SUMMARY)
+
+    def test_the_ml_service_is_told_about_stock(self, tmp_path, tmp_data_dir):
+        """config_env only forwards IMMICH_ACCEL*, so ML_STOCK has to be passed
+        explicitly or the engine never hears about it and quietly runs Vision."""
+        config = {"ml_dir": str(tmp_path)}
+        venv_python = tmp_path / "venv" / "bin"
+        venv_python.mkdir(parents=True, exist_ok=True)
+        (venv_python / "python3").write_text("")
+        (venv_python / "python3").chmod(0o755)
+
+        spec = m._venv_ml_spec({**config, "stock_ml": True}, {})
+        assert spec is not None and spec[2]["ML_STOCK"] == "true"
+        spec = m._venv_ml_spec({**config, "stock_ml": False}, {})
+        assert spec is not None and spec[2]["ML_STOCK"] == "false"
+
     def test_the_decode_switch_persists_too(self, tmp_data_dir):
         m.save_config({})
         m.cmd_encoding(self._args("hardware-decode", "off"))

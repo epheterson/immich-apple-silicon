@@ -4548,6 +4548,10 @@ def _venv_ml_spec(config: dict, env: dict):
         # It also leaves several processes on the port under a master that
         # ml.pid does not name, and nothing here is written to expect that.
         env = dict(env, PYTHONUNBUFFERED="1", WEB_CONCURRENCY="1")
+        # Stock is a config setting, and the engine reads it from its
+        # environment. config_env deliberately only forwards IMMICH_ACCEL*, so
+        # this one is passed explicitly rather than by widening that rule.
+        env["ML_STOCK"] = "true" if config.get("stock_ml") else "false"
         return [str(ml_python), "-m", "src.main"], str(ml_dir), env
     return None
 
@@ -4600,7 +4604,13 @@ def _start_ml_preferred(config: dict):
     """
     env = os.environ.copy()
     attempts = []
-    if config.get("ml_engine", "native") != "python":
+    # Stock means Immich's own ONNX models, and only the Python engine carries
+    # them. The native engine would simply ignore the setting and run Apple
+    # Vision, which is the silent half-stock state the position exists to
+    # prevent, so it is not offered at all here rather than merely discouraged.
+    if config.get("stock_ml") and config.get("ml_engine", "native") != "python":
+        log.info("Stock output requested, so the Python engine is used for ML.")
+    if config.get("ml_engine", "native") != "python" and not config.get("stock_ml"):
         native = _native_ml_spec(config, env)
         if native is not None:
             attempts.append(("native Swift", native, True))
@@ -6949,6 +6959,18 @@ ENCODING_PRESETS = {
     },
 }
 
+# What each position asks of the machine learning engine. Stock needs Immich's
+# own ONNX models, which only the Python engine carries; the others use the
+# native engine's Apple Silicon paths. Kept beside ENCODING_PRESETS because a
+# position is one statement about output, and splitting it across two tables is
+# how Stock ends up meaning stock video and accelerated everything else.
+PRESET_ML = {
+    "stock": {"ml_engine": "python", "stock_ml": True},
+    "balanced": {"ml_engine": "native", "stock_ml": False},
+    "maximum": {"ml_engine": "native", "stock_ml": False},
+}
+
+
 PRESET_SUMMARY = {
     "stock": "Output identical to Docker",
     "balanced": "Hardware video, Docker-identical audio",
@@ -6963,12 +6985,26 @@ def encoding_preset(config: dict | None = None) -> str:
     environment has to be reflected, and a stored name would go stale the moment
     it was. "custom" is a real answer, not a failure.
     """
+    if config is None:
+        try:
+            config = load_config()
+        except (RuntimeError, OSError, ValueError):
+            config = {}
     for name, wanted in ENCODING_PRESETS.items():
-        if all(
+        if not all(
             bool_setting(var, var not in _DEFAULT_OFF, config) is value
             for var, value in wanted.items()
         ):
-            return name
+            continue
+        # And the machine learning side. Without this an install running the
+        # native engine would still report "stock", which is the one claim it
+        # must never make falsely.
+        ml = PRESET_ML[name]
+        if config.get("ml_engine", "native") != ml["ml_engine"]:
+            continue
+        if bool(config.get("stock_ml", False)) != ml["stock_ml"]:
+            continue
+        return name
     return "custom"
 
 
@@ -7026,6 +7062,9 @@ def apply_encoding_preset(name: str, config: dict) -> dict:
     for var, value in ENCODING_PRESETS[name].items():
         env[var] = "1" if value else "0"
     config["env"] = env
+    # The machine learning side of the same statement.
+    for key, value in PRESET_ML[name].items():
+        config[key] = value
     return config
 
 
