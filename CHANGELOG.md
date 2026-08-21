@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.15.0 - 2026-08-21
+
+### Added
+- **One Processing screen, and one setting that decides how this Mac differs from Docker.** Components, Machine Learning and Encoding were three panes describing one decision, so they are now one, with **Stock**, **Balanced** and **Maximum** at the top and every switch they set visible underneath. The engine each position needs is shown as a pill, so Stock moving you to the Python engine is stated rather than silent.
+- **Stock output, meaning all of it.** Video, thumbnails, faces, text and search are produced the way Immich's own container produces them, so a library built here can move back to a Docker install without reprocessing. Face detection runs Immich's insightface detector, OCR runs its RapidOCR models, and CLIP runs its own ONNX exports, each with Immich's preprocessing rather than an approximation of it.
+- **Hardware audio encoding** (`aac_at`), measured at about a third less CPU than the software encoder and faster besides. Off except at Maximum, because it changes the bytes.
+
+### Fixed
+- **`encode-compare` reported the last frame's SSIM as the mean.** The summary line carrying the mean is logged at info, which the command was discarding, while `stats_file=-` wrote per-frame numbers it then read the last of. A clip ending on black therefore reported perfect quality for everything. Found and fixed by [@RxChi1d](https://github.com/RxChi1d) ([#160](https://github.com/epheterson/immich-apple-silicon/pull/160)). The quality figures in the 1.14.0 notes came from that bug and are corrected here: software 0.967 against hardware 0.974, not 0.961 against 0.980.
+- **HEVC lost its `hvc1` tag with hardware encoding switched off.** The tag is about the container rather than the encoder, and libx265 defaults to `hev1`, which Apple's decoder rejects. Reported and fixed by [@RxChi1d](https://github.com/RxChi1d) ([#159](https://github.com/epheterson/immich-apple-silicon/pull/159)).
+- **Seven tests had stopped running.** A merge duplicated them inside one class, and Python keeps only the last definition, so the earlier copies read like coverage while doing nothing. Removed, and a hygiene test now fails on any shadowed definition.
+
+### Changed
+- Encoder documentation no longer implies hardware is simply faster, and the figures it quotes are measured on real camera footage rather than a synthetic test pattern.
+
 ## 1.14.0 - 2026-08-20
 
 ### Added
