@@ -1016,10 +1016,12 @@ class TestAdoptionRunsBeforeStarting:
 
 
 class TestSpawnedServicesLeadTheirOwnSession:
-    """_signal_service decides by session leadership, so everything we spawn has
-    to be a session leader or its children stop going with it. Checked on a live
-    install for worker, ml and dashboard; this keeps start_new_session from
-    being dropped from start_service without anything noticing."""
+    """_signal_service decides by session leadership, so a service that owns its
+    session has to actually lead one or its children stop going with it. Checked
+    on a live install for worker, ml and dashboard; this keeps start_new_session
+    from being dropped from start_service without anything noticing.
+
+    A supervised ML service is the deliberate exception, covered below."""
 
     def test_start_service_leaves_a_session_leader(self, tmp_data_dir):
         with patch.object(m.time, "sleep"):  # skip the liveness pause
@@ -1028,6 +1030,87 @@ class TestSpawnedServicesLeadTheirOwnSession:
             assert os.getsid(pid) == pid
         finally:
             os.kill(pid, 9)
+
+    def test_a_supervised_service_stays_in_our_group(self, tmp_data_dir):
+        """own_session=False is the whole mechanism: the service has to end up in
+        the caller's process group, because that is the group launchd sweeps when
+        the job it manages dies."""
+        with patch.object(m.time, "sleep"):
+            pid = m.start_service(
+                "ml", ["/bin/sleep", "30"], dict(os.environ), "/tmp",
+                own_session=False,
+            )
+        try:
+            assert os.getpgid(pid) == os.getpgrp()
+            assert os.getsid(pid) != pid
+        finally:
+            os.kill(pid, 9)
+
+
+class TestTheWatcherKeepsMlInItsOwnProcessGroup:
+    """An ML service started with its own session survives the watcher dying,
+    keeps port 3003, and blocks the replacement — measured on macOS 26.3, where
+    the replacement logs EADDRINUSE and the old engine is never signalled at
+    all. Left in the watcher's group it is swept with the job. Every other
+    entry point still detaches, because a service started by `start` from a
+    terminal must survive that terminal closing.
+    """
+
+    CFG = {"ml_dir": "/ml", "ml_port": 3003}
+    NATIVE = (["nbin", "serve", "3003"], "/bundle", {})
+    VENV = (["py", "-m", "src.main"], "/ml", {})
+
+    def _spawn(self, supervising, healthy=True):
+        calls = []
+
+        def fake_start(name, cmd, env, cwd, *, own_session=True):
+            calls.append((cmd[0], own_session))
+            return 111
+
+        with patch.object(m, "_SUPERVISING_ML", supervising), patch.object(
+            m, "_native_ml_spec", return_value=self.NATIVE
+        ), patch.object(m, "_venv_ml_spec", return_value=self.VENV), patch.object(
+            m, "start_service", side_effect=fake_start
+        ), patch.object(m, "_ml_healthy", return_value=healthy), patch.object(
+            m, "kill_pid", return_value=True
+        ), patch.object(m, "wait_for_port_free", return_value=True), patch.object(
+            m, "ml_port_state", return_value=m.PORT_FREE
+        ):
+            m._start_ml_service(dict(self.CFG))
+        return calls
+
+    def test_the_watcher_supervises_the_engine_it_starts(self):
+        assert self._spawn(supervising=True) == [("nbin", False)]
+
+    def test_every_other_caller_leaves_the_engine_detached(self):
+        assert self._spawn(supervising=False) == [("nbin", True)]
+
+    def test_the_fallback_engine_follows_the_same_rule(self):
+        """_ml_verify_or_fallback starts the venv after native fails its health
+        check. Missing it would leave the bug on the fallback path only."""
+        assert self._spawn(supervising=True, healthy=False) == [
+            ("nbin", False),
+            ("py", False),
+        ]
+
+    def test_watch_is_what_claims_the_role(self):
+        """Nothing else may set the flag, so the claim has to come from entering
+        the watch command, and it has to be set before the loop starts anything."""
+        assert m._SUPERVISING_ML is False, "must default to detached"
+        seen = []
+
+        def loop(_config):
+            seen.append(m._SUPERVISING_ML)
+            return None  # not _SWITCH, so cmd_watch returns
+
+        with patch.object(m, "_SUPERVISING_ML", False), patch.object(
+            m, "load_config", return_value={}
+        ), patch.object(m, "_component_enabled", return_value=False), patch.object(
+            m, "_watch_without_worker", side_effect=loop
+        ):
+            m.cmd_watch(None)
+        assert seen == [True]
+        assert m._SUPERVISING_ML is False, "patch.object must have restored it"
 
 
 class TestTheGroupIsSignalledOnlyWhenWeLeadTheSession:
