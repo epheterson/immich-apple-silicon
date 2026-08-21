@@ -2080,12 +2080,12 @@ class TestEncodingSwitches:
         m.cmd_encoding(self._args())
         assert m.load_config() == before
 
-    def test_an_unconfigured_install_is_balanced(self, tmp_data_dir):
-        """The default position has a name. If this ever reports something
-        else, an install nobody touched has drifted somewhere it was never
-        asked to be."""
+    def test_an_unconfigured_install_sits_at_a_named_end(self, tmp_data_dir):
+        """An install nobody has configured must not read as custom. Everyone
+        upgrading has exactly this config, and telling them they customised
+        something they never touched is both wrong and alarming."""
         m.save_config({})
-        assert m.encoding_preset() == "balanced"
+        assert m.encoding_preset() == "apple-silicon"
 
     def test_every_preset_round_trips(self, tmp_data_dir):
         """Applying a preset must make encoding_preset name that same preset.
@@ -2135,11 +2135,16 @@ class TestEncodingSwitches:
         assert config["ml_engine"] == "python"
         assert config["stock_ml"] is True
 
-    def test_the_other_positions_keep_the_native_engine(self, tmp_data_dir):
-        for name in ("balanced", "maximum"):
-            config = m.apply_encoding_preset(name, {})
-            assert config["ml_engine"] == "native", name
-            assert config["stock_ml"] is False, name
+    def test_the_apple_silicon_end_keeps_the_native_engine(self, tmp_data_dir):
+        config = m.apply_encoding_preset("apple-silicon", {})
+        assert config["ml_engine"] == "native"
+        assert config["stock_ml"] is False
+
+    def test_turning_on_hardware_audio_reads_as_custom(self, tmp_data_dir):
+        """It is a step past the named end, so saying custom is the truth."""
+        m.save_config(m.apply_encoding_preset("apple-silicon", {}))
+        m.cmd_encoding(self._args("hardware-audio", "on"))
+        assert m.encoding_preset() == "custom"
 
     def test_stock_video_with_accelerated_ml_is_not_stock(self, tmp_data_dir):
         """An install with the Stock switches but the native engine must report

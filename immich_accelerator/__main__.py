@@ -6947,34 +6947,47 @@ ENCODING_PRESETS = {
         "IMMICH_ACCEL_HW_DECODE": False,
         "IMMICH_ACCEL_HW_AUDIO": False,
     },
-    "balanced": {
+    # Audio is deliberately not part of this end. It is off by default, so
+    # including it would make every install that has never touched these
+    # settings report "custom" the moment it upgrades, for a configuration
+    # nobody customised. It stays an individual switch: turning it on is a
+    # further step past the named end, and reporting custom is then true.
+    "apple-silicon": {
         "IMMICH_ACCEL_HW_VIDEO": True,
         "IMMICH_ACCEL_HW_DECODE": True,
         "IMMICH_ACCEL_HW_AUDIO": False,
     },
-    "maximum": {
-        "IMMICH_ACCEL_HW_VIDEO": True,
-        "IMMICH_ACCEL_HW_DECODE": True,
-        "IMMICH_ACCEL_HW_AUDIO": True,
-    },
 }
 
-# What each position asks of the machine learning engine. Stock needs Immich's
-# own ONNX models, which only the Python engine carries; the others use the
-# native engine's Apple Silicon paths. Kept beside ENCODING_PRESETS because a
-# position is one statement about output, and splitting it across two tables is
-# how Stock ends up meaning stock video and accelerated everything else.
+
+# What each end asks of the machine learning engine. Stock needs Immich's own
+# ONNX models, which only the Python engine carries.
 PRESET_ML = {
     "stock": {"ml_engine": "python", "stock_ml": True},
-    "balanced": {"ml_engine": "native", "stock_ml": False},
-    "maximum": {"ml_engine": "native", "stock_ml": False},
+    "apple-silicon": {"ml_engine": "native", "stock_ml": False},
 }
 
 
 PRESET_SUMMARY = {
     "stock": "Output identical to Docker",
-    "balanced": "Hardware video, Docker-identical audio",
-    "maximum": "Hardware everywhere it measured faster",
+    "apple-silicon": "Hardware and Apple frameworks throughout",
+}
+
+# Shown before choosing, not after: the point of a two-ended setting is that a
+# person can see what each end costs them without having to try it.
+PRESET_DETAIL = {
+    "stock": (
+        "Video, thumbnails, faces and text produced exactly as Immich's own "
+        "container produces them. A library built here moves back to Docker "
+        "with no reprocessing. Uses the most CPU."
+    ),
+    "apple-silicon": (
+        "VideoToolbox for video, Apple frameworks for machine learning. Much "
+        "less CPU, so the Mac keeps up with everything else it is doing. Video "
+        "is visually identical to Docker's; 10-bit thumbnails differ byte for "
+        "byte. Hardware audio is a further step, below."
+    ),
+    "custom": "Switches set individually.",
 }
 
 
@@ -7087,10 +7100,12 @@ def cmd_encoding(args):
         if state not in ENCODING_PRESETS:
             current = encoding_preset(config)
             log.info("Currently: %s", current)
+            log.info("")
             for key, summary in PRESET_SUMMARY.items():
-                log.info("  %-9s %s", key, summary)
+                log.info("  %s: %s", key, summary)
+                log.info("    %s", PRESET_DETAIL[key])
             if current == "custom":
-                log.info("  custom    switches set individually")
+                log.info("  custom: %s", PRESET_DETAIL["custom"])
             return
         apply_encoding_preset(state, config)
         save_config(config)

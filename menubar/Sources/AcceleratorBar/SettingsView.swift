@@ -252,18 +252,28 @@ struct SettingsView: View {
                 .disabled(applyingSwitch != nil)
 
                 VStack(alignment: .leading, spacing: Metrics.md) {
-                    if let engine = presetEngine {
-                        HStack(spacing: Metrics.md) {
-                            Text("Machine learning")
+                    // Every end described before choosing. A description that
+                    // only appears after selecting is no help at all: the
+                    // question is which one to pick.
+                    ForEach(Self.presets.filter {
+                        $0.name != "custom" || currentPreset == "custom"
+                    }, id: \.name) { preset in
+                        VStack(alignment: .leading, spacing: Metrics.xs) {
+                            HStack(spacing: Metrics.md) {
+                                Text(preset.title)
+                                    .font(.rowDetail)
+                                    .foregroundStyle(
+                                        preset.name == currentPreset ? .primary : .secondary)
+                                if let engine = preset.engine {
+                                    BadgeLabel(text: engine,
+                                               tint: engine == "NATIVE" ? .green : .orange)
+                                }
+                            }
+                            Text(preset.detail)
                                 .font(.rowDetail).foregroundStyle(.secondary)
-                            BadgeLabel(text: engine,
-                                       tint: engine == "NATIVE" ? .green : .orange)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
-                    // Changing position changes the face detector, and the two
-                    // detectors do not agree on where faces are. Existing faces
-                    // stay as they were detected, so this belongs at the moment
-                    // of choosing rather than in a release note nobody reads.
                     if pendingDetectorChange {
                         Label(
                             "Changes the face detector. Faces already found keep their old boxes until you re-run Face Detection in Immich.",
@@ -272,14 +282,12 @@ struct SettingsView: View {
                             .foregroundStyle(.orange)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    Text(presetDetail)
-                        .font(.rowDetail).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
             } header: {
                 Text("Output")
             }
 
+            if workerOn {
             Section("Hardware") {
                 encodingToggle(
                     "hardware-video", $hardwareVideoOn, "Video encoding",
@@ -292,6 +300,8 @@ struct SettingsView: View {
                     "AAC on AudioToolbox")
             }
 
+            }
+
             Section("Running") {
                 componentToggle("worker", $workerOn, "Worker",
                                 "Thumbnails, video, metadata")
@@ -301,6 +311,7 @@ struct SettingsView: View {
                                 dashboardStatus)
             }
 
+            if mlOn {
             Section("Machine learning engine") {
                 Picker("Engine", selection: $engine) {
                     ForEach(["native", "python"], id: \.self) { value in
@@ -340,6 +351,9 @@ struct SettingsView: View {
                 }
             }
 
+            }
+
+            if workerOn {
             Section {
                 LabeledContent("Compare encoders") {
                     Button(comparing ? "Comparing…" : "Choose Video…") { compareEncoders() }
@@ -357,6 +371,7 @@ struct SettingsView: View {
             } footer: {
                 Text("Runs both encoders on a file of yours and reports the difference.")
                     .font(.rowDetail).foregroundStyle(.secondary)
+            }
             }
 
             if let message = encodingError ?? componentError {
@@ -377,14 +392,16 @@ struct SettingsView: View {
     /// The named positions. `engine` is the machine learning engine a position
     /// requires, shown as a pill so switching is never a surprise: Stock needs
     /// Immich's own ONNX models, which only the Python engine carries.
+    /// Two ends and the middle you land in by setting switches yourself.
+    /// `engine` is the machine learning engine the end requires, shown as a
+    /// pill so Stock moving you to the Python engine is never a surprise.
     private static let presets: [(name: String, title: String, engine: String?, detail: String)] = [
-        ("stock", "Stock", "PYTHON",
-         "Every output identical to Docker: video, thumbnails, faces and text. A library built here can move back to a Docker install without reprocessing."),
-        ("balanced", "Balanced", "NATIVE",
-         "Video encoded and decoded on the hardware. Thumbnails from 10-bit video differ slightly from Docker; everything else matches."),
-        ("maximum", "Maximum", "NATIVE",
-         "Hardware wherever it measured faster, which leaves the most CPU for other jobs. Audio is re-encoded, so those files differ from Docker."),
-        ("custom", "Custom", nil, "Switches set individually."),
+        ("stock", "Stock Immich", "PYTHON",
+         "Video, thumbnails, faces and text exactly as Immich's own container produces them. A library built here moves back to Docker with no reprocessing. Uses the most CPU."),
+        ("apple-silicon", "Apple Silicon", "NATIVE",
+         "VideoToolbox for video, Apple frameworks for machine learning. Much less CPU, so the Mac keeps up with everything else it is doing. Video is visually identical; 10-bit thumbnails differ byte for byte."),
+        ("custom", "Custom", nil,
+         "Switches set individually, below."),
     ]
 
     private var presetDetail: String {
