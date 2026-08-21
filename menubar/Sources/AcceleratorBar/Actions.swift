@@ -202,6 +202,40 @@ enum Actions {
     // turning the worker back on runs a full `start`, which can fail for real
     // reasons (Docker down, media not mounted, sharp needs a rebuild), and the
     // CLI already explains each one better than the UI could.
+    /// Transcode one file both ways and return the report as text. Slow by
+    /// nature (it runs five real encodes), so the caller shows a busy state.
+    static func encodeCompare(_ path: String) async -> String {
+        guard isBrewInstall else { return "Could not reach the accelerator CLI." }
+        let (_, out) = await run(cli, ["encode-compare", path])
+        // The CLI logs with a timestamp prefix, which is noise in a window
+        // that is not a log.
+        let cleaned = out.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> String in
+                let s = String(line)
+                guard let r = s.range(of: #"^\d\d:\d\d:\d\d (INFO|WARNING|ERROR)\s+"#,
+                                      options: .regularExpression) else { return s }
+                return String(s[r.upperBound...])
+            }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "No output." : cleaned
+    }
+
+    /// Flip one encoding switch through the CLI, which owns what a switch
+    /// means and which variable it writes. Deliberately not a direct
+    /// config.json write like setMLEngine: the value has to agree with what
+    /// ffmpeg-wrapper.sh reads, and there is a test pinning the CLI to the
+    /// wrapper. A second implementation here would not be covered by it.
+    static func setEncodingSwitch(_ name: String, _ on: Bool) async -> (ok: Bool, message: String) {
+        guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
+        let (code, out) = await run(cli, ["encoding", name, on ? "on" : "off"])
+        if code == 0 { return (true, "") }
+        let detail = out.split(separator: "\n")
+            .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+            .map(String.init) ?? "exit \(code)"
+        return (false, detail)
+    }
+
     static func setComponent(_ name: String, _ on: Bool) async -> (ok: Bool, message: String) {
         guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
         let (code, out) = await run(cli, ["component", name, on ? "on" : "off"])

@@ -12,6 +12,7 @@ starting again.
 
 import argparse
 import os
+import signal
 import socket
 import subprocess
 from unittest.mock import MagicMock, patch
@@ -1543,3 +1544,219 @@ class TestTwoPauseReasonsShareOneMarker:
 
         with patch.object(m.subprocess, "run", side_effect=run):
             assert m.mount_recipe_for("/Users/elp/Pictures/immich") is None
+
+
+class TestASplitInstallDoesNotReadAStrangersContainer:
+    """immich_url marks a split install, and the Immich it names is the one this
+    install answers to.
+
+    A Mac can also be running an unrelated Immich in Docker. detect_immich
+    returns the first container whose name or image looks like Immich, so
+    reading configuration out of one compared this install against a stranger:
+    it refused to start over a mismatch that did not exist, and copied that
+    stranger's database credentials and version into this config and saved them.
+    """
+
+    SPLIT = {"immich_url": "http://10.0.0.14:2283", "upload_mount": "/nas/immich"}
+    LOCAL = {"upload_mount": "/data/immich"}
+    STRANGER = {
+        "workers_include": "microservices",   # would fail the local check
+        "media_location": "/somewhere/else",  # and so would this
+        "version": "9.9.9",
+        "container": "someone-elses-immich",
+        "db_password": "THEIR-SECRET", "db_username": "them", "db_name": "theirs",
+        "db_port": 1111, "redis_port": 2222,
+    }
+
+    def test_a_split_install_never_touches_the_local_container(self, tmp_data_dir):
+        with patch.object(m, "_find_running_docker") as docker, patch.object(
+            m, "detect_immich", return_value=dict(self.STRANGER)
+        ) as detect, patch.object(
+            m, "_warn_on_path_mismatch", return_value=False
+        ), patch.object(m, "log"):
+            assert m._preflight_split(dict(self.SPLIT)) is True
+        docker.assert_not_called()
+        detect.assert_not_called()
+
+    def test_a_strangers_credentials_are_never_saved(self, tmp_data_dir):
+        """The part that made the first attempt at this worse than the bug."""
+        cfg = dict(self.SPLIT)
+        with patch.object(m, "_warn_on_path_mismatch", return_value=False), patch.object(
+            m, "save_config"
+        ) as save, patch.object(m, "log"):
+            m._preflight_split(cfg)
+        save.assert_not_called()
+        assert "db_password" not in cfg
+
+    def test_a_correctly_configured_split_install_starts(self, tmp_data_dir):
+        """The case every real split install is in, and the one my own tests
+        missed: api_key and upload_mount both set, and the probe finds nothing
+        wrong. A misplaced return here refused every one of them."""
+        with patch.object(
+            m, "_warn_on_path_mismatch", return_value=False
+        ), patch.object(m, "log"):
+            assert m._preflight_split(dict(self.SPLIT, api_key="k")) is True
+
+    def test_a_split_install_still_checks_its_path_mapping(self, tmp_data_dir):
+        """Skipping the container checks must not mean checking nothing: a
+        broken upload path 404s every thumbnail."""
+        with patch.object(
+            m, "_warn_on_path_mismatch", return_value=True
+        ) as probe, patch.object(m, "log"):
+            assert m._preflight_split(dict(self.SPLIT, api_key="k")) is False
+        probe.assert_called_once()
+
+    def test_a_local_install_still_gets_the_container_checks(self, tmp_data_dir):
+        """Where the container really is the server, both guards still apply."""
+        with patch.object(m, "_find_running_docker", return_value="/usr/bin/docker"), \
+             patch.object(m, "detect_immich", return_value=dict(self.STRANGER)), \
+             patch.object(m, "log") as log:
+            assert m._preflight_local(dict(self.LOCAL)) is False
+        said = " ".join(str(c) for c in log.error.call_args_list)
+        assert "still running microservices" in said
+
+
+class TestTheKillEscalationKnowsWhichServiceItIsKilling:
+    """stop_all_fast signals everything, waits, then SIGKILLs whatever is left.
+
+    The escalation loop iterated values() and passed a `name` left bound by the
+    loop above it, so every service was escalated as "dashboard". The ownership
+    check then compared the worker's command line against the dashboard's,
+    concluded the group was not ours, and killed the worker by pid alone,
+    leaving its ffmpeg running after the stop reported success.
+    """
+
+    def test_a_worker_that_survives_sigterm_is_escalated_as_the_worker(self):
+        seen = []
+        alive_pids = {111}
+
+        with patch.object(
+            m, "read_pid", side_effect=lambda n: {"worker": 111, "ml": 222}.get(n)
+        ), patch.object(
+            m, "_signal_service", side_effect=lambda p, s, n="": seen.append((n, s))
+        ), patch.object(
+            m.os, "kill", side_effect=lambda p, s: None if p in alive_pids else (_ for _ in ()).throw(OSError())
+        ), patch.object(m, "_kill_all_worker_processes"), patch.object(
+            m.time, "sleep"
+        ), patch.object(m, "log"):
+            m.stop_all_fast()
+
+        escalated = [n for n, sig in seen if sig == signal.SIGKILL]
+        assert "worker" in escalated, f"escalated as {escalated}"
+        assert "dashboard" not in escalated
+class TestSettingsReachableOnAHomebrewInstall:
+    """The IMMICH_ACCEL* variables are documented, and on the standard install
+    there was no supported way to set any of them: brew services generates the
+    plist, it carries no EnvironmentVariables, launchctl setenv does not reach
+    the agent, and a hand edit is undone by the next restart. The only way
+    through was wrapping the binary in a script. Reported by RxChi1d on #137.
+    """
+
+    def test_a_setting_in_config_reaches_a_spawned_service(self, tmp_data_dir):
+        cfg = {"env": {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "3"}}
+        with patch.object(m, "load_config", return_value=cfg), patch.object(
+            m.subprocess, "Popen"
+        ) as popen, patch.object(m, "write_pid"), patch.object(
+            m.time, "sleep"
+        ), patch.object(m, "log"):
+            popen.return_value = MagicMock(pid=4242, poll=MagicMock(return_value=None))
+            m.start_service("worker", ["/bin/true"], {"PATH": "/usr/bin"}, "/tmp")
+        passed = popen.call_args.kwargs["env"]
+        assert passed["IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY"] == "3"
+        assert passed["PATH"] == "/usr/bin", "the rest of the environment survives"
+
+    def test_only_our_own_variables_can_be_set_there(self, tmp_data_dir):
+        """Everything else a service needs is worked out here. A config file
+        that could override the database or the port would be a way to break an
+        install from a place nobody thinks to look."""
+        cfg = {"env": {"DB_PASSWORD": "nope", "PATH": "/evil", "IMMICH_ACCEL_X": "1"}}
+        with patch.object(m, "log"):
+            got = m.config_env(cfg)
+        assert got == {"IMMICH_ACCEL_X": "1"}
+
+    def test_no_config_at_all_is_not_an_error(self, tmp_data_dir):
+        """start_service runs before setup has written anything."""
+        with patch.object(m, "load_config", side_effect=RuntimeError("not set up")):
+            assert m.config_env() == {}
+
+    def test_the_watcher_reads_its_own_knobs_from_config(self, tmp_data_dir):
+        """These are bound at import, so a value in config could never reach
+        them however it was set."""
+        cfg = {"env": {"IMMICH_ACCEL_FD_RESTART_THRESHOLD": "500"}}
+        assert m.int_setting("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000, cfg) == 500
+
+    def test_a_value_that_is_not_a_number_falls_back(self, tmp_data_dir):
+        cfg = {"env": {"IMMICH_ACCEL_FD_RESTART_THRESHOLD": "lots"}}
+        with patch.object(m, "log"):
+            assert m.int_setting("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000, cfg) == 10000
+
+    def test_a_real_environment_variable_beats_the_config_file(self, tmp_data_dir):
+        """The file exists because the environment cannot be reached on a
+        Homebrew install, not to outrank it. Someone exporting one in a shell
+        and running this by hand means it."""
+        cfg = {"env": {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "3"}}
+        with patch.object(m, "load_config", return_value=cfg), patch.object(
+            m.subprocess, "Popen"
+        ) as popen, patch.object(m, "write_pid"), patch.object(
+            m.time, "sleep"
+        ), patch.object(m, "log"):
+            popen.return_value = MagicMock(pid=1, poll=MagicMock(return_value=None))
+            m.start_service(
+                "worker", ["/bin/true"],
+                {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "8"}, "/tmp",
+            )
+        assert popen.call_args.kwargs["env"][
+            "IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY"
+        ] == "8"
+
+    def test_the_same_holds_for_the_watcher_s_own_knobs(self, tmp_data_dir):
+        cfg = {"env": {"IMMICH_ACCEL_FD_RESTART_THRESHOLD": "500"}}
+        with patch.dict(m.os.environ, {"IMMICH_ACCEL_FD_RESTART_THRESHOLD": "900"}):
+            assert m.int_setting("IMMICH_ACCEL_FD_RESTART_THRESHOLD", 10000, cfg) == 900
+class TestEncodeCompare:
+    """Encoding the same input both ways is how the quality question gets
+    answered with numbers instead of opinions: what the hardware encoder costs
+    in quality, what it saves in time, and which setting makes its output match
+    what Immich would have produced on its own.
+    """
+
+    def test_ffprobe_is_found_next_to_ffmpeg(self, tmp_path):
+        """The shipped path is .../jellyfin-ffmpeg/ffmpeg, so replacing every
+        occurrence of the name points at a directory that does not exist."""
+        d = tmp_path / "jellyfin-ffmpeg"
+        d.mkdir()
+        (d / "ffmpeg").write_text("")
+        probe = d / "ffprobe"
+        probe.write_text("")
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(stdout="12.5\n")
+        ) as run:
+            assert m._ffprobe_duration(str(d / "ffmpeg"), "/x.mov") == 12.5
+        assert run.call_args.args[0][0] == str(probe)
+
+    def test_a_missing_ffprobe_is_not_fatal(self, tmp_path):
+        (tmp_path / "ffmpeg").write_text("")
+        assert m._ffprobe_duration(str(tmp_path / "ffmpeg"), "/x.mov") == 0.0
+
+    def test_a_failed_encode_reports_no_bytes(self, tmp_path):
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(returncode=1, stderr="boom")
+        ), patch.object(m, "log"):
+            secs, size, cpu = m._encode_once(
+                "/bin/ffmpeg", "/in.mov", str(tmp_path / "o.mp4"), []
+            )
+        assert size == 0
+
+    def test_the_mean_ssim_is_the_last_one_reported(self):
+        """ffmpeg prints a line per frame and the summary last."""
+        out = "n:1 All:0.9 \nn:2 All:0.8 \nSSIM All:0.997649 (26.3)\n"
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(stdout=out, stderr="")
+        ):
+            assert m._ssim_against("/bin/ffmpeg", "/a.mp4", "/b.mp4") == 0.997649
+
+    def test_unreadable_ssim_output_is_not_a_number(self):
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(stdout="", stderr="")
+        ):
+            assert m._ssim_against("/bin/ffmpeg", "/a.mp4", "/b.mp4") is None

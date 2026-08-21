@@ -21,6 +21,7 @@ import pytest
 
 from unittest.mock import patch, MagicMock
 
+import immich_accelerator.__main__ as m
 from immich_accelerator.__main__ import (
     SUPPORTED_NODE_MAJORS,
     _COMPOSE_TEMPLATE,
@@ -1595,16 +1596,18 @@ const fake = () => {
             [node, "--require", str(self.SHIM), str(driver)],
             cwd=str(tmp_path),
             env={"PATH": "/usr/bin:/bin"},
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         assert r.returncode == 0, r.stderr
         line = next(l for l in r.stdout.splitlines() if l.startswith("PER:"))
-        applied = json.loads(line[len("PER:"):])
+        applied = json.loads(line[len("PER:") :])
         assert applied, "the proxy never built a Sharp instance"
         for chain in applied:
-            assert chain.count("rotate") <= 1, (
-                f"chain applied more than once to one instance: {applied}"
-            )
+            assert (
+                chain.count("rotate") <= 1
+            ), f"chain applied more than once to one instance: {applied}"
 
     def test_routes_heic_to_vips_and_passes_others_through(self, tmp_path):
         """HEIC path is decoded to a Buffer via the primary (vips) decoder; a
@@ -1858,7 +1861,11 @@ const fake = () => {
             ".then(()=>process.stdout.write('DONE\\n'))"
             ".catch(e=>{console.error(e);process.exit(1);});\n"
         )
-        env = {"PATH": "/usr/bin:/bin", "IMMICH_ACCELERATOR_VIPS": str(vips), **env_extra}
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "IMMICH_ACCELERATOR_VIPS": str(vips),
+            **env_extra,
+        }
         return subprocess.run(
             [node, "--require", str(self.SHIM), str(driver), str(heic1), str(heic2)],
             cwd=str(tmp_path),
@@ -1918,6 +1925,198 @@ const fake = () => {
         ), "raising concurrency to 2 should let two decodes run at once"
 
 
+class TestHardwareEncodingCanBeTurnedOff:
+    """Hardware encoding is a choice, not a law.
+
+    On an idle Mac the software encoder often finishes one file sooner, because
+    Immich asks for preset ultrafast; what the hardware buys is the machine,
+    roughly one core against every core software can reach. Which of those a
+    person wants depends on their Mac and what else it is doing, so there has to
+    be a way to say. Asked for in #155.
+    """
+
+    WRAPPER = REPO_ROOT / "immich_accelerator" / "ffmpeg-wrapper.sh"
+
+    def _run(self, tmp_path, args, env=None):
+        import os
+
+        echo = tmp_path / "ffmpeg"
+        echo.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\n')
+        echo.chmod(0o755)
+        w = tmp_path / "w.sh"
+        w.write_text(
+            self.WRAPPER.read_text().replace(
+                'REAL_FFMPEG="/opt/homebrew/bin/ffmpeg"', f'REAL_FFMPEG="{echo}"'
+            )
+        )
+        w.chmod(0o755)
+        r = subprocess.run(
+            ["/bin/bash", str(w), *args],
+            capture_output=True,
+            text=True,
+            env={**os.environ, **(env or {})},
+        )
+        return r.stdout.split("\n")
+
+    def test_hardware_is_the_default(self, tmp_path):
+        out = self._run(tmp_path, ["-i", "in.mov", "-c:v", "h264", "out.mp4"])
+        assert "h264_videotoolbox" in out
+
+    def test_it_can_be_turned_off(self, tmp_path):
+        out = self._run(
+            tmp_path,
+            ["-i", "in.mov", "-c:v", "h264", "out.mp4"],
+            env={"IMMICH_ACCEL_HW_VIDEO": "0"},
+        )
+        assert "h264" in out and "h264_videotoolbox" not in out
+
+    def test_hevc_too(self, tmp_path):
+        out = self._run(
+            tmp_path,
+            ["-i", "in.mov", "-c:v", "hevc", "out.mp4"],
+            env={"IMMICH_ACCEL_HW_VIDEO": "0"},
+        )
+        assert "hevc" in out and "hevc_videotoolbox" not in out
+
+    def test_the_words_people_actually_type_all_work(self, tmp_path):
+        for value in ("0", "false", "no"):
+            out = self._run(
+                tmp_path,
+                ["-i", "in.mov", "-c:v", "h264", "out.mp4"],
+                env={"IMMICH_ACCEL_HW_VIDEO": value},
+            )
+            assert "h264_videotoolbox" not in out, f"{value!r} should turn it off"
+
+    def test_anything_else_leaves_it_on(self, tmp_path):
+        """An unset or unrecognised value must not silently disable the
+        hardware path on every install."""
+        for value in ("1", "true", "yes", ""):
+            out = self._run(
+                tmp_path,
+                ["-i", "in.mov", "-c:v", "h264", "out.mp4"],
+                env={"IMMICH_ACCEL_HW_VIDEO": value},
+            )
+            assert "h264_videotoolbox" in out, f"{value!r} should leave it on"
+
+
+class TestEncodingSwitches:
+    """The `encoding` command, which is what the Settings switch calls.
+
+    The app shells out to this rather than writing config.json itself, so there
+    is one implementation of what a switch means and one place to test it.
+    """
+
+    def _args(self, switch=None, state=None):
+        import argparse
+
+        return argparse.Namespace(switch=switch, state=state)
+
+    def test_switches_default_to_on(self, tmp_data_dir):
+        m.save_config({})
+        assert m.encoding_switch_on("hardware-video") is True
+
+    def test_turning_one_off_persists_to_config(self, tmp_data_dir):
+        m.save_config({})
+        m.cmd_encoding(self._args("hardware-video", "off"))
+        assert m.load_config()["env"]["IMMICH_ACCEL_HW_VIDEO"] == "0"
+        assert m.encoding_switch_on("hardware-video") is False
+
+    def test_turning_it_back_on_persists_too(self, tmp_data_dir):
+        """An off switch must be re-settable. Deleting the key would also read
+        as on, but leaves no record that anyone chose it."""
+        m.save_config({"env": {"IMMICH_ACCEL_HW_VIDEO": "0"}})
+        m.cmd_encoding(self._args("hardware-video", "on"))
+        assert m.encoding_switch_on("hardware-video") is True
+
+    def test_it_keeps_the_rest_of_the_config(self, tmp_data_dir):
+        """Writing a switch must not drop settings, which is how a config
+        rewrite quietly destroys an install."""
+        m.save_config({"immich_url": "http://10.0.0.9:2283", "api_key": "abc"})
+        m.cmd_encoding(self._args("hardware-video", "off"))
+        after = m.load_config()
+        assert after["immich_url"] == "http://10.0.0.9:2283"
+        assert after["api_key"] == "abc"
+
+    def test_it_keeps_other_env_entries(self, tmp_data_dir):
+        m.save_config({"env": {"IMMICH_ACCEL_CONCURRENCY": "3"}})
+        m.cmd_encoding(self._args("hardware-video", "off"))
+        env = m.load_config()["env"]
+        assert env["IMMICH_ACCEL_CONCURRENCY"] == "3"
+        assert env["IMMICH_ACCEL_HW_VIDEO"] == "0"
+
+    def test_a_real_environment_variable_still_wins(self, tmp_data_dir, monkeypatch):
+        """Someone who exported one is debugging, and a file must not overrule
+        them. Same precedence as int_setting."""
+        m.save_config({"env": {"IMMICH_ACCEL_HW_VIDEO": "0"}})
+        monkeypatch.setenv("IMMICH_ACCEL_HW_VIDEO", "1")
+        assert m.encoding_switch_on("hardware-video") is True
+
+    def test_listing_does_not_write_anything(self, tmp_data_dir):
+        m.save_config({"immich_url": "http://x"})
+        before = m.load_config()
+        m.cmd_encoding(self._args())
+        assert m.load_config() == before
+
+    def test_the_decode_switch_persists_too(self, tmp_data_dir):
+        m.save_config({})
+        m.cmd_encoding(self._args("hardware-decode", "off"))
+        assert m.load_config()["env"]["IMMICH_ACCEL_HW_DECODE"] == "0"
+        assert m.encoding_switch_on("hardware-decode") is False
+
+    def test_the_two_switches_are_independent(self, tmp_data_dir):
+        """Turning decode off must not disturb encoding, and the reverse. They
+        gate different halves of the wrapper."""
+        m.save_config({})
+        m.cmd_encoding(self._args("hardware-decode", "off"))
+        assert m.encoding_switch_on("hardware-video") is True
+        m.cmd_encoding(self._args("hardware-video", "off"))
+        assert m.encoding_switch_on("hardware-decode") is False
+        m.cmd_encoding(self._args("hardware-decode", "on"))
+        assert m.encoding_switch_on("hardware-video") is False
+
+    # The one that actually protects the feature. cmd_encoding writes values
+    # that ffmpeg-wrapper.sh reads, and the two decide "off" in different
+    # languages: Python's bool_setting and the wrapper's _off(). If they ever
+    # disagree, a switch reports off in the UI while the wrapper carries on
+    # using the hardware, which is invisible until someone compares output.
+    #
+    # Every switch is checked, so adding one to ENCODING_SWITCHES without a
+    # wrapper probe here fails rather than going quietly uncovered.
+    PROBES = {
+        # variable -> (args to run, marker that means "hardware is in use")
+        "IMMICH_ACCEL_HW_VIDEO": (
+            ["-i", "in.mov", "-c:v", "h264", "out.mp4"],
+            "h264_videotoolbox",
+        ),
+        "IMMICH_ACCEL_HW_DECODE": (
+            ["-i", "in.mov", "-frames:v", "1", "out.jpg"],
+            "-hwaccel",
+        ),
+    }
+
+    def test_every_switch_means_the_same_thing_to_the_cli_and_the_wrapper(
+        self, tmp_path
+    ):
+        wrapper = TestHardwareEncodingCanBeTurnedOff()
+        for _, (variable, _description) in m.ENCODING_SWITCHES.items():
+            assert variable in self.PROBES, (
+                f"{variable} has no wrapper probe, so nothing checks that the "
+                f"switch and the wrapper agree"
+            )
+            args, marker = self.PROBES[variable]
+            for value in ("0", "false", "no", "1", "true", "yes", "", "off", "banana"):
+                python_says_on = m.bool_setting(
+                    variable, True, {"env": {variable: value}}
+                )
+                out = wrapper._run(tmp_path, args, env={variable: value})
+                wrapper_says_on = marker in out
+                assert python_says_on == wrapper_says_on, (
+                    f"{variable}={value!r}: the CLI says "
+                    f"{'on' if python_says_on else 'off'} but the wrapper says "
+                    f"{'on' if wrapper_says_on else 'off'}"
+                )
+
+
 class TestFfmpegWrapperQuickLookFallback:
     """ffmpeg's own HEVC decoder can hard-reject a stream (e.g. real HDR10/
     BT.2020 phone footage) that macOS's native AVFoundation decodes fine.
@@ -1934,11 +2133,21 @@ class TestFfmpegWrapperQuickLookFallback:
     # target pixel size, and the output path is always the last argument.
     def _thumbnail_args(self, input_path, output_path, scale="-2:250"):
         return [
-            "-skip_frame", "nointra",
-            "-i", str(input_path),
-            "-fps_mode", "vfr", "-frames:v", "1", "-update", "1",
-            "-vf", f"scale={scale}",
-            "-f", "image2", str(output_path),
+            "-skip_frame",
+            "nointra",
+            "-i",
+            str(input_path),
+            "-fps_mode",
+            "vfr",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-vf",
+            f"scale={scale}",
+            "-f",
+            "image2",
+            str(output_path),
         ]
 
     def _bash_stub(self, path_, body):
@@ -2009,16 +2218,25 @@ class TestFfmpegWrapperQuickLookFallback:
         output = tmp_path / "out.mp4"
 
         result = subprocess.run(
-            ["/bin/bash", str(wrapper), "-i", str(tmp_path / "in.mp4"),
-             "-c:v", "libx264", "-c:a", "aac", str(output)],
+            [
+                "/bin/bash",
+                str(wrapper),
+                "-i",
+                str(tmp_path / "in.mp4"),
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                str(output),
+            ],
             env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
             capture_output=True,
             text=True,
             timeout=10,
         )
-        assert result.returncode == 69, (
-            f"real ffmpeg exit code must propagate; got {result.returncode}"
-        )
+        assert (
+            result.returncode == 69
+        ), f"real ffmpeg exit code must propagate; got {result.returncode}"
         assert not ql_marker.exists(), "fallback must not run for a full transcode"
         assert not output.exists()
 
@@ -2066,7 +2284,9 @@ class TestFfmpegWrapperQuickLookFallback:
         and nobody ever found out. Only a decoder rejection qualifies now.
         """
         ffmpeg = tmp_path / "ffmpeg"
-        self._bash_stub(ffmpeg, "echo 'in.mp4: No such file or directory' >&2\nexit 1\n")
+        self._bash_stub(
+            ffmpeg, "echo 'in.mp4: No such file or directory' >&2\nexit 1\n"
+        )
         qlmanage = tmp_path / "qlmanage"
         self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
         vips = tmp_path / "vips_stub.sh"
@@ -2077,9 +2297,13 @@ class TestFfmpegWrapperQuickLookFallback:
 
         result = subprocess.run(
             ["/bin/bash", str(wrapper), *args],
-            env={"PATH": f"{tmp_path}:/usr/bin:/bin",
-                 "IMMICH_ACCELERATOR_VIPS": str(vips)},
-            capture_output=True, text=True, timeout=10,
+            env={
+                "PATH": f"{tmp_path}:/usr/bin:/bin",
+                "IMMICH_ACCELERATOR_VIPS": str(vips),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         assert result.returncode == 1, "ffmpeg's real failure must propagate"
         assert not output.exists(), "no thumbnail should be invented for a broken file"
@@ -2139,8 +2363,17 @@ class TestFfmpegWrapperQuickLookFallback:
         wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
 
         result = subprocess.run(
-            ["/bin/bash", str(wrapper), "-i", str(tmp_path / "in.mov"),
-             "-c:v", "libx264", "-preset", "fast", str(tmp_path / "out.mp4")],
+            [
+                "/bin/bash",
+                str(wrapper),
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                str(tmp_path / "out.mp4"),
+            ],
             env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
             capture_output=True,
             text=True,
@@ -2151,7 +2384,184 @@ class TestFfmpegWrapperQuickLookFallback:
         assert "-hwaccel" in received and "videotoolbox" in received
         assert "h264_videotoolbox" in received
         assert "libx264" not in received
-        assert "-preset" not in received, "software presets must be stripped for VideoToolbox"
+        assert (
+            "-preset" not in received
+        ), "software presets must be stripped for VideoToolbox"
+
+    def test_thumbnail_job_gets_hardware_decode(self, tmp_path):
+        """Immich's thumbnail and preview jobs send no -c:v at all, so there is
+        no encoder to remap. Hardware decode still has to be injected."""
+        ffmpeg = tmp_path / "ffmpeg"
+        seen_args = tmp_path / "seen_args"
+        self._bash_stub(ffmpeg, f'printf "%s\\n" "$@" > {seen_args}\nexit 0\n')
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        args = self._thumbnail_args(tmp_path / "in.mov", tmp_path / "out.jpg")
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        received = seen_args.read_text().splitlines()
+        assert received[:2] == [
+            "-hwaccel",
+            "videotoolbox",
+        ], f"-hwaccel must be injected as an input option, before -i; got {received}"
+        # Nothing else may change: no encoder was requested, so none is invented.
+        assert not any(a.endswith("_videotoolbox") for a in received[2:])
+        assert (
+            received[2:] == args
+        ), "the remaining arguments must pass through verbatim"
+
+    def _capture_ffmpeg_args(self, tmp_path, args):
+        """Run the wrapper against a stub ffmpeg that records its argv."""
+        ffmpeg = tmp_path / "ffmpeg"
+        seen_args = tmp_path / "seen_args"
+        self._bash_stub(ffmpeg, f'printf "%s\\n" "$@" > {seen_args}\nexit 0\n')
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        return seen_args.read_text().splitlines()
+
+    def _quality_value(self, received):
+        assert received.count("-q:v") == 1, received
+        return received[received.index("-q:v") + 1]
+
+    # Immich's quality setting is a CRF number, 0-51, lower is better. The
+    # VideoToolbox encoders ignore -crf outright and read -q:v on a 0-100
+    # scale where higher is better, so the wrapper translates the number.
+    # CRF 23 (Immich's default) maps to 59; the median matched quality
+    # measured across six clips and five metrics at CRF 23 was 58.9.
+    def test_crf_is_translated_for_videotoolbox(self, tmp_path):
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "h264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "23",
+                str(tmp_path / "out.mp4"),
+            ],
+        )
+        assert "-crf" not in received, "-crf means nothing to h264_videotoolbox"
+        assert self._quality_value(received) == "59"
+
+        # A leading zero must not be read as octal.
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "h264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "08",
+                str(tmp_path / "out.mp4"),
+            ],
+        )
+        assert self._quality_value(received) == "88"
+
+    def test_incoming_quality_flag_is_rewritten_to_the_encoder_scale(self, tmp_path):
+        """With CQ mode set to CQP, Immich sends `-q:v N` carrying the same
+        CRF-scale number. Passed through untouched it inverts the setting:
+        CRF 23 would execute as quality 23 out of 100."""
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "h264",
+                "-q:v",
+                "23",
+                str(tmp_path / "out.mp4"),
+            ],
+        )
+        assert self._quality_value(received) == "59"
+
+        # The stream-specific spelling carries the same number.
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "h264",
+                "-q:v:0",
+                "23",
+                str(tmp_path / "out.mp4"),
+            ],
+        )
+        assert self._quality_value(received) == "59"
+
+    def test_translated_quality_stays_inside_the_encoder_scale(self, tmp_path):
+        """VideoToolbox rejects a quality outside 0-100. Values outside the
+        0-51 range Immich's UI offers clamp to the ends of the scale."""
+        best = self._capture_ffmpeg_args(
+            tmp_path,
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "hevc",
+                "-crf",
+                "0",
+                str(tmp_path / "out.mp4"),
+            ],
+        )
+        assert self._quality_value(best) == "100"
+        worst = self._capture_ffmpeg_args(
+            tmp_path,
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "hevc",
+                "-crf",
+                "63",
+                str(tmp_path / "out.mp4"),
+            ],
+        )
+        assert self._quality_value(worst) == "1"
+
+    def test_software_encode_keeps_its_own_crf(self, tmp_path):
+        """The translation is only correct for VideoToolbox. An encoder the
+        wrapper doesn't remap keeps the arguments Immich sent."""
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "libvpx-vp9",
+                "-crf",
+                "23",
+                str(tmp_path / "out.webm"),
+            ],
+        )
+        # No assertion about -hwaccel. This test arrived (#154) when hardware
+        # decode was still tied to the encoder remap, so "not remapped" and
+        # "no -hwaccel" were the same statement. #153 separated them: decode
+        # is now requested for every input, including the ones encoded in
+        # software, which is the entire point of it. Whether -hwaccel is
+        # present is covered by the decode switch's own tests.
+        assert "-q:v" not in received
+        assert received[received.index("-crf") + 1] == "23"
 
     def test_thumbnail_job_gets_hardware_decode(self, tmp_path):
         """Immich's thumbnail and preview jobs send no -c:v at all, so there is
@@ -2493,7 +2903,9 @@ class TestJobRetryShim:
         # what makes that affordable, not a limit on attempts.
         assert f"ATTEMPTS:{2**53 - 1}" in out, out
         assert "BACKOFF_TYPE:immich-accel" in out, out
-        assert "EXPLICIT_ATTEMPTS:5" in out, out  # never override a real explicit choice
+        assert (
+            "EXPLICIT_ATTEMPTS:5" in out
+        ), out  # never override a real explicit choice
         assert f"BULK_A_ATTEMPTS:{2**53 - 1}" in out, out
         assert "BULK_B_ATTEMPTS:7" in out, out
 
@@ -2601,11 +3013,19 @@ class TestJobRetryShim:
         env = {"IMMICH_ACCEL_JOB_RETRY_BACKOFF_MS": "1000", "PATH": "/usr/bin:/bin"}
         run1 = subprocess.run(
             [node, "--require", str(self.SHIM_PATH), str(caller)],
-            cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=15,
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         run2 = subprocess.run(
             [node, "--require", str(self.SHIM_PATH), str(caller)],
-            cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=15,
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         assert run1.returncode == 0, run1.stderr
         assert run2.returncode == 0, run2.stderr

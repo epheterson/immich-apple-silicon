@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.14.0 - 2026-08-20
+
+### Added
+- **Encoding pane in Settings.** Hardware video encoding and hardware decoding, both on by default. The switches call `immich-accelerator encoding <switch> on|off`. Asked for by [@RxChi1d](https://github.com/RxChi1d) ([#155](https://github.com/epheterson/immich-apple-silicon/issues/155)).
+- **Hardware decoding for thumbnails and previews.** Immich sends no `-c:v` for thumbnail jobs, so decode was tied to an encoder remap that never happened. About 25% less CPU and 31% less wall clock. 10-bit sources give `p010le` instead of `yuv420p10le` (55.3 dB PSNR); 8-bit output is byte-identical. By [@RxChi1d](https://github.com/RxChi1d) ([#153](https://github.com/epheterson/immich-apple-silicon/pull/153)).
+- **Immich's CRF setting is translated to `-q:v`** for the VideoToolbox encoders, which ignore `-crf`. With CQ mode set to CQP it previously did the opposite of what it said. By [@RxChi1d](https://github.com/RxChi1d) ([#154](https://github.com/epheterson/immich-apple-silicon/pull/154)).
+- **`immich-accelerator encode-compare <video>`** transcodes one file both ways and reports size, wall time, cpu time and SSIM, then names the VideoToolbox quality closest to the software result.
+- **`IMMICH_ACCEL*` settings can be set in an `env` block in `config.json`.** On a Homebrew install there was no supported way to set them: the launch agent carries no environment, `launchctl setenv` does not reach it, and plist edits are undone on restart. A real environment variable still wins. Reported by [@RxChi1d](https://github.com/RxChi1d).
+
+### Fixed
+- **A wedged machine learning service held the port and never came back.** It had its own session, which excluded it from launchd's cleanup sweep, so any exit skipping the watcher's handler left it running. Reported, diagnosed and fixed by [@RxChi1d](https://github.com/RxChi1d) ([#157](https://github.com/epheterson/immich-apple-silicon/pull/157)).
+- **A worker that ignored the first stop signal left its ffmpeg running,** still writing into the library. The escalation labelled every service as the dashboard, so the process-group ownership check refused. Introduced in 1.13.0.
+- **A split install read its configuration out of an unrelated Docker container,** refused to start over a version mismatch that did not exist, and copied that container's database credentials into its own config. `immich_url` now decides. Reported by [@RxChi1d](https://github.com/RxChi1d) ([#139](https://github.com/epheterson/immich-apple-silicon/issues/139)).
+
+### Changed
+- **Encoder documentation corrected.** Immich asks for `preset ultrafast`, so software often finishes one file sooner. Measured on an M4 over 20 seconds of 1080p footage: software 12.5s cpu across about eight cores, hardware 5s across about two, SSIM 0.980 hardware against 0.961 software in half the size. The earlier figures came from a synthetic test pattern and were wrong.
+
 ## 1.13.0 - 2026-08-19
 
 ### Fixed

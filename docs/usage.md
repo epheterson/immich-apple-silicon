@@ -156,6 +156,39 @@ The cap is close to free, because the parallelism saturates early. On an M4 with
 
 ## Configuration details
 
+<<<<<<< HEAD
+### Setting `IMMICH_ACCEL*` variables
+
+Put them in the `env` block of `~/.immich-accelerator/config.json`:
+
+```json
+{
+  "env": {
+    "IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "2",
+    "IMMICH_ACCEL_ML_THREADS": "4"
+  }
+}
+```
+
+They are passed to the worker and the ML service, and the accelerator reads its own from there too. Restart with `brew services restart immich-accelerator` to apply.
+
+A real environment variable still wins, so running the accelerator by hand with one exported does what you would expect. The config block exists because the environment cannot be reached on a Homebrew install, not to outrank it.
+
+Setting them in the shell environment does not work on a Homebrew install, which is why this exists: `brew services` generates the launch agent, it carries no environment, `launchctl setenv` does not reach it, and editing the plist is undone the next time the service restarts.
+
+Only `IMMICH_ACCEL*` names are accepted. Everything else a service needs is worked out at startup, and anything else in that block is ignored with a warning.
+=======
+### Hardware video encoding
+
+On by default. Set `IMMICH_ACCEL_HW_VIDEO=0` to keep Immich's own software encoder instead.
+
+Worth knowing what the switch trades, because "hardware" does not simply mean "faster". Immich asks ffmpeg for `preset ultrafast`, which is genuinely quick, so on an idle Mac the software encoder often finishes a single file sooner. What VideoToolbox buys is the rest of the machine. Measured on an M4 over 20 seconds of 1080p camera footage: software finished in 1.5 seconds but spent 12.5 seconds of CPU across about eight cores, while VideoToolbox took 2.8 seconds of wall clock and 5 seconds of CPU across about two. On a Mac also running Immich's other jobs and the machine learning engine, that is usually the trade you want.
+
+Quality is not the thing you give up, and on real footage it often goes the other way. `preset ultrafast` disables most of what x264 is good at, which shows up badly on grainy or high-motion video: on that same footage the software encode scored SSIM 0.961 against the original while the hardware encode scored 0.980 in half the file size. On synthetic test patterns the ranking reverses, which is exactly why the numbers below come from a command you run on your own files rather than from a table here.
+
+`immich-accelerator encode-compare <video>` runs both on a file of yours and prints the numbers, including which hardware quality setting lands closest to what Immich would have produced on its own.
+>>>>>>> feat/encoder-toggles
+
 ### Understanding `IMMICH_MEDIA_LOCATION`
 
 This is the directory Immich uses as its media root. It contains these subdirectories: `upload/`, `thumbs/`, `encoded-video/`, `library/`, `profile/`, `backups/`. Both Docker and the native worker must see this directory at the same absolute path. Setup handles this automatically for same-machine installs.

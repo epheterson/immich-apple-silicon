@@ -21,6 +21,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import sys
 import time
 import uuid
@@ -693,9 +694,7 @@ def _docker_capture(argv: list[str], timeout: int) -> subprocess.CompletedProces
 
 def detect_immich(docker: str) -> dict:
     """Detect running Immich instance from Docker."""
-    result = _docker_capture(
-        [docker, "ps", "--format", "{{.Names}}\t{{.Image}}"], 10
-    )
+    result = _docker_capture([docker, "ps", "--format", "{{.Names}}\t{{.Image}}"], 10)
     if result.returncode != 0:
         raise RuntimeError(
             f"Docker not running or not accessible: {result.stderr.strip()}"
@@ -1889,7 +1888,9 @@ def _group_leader_is_ours(pgid: int, name: str) -> bool:
     try:
         cmd = subprocess.run(
             ["/bin/ps", "-p", str(pgid), "-o", "command="],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return False
@@ -1913,7 +1914,7 @@ def _signal_service(pid: int, sig: int, name: str = "") -> None:
 
     An ML service started by the watcher is the exception: it shares the
     watcher's process group on purpose, so both tests below fail for it and it
-    is signalled by pid. That is what we want — it has no children to sweep,
+    is signalled by pid. That is what we want: it has no children to sweep,
     and its group is the watcher's own.
 
     A pid can also be one we adopted rather than spawned — read_pid falls back
@@ -2268,9 +2269,15 @@ def _resolve_offthread(path: str, timeout: int = 5) -> str | None:
     """
     try:
         r = subprocess.run(
-            [sys.executable, "-c",
-             "import sys,pathlib;print(pathlib.Path(sys.argv[1]).resolve())", path],
-            capture_output=True, text=True, timeout=timeout,
+            [
+                sys.executable,
+                "-c",
+                "import sys,pathlib;print(pathlib.Path(sys.argv[1]).resolve())",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -2491,7 +2498,9 @@ def backends_down(config: dict) -> list[str]:
         if not host:
             continue
         try:
-            with socket.create_connection((host, int(config.get(port_key, default))), timeout=2):
+            with socket.create_connection(
+                (host, int(config.get(port_key, default))), timeout=2
+            ):
                 pass
         except (OSError, ValueError):
             down.append(label)
@@ -2619,6 +2628,48 @@ def ensure_media_ready(config: dict) -> bool:
     return False
 
 
+# Only our own variables can be set this way. Everything else a service needs
+# is worked out here (ports, database settings, the model directory), and a
+# config file that could quietly override those would be a way to break an
+# install from a place nobody thinks to look.
+_CONFIG_ENV_PREFIX = "IMMICH_ACCEL"
+
+
+def config_env(config: dict | None = None) -> dict:
+    """The IMMICH_ACCEL* variables set in config.json.
+
+    They are documented, and until now there was no supported way to set them on
+    the standard Homebrew install: brew services generates the plist, it carries
+    no EnvironmentVariables, launchctl setenv does not reach the agent, and any
+    hand edit is undone the next time the service restarts. The only way through
+    was to wrap the binary in a script. config.json survives upgrades and
+    restarts and is already where settings live. Reported by RxChi1d.
+    """
+    if config is None:
+        # start_service runs before setup has written anything, and on a machine
+        # with no config at all. No config simply means nothing set here.
+        try:
+            config = load_config()
+        except (RuntimeError, OSError, ValueError):
+            return {}
+    raw = config.get("env")
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key, value in raw.items():
+        name = str(key)
+        if name.startswith(_CONFIG_ENV_PREFIX):
+            out[name] = str(value)
+        else:
+            log.warning(
+                'Ignoring %s in the config "env" block: only %s* variables can '
+                "be set there.",
+                name,
+                _CONFIG_ENV_PREFIX,
+            )
+    return out
+
+
 # True only inside `immich-accelerator watch`. The watcher supervises the ML
 # service it starts, so ML stays in the watcher's process group and ends with
 # it. Every other entry point starts ML to outlive the command that asked for
@@ -2639,9 +2690,18 @@ def start_service(
 
     Pass own_session=False only for a service whose lifetime belongs to its
     supervisor. It then shares the supervisor's process group, which is what
-    lets launchd's job cleanup — and a terminal hangup, for a watcher run by
-    hand — reach the service as well as the supervisor.
+    lets launchd's job cleanup, and a terminal hangup for a watcher run by
+    hand, reach the service as well as the supervisor.
     """
+    # Applied here rather than at each caller, so every service gets them and a
+    # service added later does not have to remember.
+    #
+    # config first, so a real environment variable still wins. The file exists
+    # because the environment cannot be reached on a Homebrew install, not to
+    # outrank it: someone who exports one in a shell and runs the accelerator by
+    # hand means it, and having a file quietly beat them is the opposite of what
+    # everything else on a Unix box does.
+    env = {**config_env(), **env}
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"{name}.log"
     cap_log(log_file)  # don't inherit a giant log across a (re)start
@@ -4571,8 +4631,13 @@ def _start_ml_preferred(config: dict):
         if state != PORT_FREE:
             log.warning(
                 "Not starting the %s ML engine: port %d is %s.",
-                label, port, "already in use" if state == PORT_OCCUPIED
-                else "in an unknown state (could not inspect it)",
+                label,
+                port,
+                (
+                    "already in use"
+                    if state == PORT_OCCUPIED
+                    else "in an unknown state (could not inspect it)"
+                ),
             )
             return None, None, False
         log.info("Starting ML service (%s)...", label)
@@ -4695,7 +4760,9 @@ def _our_ml_process(port: int) -> int | None:
     try:
         out = subprocess.run(
             ["/bin/ps", "-axo", "pid=,command="],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -4726,7 +4793,9 @@ def _venv_ml_port(pid: int) -> int | None:
     try:
         env = subprocess.run(
             ["/bin/ps", "-p", str(pid), "-Eww", "-o", "command="],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -4796,7 +4865,11 @@ def ml_port_state(port: int) -> str:
         # connect said nothing is listening. lsof was only going to confirm it.
         return PORT_FREE
     out = result.stdout.strip()
-    if result.returncode == 0 and out.splitlines() and out.splitlines()[0].strip().isdigit():
+    if (
+        result.returncode == 0
+        and out.splitlines()
+        and out.splitlines()[0].strip().isdigit()
+    ):
         return PORT_OCCUPIED
     # Exit 1 is also how lsof reports its own errors, so an empty stdout alone
     # does not mean "nothing matched". -t selects -w (lsof(8)), which suppresses
@@ -5267,6 +5340,94 @@ def _require_worker_config(config: dict) -> None:
         )
 
 
+def _preflight_local(config: dict) -> bool:
+    """Check this install against the Immich container on this Mac.
+
+    Only for a local install, where that container really is the server.
+    Returns False to refuse the start.
+    """
+    try:
+        docker = _find_running_docker()
+        immich = detect_immich(docker)
+        if immich["workers_include"] != "api":
+            log.error(
+                "Docker is still running microservices. Two workers will conflict."
+            )
+            log.error("Set IMMICH_WORKERS_INCLUDE=api in docker-compose.yml first.")
+            log.error("Run 'python -m immich_accelerator setup' for full instructions.")
+            return False
+        if (
+            config.get("upload_mount")
+            and immich["media_location"] != config["upload_mount"]
+        ):
+            log.error(
+                "IMMICH_MEDIA_LOCATION mismatch — Docker has '%s', we expect '%s'.",
+                immich["media_location"] or "(not set)",
+                config["upload_mount"],
+            )
+            log.error(
+                "This WILL corrupt file paths in the database. Fix docker-compose.yml first."
+            )
+            return False
+
+        # Auto-update: if Docker image version changed, re-extract
+        running_version = immich["version"].lstrip("v")
+        cached_version = config.get("version", "").lstrip("v")
+        if is_valid_version(immich["version"]) and running_version != cached_version:
+            log.info(
+                "Immich updated: %s -> %s. Re-extracting server...",
+                cached_version,
+                running_version,
+            )
+            server_dir = extract_immich_server(
+                docker, immich["container"], immich["version"]
+            )
+            config["version"] = immich["version"]
+            config["server_dir"] = str(server_dir)
+            # Refresh connection info in case it changed
+            config["db_password"] = immich["db_password"]
+            config["db_port"] = immich["db_port"]
+            config["redis_port"] = immich["redis_port"]
+            save_config(config)
+    except RuntimeError as e:
+        log.error("Could not read the local Immich container: %s", e)
+        log.error("Start the Immich Docker stack, then try again.")
+        return False
+    return True
+
+
+def _preflight_split(config: dict) -> bool:
+    """Check a split install against the Immich it is configured to use.
+
+    immich_url is what marks an install as split: setup --url is the only thing
+    that writes it. A container on this Mac is not necessarily that server, so
+    nothing here reads configuration out of one. Reading it compared this
+    install against a stranger, refused the start over a mismatch that did not
+    exist, and copied that stranger's database credentials into this config.
+    Local Docker stays useful as a place to fetch server files from, and the
+    version comes from the configured Immich's own API.
+
+    The path mapping still has to be right, and the API can answer that. Returns
+    False to refuse.
+    """
+    log.info(
+        "Split install: validating path mapping against %s", config.get("immich_url")
+    )
+    api_key = config.get("api_key", "")
+    upload_mount = config.get("upload_mount", "")
+    if api_key and upload_mount:
+        if _warn_on_path_mismatch(config.get("immich_url", ""), api_key, upload_mount):
+            log.error("Refusing to start with a broken path mapping. Fix and retry.")
+            return False
+    else:
+        log.warning(
+            "Cannot check the path mapping: this split install has no api_key "
+            "or no upload_mount set. Starting anyway; if thumbnails 404, that "
+            "is the first thing to look at."
+        )
+    return True
+
+
 def cmd_start(args):
     """Bring up the components this install has enabled.
 
@@ -5292,84 +5453,14 @@ def _cmd_start(args):
     # Kill any stale processes before starting
     _kill_stale_processes()
 
-    # Pre-flight: verify Docker config and auto-update if version changed
-    immich = {}
-    try:
-        docker = _find_running_docker()
-        immich = detect_immich(docker)
-        if immich["workers_include"] != "api":
-            log.error(
-                "Docker is still running microservices. Two workers will conflict."
-            )
-            log.error("Set IMMICH_WORKERS_INCLUDE=api in docker-compose.yml first.")
-            log.error("Run 'python -m immich_accelerator setup' for full instructions.")
+    # immich_url marks a split install: the Immich it names is authoritative,
+    # and a container on this Mac is a different server that must not describe
+    # this one. See docs/deployment.md.
+    if config.get("immich_url"):
+        if not _preflight_split(config):
             return
-        if (
-            config.get("upload_mount")
-            and immich["media_location"] != config["upload_mount"]
-        ):
-            log.error(
-                "IMMICH_MEDIA_LOCATION mismatch — Docker has '%s', we expect '%s'.",
-                immich["media_location"] or "(not set)",
-                config["upload_mount"],
-            )
-            log.error(
-                "This WILL corrupt file paths in the database. Fix docker-compose.yml first."
-            )
-            return
-
-        # Auto-update: if Docker image version changed, re-extract
-        running_version = immich["version"].lstrip("v")
-        cached_version = config.get("version", "").lstrip("v")
-        if is_valid_version(immich["version"]) and running_version != cached_version:
-            log.info(
-                "Immich updated: %s -> %s. Re-extracting server...",
-                cached_version,
-                running_version,
-            )
-            server_dir = extract_immich_server(
-                docker, immich["container"], immich["version"]
-            )
-            config["version"] = immich["version"]
-            config["server_dir"] = str(server_dir)
-            # Refresh connection info in case it changed
-            config["db_password"] = immich["db_password"]
-            config["db_port"] = immich["db_port"]
-            config["redis_port"] = immich["redis_port"]
-            save_config(config)
-    except RuntimeError as e:
-        # Only a split setup has somewhere else to look. setup --url is the
-        # only thing that writes immich_url, so its absence means Immich is
-        # meant to be in local Docker — and we just failed to read it. There
-        # is nothing left to validate against, so starting the worker would
-        # skip both checks above and feed a stack we never confirmed.
-        if not config.get("immich_url"):
-            log.error("Could not read the local Immich container: %s", e)
-            log.error("Start the Immich Docker stack, then try again.")
-            return
-
-        # Split setup: we can't read IMMICH_MEDIA_LOCATION from the container
-        # env, but we CAN probe the Immich API for the Docker-side path prefix
-        # and compare it to our upload_mount. This is the exact case issue #19
-        # hit, where a silent "proceeding anyway" let the worker start with
-        # mismatched paths and 404 all thumbnails.
-        log.info("No local Docker — using API probe to validate path mapping.")
-        api_key = config.get("api_key", "")
-        upload_mount = config.get("upload_mount", "")
-        if api_key and upload_mount:
-            if _warn_on_path_mismatch(
-                config.get("immich_url", ""), api_key, upload_mount
-            ):
-                log.error(
-                    "Refusing to start with a broken path mapping. Fix and retry."
-                )
-                return
-        else:
-            log.warning(
-                "Could not verify Docker config (%s) — proceeding without API probe "
-                "because no api_key or upload_mount is set in config.",
-                e,
-            )
+    elif not _preflight_local(config):
+        return
 
     worker_pid = read_pid("worker")
     if worker_pid:
@@ -5742,7 +5833,13 @@ def stop_all_fast() -> None:
         if all(not alive(p) for p in pids.values()):
             break
         time.sleep(0.1)
-    for pid in pids.values():
+    # items(), not values(): `name` would otherwise be whatever the loop above
+    # left bound, which is always "dashboard". The ownership check then compares
+    # the worker's node command line against the dashboard's, decides the group
+    # is not ours, and kills the worker by pid alone. Its ffmpeg and exiftool
+    # survive the stop, which is the regression _signal_service exists to
+    # prevent, on the escalation path rather than the first signal.
+    for name, pid in pids.items():
         if alive(pid):
             _signal_service(pid, signal.SIGKILL, name)
     for name in pids:
@@ -5771,9 +5868,7 @@ def cmd_status(_args):
 
     paused = read_paused()
     if paused and paused.get("reason") == "backend-unreachable":
-        log.warning(
-            "Worker:     paused, %s not answering", paused.get("detail") or "?"
-        )
+        log.warning("Worker:     paused, %s not answering", paused.get("detail") or "?")
         log.warning("            It starts again on its own when they are back.")
     elif paused and paused.get("reason") == "library-unreachable":
         log.warning(
@@ -5850,6 +5945,26 @@ def cmd_update(_args):
     save_config(config)
 
     log.info("Updated to %s. Run: python -m immich_accelerator start", running)
+
+
+def int_setting(name: str, default: int, config: dict | None = None) -> int:
+    """An integer knob, from config.json first and the environment second.
+
+    The module-level constants below are bound at import, so a value in
+    config.json could never reach them. On a Homebrew install the environment
+    cannot be set at all (see config_env), which left these documented and
+    unreachable.
+    """
+    # Same order as start_service: a real environment variable wins.
+    if os.environ.get(name) is not None:
+        return _int_env(name, default)
+    raw = config_env(config).get(name)
+    if raw is not None:
+        try:
+            return int(raw)
+        except ValueError:
+            log.warning("Ignoring %s=%r in config: not a whole number.", name, raw)
+    return _int_env(name, default)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -6083,7 +6198,13 @@ def _watch_worker(config: dict) -> str | None:
     mid-flight, so cmd_watch can hand over to the worker-free loop."""
     log.info("Watching services (Ctrl+C to stop)...")
 
-    if FD_RESTART_THRESHOLD > 0 and _LIBPROC is None:
+    fd_threshold = int_setting(
+        "IMMICH_ACCEL_FD_RESTART_THRESHOLD", FD_RESTART_THRESHOLD, config
+    )
+    fd_cooldown = int_setting(
+        "IMMICH_ACCEL_FD_RESTART_COOLDOWN", FD_RESTART_COOLDOWN, config
+    )
+    if fd_threshold > 0 and _LIBPROC is None:
         log.warning(
             "fd-leak watchdog (#89) inactive: libproc unavailable, cannot read "
             "worker fd counts on this system."
@@ -6350,12 +6471,12 @@ def _watch_worker(config: dict) -> str | None:
             # exhausts the table and crashes it with `spawn EBADF`. Sum fds
             # across all worker processes (the leak may be in a sibling), and
             # cool down between restarts so a fast leak can't thrash.
-            if FD_RESTART_THRESHOLD > 0:
+            if fd_threshold > 0:
                 fd_total = _worker_fd_total()
-                if fd_total is not None and fd_total >= FD_RESTART_THRESHOLD:
+                if fd_total is not None and fd_total >= fd_threshold:
                     cooled = (
                         last_fd_restart is None
-                        or time.monotonic() - last_fd_restart >= FD_RESTART_COOLDOWN
+                        or time.monotonic() - last_fd_restart >= fd_cooldown
                     )
                     if cooled:
                         last_fd_restart = time.monotonic()
@@ -6364,7 +6485,7 @@ def _watch_worker(config: dict) -> str | None:
                             "handles on some media (#89). Restarting the worker "
                             "before it exhausts the fd table and crashes.",
                             fd_total,
-                            FD_RESTART_THRESHOLD,
+                            fd_threshold,
                         )
                         kill_pid("worker")
                         try:
@@ -6383,7 +6504,7 @@ def _watch_worker(config: dict) -> str | None:
                             "Worker fd count %d high but within restart "
                             "cooldown (%ds); not restarting yet.",
                             fd_total,
-                            FD_RESTART_COOLDOWN,
+                            fd_cooldown,
                         )
 
             # Check worker
@@ -6660,6 +6781,335 @@ def cmd_dashboard(args):
     dashboard_mod = importlib.import_module(".dashboard", package=__package__)
     log.info("Starting dashboard on port %d...", args.port)
     dashboard_mod.run_dashboard(config, port=args.port)
+
+
+# Immich's own transcode settings, so "stock" here means what a Docker Immich
+# would have produced from the same input. preset ultrafast is what Immich sends,
+# not veryfast: calibrating against the wrong preset is how a mapping ends up
+# looking correct and measuring worse.
+_STOCK_PRESET = "ultrafast"
+
+
+def _ffprobe_duration(ffmpeg: str, path: str) -> float:
+    # Only the last component. The shipped path is .../jellyfin-ffmpeg/ffmpeg,
+    # so replacing every occurrence names a directory that does not exist.
+    probe = str(Path(ffmpeg).with_name(Path(ffmpeg).name.replace("ffmpeg", "ffprobe")))
+    if not Path(probe).exists():
+        return 0.0
+    try:
+        out = subprocess.run(
+            [
+                probe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=nw=1:nk=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ).stdout.strip()
+        return float(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0.0
+
+
+def _encode_once(
+    ffmpeg: str, src: str, dest: str, args: list[str]
+) -> tuple[float, int, float]:
+    """Encode and return (wall seconds, output bytes, cpu seconds).
+
+    CPU time is the number that actually decides this. Wall time says which
+    finishes one file first; CPU time says what the encode costs the rest of the
+    machine, and this Mac is running Immich's other jobs and the ML engine at the
+    same time. Zero bytes means it failed.
+    """
+    import resource
+
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    start = time.monotonic()
+    try:
+        r = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                src,
+                *args,
+                dest,
+                "-y",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0.0, 0, 0.0
+    elapsed = time.monotonic() - start
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+    if r.returncode != 0:
+        log.debug("encode failed: %s", (r.stderr or "").strip()[:300])
+        return elapsed, 0, cpu
+    try:
+        return elapsed, Path(dest).stat().st_size, cpu
+    except OSError:
+        return elapsed, 0, cpu
+
+
+def _ssim_against(ffmpeg: str, candidate: str, reference: str) -> float | None:
+    """Mean SSIM of candidate against reference, or None if it could not be read."""
+    try:
+        r = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                candidate,
+                "-i",
+                reference,
+                "-lavfi",
+                "[0:v][1:v]ssim=stats_file=-",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    hit = re.findall(r"All:([0-9.]+)", r.stdout + r.stderr)
+    return float(hit[-1]) if hit else None
+
+
+# The encoding switches, and the variable each one sets. The names live here
+# rather than in the menu bar app so the CLI, the app and the tests cannot
+# drift apart: the app calls this command, it does not write config.json.
+#
+# Each entry is (variable, what it does, what reads it). "what reads it" is not
+# decoration: hardware video is honoured by ffmpeg-wrapper.sh, so its truthiness
+# has to agree with the wrapper's own _off(), which test_encoding_switches pins
+# by running the real script.
+ENCODING_SWITCHES = {
+    "hardware-video": (
+        "IMMICH_ACCEL_HW_VIDEO",
+        "Encode H.264 and HEVC with VideoToolbox",
+    ),
+    "hardware-decode": (
+        "IMMICH_ACCEL_HW_DECODE",
+        "Decode with VideoToolbox, including thumbnails and previews",
+    ),
+}
+
+# The wrapper treats exactly these as off, and anything else (including an unset
+# variable) as on. Parity with ffmpeg-wrapper.sh's _off() is the contract.
+_ENV_OFF = ("0", "false", "no")
+
+
+def bool_setting(name: str, default: bool = True, config: dict | None = None) -> bool:
+    """A boolean knob, from the environment first and config.json second.
+
+    Same precedence as int_setting: a real environment variable wins, because
+    someone who exported one is debugging and should not be overruled by a file.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        raw = config_env(config).get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in _ENV_OFF
+
+
+def encoding_switch_on(switch: str, config: dict | None = None) -> bool:
+    """Whether one encoding switch is currently on. They default to on."""
+    name, _ = ENCODING_SWITCHES[switch]
+    return bool_setting(name, True, config)
+
+
+def cmd_encoding(args):
+    """Show or flip the encoding switches.
+
+    These write config.json rather than the environment, because on a Homebrew
+    install the environment is not reachable at all (see config_env). A real
+    environment variable still wins at read time, so this reports what would
+    actually take effect, not just what the file says.
+    """
+    switch = getattr(args, "switch", None)
+    state = getattr(args, "state", None)
+    config = load_config()
+
+    if not switch:
+        for key, (name, description) in ENCODING_SWITCHES.items():
+            on = encoding_switch_on(key, config)
+            overridden = os.environ.get(name) is not None
+            log.info(
+                "  %-16s %-3s  %s%s",
+                key,
+                "on" if on else "off",
+                description,
+                (
+                    " (set in the environment, which overrides config)"
+                    if overridden
+                    else ""
+                ),
+            )
+        return
+
+    name, _ = ENCODING_SWITCHES[switch]
+    if state not in ("on", "off"):
+        log.info(
+            "%s: %s", switch, "on" if encoding_switch_on(switch, config) else "off"
+        )
+        return
+
+    env = config.get("env")
+    if not isinstance(env, dict):
+        env = {}
+    env[name] = "1" if state == "on" else "0"
+    config["env"] = env
+    save_config(config)
+
+    log.info("%s is %s.", switch, state)
+    # Worth saying, because otherwise the switch looks broken: the file changed
+    # and the setting did not.
+    if os.environ.get(name) is not None:
+        log.warning(
+            "%s is also set in the environment, and that wins. Unset it for this "
+            "to take effect.",
+            name,
+        )
+    log.info("Restart the accelerator for it to take effect.")
+
+
+def cmd_encode_compare(args):
+    """Transcode one file the way Immich would, and the way this Mac would.
+
+    The point is to answer two questions with numbers from your own footage
+    rather than from someone else's: how much faster the hardware encoder is,
+    and what quality setting makes its output match what Immich would have
+    produced on its own.
+    """
+    src = str(Path(args.video).expanduser())
+    if not Path(src).is_file():
+        log.error("No such file: %s", src)
+        return
+    config = load_config() if CONFIG_FILE.exists() else {}
+    ffmpeg = config.get("ffmpeg_path") or shutil.which("ffmpeg")
+    if not ffmpeg or not Path(ffmpeg).exists():
+        log.error("No ffmpeg found. Run setup, or pass one on PATH.")
+        return
+
+    duration = _ffprobe_duration(ffmpeg, src)
+    log.info("Comparing encoders on %s", Path(src).name)
+    if duration:
+        log.info("  %.1fs of video, CRF %d", duration, args.crf)
+    log.info("")
+
+    with tempfile.TemporaryDirectory(prefix="immich-encode-compare-") as tmp:
+        stock = str(Path(tmp) / "stock.mp4")
+        secs, size, cpu = _encode_once(
+            ffmpeg,
+            src,
+            stock,
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                _STOCK_PRESET,
+                "-crf",
+                str(args.crf),
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+            ],
+        )
+        if not size:
+            log.error(
+                "The software encode failed, so there is nothing to compare against."
+            )
+            return
+        stock_ssim = _ssim_against(ffmpeg, stock, src)
+        log.info("Software, as Immich would do it")
+        log.info("  x264 preset %s, CRF %d", _STOCK_PRESET, args.crf)
+        _report(secs, size, stock_ssim, duration, cpu)
+        stock_cpu, stock_wall = cpu, secs
+        log.info("")
+
+        log.info("Hardware, VideoToolbox")
+        best = None
+        hw_cpu = hw_wall = 0.0
+        for q in args.quality:
+            dest = str(Path(tmp) / f"vt{q}.mp4")
+            secs, size, cpu = _encode_once(
+                ffmpeg, src, dest, ["-c:v", "h264_videotoolbox", "-q:v", str(q), "-an"]
+            )
+            if not size:
+                log.warning("  q:v %-3d encode failed", q)
+                continue
+            ssim = _ssim_against(ffmpeg, dest, src)
+            log.info("  q:v %d", q)
+            _report(secs, size, ssim, duration, cpu)
+            hw_cpu, hw_wall = cpu, secs
+            if ssim is not None and stock_ssim is not None:
+                gap = abs(ssim - stock_ssim)
+                if best is None or gap < best[0]:
+                    best = (gap, q, ssim)
+
+        log.info("")
+        if best:
+            log.info(
+                "Closest to the software encode: q:v %d (SSIM %.6f against %.6f).",
+                best[1],
+                best[2],
+                stock_ssim,
+            )
+            log.info(
+                "  Quality is content dependent, so run this on footage of your own "
+                "before trusting one number."
+            )
+            log.info("")
+            # The tradeoff is rarely the one people expect. Immich's preset is
+            # ultrafast, which is genuinely quick, so software often finishes one
+            # file sooner. What hardware buys is the machine: it leaves the cores
+            # for the other jobs and for the ML engine running beside it.
+            if stock_wall and hw_wall:
+                faster = "software" if stock_wall < hw_wall else "hardware"
+                log.info(
+                    "On this file %s finished sooner (%.1fs against %.1fs).",
+                    faster,
+                    min(stock_wall, hw_wall),
+                    max(stock_wall, hw_wall),
+                )
+            if stock_cpu and hw_cpu:
+                log.info(
+                    "Hardware used %.1fs of cpu against %.1fs, so it leaves the "
+                    "machine free for the other jobs and for machine learning.",
+                    hw_cpu,
+                    stock_cpu,
+                )
+        else:
+            log.warning("No hardware encode completed, so there is nothing to compare.")
+
+
+def _report(
+    secs: float, size: int, ssim: float | None, duration: float, cpu: float = 0.0
+) -> None:
+    speed = f", {duration / secs:.1f}x realtime" if duration and secs else ""
+    log.info("    %6.1fs wall   %7.1f MB%s", secs, size / (1024 * 1024), speed)
+    if cpu:
+        cores = f" ({cpu / secs:.1f} cores busy)" if secs else ""
+        log.info("    %6.1fs cpu%s", cpu, cores)
+    if ssim is not None:
+        log.info("    SSIM %.6f against the original", ssim)
 
 
 def cmd_ml_test(_args):
@@ -7017,6 +7467,33 @@ def main():
         "ml-test",
         help="Diagnose the ML service (health + CLIP + OCR round-trip)",
     )
+    enc_p = sub.add_parser(
+        "encoding", help="Turn hardware encoding on or off (omit args to list)"
+    )
+    enc_p.add_argument(
+        "switch", nargs="?", choices=list(ENCODING_SWITCHES), help="Which switch"
+    )
+    enc_p.add_argument(
+        "state", nargs="?", choices=["on", "off"], help="Turn it on or off"
+    )
+    cmp_p = sub.add_parser(
+        "encode-compare",
+        help="Transcode one video both ways and report speed, size and quality",
+    )
+    cmp_p.add_argument("video", help="a video file to test with, ideally your own")
+    cmp_p.add_argument(
+        "--crf",
+        type=int,
+        default=23,
+        help="the CRF Immich is set to (default 23, Immich's own default)",
+    )
+    cmp_p.add_argument(
+        "--quality",
+        type=int,
+        nargs="+",
+        default=[59, 65, 75, 85],
+        help="VideoToolbox q:v values to try",
+    )
     sub.add_parser("uninstall", help="Remove services, data, and launchd config")
 
     args = parser.parse_args()
@@ -7036,6 +7513,8 @@ def main():
             "dashboard": cmd_dashboard,
             "component": cmd_component,
             "ml-test": cmd_ml_test,
+            "encoding": cmd_encoding,
+            "encode-compare": cmd_encode_compare,
             "uninstall": cmd_uninstall,
         }[args.command](args)
     except RuntimeError as e:
