@@ -15,7 +15,7 @@
 - **A split install read its configuration out of an unrelated Docker container,** refused to start over a version mismatch that did not exist, and copied that container's database credentials into its own config. `immich_url` now decides. Reported by [@RxChi1d](https://github.com/RxChi1d) ([#139](https://github.com/epheterson/immich-apple-silicon/issues/139)).
 
 ### Changed
-- **Encoder documentation corrected.** Immich asks for `preset ultrafast`, so software often finishes one file sooner. Measured on an M4 over 20 seconds of 1080p footage: software 12.5s cpu across about eight cores, hardware 5s across about two, SSIM 0.980 hardware against 0.961 software in half the size. The earlier figures came from a synthetic test pattern and were wrong.
+- **Encoder documentation corrected.** Immich asks for `preset ultrafast`, so software often finishes one file sooner. Measured on an M4 over 20 seconds of 1080p footage: software 12.5s cpu across about eight cores, hardware 5s across about two, SSIM 0.974 hardware against 0.967 software in half the size. The earlier figures came from a synthetic test pattern and were wrong.
 
 ## 1.13.0 - 2026-08-19
 
