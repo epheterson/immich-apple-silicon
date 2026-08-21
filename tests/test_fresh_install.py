@@ -1998,6 +1998,29 @@ class TestHardwareEncodingCanBeTurnedOff:
             )
             assert "h264_videotoolbox" in out, f"{value!r} should leave it on"
 
+    def test_hevc_still_gets_the_hvc1_tag_with_the_switch_off(self, tmp_path):
+        """hev1 (ffmpeg's default) stores parameter sets in-band and Apple's
+        decoder rejects it, so the wrapper injects hvc1 when the caller did not.
+        That is a property of the output container rather than of the encoder,
+        and libx265 defaults to hev1 as well."""
+        out = self._run(
+            tmp_path,
+            ["-i", "in.mov", "-c:v", "hevc", "out.mp4"],
+            env={"IMMICH_ACCEL_HW_VIDEO": "0"},
+        )
+        assert "hevc_videotoolbox" not in out, "the switch must still be honoured"
+        assert "hvc1" in out
+
+    def test_a_tag_the_caller_passed_is_still_left_alone(self, tmp_path):
+        """Immich passes -tag:v hvc1 itself for an HEVC target, so the injection
+        is a fallback and must not add a second tag."""
+        out = self._run(
+            tmp_path,
+            ["-i", "in.mov", "-c:v", "hevc", "-tag:v", "hvc1", "out.mp4"],
+            env={"IMMICH_ACCEL_HW_VIDEO": "0"},
+        )
+        assert out.count("hvc1") == 1, out
+
 
 class TestEncodingSwitches:
     """The `encoding` command, which is what the Settings switch calls.
