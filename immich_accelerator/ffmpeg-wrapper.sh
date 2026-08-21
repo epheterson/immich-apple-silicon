@@ -109,6 +109,10 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
     # inverted scale. Both become a -q:v value that means what the CRF
     # setting asked for. Matched as prefixes so the stream-specific spellings
     # (-crf:v, -q:v:0) are translated too.
+    #
+    # USE_HW_ENCODER, not USE_HW: this arrived alongside the rename in #153,
+    # and the two merge without a git conflict, so the old name would simply
+    # never be true and the translation would silently stop happening.
     if [[ ( "$arg" == -crf* || "$arg" == -q:v* ) && "$USE_HW_ENCODER" == true ]]; then
         next="${ARGS[$((i+1))]:-}"
         if [[ "$next" =~ ^[0-9]+$ ]]; then

@@ -4642,7 +4642,9 @@ def _start_ml_preferred(config: dict):
             return None, None, False
         log.info("Starting ML service (%s)...", label)
         try:
-            pid = start_service("ml", cmd, senv, cwd, own_session=not _SUPERVISING_ML)
+            pid = start_service(
+                "ml", cmd, senv, cwd, own_session=not _SUPERVISING_ML
+            )
             return pid, label, is_native
         except RuntimeError:
             log.warning("  %s failed to start", label)
@@ -4718,7 +4720,9 @@ def _ml_verify_or_fallback(config: dict, pid: int, engine: str):
         log.info("Starting ML service (Python venv)...")
         try:
             return (
-                start_service("ml", cmd, senv, cwd, own_session=not _SUPERVISING_ML),
+                start_service(
+                    "ml", cmd, senv, cwd, own_session=not _SUPERVISING_ML
+                ),
                 "Python venv",
             )
         except RuntimeError:
