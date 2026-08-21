@@ -1747,13 +1747,44 @@ class TestEncodeCompare:
             )
         assert size == 0
 
-    def test_the_mean_ssim_is_the_last_one_reported(self):
-        """ffmpeg prints a line per frame and the summary last."""
-        out = "n:1 All:0.9 \nn:2 All:0.8 \nSSIM All:0.997649 (26.3)\n"
+    def test_the_ssim_command_asks_for_the_summary_and_nothing_else(self):
+        """The mean only exists in the filter's summary line, and ssim logs that
+        at info. Asking for error would drop it, and a stats file would leave
+        the per-frame numbers behind for the parser to mistake for the mean."""
         with patch.object(
-            m.subprocess, "run", return_value=MagicMock(stdout=out, stderr="")
+            m.subprocess, "run", return_value=MagicMock(stdout="", stderr="")
+        ) as run:
+            m._ssim_against("/bin/ffmpeg", "/a.mp4", "/b.mp4")
+        argv = run.call_args.args[0]
+        assert argv[argv.index("-loglevel") + 1] == "info"
+        assert "stats_file" not in argv[argv.index("-lavfi") + 1]
+
+    def test_the_mean_ssim_comes_from_the_summary_line(self):
+        """Real output at this log level, with the per-frame numbers a stats
+        file would have added, to show the parser cannot pick one of them."""
+        err = (
+            "[Parsed_ssim_0 @ 0x1] SSIM Y:0.871987 (8.927451) U:1.000000 (inf) "
+            "V:1.000000 (inf) All:0.914658 (10.688364)\n"
+        )
+        with patch.object(
+            m.subprocess,
+            "run",
+            return_value=MagicMock(stdout="n:1 All:0.9 \nn:2 All:1.0 \n", stderr=err),
         ):
-            assert m._ssim_against("/bin/ffmpeg", "/a.mp4", "/b.mp4") == 0.997649
+            assert m._ssim_against("/bin/ffmpeg", "/a.mp4", "/b.mp4") == 0.914658
+
+    def test_per_frame_numbers_alone_are_not_a_mean(self):
+        """What the old command actually produced: no summary, only frames. The
+        last one is the last frame, and a still or dark final frame reads as
+        near-perfect quality, so returning it is worse than returning nothing."""
+        with patch.object(
+            m.subprocess,
+            "run",
+            return_value=MagicMock(
+                stdout="n:1 All:0.9 \nn:2 All:1.000000 \n", stderr=""
+            ),
+        ):
+            assert m._ssim_against("/bin/ffmpeg", "/a.mp4", "/b.mp4") is None
 
     def test_unreadable_ssim_output_is_not_a_number(self):
         with patch.object(
