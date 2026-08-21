@@ -6869,14 +6869,17 @@ def _ssim_against(ffmpeg: str, candidate: str, reference: str) -> float | None:
             [
                 ffmpeg,
                 "-hide_banner",
+                # The mean is in the filter's summary line, which ssim logs at
+                # info. error drops it, and stats_file=- writes the per-frame
+                # numbers to stdout, so the last "All:" would be the last frame.
                 "-loglevel",
-                "error",
+                "info",
                 "-i",
                 candidate,
                 "-i",
                 reference,
                 "-lavfi",
-                "[0:v][1:v]ssim=stats_file=-",
+                "[0:v][1:v]ssim",
                 "-f",
                 "null",
                 "-",
@@ -6887,8 +6890,10 @@ def _ssim_against(ffmpeg: str, candidate: str, reference: str) -> float | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    hit = re.findall(r"All:([0-9.]+)", r.stdout + r.stderr)
-    return float(hit[-1]) if hit else None
+    # Anchored on the summary line, so a per-frame number can never be read as
+    # the mean if the command above ever grows a stats file again.
+    hit = re.search(r"SSIM .*\bAll:([0-9.]+)", r.stdout + r.stderr)
+    return float(hit.group(1)) if hit else None
 
 
 # The encoding switches, and the variable each one sets. The names live here
