@@ -4642,9 +4642,7 @@ def _start_ml_preferred(config: dict):
             return None, None, False
         log.info("Starting ML service (%s)...", label)
         try:
-            pid = start_service(
-                "ml", cmd, senv, cwd, own_session=not _SUPERVISING_ML
-            )
+            pid = start_service("ml", cmd, senv, cwd, own_session=not _SUPERVISING_ML)
             return pid, label, is_native
         except RuntimeError:
             log.warning("  %s failed to start", label)
@@ -4720,9 +4718,7 @@ def _ml_verify_or_fallback(config: dict, pid: int, engine: str):
         log.info("Starting ML service (Python venv)...")
         try:
             return (
-                start_service(
-                    "ml", cmd, senv, cwd, own_session=not _SUPERVISING_ML
-                ),
+                start_service("ml", cmd, senv, cwd, own_session=not _SUPERVISING_ML),
                 "Python venv",
             )
         except RuntimeError:
@@ -6908,11 +6904,77 @@ ENCODING_SWITCHES = {
         "IMMICH_ACCEL_HW_DECODE",
         "Decode with VideoToolbox, including thumbnails and previews",
     ),
+    "hardware-audio": (
+        "IMMICH_ACCEL_HW_AUDIO",
+        "Encode audio with AudioToolbox",
+    ),
 }
+
+# Switches that are off unless asked for, because they change output. Everything
+# else defaults on. Keeping the list here rather than in each reader means the
+# CLI, the app and the wrapper cannot disagree about what "unset" means.
+_DEFAULT_OFF = {"IMMICH_ACCEL_HW_AUDIO"}
+
+# The positions on the one setting that matters: how far from Docker's output
+# this install is willing to move. Each names every switch, so a preset is a
+# complete statement rather than a diff against whatever was set before.
+#
+# Stock is not "hardware off as a preference". It is the position where the
+# ffmpeg wrapper passes Immich's arguments through untouched, so a library
+# built here is byte-identical to one built by Docker and can move back.
+#
+# Maximum is what the hardware is measurably good at, not everything carrying a
+# VideoToolbox name: hardware JPEG was measured slower than the software encoder
+# and is deliberately absent.
+ENCODING_PRESETS = {
+    "stock": {
+        "IMMICH_ACCEL_HW_VIDEO": False,
+        "IMMICH_ACCEL_HW_DECODE": False,
+        "IMMICH_ACCEL_HW_AUDIO": False,
+    },
+    "balanced": {
+        "IMMICH_ACCEL_HW_VIDEO": True,
+        "IMMICH_ACCEL_HW_DECODE": True,
+        "IMMICH_ACCEL_HW_AUDIO": False,
+    },
+    "maximum": {
+        "IMMICH_ACCEL_HW_VIDEO": True,
+        "IMMICH_ACCEL_HW_DECODE": True,
+        "IMMICH_ACCEL_HW_AUDIO": True,
+    },
+}
+
+PRESET_SUMMARY = {
+    "stock": "Output identical to Docker",
+    "balanced": "Hardware video, Docker-identical audio",
+    "maximum": "Hardware everywhere it measured faster",
+}
+
+
+def encoding_preset(config: dict | None = None) -> str:
+    """Which preset the current switches spell, or "custom".
+
+    Derived rather than stored: a switch flipped from the CLI or set in the
+    environment has to be reflected, and a stored name would go stale the moment
+    it was. "custom" is a real answer, not a failure.
+    """
+    for name, wanted in ENCODING_PRESETS.items():
+        if all(
+            bool_setting(var, var not in _DEFAULT_OFF, config) is value
+            for var, value in wanted.items()
+        ):
+            return name
+    return "custom"
+
 
 # The wrapper treats exactly these as off, and anything else (including an unset
 # variable) as on. Parity with ffmpeg-wrapper.sh's _off() is the contract.
 _ENV_OFF = ("0", "false", "no")
+# The wrapper's _on(), for switches that are off unless asked for. Not the
+# negation of _ENV_OFF: an unrecognised value leaves a default-on switch on and
+# a default-off switch off, so in both cases a typo keeps the safer position
+# rather than silently flipping behaviour.
+_ENV_ON = ("1", "true", "yes")
 
 
 def bool_setting(name: str, default: bool = True, config: dict | None = None) -> bool:
@@ -6920,19 +6982,46 @@ def bool_setting(name: str, default: bool = True, config: dict | None = None) ->
 
     Same precedence as int_setting: a real environment variable wins, because
     someone who exported one is debugging and should not be overruled by a file.
+
+    Truthiness follows the default, mirroring ffmpeg-wrapper.sh exactly: a
+    default-on switch is off only for an explicit off word, and a default-off
+    switch is on only for an explicit on word. test_fresh_install pins the two
+    implementations against each other by running the real script.
     """
     raw = os.environ.get(name)
     if raw is None:
         raw = config_env(config).get(name)
     if raw is None:
         return default
-    return str(raw).strip().lower() not in _ENV_OFF
+    value = str(raw).strip().lower()
+    return value not in _ENV_OFF if default else value in _ENV_ON
 
 
 def encoding_switch_on(switch: str, config: dict | None = None) -> bool:
-    """Whether one encoding switch is currently on. They default to on."""
+    """Whether one encoding switch is currently on.
+
+    Most default on. The ones that change output default off (_DEFAULT_OFF), so
+    an install nobody has configured sits at Balanced rather than somewhere it
+    was never asked to be.
+    """
     name, _ = ENCODING_SWITCHES[switch]
-    return bool_setting(name, True, config)
+    return bool_setting(name, name not in _DEFAULT_OFF, config)
+
+
+def apply_encoding_preset(name: str, config: dict) -> dict:
+    """Write every switch a preset names. Returns the config, unsaved.
+
+    Every switch, not the ones that differ: a preset has to be a complete
+    statement, or moving from custom back to a named position would leave
+    whatever was set by hand still in place under a name that denies it.
+    """
+    env = config.get("env")
+    if not isinstance(env, dict):
+        env = {}
+    for var, value in ENCODING_PRESETS[name].items():
+        env[var] = "1" if value else "0"
+    config["env"] = env
+    return config
 
 
 def cmd_encoding(args):
@@ -6947,7 +7036,31 @@ def cmd_encoding(args):
     state = getattr(args, "state", None)
     config = load_config()
 
+    # `encoding preset <name>` moves every switch at once. The word "preset"
+    # cannot collide with a switch name: argparse restricts both to their own
+    # choices, and the switch names all begin "hardware-".
+    if switch == "preset":
+        if state not in ENCODING_PRESETS:
+            current = encoding_preset(config)
+            log.info("Currently: %s", current)
+            for key, summary in PRESET_SUMMARY.items():
+                log.info("  %-9s %s", key, summary)
+            if current == "custom":
+                log.info("  custom    switches set individually")
+            return
+        apply_encoding_preset(state, config)
+        save_config(config)
+        log.info("%s. %s.", state.capitalize(), PRESET_SUMMARY[state])
+        for var in ENCODING_PRESETS[state]:
+            if os.environ.get(var) is not None:
+                log.warning(
+                    "%s is set in the environment, and that wins over this.", var
+                )
+        log.info("Restart the accelerator for it to take effect.")
+        return
+
     if not switch:
+        log.info("Preset: %s", encoding_preset(config))
         for key, (name, description) in ENCODING_SWITCHES.items():
             on = encoding_switch_on(key, config)
             overridden = os.environ.get(name) is not None
@@ -7471,10 +7584,16 @@ def main():
         "encoding", help="Turn hardware encoding on or off (omit args to list)"
     )
     enc_p.add_argument(
-        "switch", nargs="?", choices=list(ENCODING_SWITCHES), help="Which switch"
+        "switch",
+        nargs="?",
+        choices=list(ENCODING_SWITCHES) + ["preset"],
+        help="Which switch, or 'preset'",
     )
     enc_p.add_argument(
-        "state", nargs="?", choices=["on", "off"], help="Turn it on or off"
+        "state",
+        nargs="?",
+        choices=["on", "off"] + list(ENCODING_PRESETS),
+        help="on/off for a switch, or the preset name",
     )
     cmp_p = sub.add_parser(
         "encode-compare",

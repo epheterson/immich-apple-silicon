@@ -57,10 +57,18 @@ fi
 # matters when the worker is running several jobs and the ML engine at once.
 # `immich-accelerator encode-compare` measures both on your own footage.
 _off() { [[ "$1" == "0" || "$1" == "false" || "$1" == "no" ]]; }
+# Default-off counterpart, for switches that change output and so are only
+# reached from the Maximum position. Anything unrecognised stays off.
+_on() { [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]; }
 HW_VIDEO=true
 _off "${IMMICH_ACCEL_HW_VIDEO:-1}" && HW_VIDEO=false
 HW_DECODE=true
 _off "${IMMICH_ACCEL_HW_DECODE:-1}" && HW_DECODE=false
+# AudioToolbox AAC. Off by default: measured a third less CPU than the software
+# encoder and faster besides, but it is a different encoder, so the bytes differ
+# from what Docker produces and that is only acceptable where it was asked for.
+HW_AUDIO=false
+_on "${IMMICH_ACCEL_HW_AUDIO:-0}" && HW_AUDIO=true
 
 ARGS=("$@")
 USE_HW_ENCODER=false
@@ -120,6 +128,18 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
         next="${ARGS[$((i+1))]:-}"
         if [[ "$next" =~ ^[0-9]+$ ]]; then
             NEW_ARGS+=("-q:v" "$(_crf_to_quality "$next")")
+            ((i++))
+            continue
+        fi
+    fi
+
+    # Remap the audio encoder to AudioToolbox. Same codec and same container,
+    # so nothing downstream changes shape; only the encoder differs. Left alone
+    # for `copy`, which is not an encode at all.
+    if [[ "$HW_AUDIO" == true && ( "$arg" == "-c:a" || "$arg" == "-acodec" ) ]]; then
+        next="${ARGS[$((i+1))]:-}"
+        if [[ "$next" == "aac" ]]; then
+            NEW_ARGS+=("$arg" "aac_at")
             ((i++))
             continue
         fi

@@ -290,6 +290,37 @@ final class StatusModel: ObservableObject {
         return true
     }
 
+    /// The switches each preset sets, and their default when nothing is set.
+    ///
+    /// The CLI is authoritative: it applies presets and `encoding_preset` there
+    /// decides the name. This mirror exists only so the settings window can
+    /// show the current position without shelling out on every render. Keep the
+    /// two tables in step; `ENCODING_PRESETS` in `__main__.py` is the original.
+    nonisolated static let encodingPresets: [(name: String, switches: [String: Bool])] = [
+        ("stock", ["IMMICH_ACCEL_HW_VIDEO": false,
+                   "IMMICH_ACCEL_HW_DECODE": false,
+                   "IMMICH_ACCEL_HW_AUDIO": false]),
+        ("balanced", ["IMMICH_ACCEL_HW_VIDEO": true,
+                      "IMMICH_ACCEL_HW_DECODE": true,
+                      "IMMICH_ACCEL_HW_AUDIO": false]),
+        ("maximum", ["IMMICH_ACCEL_HW_VIDEO": true,
+                     "IMMICH_ACCEL_HW_DECODE": true,
+                     "IMMICH_ACCEL_HW_AUDIO": true]),
+    ]
+
+    /// Switches that are off unless asked for, because they change output.
+    nonisolated static let encodingDefaultOff: Set<String> = ["IMMICH_ACCEL_HW_AUDIO"]
+
+    /// Which preset the current switches spell, or "custom".
+    nonisolated static func encodingPreset(_ config: [String: Any]) -> String {
+        for preset in encodingPresets {
+            if preset.switches.allSatisfy({ encodingSwitchOn($0.key, config) == $0.value }) {
+                return preset.name
+            }
+        }
+        return "custom"
+    }
+
     /// Whether an encoding switch reads as on, from the config `env` block.
     ///
     /// Mirrors the CLI's bool_setting: unset means on, and only these three
@@ -297,10 +328,15 @@ final class StatusModel: ObservableObject {
     /// but that is the background service's environment rather than this app's,
     /// so it cannot be checked from here; the CLI says so when it applies one.
     nonisolated static func encodingSwitchOn(_ name: String, _ config: [String: Any]) -> Bool {
+        let defaultOn = !encodingDefaultOff.contains(name)
         guard let env = config["env"] as? [String: Any],
-              let raw = env[name] else { return true }
+              let raw = env[name] else { return defaultOn }
         let value = String(describing: raw).trimmingCharacters(in: .whitespaces).lowercased()
-        return !["0", "false", "no"].contains(value)
+        // Truthiness follows the default, matching bool_setting and the
+        // wrapper: an unrecognised value keeps the safer position either way.
+        return defaultOn
+            ? !["0", "false", "no"].contains(value)
+            : ["1", "true", "yes"].contains(value)
     }
 
     // Blocking pidfile/ps/config probes, gathered off the main actor. Confirms

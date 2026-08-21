@@ -221,6 +221,18 @@ enum Actions {
         return cleaned.isEmpty ? "No output." : cleaned
     }
 
+    /// Move every encoding switch to a named position. The CLI owns what each
+    /// position means, so the app never has to spell out a preset itself.
+    static func setEncodingPreset(_ name: String) async -> (ok: Bool, message: String) {
+        guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
+        let (code, out) = await run(cli, ["encoding", "preset", name])
+        if code == 0 { return (true, "") }
+        let detail = out.split(separator: "\n")
+            .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+            .map(String.init) ?? "exit \(code)"
+        return (false, detail)
+    }
+
     /// Flip one encoding switch through the CLI, which owns what a switch
     /// means and which variable it writes. Deliberately not a direct
     /// config.json write like setMLEngine: the value has to agree with what

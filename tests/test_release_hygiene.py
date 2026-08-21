@@ -117,3 +117,35 @@ class TestChangelogIsExtractable:
             "the extracted notes contain another release heading, so the "
             "boundary heading is missing and the notes run on"
         )
+
+
+def test_no_test_is_shadowed_by_a_later_definition():
+    """Two methods with one name in a class: Python keeps the last, silently.
+
+    The first is then dead code that still reads like coverage, which is worse
+    than having no test at all. This happened for real: resolving a merge
+    between two branches that both appended to the same test class duplicated
+    seven methods, and the suite stayed green because the surviving copies
+    passed. Nothing pointed at the seven that had stopped running.
+    """
+    import ast
+    import collections
+    from pathlib import Path
+
+    offenders = []
+    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            names = [n.name for n in node.body if isinstance(n, ast.FunctionDef)]
+            for name, count in collections.Counter(names).items():
+                if count > 1:
+                    offenders.append(f"{path.name}::{node.name}::{name} ({count}x)")
+        # Module-level functions shadow each other the same way.
+        names = [n.name for n in tree.body if isinstance(n, ast.FunctionDef)]
+        for name, count in collections.Counter(names).items():
+            if count > 1:
+                offenders.append(f"{path.name}::{name} ({count}x)")
+
+    assert not offenders, "shadowed definitions never run:\n  " + "\n  ".join(offenders)
