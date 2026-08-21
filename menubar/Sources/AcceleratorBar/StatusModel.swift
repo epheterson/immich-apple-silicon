@@ -296,16 +296,18 @@ final class StatusModel: ObservableObject {
     /// decides the name. This mirror exists only so the settings window can
     /// show the current position without shelling out on every render. Keep the
     /// two tables in step; `ENCODING_PRESETS` in `__main__.py` is the original.
-    nonisolated static let encodingPresets: [(name: String, switches: [String: Bool])] = [
+    nonisolated static let encodingPresets: [
+        (name: String, switches: [String: Bool], mlEngine: String, stockML: Bool)
+    ] = [
         ("stock", ["IMMICH_ACCEL_HW_VIDEO": false,
                    "IMMICH_ACCEL_HW_DECODE": false,
-                   "IMMICH_ACCEL_HW_AUDIO": false]),
+                   "IMMICH_ACCEL_HW_AUDIO": false], "python", true),
         ("balanced", ["IMMICH_ACCEL_HW_VIDEO": true,
                       "IMMICH_ACCEL_HW_DECODE": true,
-                      "IMMICH_ACCEL_HW_AUDIO": false]),
+                      "IMMICH_ACCEL_HW_AUDIO": false], "native", false),
         ("maximum", ["IMMICH_ACCEL_HW_VIDEO": true,
                      "IMMICH_ACCEL_HW_DECODE": true,
-                     "IMMICH_ACCEL_HW_AUDIO": true]),
+                     "IMMICH_ACCEL_HW_AUDIO": true], "native", false),
     ]
 
     /// Switches that are off unless asked for, because they change output.
@@ -313,10 +315,17 @@ final class StatusModel: ObservableObject {
 
     /// Which preset the current switches spell, or "custom".
     nonisolated static func encodingPreset(_ config: [String: Any]) -> String {
+        let engine = (config["ml_engine"] as? String) ?? "native"
+        let stock = (config["stock_ml"] as? Bool) ?? false
         for preset in encodingPresets {
-            if preset.switches.allSatisfy({ encodingSwitchOn($0.key, config) == $0.value }) {
-                return preset.name
-            }
+            guard preset.switches.allSatisfy({ encodingSwitchOn($0.key, config) == $0.value })
+            else { continue }
+            // The machine learning side too, exactly as encoding_preset does in
+            // __main__.py. Checking only the encoding switches lets the pane
+            // show Stock, asserting output identical to Docker, on an install
+            // still running Vision and mlx.
+            guard engine == preset.mlEngine, stock == preset.stockML else { continue }
+            return preset.name
         }
         return "custom"
     }

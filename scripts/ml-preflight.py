@@ -54,16 +54,101 @@ def tiny_jpeg() -> bytes:
     return base64.b64decode(_TINY_JPEG_B64)
 
 
-def predict_clip(base: str, image: bytes) -> str:
-    """One real /predict CLIP-visual call, multipart, matching immich-accelerator
-    ml-test. Returns 'ok' or raises."""
+
+# A 320x96 JPEG reading "EXIT 42B". The OCR check needs an image that actually
+# contains text: with a blank one the detector finds no regions, the box code
+# never executes, and the gate passes on a path it never entered. That is
+# exactly how the box-shape defect survived a green run.
+_TEXT_JPEG_B64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8Q"
+    "EBEQCgwSExIQEw8QEBD/2wBDAQMDAwQDBAgEBAgQCwkLEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+    "EBAQEBAQEBD/wAARCABgAUADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUF"
+    "BAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVW"
+    "V1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi"
+    "4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAEC"
+    "AxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVm"
+    "Z2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq"
+    "8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD9U6KKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKK"
+    "KACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACi"
+    "iigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACuW+Knjc/DP4YeL/iONM/tL/hFNB1DW/sXn+T9p+y27zeV5m1tm7Zt"
+    "3bWxnOD0rqa5b4qeCP8AhZnww8YfDf8AtMab/wAJXoOoaH9sMHnfZvtVu8Pm+XuXft37tu5c4xkdaAOa8R/FTxX8ONFg8VfFfwlo"
+    "Gj6AuoR2upajpfiCa/TTbeRWCXUoks4Ds87yo2xnaJd5O1Wqt4b+LnjzxbqOo+H9M+GdjYa1Z+H9G8RpZ6xrklsPI1G71KJIpjHa"
+    "yNFMkWno7KFcB5mjziPzHzbX9nWC80JPBfiQeA4fCdxqKX+raJ4Y8HHRoNWCRkRxXP8ApUwZBJ5UhwAW8lUPylgej+Gvwo1XwL4j"
+    "v/EeseNpvEM934e0nw3G89p5c3kafdalLDLLJ5jebK0WopG7YXc8DSYHmbEAIPhn8X7/AMT/AAZ0/wCNfxC0LSPCmkaloNr4jiS1"
+    "1eXUTDZTWyz/AL0tbQ4kUNjagfJ6E5Arj0/aa8UTfCg/FZPg5c29rpzeIJNcs7zVxHJYxaXqUtk0EbLC4nvZfKZkt/lXKsnm/dZ+"
+    "20L4IeG7f4KeEPgr4qu7vWLDwppWj2AurW5uNNkuJtPjiENwDbyiSM+ZCkgUSHBA5OAa4ex/Zm8T+HrHRtD8L/E60fRdK8S6z4ql"
+    "0/xBpV7qy3d7d6hLd2rSO2oI5FqJflBJWSYfaGHmYIAOgvfjZ4tt/G+vaNa/DqxvPD/h7xfpXhC5votbc6g817aWE4uEsvsuwxRf"
+    "2im//SNwjhlkxhdtev14Jrn7KumeIfi1qfxL1O+8Lyrf+LNJ8WQzHwuDrllNYWtjClvDqZuPlgdrAF18nlJ5kz826ve6ACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA"
+    "KKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKK"
+    "ACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigD/"
+    "2Q=="
+)
+
+
+def text_jpeg() -> bytes:
+    import base64
+
+    return base64.b64decode(_TEXT_JPEG_B64)
+
+# Every task the service exposes, not just CLIP. Firing only CLIP is how three
+# new inference paths passed this gate while stock OCR returned a shape the
+# response schema rejects and the stock face detector reported zero faces for
+# every image: the gate was green and had executed neither.
+TASKS = {
+    "clip": {"clip": {"visual": {"modelName": "ViT-B-32__openai"}}},
+    "faces": {
+        "facial-recognition": {"modelName": "buffalo_l", "options": {"minScore": 0.3}}
+    },
+    "ocr": {"ocr": {"modelName": "PP-OCRv5_mobile", "options": {"minScore": 0.3}}},
+}
+
+
+def check_response(task: str, result: dict) -> str:
+    """Confirm the answer has the shape Immich expects, not merely a 200.
+
+    The stock OCR defect returned HTTP 200 from the model and only failed in
+    response validation, so a status check alone would have called it healthy.
+    """
+    if task == "clip":
+        raw = result.get("clip")
+        emb = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(emb, list) or len(emb) < 100:
+            raise RuntimeError(f"bad embedding: {type(emb).__name__}")
+        return f"dim={len(emb)}"
+    if task == "faces":
+        faces = result.get("facial-recognition")
+        if faces is None:
+            raise RuntimeError("no facial-recognition key in response")
+        if not isinstance(faces, list):
+            raise RuntimeError(f"faces should be a list, got {type(faces).__name__}")
+        return f"faces={len(faces)}"
+    ocr = result.get("ocr")
+    if not isinstance(ocr, dict):
+        raise RuntimeError(f"ocr should be an object, got {type(ocr).__name__}")
+    box = ocr.get("box", [])
+    # Flat coordinates. A list of per-box lists is what the schema rejects.
+    if box and not all(isinstance(v, (int, float)) for v in box):
+        raise RuntimeError("ocr box must be a flat list of numbers")
+    texts = ocr.get("text", [])
+    # An OCR run over an image with text that returns nothing has not exercised
+    # the box path, so a pass here would mean nothing.
+    if not texts:
+        raise RuntimeError("read no text from an image that contains text")
+    return f"text={len(texts)}"
+
+
+def predict_task(base: str, image: bytes, task: str = "clip") -> str:
+    """One real /predict call, multipart, matching immich-accelerator ml-test."""
+    if task == "ocr":
+        image = text_jpeg()
     boundary = "----iac-ml-preflight"
     body = b"".join(
         [
             f"--{boundary}\r\n".encode(),
             b'Content-Disposition: form-data; name="entries"\r\n\r\n',
-            json.dumps({"clip": {"visual": {"modelName": "ViT-B-32__openai"}}}).encode()
-            + b"\r\n",
+            json.dumps(TASKS[task]).encode() + b"\r\n",
             f"--{boundary}\r\n".encode(),
             b'Content-Disposition: form-data; name="image"; filename="t.jpg"\r\n'
             b"Content-Type: image/jpeg\r\n\r\n",
@@ -80,15 +165,9 @@ def predict_clip(base: str, image: bytes) -> str:
             "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with urllib.request.urlopen(req, timeout=120) as r:
         result = json.loads(r.read())
-    raw = result.get("clip")
-    emb = json.loads(raw) if isinstance(raw, str) else raw
-    if not isinstance(emb, list) or len(emb) < 100:
-        raise RuntimeError(
-            f"bad embedding: {type(emb).__name__} len={getattr(emb, '__len__', lambda: '?')()}"
-        )
-    return f"dim={len(emb)}"
+    return check_response(task, result)
 
 
 def wait_healthy(base: str, proc: subprocess.Popen, timeout: int) -> None:
@@ -157,14 +236,19 @@ def main() -> int:
     try:
         wait_healthy(base, proc, args.startup_timeout)
         print(
-            f"[preflight] healthy — firing {args.requests} concurrent /predict CLIP calls "
+            f"[preflight] healthy — firing {args.requests} concurrent /predict calls "
+            f"across {', '.join(TASKS)} "
             f"(concurrency={args.concurrency}) ...",
             flush=True,
         )
         image = tiny_jpeg()
         errors = []
         with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-            futs = [ex.submit(predict_clip, base, image) for _ in range(args.requests)]
+            futs = [
+                ex.submit(predict_task, base, image, task)
+                for i in range(args.requests)
+                for task in (list(TASKS)[i % len(TASKS)],)
+            ]
             for f in futs:
                 try:
                     f.result()

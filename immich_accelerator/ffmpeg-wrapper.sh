@@ -56,10 +56,17 @@ fi
 # roughly one core where software uses every core it can reach, which is what
 # matters when the worker is running several jobs and the ML engine at once.
 # `immich-accelerator encode-compare` measures both on your own footage.
-_off() { [[ "$1" == "0" || "$1" == "false" || "$1" == "no" ]]; }
+# Trimmed and lowercased before comparing, because the Python side does the
+# same and the two must not disagree: " FALSE" read as off by the CLI and on
+# by the wrapper means the settings screen and the actual encode differ.
+# tr, not ${v:l} (zsh only) or ${v,,} (bash 4; macOS ships 3.2). Both expand
+# to the string unchanged here, which would make this normalisation a no-op
+# that still looks correct.
+_norm() { printf '%s' "${1//[[:space:]]/}" | tr '[:upper:]' '[:lower:]'; }
+_off() { local v; v=$(_norm "$1"); [[ "$v" == "0" || "$v" == "false" || "$v" == "no" ]]; }
 # Default-off counterpart, for switches that change output and so are only
 # reached from the Maximum position. Anything unrecognised stays off.
-_on() { [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]; }
+_on() { local v; v=$(_norm "$1"); [[ "$v" == "1" || "$v" == "true" || "$v" == "yes" ]]; }
 HW_VIDEO=true
 _off "${IMMICH_ACCEL_HW_VIDEO:-1}" && HW_VIDEO=false
 HW_DECODE=true

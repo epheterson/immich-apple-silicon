@@ -2225,7 +2225,13 @@ class TestEncodingSwitches:
                 f"switch and the wrapper agree"
             )
             args, marker = self.PROBES[variable]
-            for value in ("0", "false", "no", "1", "true", "yes", "", "off", "banana"):
+            # Mixed case and surrounding space included: the two
+            # implementations used to disagree on exactly these, and a test
+            # that only tries already-lowercase values never notices.
+            for value in (
+                "0", "false", "no", "1", "true", "yes", "", "off", "banana",
+                "FALSE", "True", " 0", " YES ", "No", "1 ",
+            ):
                 default_on = variable not in self.DEFAULT_OFF
                 python_says_on = m.bool_setting(
                     variable, default_on, {"env": {variable: value}}
