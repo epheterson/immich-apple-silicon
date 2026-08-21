@@ -35,7 +35,7 @@ Docker (lightweight)                Native macOS (compute)
                                     +-------------------------------+
 ```
 
-The microservices worker is extracted directly from your running Immich Docker image, so it tracks whatever version you run (verified with Immich 2.7.x and 3.0.x). Always the exact same version, no source builds. The only modification is installing the macOS-native Sharp binary for image processing. Video transcoding is intercepted by a lightweight ffmpeg wrapper that remaps software encoders to VideoToolbox hardware encoders.
+The microservices worker is extracted directly from your running Immich Docker image, so it tracks whatever version you run (verified with Immich 2.7.x and 3.0.x). Always the exact same version, no source builds. The only modification is installing the macOS-native Sharp binary for image processing. ffmpeg is intercepted by a lightweight wrapper that remaps software encoders to VideoToolbox hardware encoders and requests VideoToolbox decode for every input.
 
 ### Split: worker + ML on a remote host
 

@@ -2153,6 +2153,31 @@ class TestFfmpegWrapperQuickLookFallback:
         assert "libx264" not in received
         assert "-preset" not in received, "software presets must be stripped for VideoToolbox"
 
+    def test_thumbnail_job_gets_hardware_decode(self, tmp_path):
+        """Immich's thumbnail and preview jobs send no -c:v at all, so there is
+        no encoder to remap. Hardware decode still has to be injected."""
+        ffmpeg = tmp_path / "ffmpeg"
+        seen_args = tmp_path / "seen_args"
+        self._bash_stub(ffmpeg, f'printf "%s\\n" "$@" > {seen_args}\nexit 0\n')
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        args = self._thumbnail_args(tmp_path / "in.mov", tmp_path / "out.jpg")
+
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        received = seen_args.read_text().splitlines()
+        assert received[:2] == ["-hwaccel", "videotoolbox"], (
+            f"-hwaccel must be injected as an input option, before -i; got {received}"
+        )
+        # Nothing else may change: no encoder was requested, so none is invented.
+        assert not any(a.endswith("_videotoolbox") for a in received[2:])
+        assert received[2:] == args, "the remaining arguments must pass through verbatim"
+
     def _capture_ffmpeg_args(self, tmp_path, args):
         """Run the wrapper against a stub ffmpeg that records its argv."""
         ffmpeg = tmp_path / "ffmpeg"
@@ -2238,7 +2263,9 @@ class TestFfmpegWrapperQuickLookFallback:
             ["-i", str(tmp_path / "in.mov"), "-c:v", "libvpx-vp9",
              "-crf", "23", str(tmp_path / "out.webm")],
         )
-        assert "-hwaccel" not in received
+        # No -hwaccel assertion. It was equivalent to "not remapped" until #153
+        # separated decode from encode; decode is now requested for every input,
+        # including software-encoded ones, which is the point of it.
         assert "-q:v" not in received
         assert received[received.index("-crf") + 1] == "23"
 

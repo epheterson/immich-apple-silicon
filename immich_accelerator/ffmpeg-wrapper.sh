@@ -1,7 +1,8 @@
 #!/bin/bash
 # VideoToolbox ffmpeg wrapper for Immich Accelerator
 #
-# Remaps software encoders to VideoToolbox hardware encoders.
+# Remaps software encoders to VideoToolbox hardware encoders, and requests
+# VideoToolbox decode for every input.
 # Uses jellyfin-ffmpeg which has tonemapx natively — no filter remapping needed.
 #
 # Immich doesn't support 'videotoolbox' as an accel option, so this wrapper
@@ -48,7 +49,7 @@ else
 fi
 
 ARGS=("$@")
-USE_HW=false
+USE_HW_ENCODER=false
 USE_HEVC=false
 HAS_HEVC_TAG=false
 NEW_ARGS=()
@@ -63,13 +64,13 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
             h264|libx264|libx264rgb)
                 NEW_ARGS+=("$arg" "h264_videotoolbox")
                 ((i++))
-                USE_HW=true
+                USE_HW_ENCODER=true
                 continue
                 ;;
             hevc|libx265)
                 NEW_ARGS+=("$arg" "hevc_videotoolbox")
                 ((i++))
-                USE_HW=true
+                USE_HW_ENCODER=true
                 USE_HEVC=true
                 continue
                 ;;
@@ -77,7 +78,7 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
     fi
 
     # Strip -preset for VideoToolbox (doesn't support CPU presets)
-    if [[ "$arg" == "-preset" && "$USE_HW" == true ]]; then
+    if [[ "$arg" == "-preset" && "$USE_HW_ENCODER" == true ]]; then
         ((i++))
         continue
     fi
@@ -88,7 +89,11 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
     # inverted scale. Both become a -q:v value that means what the CRF
     # setting asked for. Matched as prefixes so the stream-specific spellings
     # (-crf:v, -q:v:0) are translated too.
-    if [[ ( "$arg" == -crf* || "$arg" == -q:v* ) && "$USE_HW" == true ]]; then
+    #
+    # USE_HW_ENCODER, not USE_HW: this arrived alongside the rename in #153,
+    # and the two merge without a git conflict, so the old name would simply
+    # never be true and the translation would silently stop happening.
+    if [[ ( "$arg" == -crf* || "$arg" == -q:v* ) && "$USE_HW_ENCODER" == true ]]; then
         next="${ARGS[$((i+1))]:-}"
         if [[ "$next" =~ ^[0-9]+$ ]]; then
             NEW_ARGS+=("-q:v" "$(_crf_to_quality "$next")")
@@ -103,20 +108,22 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
     NEW_ARGS+=("$arg")
 done
 
-if [[ "$USE_HW" == true ]]; then
-    # Ensure HEVC output uses hvc1 tag (Apple-compatible).
-    # hev1 (ffmpeg default) stores parameter sets in-band — Apple's
-    # decoder rejects it. Immich usually passes -tag:v hvc1 itself,
-    # but if it's absent we inject it before the output filename.
-    if [[ "$USE_HEVC" == true && "$HAS_HEVC_TAG" == false ]]; then
-        len=${#NEW_ARGS[@]}
-        LAST="${NEW_ARGS[$((len-1))]}"
-        NEW_ARGS=("${NEW_ARGS[@]:0:$((len-1))}" "-tag:v" "hvc1" "$LAST")
-    fi
-    RUN_ARGS=(-hwaccel videotoolbox "${NEW_ARGS[@]}")
-else
-    RUN_ARGS=("${NEW_ARGS[@]}")
+# Ensure HEVC output uses hvc1 tag (Apple-compatible).
+# hev1 (ffmpeg default) stores parameter sets in-band — Apple's
+# decoder rejects it. Immich usually passes -tag:v hvc1 itself,
+# but if it's absent we inject it before the output filename.
+if [[ "$USE_HEVC" == true && "$HAS_HEVC_TAG" == false ]]; then
+    len=${#NEW_ARGS[@]}
+    LAST="${NEW_ARGS[$((len-1))]}"
+    NEW_ARGS=("${NEW_ARGS[@]:0:$((len-1))}" "-tag:v" "hvc1" "$LAST")
 fi
+
+# Decode with VideoToolbox on every call, not only the ones that remapped an
+# encoder. Immich sends no -c:v at all for thumbnail and preview jobs, so
+# tying hardware decode to the encoder remap left those decoding in software.
+# -hwaccel is a hint: ffmpeg falls back to the software decoder for anything
+# VideoToolbox will not take.
+RUN_ARGS=(-hwaccel videotoolbox "${NEW_ARGS[@]}")
 
 # Run ffmpeg with stderr captured, so the fallback below can tell a decoder
 # rejection (what it is for) from a broken file or bad arguments (what it must

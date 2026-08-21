@@ -39,6 +39,11 @@ def no_real_machine_reads(monkeypatch):
     monkeypatch.setattr(m, "_ml_ping", lambda *a, **k: False)
     monkeypatch.setattr(m, "ml_port_state", lambda *a, **k: m.PORT_FREE)
     monkeypatch.setattr(m, "port_in_use", lambda *a, **k: False)
+    # cmd_watch claims the supervisor role by setting this and never clears it,
+    # because a process runs one command. A test process runs hundreds, so a
+    # test that drives cmd_watch would otherwise leave every later test
+    # believing it supervises the ML service.
+    monkeypatch.setattr(m, "_SUPERVISING_ML", m._SUPERVISING_ML)
     yield
 
 
