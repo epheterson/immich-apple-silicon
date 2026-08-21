@@ -85,13 +85,16 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
                 continue
                 ;;
             hevc|libx265)
+                # Before the switch: the output is HEVC either way, and the
+                # hvc1 tag below is about the container, not about which
+                # encoder produced the stream.
+                USE_HEVC=true
                 if [[ "$HW_VIDEO" != true ]]; then
                     NEW_ARGS+=("$arg" "$next"); ((i++)); continue
                 fi
                 NEW_ARGS+=("$arg" "hevc_videotoolbox")
                 ((i++))
                 USE_HW_ENCODER=true
-                USE_HEVC=true
                 continue
                 ;;
         esac
