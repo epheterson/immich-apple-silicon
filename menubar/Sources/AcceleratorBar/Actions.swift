@@ -127,21 +127,33 @@ enum Actions {
     static func stopService() async { await run(brew, ["services", "stop", service]) }
     static func restartService() async { await run(brew, ["services", "restart", service]) }
 
-    /// Restart only a service that is already running.
+    /// Restart the accelerator, but only if it is actually running.
     ///
     /// `brew services restart` starts a stopped service, so using it to apply a
-    /// setting takes someone who deliberately stopped the accelerator, perhaps
-    /// while their NAS is down, and starts it transcoding because they flipped
-    /// a switch to have it ready for later. Applying a setting must never be
-    /// the thing that starts processing.
+    /// setting would take someone who deliberately stopped the accelerator and
+    /// start it transcoding because they flipped a switch.
     ///
-    /// Returns whether it restarted, so the caller can say "takes effect when
-    /// you start it" rather than claiming it already has.
+    /// Liveness is judged the same way the rest of the app judges it: a live
+    /// pid. `brew services list` alone is narrower and disagrees with the
+    /// status shown in this very window for an accelerator started by hand or
+    /// by a launchd agent, which would leave the setting unapplied while the
+    /// pane reported success.
+    ///
+    /// Returns whether it restarted, so the caller can tell the user the truth.
     @discardableResult
     static func restartIfRunning() async -> Bool {
-        let (_, out) = await run(brew, ["services", "list"])
-        let running = out.split(separator: "\n").contains { line in
-            line.hasPrefix("immich-accelerator") && line.contains("started")
+        let alive = await withCheckedContinuation { cont in
+            DispatchQueue.global().async {
+                cont.resume(returning: StatusModel.pidAlive("worker") != nil
+                    || StatusModel.pidAlive("ml") != nil)
+            }
+        }
+        var running = alive
+        if !running {
+            let (_, out) = await run(brew, ["services", "list"])
+            running = out.split(separator: "\n").contains { line in
+                line.hasPrefix("immich-accelerator") && line.contains("started")
+            }
         }
         if running { await restartService() }
         return running
@@ -210,7 +222,9 @@ enum Actions {
         guard let out = try? JSONSerialization.data(
             withJSONObject: obj, options: [.prettyPrinted]) else { return }
         try? out.write(to: url, options: .atomic)
-        await restartService()
+        // Same rule as every other setting here: apply now if it is running,
+        // never start a stopped accelerator because a setting changed.
+        await restartIfRunning()
     }
 
     // Enable/disable one component via the CLI, which flips its config key and
@@ -247,10 +261,9 @@ enum Actions {
         guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
         let (code, out) = await run(cli, ["encoding", "preset", name])
         if code == 0 {
-            // Same rule as the individual switches: apply now if it is
-            // running, never start it because a setting changed.
-            await restartIfRunning()
-            return (true, "")
+            // Same rule as the individual switches.
+            let applied = await restartIfRunning()
+            return (true, applied ? "" : "Saved. Takes effect when you start the accelerator.")
         }
         let detail = out.split(separator: "\n")
             .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
@@ -268,9 +281,11 @@ enum Actions {
         let (code, out) = await run(cli, ["encoding", name, on ? "on" : "off"])
         if code == 0 {
             // Applies now if the accelerator is running, and does not start
-            // it if it is not.
-            await restartIfRunning()
-            return (true, "")
+            // it if it is not. Saying so matters: the setting is saved either
+            // way, and a pane that reports plain success would be claiming the
+            // running behaviour changed when it did not.
+            let applied = await restartIfRunning()
+            return (true, applied ? "" : "Saved. Takes effect when you start the accelerator.")
         }
         let detail = out.split(separator: "\n")
             .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })

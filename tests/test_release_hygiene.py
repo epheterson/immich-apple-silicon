@@ -209,7 +209,11 @@ def test_no_file_ships_git_conflict_markers():
 
     root = Path(__file__).parent.parent
     offenders = []
-    for pattern in ("*.md", "*.py", "*.sh", "*.swift", "*.json", "*.yml"):
+    # .js and .html included: the hook shims and the dashboard are tracked
+    # source that a bad merge can land in just as easily as the rest.
+    for pattern in (
+        "*.md", "*.py", "*.sh", "*.swift", "*.json", "*.yml", "*.js", "*.html",
+    ):
         for path in root.rglob(pattern):
             if any(
                 part in {".git", "node_modules", ".build", "venv", "graphify-out"}

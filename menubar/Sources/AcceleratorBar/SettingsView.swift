@@ -242,6 +242,7 @@ struct SettingsView: View {
     /// grain, shown rather than hidden so the preset is never a black box.
     private var processingTab: some View {
         Form {
+            if workerOn {
             Section {
                 // Centred, and no section header: the control is the first
                 // thing in the pane and a word above it saying "Output" only
@@ -288,6 +289,8 @@ struct SettingsView: View {
 
                 Text("This covers transcoding. Machine learning is chosen separately below.")
                     .font(.rowDetail).foregroundStyle(.secondary)
+            }
+
             }
 
             Section("Services") {
@@ -433,7 +436,9 @@ struct SettingsView: View {
                 applyingSwitch = "preset"
                 Task {
                     let result = await Actions.setEncodingPreset(name)
-                    encodingError = result.ok ? nil : result.message
+                    // message is also set on success when the accelerator was
+                    // not running, to say the setting is saved but not live.
+                    encodingError = result.message.isEmpty ? nil : result.message
                     config = StatusModel.readConfig()
                     loadSwitches()
                     // Re-seed everything the write could have moved, not just

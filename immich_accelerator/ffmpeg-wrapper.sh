@@ -62,7 +62,14 @@ fi
 # tr, not ${v:l} (zsh only) or ${v,,} (bash 4; macOS ships 3.2). Both expand
 # to the string unchanged here, which would make this normalisation a no-op
 # that still looks correct.
-_norm() { printf '%s' "${1//[[:space:]]/}" | tr '[:upper:]' '[:lower:]'; }
+# Ends only, matching Python's str.strip(). Deleting interior whitespace made
+# the two disagree on exactly the values this exists to keep aligned.
+_norm() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    printf '%s' "$v" | tr '[:upper:]' '[:lower:]'
+}
 _off() { local v; v=$(_norm "$1"); [[ "$v" == "0" || "$v" == "false" || "$v" == "no" ]]; }
 # Default-off counterpart, for switches that change output and so are only
 # reached from the Maximum position. Anything unrecognised stays off.
@@ -258,7 +265,12 @@ if [[ "$IS_SINGLE_FRAME" == true && "$DECODE_REJECTED" == true && -n "$INPUT" \
             else
                 RESIZE=("--width" "${SCALE_W:-$QL_SIZE}")
             fi
-            if "$VIPS_BIN" thumbnail "$QL_RESULT" "$OUTPUT" "${RESIZE[@]:1:1}" >/dev/null 2>&1 \
+            # The whole array, not a slice of it. ":1:1" took the second
+            # element only, so vips got the number without its flag and read it
+            # as the positional width: a preview requested at height 1440 came
+            # back 1440 wide. The wrapper exits 0, so Immich recorded the asset
+            # as thumbnailed and never retried. Present since before 1.14.0.
+            if "$VIPS_BIN" thumbnail "$QL_RESULT" "$OUTPUT" "${RESIZE[@]}" >/dev/null 2>&1 \
                || "$VIPS_BIN" copy "$QL_RESULT" "$OUTPUT" >/dev/null 2>&1; then
                 echo "[immich-accelerator] ffmpeg couldn't decode $INPUT for a thumbnail; QuickLook/AVFoundation produced one instead" >&2
                 exit 0

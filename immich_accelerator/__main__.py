@@ -7332,8 +7332,12 @@ def cmd_compare(args):
         return
 
     if has_original:
+        # Labelled as the whole file, because that is what it measures: every
+        # encode below strips audio with -an, so putting the source's total
+        # size in the same column would overstate what the encodes saved.
         rows.insert(0, {
-            "label": "Original", "wall": 0.0, "cpu": 0.0, "cores": 0.0,
+            "label": "Original (whole file, with audio)",
+            "wall": 0.0, "cpu": 0.0, "cores": 0.0,
             "mb": Path(src).stat().st_size / (1024 * 1024), "ssim": None,
             "frame": original.name,
         })

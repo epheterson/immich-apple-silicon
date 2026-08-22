@@ -11,7 +11,7 @@
 
 ### Fixed
 - **Re-running `setup` no longer discards your encoding settings.** It rebuilds the config from scratch and saves it wholesale, and the `env` block was not on the list of keys carried across, so the documented repair step quietly reverted a chosen position.
-- **Settings changes take effect when you make them.** Both the position control and the individual switches restart the accelerator, rather than writing config and reporting success while nothing changed.
+- **Settings changes take effect when you make them**, rather than being written and reported as successful while the running accelerator carries on with the old ones. Changing a setting while the accelerator is stopped saves it and says so, because applying a setting must never be the thing that starts processing.
 
 ### Changed
 - The mount switch now says what the whole system does: it remembers SMB shares and reconnects them at login, and separately the accelerator watches the mount holding your library the entire time it runs and remounts it on its own.
