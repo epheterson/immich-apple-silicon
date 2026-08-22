@@ -226,7 +226,15 @@ enum Actions {
     static func setEncodingPreset(_ name: String) async -> (ok: Bool, message: String) {
         guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
         let (code, out) = await run(cli, ["encoding", "preset", name])
-        if code == 0 { return (true, "") }
+        if code == 0 {
+            // The CLI writes config.json and says "restart to take effect",
+            // which is the right advice for a terminal and useless in a
+            // settings window: a switch that reports success and changes
+            // nothing until something else restarts the service is a switch
+            // that looks broken.
+            await restartService()
+            return (true, "")
+        }
         let detail = out.split(separator: "\n")
             .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
             .map(String.init) ?? "exit \(code)"

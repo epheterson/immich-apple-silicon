@@ -174,24 +174,16 @@ def test_the_swift_preset_mirror_matches_the_python_one():
     table = swift[swift.index("encodingPresets:") : swift.index("encodingDefaultOff")]
 
     parsed = {}
-    for entry in re.finditer(
-        r'\("([a-z-]+)",\s*\[(.*?)\],\s*"(\w+)",\s*(true|false)\)', table, re.S
-    ):
-        name, switches, engine, stock = entry.groups()
+    for entry in re.finditer(r'\("([a-z-]+)",\s*\[(.*?)\]\)', table, re.S):
+        name, switches = entry.groups()
         parsed[name] = {
-            "switches": {
-                k: v == "true"
-                for k, v in re.findall(r'"(\w+)":\s*(true|false)', switches)
-            },
-            "ml_engine": engine,
-            "stock_ml": stock == "true",
+            k: v == "true"
+            for k, v in re.findall(r'"(\w+)":\s*(true|false)', switches)
         }
 
     assert parsed, "could not parse the Swift preset table; update this test"
     assert set(parsed) == set(m.ENCODING_PRESETS), (
         f"Swift has {sorted(parsed)}, Python has {sorted(m.ENCODING_PRESETS)}"
     )
-    for name, swift_preset in parsed.items():
-        assert swift_preset["switches"] == m.ENCODING_PRESETS[name], name
-        assert swift_preset["ml_engine"] == m.PRESET_ML[name]["ml_engine"], name
-        assert swift_preset["stock_ml"] == m.PRESET_ML[name]["stock_ml"], name
+    for name, switches in parsed.items():
+        assert switches == m.ENCODING_PRESETS[name], name

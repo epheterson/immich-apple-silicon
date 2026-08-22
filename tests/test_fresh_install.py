@@ -2125,71 +2125,58 @@ class TestEncodingSwitches:
         m.save_config({})
         assert m.encoding_switch_on("hardware-audio") is False
 
-    def test_stock_selects_the_engine_that_can_actually_do_it(self, tmp_data_dir):
-        """The whole failure this guards against: Stock writes the ffmpeg
-        switches, leaves the native engine in place, and the label claims
-        Docker-identical output while faces, text and search are still Apple
-        Vision and mlx."""
-        config = m.apply_encoding_preset("stock", {})
-        assert config["ml_engine"] == "python"
-        assert config["stock_ml"] is True
 
-    def test_the_apple_silicon_end_keeps_the_native_engine(self, tmp_data_dir):
-        config = m.apply_encoding_preset("apple-silicon", {})
-        assert config["ml_engine"] == "native"
-        assert config["stock_ml"] is False
 
     def test_turning_off_one_switch_reads_as_custom(self, tmp_data_dir):
         m.save_config(m.apply_encoding_preset("apple-silicon", {}))
         m.cmd_encoding(self._args("hardware-audio", "off"))
         assert m.encoding_preset() == "custom"
 
-    def test_stock_video_with_accelerated_ml_is_not_stock(self, tmp_data_dir):
-        """An install with the Stock switches but the native engine must report
-        custom. Reporting "stock" there is the one lie this must never tell."""
-        config = m.apply_encoding_preset("stock", {})
-        config["ml_engine"] = "native"
-        config["stock_ml"] = False
-        assert m.encoding_preset(config) == "custom"
 
-    def test_every_preset_names_the_ml_side(self, tmp_data_dir):
-        """A position added to one table and not the other would apply half of
-        itself and then report as custom immediately afterwards."""
-        assert set(m.ENCODING_PRESETS) == set(m.PRESET_ML)
-        assert set(m.ENCODING_PRESETS) == set(m.PRESET_SUMMARY)
 
-    def test_the_ml_service_is_told_about_stock(self, tmp_path, tmp_data_dir):
-        """config_env only forwards IMMICH_ACCEL*, so ML_STOCK has to be passed
-        explicitly or the engine never hears about it and quietly runs Vision."""
-        config = {"ml_dir": str(tmp_path)}
-        venv_python = tmp_path / "venv" / "bin"
-        venv_python.mkdir(parents=True, exist_ok=True)
-        (venv_python / "python3").write_text("")
-        (venv_python / "python3").chmod(0o755)
 
-        spec = m._venv_ml_spec({**config, "stock_ml": True}, {})
-        assert spec is not None and spec[2]["ML_STOCK"] == "true"
-        spec = m._venv_ml_spec({**config, "stock_ml": False}, {})
-        assert spec is not None and spec[2]["ML_STOCK"] == "false"
+    def test_re_running_setup_keeps_a_chosen_position(self, tmp_data_dir):
+        """The bug this exists for: setup builds a new config dict carrying
+        only a few keys across, so anything asked of THAT dict reports "never
+        chosen" every time and a re-run silently reset the user's choice.
+
+        Re-running setup is the documented repair step, so it is a path people
+        take. The check has to read the file, and this test has to go through
+        the file rather than hand the function a dict that already has the
+        answer, which is exactly how the first version passed while broken.
+        """
+        m.save_config(m.apply_encoding_preset("stock", {}))
+        assert m.encoding_preset() == "stock"
+
+        # What setup does: a fresh dict, only a few keys preserved.
+        rebuilt = {"immich_url": "http://x", "api_key": "k"}
+        assert m._has_chosen_processing() is True, (
+            "reading the rebuilt config instead of the file is the bug"
+        )
+        if not m._has_chosen_processing():
+            m.apply_encoding_preset("apple-silicon", rebuilt)
+        assert "env" not in rebuilt, "a chosen position must not be overwritten"
 
     def test_a_fresh_install_starts_at_a_named_end(self, tmp_data_dir):
         """Someone installing today has no behaviour to preserve, so landing
         them in the middle of the range is a bad first impression."""
-        config = {}
-        assert m._has_chosen_processing(config) is False
+        m.save_config({})
+        assert m._has_chosen_processing() is False
+        config = m.load_config()
         m.apply_encoding_preset("apple-silicon", config)
         assert m.encoding_preset(config) == "apple-silicon"
 
     def test_an_upgrade_is_not_treated_as_fresh(self, tmp_data_dir):
         """An install that already set one of these keeps what it had. Moving
         it would change output on someone who never asked."""
-        chosen = m.apply_encoding_preset("stock", {})
-        assert m._has_chosen_processing(chosen) is True
+        m.save_config(m.apply_encoding_preset("stock", {}))
+        assert m._has_chosen_processing() is True
 
     def test_a_half_configured_install_counts_as_chosen(self, tmp_data_dir):
         """One switch set by hand is still a choice, and must not be
         overwritten by the fresh-install default."""
-        assert m._has_chosen_processing({"env": {"IMMICH_ACCEL_HW_VIDEO": "0"}}) is True
+        m.save_config({"env": {"IMMICH_ACCEL_HW_VIDEO": "0"}})
+        assert m._has_chosen_processing() is True
 
     def test_the_comparison_page_shows_every_encode(self, tmp_path):
         """The page is the deliverable: if a row is dropped the person is

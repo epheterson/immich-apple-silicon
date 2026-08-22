@@ -280,14 +280,8 @@ struct SettingsView: View {
                     }
                 }
 
-                if pendingDetectorChange {
-                    Label(
-                        "Changes the face detector. Faces already found keep their old boxes until you re-run Face Detection in Immich.",
-                        systemImage: "exclamationmark.triangle.fill")
-                        .font(.rowDetail)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text("This covers transcoding. Machine learning is chosen separately below.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
             }
 
             Section("Services") {
@@ -395,10 +389,10 @@ struct SettingsView: View {
     /// rather than a fourth option tacked on the end, and a switch moved off
     /// either end lands there.
     private static let presets: [(name: String, title: String, engine: String?, detail: String)] = [
-        ("stock", "Stock Immich", "PYTHON",
-         "Video, thumbnails, faces and text exactly as Immich's own container produces them. A library built here moves back to Docker with no reprocessing. Uses the most CPU."),
-        ("apple-silicon", "Apple Silicon", "NATIVE",
-         "VideoToolbox for video and audio, Apple frameworks for machine learning. Much less CPU, so the Mac keeps up with everything else it is doing. Video is visually identical; audio and 10-bit thumbnails differ byte for byte."),
+        ("stock", "Stock", nil,
+         "Transcoding done exactly as Immich's own container does it: software encoders, software decoding. Video and thumbnails are byte for byte what Docker produces. Uses the most CPU."),
+        ("apple-silicon", "Apple Silicon", nil,
+         "VideoToolbox for decoding, video and audio. Much less CPU, so the Mac keeps up with everything else it is doing. Video is visually identical to Docker's; audio and 10-bit thumbnails differ byte for byte."),
     ]
 
     /// Inserted between the two ends when the switches spell neither.
@@ -418,15 +412,6 @@ struct SettingsView: View {
             .first { $0.name == currentPreset }?.engine
     }
 
-    /// True while the selected position uses a different face detector from
-    /// the one that produced the faces already in the library.
-    private var pendingDetectorChange: Bool {
-        guard let engine = presetEngine else { return false }
-        let running = model.snap.mlEngine
-        guard running != .unknown else { return false }
-        return (engine == "PYTHON") != (running == .python)
-    }
-
     private var currentPreset: String { StatusModel.encodingPreset(config) }
 
     /// Reads the derived preset, writes through the CLI. Selecting the position
@@ -443,6 +428,11 @@ struct SettingsView: View {
                     encodingError = result.ok ? nil : result.message
                     config = StatusModel.readConfig()
                     loadSwitches()
+                    // Re-seed everything the write could have moved, not just
+                    // the switches. Leaving the engine picker on its old value
+                    // means an Apply there writes the stale engine back.
+                    savedEngine = (config["ml_engine"] as? String) ?? "native"
+                    engine = savedEngine
                     applyingSwitch = nil
                 }
             })

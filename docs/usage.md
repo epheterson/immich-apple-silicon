@@ -178,25 +178,6 @@ Setting them in the shell environment does not work on a Homebrew install, which
 
 Only `IMMICH_ACCEL*` names are accepted. Everything else a service needs is worked out at startup, and anything else in that block is ignored with a warning.
 =======
-### How this Mac differs from Docker
-
-One setting decides it, in Settings under Processing, or from the CLI:
-
-```bash
-immich-accelerator encoding preset          # what is set now
-immich-accelerator encoding preset stock    # change it
-```
-
-| Position | What it means |
-|---|---|
-| **Stock** | Every output identical to Docker: video, thumbnails, faces and text. Nothing runs on the video hardware, and machine learning runs Immich's own ONNX models rather than Apple's frameworks. A library built here can move back to a Docker install without reprocessing. |
-| **Balanced** | The default. Video encoded and decoded on the hardware, machine learning on Apple Silicon. Thumbnails from 10-bit video are visually identical to Docker's but not byte-identical. |
-| **Maximum** | Hardware wherever it measured faster, which leaves the most CPU for other jobs. Audio is re-encoded with AudioToolbox, so those files differ from Docker's. |
-
-Each position sets the individual switches below, and they stay visible: change one by hand and the position reads `custom`, which is a real answer rather than an error.
-
-**Stock uses the Python machine learning engine**, because Immich's own models are what make the output match and only that engine carries them. Switching between Stock and the others therefore changes the face detector, and the two detectors do not agree on exactly where faces are. Faces already in your library keep the boxes they were found with; re-run Face Detection in Immich if you want them redone.
-
 ### Hardware video encoding
 
 On by default. Set `IMMICH_ACCEL_HW_VIDEO=0` to keep Immich's own software encoder instead.
