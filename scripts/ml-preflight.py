@@ -473,10 +473,23 @@ def face_jpeg() -> bytes:
 # every image: the gate was green and had executed neither.
 TASKS = {
     "clip": {"clip": {"visual": {"modelName": "ViT-B-32__openai"}}},
+    # The nested shape the service actually reads (main.py: task_config
+    # ["detection"]["options"]["minScore"], ["recognition"]["modelName"]). The
+    # flat form parses fine and the thresholds inside it reach nothing, so the
+    # gate would run at whatever the service defaults to while believing it had
+    # asked for something else.
     "faces": {
-        "facial-recognition": {"modelName": "buffalo_l", "options": {"minScore": 0.3}}
+        "facial-recognition": {
+            "detection": {"options": {"minScore": 0.3}},
+            "recognition": {"modelName": "buffalo_l"},
+        }
     },
-    "ocr": {"ocr": {"modelName": "PP-OCRv5_mobile", "options": {"minScore": 0.3}}},
+    "ocr": {
+        "ocr": {
+            "detection": {"options": {"minScore": 0.3}},
+            "recognition": {"modelName": "PP-OCRv5_mobile", "options": {"minScore": 0.3}},
+        }
+    },
 }
 
 
@@ -619,8 +632,8 @@ def main() -> int:
     try:
         wait_healthy(base, proc, args.startup_timeout)
         print(
-            f"[preflight] healthy — firing {args.requests} concurrent /predict calls "
-            f"across {', '.join(TASKS)} "
+            f"[preflight] healthy — firing {args.requests} concurrent CLIP "
+            f"/predict calls plus one each of {', '.join(t for t in TASKS if t != 'clip')} "
             f"(concurrency={args.concurrency}) ...",
             flush=True,
         )
@@ -668,13 +681,14 @@ def main() -> int:
             return 1
         if errors:
             print(
-                f"[preflight] FAIL — {len(errors)}/{args.requests} predict calls errored"
+                f"[preflight] FAIL — {len(errors)}/{len(futs)} predict calls errored"
             )
             for e in errors[:3]:
                 print(f"[preflight]   {e}")
             return 1
         print(
-            f"[preflight] PASS — {args.requests} real concurrent CLIP inferences, service alive, "
+            f"[preflight] PASS — {args.requests} real concurrent CLIP inferences "
+            f"plus {len(futs) - args.requests} other task calls, service alive, "
             f"no Stream abort"
         )
         return 0

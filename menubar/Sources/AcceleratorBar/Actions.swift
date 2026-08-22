@@ -127,6 +127,26 @@ enum Actions {
     static func stopService() async { await run(brew, ["services", "stop", service]) }
     static func restartService() async { await run(brew, ["services", "restart", service]) }
 
+    /// Restart only a service that is already running.
+    ///
+    /// `brew services restart` starts a stopped service, so using it to apply a
+    /// setting takes someone who deliberately stopped the accelerator, perhaps
+    /// while their NAS is down, and starts it transcoding because they flipped
+    /// a switch to have it ready for later. Applying a setting must never be
+    /// the thing that starts processing.
+    ///
+    /// Returns whether it restarted, so the caller can say "takes effect when
+    /// you start it" rather than claiming it already has.
+    @discardableResult
+    static func restartIfRunning() async -> Bool {
+        let (_, out) = await run(brew, ["services", "list"])
+        let running = out.split(separator: "\n").contains { line in
+            line.hasPrefix("immich-accelerator") && line.contains("started")
+        }
+        if running { await restartService() }
+        return running
+    }
+
     // Runs the CLI's real ML test and condenses the result to one line.
     static func mlTest() async -> String {
         let (code, out) = await run(cli, ["ml-test"])
@@ -227,12 +247,9 @@ enum Actions {
         guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
         let (code, out) = await run(cli, ["encoding", "preset", name])
         if code == 0 {
-            // The CLI writes config.json and says "restart to take effect",
-            // which is the right advice for a terminal and useless in a
-            // settings window: a switch that reports success and changes
-            // nothing until something else restarts the service is a switch
-            // that looks broken.
-            await restartService()
+            // Same rule as the individual switches: apply now if it is
+            // running, never start it because a setting changed.
+            await restartIfRunning()
             return (true, "")
         }
         let detail = out.split(separator: "\n")
@@ -250,11 +267,9 @@ enum Actions {
         guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
         let (code, out) = await run(cli, ["encoding", name, on ? "on" : "off"])
         if code == 0 {
-            // Same as setEncodingPreset. A switch here and a switch in the
-            // control above it must not differ in whether they take effect,
-            // and "changes nothing until you restart something" is not a
-            // behaviour a settings window should have at all.
-            await restartService()
+            // Applies now if the accelerator is running, and does not start
+            // it if it is not.
+            await restartIfRunning()
             return (true, "")
         }
         let detail = out.split(separator: "\n")

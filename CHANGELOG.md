@@ -16,6 +16,7 @@
 ### Changed
 - The mount switch now says what the whole system does: it remembers SMB shares and reconnects them at login, and separately the accelerator watches the mount holding your library the entire time it runs and remounts it on its own.
 
+
 ## 1.14.1 - 2026-08-22
 
 ### Fixed

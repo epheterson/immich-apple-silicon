@@ -4323,6 +4323,12 @@ def _setup_manual(_args):
         "api_key": "YOUR_API_KEY (optional, for dashboard re-queue)",
     }
 
+    # A template is a first install by definition, so it starts at an end
+    # rather than in the middle. Without this, the manual path never reaches
+    # _finalize_config, the config exists by the time any later setup run
+    # looks, and a brand new install opens on Custom.
+    apply_encoding_preset("hardware", template)
+
     save_config(template)
 
     # Check local tools so the user knows what's missing before they start
@@ -7280,11 +7286,16 @@ def cmd_compare(args):
         if preset == _STOCK_PRESET
         else f"Software (x264 {preset})"
     )
-    plans = [(software_label, ["-c:v", "libx264", "-preset",
-                               preset, "-crf", str(args.crf)])]
+    # The same arguments cmd_encode_compare uses, because a row captioned
+    # "what Immich does" that omits them is not what Immich does: the pixel
+    # format changes the encode, and leaving audio in makes the sizes on the
+    # page incomparable between rows.
+    plans = [(software_label, ["-c:v", "libx264", "-preset", preset,
+                               "-crf", str(args.crf), "-pix_fmt", "yuv420p", "-an"])]
     for q in args.quality:
         plans.append((f"VideoToolbox q:v {q}",
-                      ["-c:v", "h264_videotoolbox", "-q:v", str(q)]))
+                      ["-c:v", "h264_videotoolbox", "-q:v", str(q),
+                       "-pix_fmt", "yuv420p", "-an"]))
 
     for label, encode_args in plans:
         dest = out_dir / f"{label.replace(' ', '-').replace(':', '').lower()}.mp4"
@@ -7310,6 +7321,14 @@ def cmd_compare(args):
 
     if not rows:
         log.error("Nothing encoded, so there is nothing to compare.")
+        return
+    # The page tells the reader to judge every row against the software one.
+    # Carrying on without it produces a comparison against something absent.
+    if not any(r["label"].startswith("Software") for r in rows):
+        log.error(
+            "The software encode failed, and every other row is only meaningful "
+            "next to it. Nothing written."
+        )
         return
 
     if has_original:
@@ -7378,7 +7397,11 @@ def cmd_encode_compare(args):
             )
             return
         stock_ssim = _ssim_against(ffmpeg, stock, src)
-        log.info("Software, as Immich would do it")
+        log.info(
+            "Software, as Immich would do it"
+            if preset == _STOCK_PRESET
+            else f"Software, x264 {preset}"
+        )
         log.info("  x264 preset %s, CRF %d", preset, args.crf)
         _report(secs, size, stock_ssim, duration, cpu)
         stock_cpu, stock_wall = cpu, secs

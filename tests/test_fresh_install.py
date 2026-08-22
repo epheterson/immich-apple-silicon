@@ -2183,6 +2183,20 @@ class TestEncodingSwitches:
         monkeypatch.setattr("builtins.input", lambda *a: "n")
         m._finalize_config(config)
 
+    def test_a_first_install_lands_on_a_position(self, tmp_data_dir, monkeypatch):
+        """Nothing asserted this before, which is how a path that never applies
+        one went unnoticed."""
+        rebuilt = {"immich_url": "http://x"}
+        self._finalize(rebuilt, monkeypatch)
+        assert m.encoding_preset() == "hardware"
+
+    def test_the_manual_template_lands_on_a_position_too(self, tmp_data_dir):
+        """setup --manual writes its template and never reaches
+        _finalize_config, so a manual install would open on Custom."""
+        template = {"immich_url": "http://x"}
+        m.apply_encoding_preset("hardware", template)
+        assert m.encoding_preset(template) == "hardware"
+
     def test_setup_preserves_a_chosen_position(self, tmp_data_dir, monkeypatch):
         """Through the real path, not the helper.
 
