@@ -7272,8 +7272,16 @@ def cmd_compare(args):
     has_original = _extract_frame(ffmpeg, src, str(original), at)
 
     # Software first: it is the reference every other row is judged against.
-    plans = [("Software (what Immich does)", ["-c:v", "libx264", "-preset",
-                                              preset, "-crf", str(args.crf)])]
+    # The label names the preset unless it is Immich's own, because a row
+    # reading "what Immich does" while encoding at some other preset is a
+    # caption that contradicts the numbers underneath it.
+    software_label = (
+        "Software (what Immich does)"
+        if preset == _STOCK_PRESET
+        else f"Software (x264 {preset})"
+    )
+    plans = [(software_label, ["-c:v", "libx264", "-preset",
+                               preset, "-crf", str(args.crf)])]
     for q in args.quality:
         plans.append((f"VideoToolbox q:v {q}",
                       ["-c:v", "h264_videotoolbox", "-q:v", str(q)]))
