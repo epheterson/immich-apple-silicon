@@ -156,7 +156,6 @@ The cap is close to free, because the parallelism saturates early. On an M4 with
 
 ## Configuration details
 
-<<<<<<< HEAD
 ### Setting `IMMICH_ACCEL*` variables
 
 Put them in the `env` block of `~/.immich-accelerator/config.json`:
@@ -177,7 +176,7 @@ A real environment variable still wins, so running the accelerator by hand with 
 Setting them in the shell environment does not work on a Homebrew install, which is why this exists: `brew services` generates the launch agent, it carries no environment, `launchctl setenv` does not reach it, and editing the plist is undone the next time the service restarts.
 
 Only `IMMICH_ACCEL*` names are accepted. Everything else a service needs is worked out at startup, and anything else in that block is ignored with a warning.
-=======
+
 ### Hardware video encoding
 
 On by default. Set `IMMICH_ACCEL_HW_VIDEO=0` to keep Immich's own software encoder instead.
@@ -187,7 +186,6 @@ Worth knowing what the switch trades, because "hardware" does not simply mean "f
 Quality is not the thing you give up, and on real footage it often goes the other way. `preset ultrafast` disables most of what x264 is good at, which shows up badly on grainy or high-motion video: on that same footage the software encode scored SSIM 0.967 against the original while the hardware encode scored 0.974 in half the file size. On synthetic test patterns the ranking reverses, which is exactly why the numbers below come from a command you run on your own files rather than from a table here.
 
 `immich-accelerator encode-compare <video>` runs both on a file of yours and prints the numbers, including which hardware quality setting lands closest to what Immich would have produced on its own.
->>>>>>> feat/encoder-toggles
 
 ### Understanding `IMMICH_MEDIA_LOCATION`
 

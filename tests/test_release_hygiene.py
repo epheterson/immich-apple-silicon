@@ -117,3 +117,35 @@ class TestChangelogIsExtractable:
             "the extracted notes contain another release heading, so the "
             "boundary heading is missing and the notes run on"
         )
+
+
+
+def test_no_file_ships_git_conflict_markers():
+    """An unresolved merge left conflict markers in docs/usage.md and
+    v1.14.0 published it. The suite was green throughout, because nothing looks
+    at prose. Cheap to check, and the failure mode is documentation that
+    contradicts itself in front of a user.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).parent.parent
+    offenders = []
+    for pattern in ("*.md", "*.py", "*.sh", "*.swift", "*.json", "*.yml"):
+        for path in root.rglob(pattern):
+            if any(
+                part in {".git", "node_modules", ".build", "venv", "graphify-out"}
+                for part in path.parts
+            ):
+                continue
+            try:
+                text = path.read_text()
+            except (OSError, UnicodeDecodeError):
+                continue
+            # Built rather than written, so this file does not contain the
+            # very markers it looks for and flag itself.
+            for marker in ("<" * 7 + " ", "\n" + ">" * 7 + " "):
+                if marker in text:
+                    offenders.append(f"{path.relative_to(root)}: {marker.strip()}")
+                    break
+
+    assert not offenders, "unresolved conflict markers:\n  " + "\n  ".join(offenders)
