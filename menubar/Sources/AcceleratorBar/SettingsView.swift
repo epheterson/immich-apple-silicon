@@ -237,24 +237,29 @@ struct SettingsView: View {
     private var processingTab: some View {
         Form {
             Section {
-                Picker("", selection: presetBinding) {
-                    // Custom is a state, not a destination. Offering it as a
-                    // choice would mean picking it does nothing, so it appears
-                    // only while the switches actually spell it.
-                    ForEach(Self.presets.filter {
-                        $0.name != "custom" || currentPreset == "custom"
-                    }, id: \.name) { preset in
-                        Text(preset.title).tag(preset.name)
+                // Centred, and no section header: the control is the first
+                // thing in the pane and a word above it saying "Output" only
+                // repeats what the descriptions underneath already say.
+                HStack {
+                    Spacer()
+                    Picker("", selection: presetBinding) {
+                        ForEach(Self.presets.filter {
+                            $0.name != "custom" || currentPreset == "custom"
+                        }, id: \.name) { preset in
+                            Text(preset.title).tag(preset.name)
+                        }
                     }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                    .disabled(applyingSwitch != nil)
+                    Spacer()
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .disabled(applyingSwitch != nil)
 
-                VStack(alignment: .leading, spacing: Metrics.md) {
-                    // Every end described before choosing. A description that
-                    // only appears after selecting is no help at all: the
-                    // question is which one to pick.
+                // Laid out where the ends sit on the control: Stock on the
+                // left, Apple Silicon on the right, so the description a
+                // person reads is under the choice it belongs to.
+                HStack(alignment: .top, spacing: Metrics.lg) {
                     ForEach(Self.presets.filter {
                         $0.name != "custom" || currentPreset == "custom"
                     }, id: \.name) { preset in
@@ -273,36 +278,21 @@ struct SettingsView: View {
                                 .font(.rowDetail).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
-                    }
-                    if pendingDetectorChange {
-                        Label(
-                            "Changes the face detector. Faces already found keep their old boxes until you re-run Face Detection in Immich.",
-                            systemImage: "exclamationmark.triangle.fill")
-                            .font(.rowDetail)
-                            .foregroundStyle(.orange)
-                            .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-            } header: {
-                Text("Output")
+
+                if pendingDetectorChange {
+                    Label(
+                        "Changes the face detector. Faces already found keep their old boxes until you re-run Face Detection in Immich.",
+                        systemImage: "exclamationmark.triangle.fill")
+                        .font(.rowDetail)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
-            if workerOn {
-            Section("Hardware") {
-                encodingToggle(
-                    "hardware-video", $hardwareVideoOn, "Video encoding",
-                    "H.264 and HEVC on VideoToolbox")
-                encodingToggle(
-                    "hardware-decode", $hardwareDecodeOn, "Decoding",
-                    "Video, thumbnails and previews")
-                encodingToggle(
-                    "hardware-audio", $hardwareAudioOn, "Audio encoding",
-                    "AAC on AudioToolbox")
-            }
-
-            }
-
-            Section("Running") {
+            Section("Services") {
                 componentToggle("worker", $workerOn, "Worker",
                                 "Thumbnails, video, metadata")
                 componentToggle("ml", $mlOn, "Machine learning",
@@ -311,67 +301,80 @@ struct SettingsView: View {
                                 dashboardStatus)
             }
 
-            if mlOn {
-            Section("Machine learning engine") {
-                Picker("Engine", selection: $engine) {
-                    ForEach(["native", "python"], id: \.self) { value in
-                        BadgeLabel(text: value == "native" ? "NATIVE" : "PYTHON",
-                                   tint: value == "native" ? .green : .orange)
-                            .tag(value)
-                    }
-                }
-                if engine != savedEngine {
-                    HStack(spacing: Metrics.md) {
-                        Text("Restarts the accelerator.")
-                            .font(.rowDetail).foregroundStyle(.secondary)
-                        Spacer()
-                        Button(applying ? "Applying…" : "Apply") {
-                            applying = true
-                            Task {
-                                await Actions.setMLEngine(engine)
-                                savedEngine = engine
-                                await model.refresh()
-                                applying = false
-                            }
-                        }
-                        .disabled(applying)
-                    }
-                }
-                LabeledContent("Self-test") {
-                    Button(testing ? "Running…" : "Run") { runMLTest() }
-                        .disabled(testing || !model.snap.mlHealthy)
-                }
-                if let result = model.lastMLTest {
-                    let passed = result.contains("OK") || result.contains("passed")
-                    Label(result, systemImage: passed
-                          ? "checkmark.circle.fill" : "xmark.circle.fill")
-                        .foregroundStyle(passed ? .green : .red)
-                        .font(.rowDetail)
-                        .fixedSize(horizontal: false, vertical: true)
+            if workerOn {
+                Section("Hardware Transcoding") {
+                    encodingToggle(
+                        "hardware-decode", $hardwareDecodeOn, "Decoding",
+                        "Video, thumbnails and previews")
+                    encodingToggle(
+                        "hardware-video", $hardwareVideoOn, "Video encoding",
+                        "H.264 and HEVC on VideoToolbox")
+                    encodingToggle(
+                        "hardware-audio", $hardwareAudioOn, "Audio encoding",
+                        "AAC on AudioToolbox")
                 }
             }
 
+            if mlOn {
+                Section("Machine learning engine") {
+                    Picker("Engine", selection: $engine) {
+                        ForEach(["native", "python"], id: \.self) { value in
+                            BadgeLabel(text: value == "native" ? "NATIVE" : "PYTHON",
+                                       tint: value == "native" ? .green : .orange)
+                                .tag(value)
+                        }
+                    }
+                    if engine != savedEngine {
+                        HStack(spacing: Metrics.md) {
+                            Text("Restarts the accelerator.")
+                                .font(.rowDetail).foregroundStyle(.secondary)
+                            Spacer()
+                            Button(applying ? "Applying…" : "Apply") {
+                                applying = true
+                                Task {
+                                    await Actions.setMLEngine(engine)
+                                    savedEngine = engine
+                                    await model.refresh()
+                                    applying = false
+                                }
+                            }
+                            .disabled(applying)
+                        }
+                    }
+                    LabeledContent("Self-test") {
+                        Button(testing ? "Running…" : "Run") { runMLTest() }
+                            .disabled(testing || !model.snap.mlHealthy)
+                    }
+                    if let result = model.lastMLTest {
+                        let passed = result.contains("OK") || result.contains("passed")
+                        Label(result, systemImage: passed
+                              ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(passed ? .green : .red)
+                            .font(.rowDetail)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
 
             if workerOn {
-            Section {
-                LabeledContent("Compare encoders") {
-                    Button(comparing ? "Comparing…" : "Choose Video…") { compareEncoders() }
-                        .disabled(comparing)
-                }
-                if let compareResult {
-                    ScrollView {
-                        Text(compareResult)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                Section {
+                    LabeledContent("Compare encoders") {
+                        Button(comparing ? "Comparing…" : "Choose Video…") { compareEncoders() }
+                            .disabled(comparing)
                     }
-                    .frame(maxHeight: Metrics.compareResultHeight)
+                    if let compareResult {
+                        ScrollView {
+                            Text(compareResult)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: Metrics.compareResultHeight)
+                    }
+                } footer: {
+                    Text("Runs both encoders on a file of yours and reports the difference.")
+                        .font(.rowDetail).foregroundStyle(.secondary)
                 }
-            } footer: {
-                Text("Runs both encoders on a file of yours and reports the difference.")
-                    .font(.rowDetail).foregroundStyle(.secondary)
-            }
             }
 
             if let message = encodingError ?? componentError {
@@ -386,12 +389,6 @@ struct SettingsView: View {
         .formStyle(.grouped)
     }
 
-    /// The named positions, plus the one the segmented control shows when the
-    /// switches spell none of them. "Custom" is only offered as a tag when it
-    /// is the current state; picking it would mean nothing.
-    /// The named positions. `engine` is the machine learning engine a position
-    /// requires, shown as a pill so switching is never a surprise: Stock needs
-    /// Immich's own ONNX models, which only the Python engine carries.
     /// Two ends and the middle you land in by setting switches yourself.
     /// `engine` is the machine learning engine the end requires, shown as a
     /// pill so Stock moving you to the Python engine is never a surprise.

@@ -302,10 +302,9 @@ final class StatusModel: ObservableObject {
         ("stock", ["IMMICH_ACCEL_HW_VIDEO": false,
                    "IMMICH_ACCEL_HW_DECODE": false,
                    "IMMICH_ACCEL_HW_AUDIO": false], "python", true),
-        // Audio is not part of this end; see ENCODING_PRESETS in __main__.py.
         ("apple-silicon", ["IMMICH_ACCEL_HW_VIDEO": true,
                            "IMMICH_ACCEL_HW_DECODE": true,
-                           "IMMICH_ACCEL_HW_AUDIO": false], "native", false),
+                           "IMMICH_ACCEL_HW_AUDIO": true], "native", false),
     ]
 
     /// Switches that are off unless asked for, because they change output.

@@ -2080,12 +2080,11 @@ class TestEncodingSwitches:
         m.cmd_encoding(self._args())
         assert m.load_config() == before
 
-    def test_an_unconfigured_install_sits_at_a_named_end(self, tmp_data_dir):
-        """An install nobody has configured must not read as custom. Everyone
-        upgrading has exactly this config, and telling them they customised
-        something they never touched is both wrong and alarming."""
+    def test_an_install_from_before_these_settings_reads_as_custom(self, tmp_data_dir):
+        """Hardware video without hardware audio is genuinely neither end, and
+        saying so is better than pretending. One click moves it to an end."""
         m.save_config({})
-        assert m.encoding_preset() == "apple-silicon"
+        assert m.encoding_preset() == "custom"
 
     def test_every_preset_round_trips(self, tmp_data_dir):
         """Applying a preset must make encoding_preset name that same preset.
@@ -2140,10 +2139,9 @@ class TestEncodingSwitches:
         assert config["ml_engine"] == "native"
         assert config["stock_ml"] is False
 
-    def test_turning_on_hardware_audio_reads_as_custom(self, tmp_data_dir):
-        """It is a step past the named end, so saying custom is the truth."""
+    def test_turning_off_one_switch_reads_as_custom(self, tmp_data_dir):
         m.save_config(m.apply_encoding_preset("apple-silicon", {}))
-        m.cmd_encoding(self._args("hardware-audio", "on"))
+        m.cmd_encoding(self._args("hardware-audio", "off"))
         assert m.encoding_preset() == "custom"
 
     def test_stock_video_with_accelerated_ml_is_not_stock(self, tmp_data_dir):

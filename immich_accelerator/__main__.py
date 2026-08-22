@@ -6947,15 +6947,14 @@ ENCODING_PRESETS = {
         "IMMICH_ACCEL_HW_DECODE": False,
         "IMMICH_ACCEL_HW_AUDIO": False,
     },
-    # Audio is deliberately not part of this end. It is off by default, so
-    # including it would make every install that has never touched these
-    # settings report "custom" the moment it upgrades, for a configuration
-    # nobody customised. It stays an individual switch: turning it on is a
-    # further step past the named end, and reporting custom is then true.
+    # Everything, including audio: this end means all of it. The cost is that
+    # an install upgrading from before these settings existed has hardware
+    # video without hardware audio, so it reads as custom until someone picks
+    # an end. That is true rather than tidy, and one click fixes it.
     "apple-silicon": {
         "IMMICH_ACCEL_HW_VIDEO": True,
         "IMMICH_ACCEL_HW_DECODE": True,
-        "IMMICH_ACCEL_HW_AUDIO": False,
+        "IMMICH_ACCEL_HW_AUDIO": True,
     },
 }
 
@@ -6984,8 +6983,8 @@ PRESET_DETAIL = {
     "apple-silicon": (
         "VideoToolbox for video, Apple frameworks for machine learning. Much "
         "less CPU, so the Mac keeps up with everything else it is doing. Video "
-        "is visually identical to Docker's; 10-bit thumbnails differ byte for "
-        "byte. Hardware audio is a further step, below."
+        "is visually identical to Docker's; audio and 10-bit thumbnails differ "
+        "byte for byte."
     ),
     "custom": "Switches set individually.",
 }

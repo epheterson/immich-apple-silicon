@@ -149,3 +149,49 @@ def test_no_test_is_shadowed_by_a_later_definition():
                 offenders.append(f"{path.name}::{name} ({count}x)")
 
     assert not offenders, "shadowed definitions never run:\n  " + "\n  ".join(offenders)
+
+
+
+def test_the_swift_preset_mirror_matches_the_python_one():
+    """The app keeps its own copy of the preset table so the settings window
+    can show the current position without shelling out on every render.
+
+    A copy drifts. It already has, twice: once shipping a pane that would
+    report Stock, asserting output identical to Docker, on an install running
+    Vision and mlx, and once showing Apple Silicon selected on a config the CLI
+    called custom. Nothing but this test connects the two files, so parse the
+    Swift and compare rather than trusting a comment to be read.
+    """
+    import re
+    from pathlib import Path
+
+    import immich_accelerator.__main__ as m
+
+    swift = (
+        Path(__file__).parent.parent
+        / "menubar/Sources/AcceleratorBar/StatusModel.swift"
+    ).read_text()
+    table = swift[swift.index("encodingPresets:") : swift.index("encodingDefaultOff")]
+
+    parsed = {}
+    for entry in re.finditer(
+        r'\("([a-z-]+)",\s*\[(.*?)\],\s*"(\w+)",\s*(true|false)\)', table, re.S
+    ):
+        name, switches, engine, stock = entry.groups()
+        parsed[name] = {
+            "switches": {
+                k: v == "true"
+                for k, v in re.findall(r'"(\w+)":\s*(true|false)', switches)
+            },
+            "ml_engine": engine,
+            "stock_ml": stock == "true",
+        }
+
+    assert parsed, "could not parse the Swift preset table; update this test"
+    assert set(parsed) == set(m.ENCODING_PRESETS), (
+        f"Swift has {sorted(parsed)}, Python has {sorted(m.ENCODING_PRESETS)}"
+    )
+    for name, swift_preset in parsed.items():
+        assert swift_preset["switches"] == m.ENCODING_PRESETS[name], name
+        assert swift_preset["ml_engine"] == m.PRESET_ML[name]["ml_engine"], name
+        assert swift_preset["stock_ml"] == m.PRESET_ML[name]["stock_ml"], name
