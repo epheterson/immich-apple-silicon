@@ -7051,7 +7051,6 @@ def cmd_encode_compare(args):
 
         log.info("Hardware, VideoToolbox")
         best = None
-        hw_cpu = hw_wall = 0.0
         for q in args.quality:
             dest = str(Path(tmp) / f"vt{q}.mp4")
             secs, size, cpu = _encode_once(
@@ -7063,11 +7062,13 @@ def cmd_encode_compare(args):
             ssim = _ssim_against(ffmpeg, dest, src)
             log.info("  q:v %d", q)
             _report(secs, size, ssim, duration, cpu)
-            hw_cpu, hw_wall = cpu, secs
             if ssim is not None and stock_ssim is not None:
                 gap = abs(ssim - stock_ssim)
                 if best is None or gap < best[0]:
-                    best = (gap, q, ssim)
+                    # The timings travel with the setting they belong to. Held
+                    # outside the tuple they were whatever the last q:v in the
+                    # sweep happened to cost, which is not the one recommended.
+                    best = (gap, q, ssim, secs, cpu)
 
         log.info("")
         if best:
@@ -7086,17 +7087,20 @@ def cmd_encode_compare(args):
             # ultrafast, which is genuinely quick, so software often finishes one
             # file sooner. What hardware buys is the machine: it leaves the cores
             # for the other jobs and for the ML engine running beside it.
+            hw_wall, hw_cpu = best[3], best[4]
             if stock_wall and hw_wall:
                 faster = "software" if stock_wall < hw_wall else "hardware"
                 log.info(
-                    "On this file %s finished sooner (%.1fs against %.1fs).",
+                    "At q:v %d on this file, %s finished sooner "
+                    "(%.1fs against %.1fs).",
+                    best[1],
                     faster,
                     min(stock_wall, hw_wall),
                     max(stock_wall, hw_wall),
                 )
             if stock_cpu and hw_cpu:
                 log.info(
-                    "Hardware used %.1fs of cpu against %.1fs, so it leaves the "
+                    "It used %.1fs of cpu against %.1fs, so it leaves the "
                     "machine free for the other jobs and for machine learning.",
                     hw_cpu,
                     stock_cpu,
