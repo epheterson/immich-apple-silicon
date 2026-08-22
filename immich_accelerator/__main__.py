@@ -7249,6 +7249,7 @@ def cmd_compare(args):
     between Stock and Apple Silicon cannot answer it from a table alone, and
     cannot answer it from pictures alone either.
     """
+    preset = getattr(args, "preset", _STOCK_PRESET)
     src = str(Path(args.video).expanduser())
     if not Path(src).is_file():
         log.error("No such file: %s", src)
@@ -7334,6 +7335,9 @@ def cmd_encode_compare(args):
     and what quality setting makes its output match what Immich would have
     produced on its own.
     """
+    # getattr, because argparse always sets this and a caller building the
+    # namespace by hand (the tests do) reasonably does not.
+    preset = getattr(args, "preset", _STOCK_PRESET)
     src = str(Path(args.video).expanduser())
     if not Path(src).is_file():
         log.error("No such file: %s", src)
@@ -7360,7 +7364,7 @@ def cmd_encode_compare(args):
                 "-c:v",
                 "libx264",
                 "-preset",
-                args.preset,
+                preset,
                 "-crf",
                 str(args.crf),
                 "-pix_fmt",
@@ -7375,7 +7379,7 @@ def cmd_encode_compare(args):
             return
         stock_ssim = _ssim_against(ffmpeg, stock, src)
         log.info("Software, as Immich would do it")
-        log.info("  x264 preset %s, CRF %d", args.preset, args.crf)
+        log.info("  x264 preset %s, CRF %d", preset, args.crf)
         _report(secs, size, stock_ssim, duration, cpu)
         stock_cpu, stock_wall = cpu, secs
         log.info("")
