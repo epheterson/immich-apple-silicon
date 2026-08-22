@@ -3148,6 +3148,14 @@ def _finalize_config(config: dict) -> None:
         log.info('  Edit %s and add: "api_key": "your-key-here"', CONFIG_FILE)
         log.info("  Generate a key in Immich → Administration → API Keys")
 
+    # A fresh install starts at an end rather than in the middle. Without this
+    # it would land on custom, because hardware audio is off by default and a
+    # config that has hardware video without it is genuinely neither end. That
+    # is the right answer for someone upgrading, whose settings predate the
+    # choice, and the wrong first impression for someone who has none.
+    if not _has_chosen_processing(config):
+        apply_encoding_preset("apple-silicon", config)
+
     save_config(config)
 
     # Ensure /build firmlink for plugin path compatibility (Immich 2.7+).
@@ -6990,6 +6998,21 @@ PRESET_DETAIL = {
 }
 
 
+def _has_chosen_processing(config: dict) -> bool:
+    """Whether anyone has ever set one of these switches on this install.
+
+    Distinguishes a fresh install from one that predates the setting: an
+    upgrade must keep the behaviour it already had, while a new install has no
+    behaviour to preserve and should start somewhere with a name.
+    """
+    env = config.get("env")
+    if isinstance(env, dict) and any(
+        var in env for var, _ in ENCODING_SWITCHES.values()
+    ):
+        return True
+    return "stock_ml" in config
+
+
 def encoding_preset(config: dict | None = None) -> str:
     """Which preset the current switches spell, or "custom".
 
@@ -7159,6 +7182,170 @@ def cmd_encoding(args):
             name,
         )
     log.info("Restart the accelerator for it to take effect.")
+
+
+def _extract_frame(ffmpeg: str, video: str, dest: str, at: float) -> bool:
+    """One frame as PNG, for looking at rather than measuring.
+
+    PNG because a JPEG here would add its own artefacts on top of the ones the
+    comparison is about, which is the fastest way to make a visual comparison
+    lie.
+    """
+    r = subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+         "-ss", f"{at:.2f}", "-i", video, "-frames:v", "1", dest],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0 and Path(dest).is_file()
+
+
+def _comparison_page(rows: list[dict], out_dir: Path, source: str) -> Path:
+    """A page with the numbers and the frames side by side.
+
+    The numbers alone cannot answer "will I notice", and the frames alone
+    cannot answer "what does it cost", so neither is much use without the
+    other. Plain HTML with no external anything: it opens from a file:// URL
+    on a Mac with no network and nothing to install.
+    """
+    def cell(row: dict) -> str:
+        img = (
+            f'<img src="{row["frame"]}" alt="{row["label"]}">'
+            if row.get("frame") else '<div class="noframe">no frame</div>'
+        )
+        ssim = f'{row["ssim"]:.6f}' if row.get("ssim") is not None else "n/a"
+        return f"""<figure>
+  {img}
+  <figcaption>
+    <strong>{row["label"]}</strong>
+    <dl>
+      <dt>Wall</dt><dd>{row["wall"]:.1f}s</dd>
+      <dt>CPU</dt><dd>{row["cpu"]:.1f}s ({row["cores"]:.1f} cores)</dd>
+      <dt>Size</dt><dd>{row["mb"]:.1f} MB</dd>
+      <dt>SSIM</dt><dd>{ssim}</dd>
+    </dl>
+  </figcaption>
+</figure>"""
+
+    body = "\n".join(cell(r) for r in rows)
+    html = f"""<!doctype html>
+<meta charset="utf-8">
+<title>Encoder comparison: {source}</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 2rem auto;
+         max-width: 68rem; padding: 0 1rem; }}
+  h1 {{ font-size: 1.3rem; margin-bottom: .2rem; }}
+  p.sub {{ color: #888; margin-top: 0; }}
+  .grid {{ display: grid; gap: 1.5rem;
+           grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); }}
+  figure {{ margin: 0; }}
+  img {{ width: 100%; border-radius: 6px; display: block; }}
+  .noframe {{ aspect-ratio: 16/9; display: grid; place-items: center;
+              background: #8883; border-radius: 6px; color: #888; }}
+  figcaption {{ margin-top: .5rem; }}
+  dl {{ display: grid; grid-template-columns: auto 1fr; gap: 0 .75rem;
+        margin: .35rem 0 0; }}
+  dt {{ color: #888; }}
+  dd {{ margin: 0; font-variant-numeric: tabular-nums; }}
+</style>
+<h1>Encoder comparison</h1>
+<p class="sub">{source} &middot; same frame from every encode, at full quality</p>
+<div class="grid">
+{body}
+</div>
+<p class="sub">SSIM is measured against the original. Higher is closer to the
+source, not necessarily closer to what Immich would have produced: compare each
+number against the software row, which is what Immich does on its own.</p>
+"""
+    page = out_dir / "comparison.html"
+    page.write_text(html)
+    return page
+
+
+def cmd_compare(args):
+    """Encode one of your files every way this Mac can, and show the results.
+
+    encode-compare answers "which quality setting matches"; this answers the
+    question before it, "what am I choosing between", with the numbers and a
+    frame from each encode kept side by side. A person deciding where to sit
+    between Stock and Apple Silicon cannot answer it from a table alone, and
+    cannot answer it from pictures alone either.
+    """
+    src = str(Path(args.video).expanduser())
+    if not Path(src).is_file():
+        log.error("No such file: %s", src)
+        return
+    config = load_config() if CONFIG_FILE.exists() else {}
+    ffmpeg = config.get("ffmpeg_path") or shutil.which("ffmpeg")
+    if not ffmpeg or not Path(ffmpeg).exists():
+        log.error("No ffmpeg found. Run setup, or pass one on PATH.")
+        return
+
+    out_dir = Path(args.output).expanduser() if args.output else (
+        Path(tempfile.mkdtemp(prefix="immich-compare-"))
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    duration = _ffprobe_duration(ffmpeg, src)
+    # A frame from a quarter in, rather than the first: openings are often a
+    # fade from black, where every encoder looks identical and perfect.
+    at = (duration or 4.0) * 0.25
+
+    log.info("Comparing on %s", Path(src).name)
+    if duration:
+        log.info("  %.0fs of video, CRF %d", duration, args.crf)
+    log.info("")
+
+    rows = []
+    original = out_dir / "frame-original.png"
+    has_original = _extract_frame(ffmpeg, src, str(original), at)
+
+    # Software first: it is the reference every other row is judged against.
+    plans = [("Software (what Immich does)", ["-c:v", "libx264", "-preset",
+                                              _STOCK_PRESET, "-crf", str(args.crf)])]
+    for q in args.quality:
+        plans.append((f"VideoToolbox q:v {q}",
+                      ["-c:v", "h264_videotoolbox", "-q:v", str(q)]))
+
+    for label, encode_args in plans:
+        dest = out_dir / f"{label.replace(' ', '-').replace(':', '').lower()}.mp4"
+        secs, size, cpu = _encode_once(ffmpeg, src, str(dest), encode_args)
+        if size == 0:
+            log.warning("  %s: encode failed, skipped", label)
+            continue
+        ssim = _ssim_against(ffmpeg, str(dest), src)
+        frame = out_dir / f"frame-{dest.stem}.png"
+        got_frame = _extract_frame(ffmpeg, str(dest), str(frame), at)
+        rows.append({
+            "label": label,
+            "wall": secs,
+            "cpu": cpu,
+            "cores": (cpu / secs) if secs else 0.0,
+            "mb": size / (1024 * 1024),
+            "ssim": ssim,
+            "frame": frame.name if got_frame else None,
+        })
+        log.info("  %-28s %5.1fs wall  %5.1fs cpu  %6.1f MB  SSIM %s",
+                 label, secs, cpu, size / (1024 * 1024),
+                 f"{ssim:.6f}" if ssim is not None else "n/a")
+
+    if not rows:
+        log.error("Nothing encoded, so there is nothing to compare.")
+        return
+
+    if has_original:
+        rows.insert(0, {
+            "label": "Original", "wall": 0.0, "cpu": 0.0, "cores": 0.0,
+            "mb": Path(src).stat().st_size / (1024 * 1024), "ssim": None,
+            "frame": original.name,
+        })
+
+    page = _comparison_page(rows, out_dir, Path(src).name)
+    log.info("")
+    log.info("Wrote %s", page)
+    log.info("  The videos and frames are beside it, so you can look at them.")
+    if not args.no_open and shutil.which("open"):
+        subprocess.run(["open", str(page)], capture_output=True)
 
 
 def cmd_encode_compare(args):
@@ -7657,6 +7844,22 @@ def main():
         choices=["on", "off"] + list(ENCODING_PRESETS),
         help="on/off for a switch, or the preset name",
     )
+    all_p = sub.add_parser(
+        "compare",
+        help="Encode one video every way this Mac can, with frames to look at",
+    )
+    all_p.add_argument("video", help="a video file of your own")
+    all_p.add_argument(
+        "--crf", type=int, default=23, help="the CRF Immich is set to (default 23)"
+    )
+    all_p.add_argument(
+        "--quality", type=int, nargs="+", default=[59, 75],
+        help="VideoToolbox q:v values to include",
+    )
+    all_p.add_argument("--output", help="where to write the comparison")
+    all_p.add_argument(
+        "--no-open", action="store_true", help="do not open the page when done"
+    )
     cmp_p = sub.add_parser(
         "encode-compare",
         help="Transcode one video both ways and report speed, size and quality",
@@ -7695,6 +7898,7 @@ def main():
             "component": cmd_component,
             "ml-test": cmd_ml_test,
             "encoding": cmd_encoding,
+            "compare": cmd_compare,
             "encode-compare": cmd_encode_compare,
             "uninstall": cmd_uninstall,
         }[args.command](args)

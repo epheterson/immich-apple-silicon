@@ -243,9 +243,8 @@ struct SettingsView: View {
                 HStack {
                     Spacer()
                     Picker("", selection: presetBinding) {
-                        ForEach(Self.presets.filter {
-                            $0.name != "custom" || currentPreset == "custom"
-                        }, id: \.name) { preset in
+                        ForEach(Self.visiblePresets(current: currentPreset),
+                                id: \.name) { preset in
                             Text(preset.title).tag(preset.name)
                         }
                     }
@@ -260,9 +259,8 @@ struct SettingsView: View {
                 // left, Apple Silicon on the right, so the description a
                 // person reads is under the choice it belongs to.
                 HStack(alignment: .top, spacing: Metrics.lg) {
-                    ForEach(Self.presets.filter {
-                        $0.name != "custom" || currentPreset == "custom"
-                    }, id: \.name) { preset in
+                    ForEach(Self.visiblePresets(current: currentPreset),
+                            id: \.name) { preset in
                         VStack(alignment: .leading, spacing: Metrics.xs) {
                             HStack(spacing: Metrics.md) {
                                 Text(preset.title)
@@ -295,9 +293,9 @@ struct SettingsView: View {
             Section("Services") {
                 componentToggle("worker", $workerOn, "Worker",
                                 "Thumbnails, video, metadata")
-                componentToggle("ml", $mlOn, "Machine learning",
+                componentToggle("ml", $mlOn, "Machine Learning",
                                 "Search, faces, text")
-                componentToggle("dashboard", $dashboardOn, "Web dashboard",
+                componentToggle("dashboard", $dashboardOn, "Web Dashboard",
                                 dashboardStatus)
             }
 
@@ -307,16 +305,16 @@ struct SettingsView: View {
                         "hardware-decode", $hardwareDecodeOn, "Decoding",
                         "Video, thumbnails and previews")
                     encodingToggle(
-                        "hardware-video", $hardwareVideoOn, "Video encoding",
+                        "hardware-video", $hardwareVideoOn, "Video Encoding",
                         "H.264 and HEVC on VideoToolbox")
                     encodingToggle(
-                        "hardware-audio", $hardwareAudioOn, "Audio encoding",
+                        "hardware-audio", $hardwareAudioOn, "Audio Encoding",
                         "AAC on AudioToolbox")
                 }
             }
 
             if mlOn {
-                Section("Machine learning engine") {
+                Section("Machine Learning Engine") {
                     Picker("Engine", selection: $engine) {
                         ForEach(["native", "python"], id: \.self) { value in
                             BadgeLabel(text: value == "native" ? "NATIVE" : "PYTHON",
@@ -392,21 +390,32 @@ struct SettingsView: View {
     /// Two ends and the middle you land in by setting switches yourself.
     /// `engine` is the machine learning engine the end requires, shown as a
     /// pill so Stock moving you to the Python engine is never a surprise.
+    /// Order is the order on the control: Stock on the left, Custom between
+    /// them, Apple Silicon on the right. Custom is the middle of the range
+    /// rather than a fourth option tacked on the end, and a switch moved off
+    /// either end lands there.
     private static let presets: [(name: String, title: String, engine: String?, detail: String)] = [
         ("stock", "Stock Immich", "PYTHON",
          "Video, thumbnails, faces and text exactly as Immich's own container produces them. A library built here moves back to Docker with no reprocessing. Uses the most CPU."),
         ("apple-silicon", "Apple Silicon", "NATIVE",
-         "VideoToolbox for video, Apple frameworks for machine learning. Much less CPU, so the Mac keeps up with everything else it is doing. Video is visually identical; 10-bit thumbnails differ byte for byte."),
-        ("custom", "Custom", nil,
-         "Switches set individually, below."),
+         "VideoToolbox for video and audio, Apple frameworks for machine learning. Much less CPU, so the Mac keeps up with everything else it is doing. Video is visually identical; audio and 10-bit thumbnails differ byte for byte."),
     ]
 
-    private var presetDetail: String {
-        Self.presets.first { $0.name == currentPreset }?.detail ?? ""
+    /// Inserted between the two ends when the switches spell neither.
+    private static let customPreset = (
+        name: "custom", title: "Custom", engine: String?.none,
+        detail: "Switches set individually, below.")
+
+    /// The ends, with Custom in the middle only while it is the current state.
+    private static func visiblePresets(current: String)
+        -> [(name: String, title: String, engine: String?, detail: String)] {
+        guard current == "custom" else { return presets }
+        return [presets[0], customPreset, presets[1]]
     }
 
     private var presetEngine: String? {
-        Self.presets.first { $0.name == currentPreset }?.engine
+        Self.visiblePresets(current: currentPreset)
+            .first { $0.name == currentPreset }?.engine
     }
 
     /// True while the selected position uses a different face detector from

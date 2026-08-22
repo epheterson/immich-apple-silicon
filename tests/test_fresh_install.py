@@ -2172,6 +2172,60 @@ class TestEncodingSwitches:
         spec = m._venv_ml_spec({**config, "stock_ml": False}, {})
         assert spec is not None and spec[2]["ML_STOCK"] == "false"
 
+    def test_a_fresh_install_starts_at_a_named_end(self, tmp_data_dir):
+        """Someone installing today has no behaviour to preserve, so landing
+        them in the middle of the range is a bad first impression."""
+        config = {}
+        assert m._has_chosen_processing(config) is False
+        m.apply_encoding_preset("apple-silicon", config)
+        assert m.encoding_preset(config) == "apple-silicon"
+
+    def test_an_upgrade_is_not_treated_as_fresh(self, tmp_data_dir):
+        """An install that already set one of these keeps what it had. Moving
+        it would change output on someone who never asked."""
+        chosen = m.apply_encoding_preset("stock", {})
+        assert m._has_chosen_processing(chosen) is True
+
+    def test_a_half_configured_install_counts_as_chosen(self, tmp_data_dir):
+        """One switch set by hand is still a choice, and must not be
+        overwritten by the fresh-install default."""
+        assert m._has_chosen_processing({"env": {"IMMICH_ACCEL_HW_VIDEO": "0"}}) is True
+
+    def test_the_comparison_page_shows_every_encode(self, tmp_path):
+        """The page is the deliverable: if a row is dropped the person is
+        comparing against something that is not there."""
+        rows = [
+            {"label": "Original", "wall": 0.0, "cpu": 0.0, "cores": 0.0,
+             "mb": 50.0, "ssim": None, "frame": "frame-original.png"},
+            {"label": "Software (what Immich does)", "wall": 1.5, "cpu": 12.8,
+             "cores": 8.5, "mb": 66.6, "ssim": 0.966586, "frame": "a.png"},
+            {"label": "VideoToolbox q:v 59", "wall": 2.7, "cpu": 5.3,
+             "cores": 2.0, "mb": 32.3, "ssim": 0.974089, "frame": "b.png"},
+        ]
+        page = m._comparison_page(rows, tmp_path, "clip.mp4")
+        html = page.read_text()
+        for row in rows:
+            assert row["label"] in html
+        assert "0.966586" in html and "0.974089" in html
+        assert "frame-original.png" in html and "b.png" in html
+        # No network anything: this opens from file:// on a Mac with no
+        # connection, and a remote stylesheet would silently strip the layout.
+        assert "http://" not in html and "https://" not in html
+
+    def test_a_row_with_no_frame_still_appears(self, tmp_path):
+        """A failed frame extraction must not remove the measurements: the
+        numbers are still the answer to half the question."""
+        rows = [{"label": "VideoToolbox q:v 59", "wall": 2.7, "cpu": 5.3,
+                 "cores": 2.0, "mb": 32.3, "ssim": 0.97, "frame": None}]
+        html = m._comparison_page(rows, tmp_path, "clip.mp4").read_text()
+        assert "VideoToolbox q:v 59" in html and "no frame" in html
+
+    def test_a_missing_ssim_reads_as_unavailable(self, tmp_path):
+        rows = [{"label": "X", "wall": 1.0, "cpu": 1.0, "cores": 1.0,
+                 "mb": 1.0, "ssim": None, "frame": None}]
+        html = m._comparison_page(rows, tmp_path, "c.mp4").read_text()
+        assert "n/a" in html
+
     def test_the_decode_switch_persists_too(self, tmp_data_dir):
         m.save_config({})
         m.cmd_encoding(self._args("hardware-decode", "off"))
