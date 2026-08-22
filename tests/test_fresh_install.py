@@ -2135,48 +2135,9 @@ class TestEncodingSwitches:
 
 
 
-    def test_re_running_setup_keeps_a_chosen_position(self, tmp_data_dir):
-        """The bug this exists for: setup builds a new config dict carrying
-        only a few keys across, so anything asked of THAT dict reports "never
-        chosen" every time and a re-run silently reset the user's choice.
 
-        Re-running setup is the documented repair step, so it is a path people
-        take. The check has to read the file, and this test has to go through
-        the file rather than hand the function a dict that already has the
-        answer, which is exactly how the first version passed while broken.
-        """
-        m.save_config(m.apply_encoding_preset("software", {}))
-        assert m.encoding_preset() == "software"
 
-        # What setup does: a fresh dict, only a few keys preserved.
-        rebuilt = {"immich_url": "http://x", "api_key": "k"}
-        assert m._has_chosen_processing() is True, (
-            "reading the rebuilt config instead of the file is the bug"
-        )
-        if not m._has_chosen_processing():
-            m.apply_encoding_preset("hardware", rebuilt)
-        assert "env" not in rebuilt, "a chosen position must not be overwritten"
 
-    def test_a_fresh_install_starts_at_a_named_end(self, tmp_data_dir):
-        """Someone installing today has no behaviour to preserve, so landing
-        them in the middle of the range is a bad first impression."""
-        m.save_config({})
-        assert m._has_chosen_processing() is False
-        config = m.load_config()
-        m.apply_encoding_preset("hardware", config)
-        assert m.encoding_preset(config) == "hardware"
-
-    def test_an_upgrade_is_not_treated_as_fresh(self, tmp_data_dir):
-        """An install that already set one of these keeps what it had. Moving
-        it would change output on someone who never asked."""
-        m.save_config(m.apply_encoding_preset("software", {}))
-        assert m._has_chosen_processing() is True
-
-    def test_a_half_configured_install_counts_as_chosen(self, tmp_data_dir):
-        """One switch set by hand is still a choice, and must not be
-        overwritten by the fresh-install default."""
-        m.save_config({"env": {"IMMICH_ACCEL_HW_VIDEO": "0"}})
-        assert m._has_chosen_processing() is True
 
     def test_the_comparison_page_shows_every_encode(self, tmp_path):
         """The page is the deliverable: if a row is dropped the person is
@@ -2212,6 +2173,48 @@ class TestEncodingSwitches:
                  "mb": 1.0, "ssim": None, "frame": None}]
         html = m._comparison_page(rows, tmp_path, "c.mp4").read_text()
         assert "n/a" in html
+
+    def _finalize(self, config, monkeypatch):
+        """_finalize_config with its interactive tail stubbed.
+
+        The /build firmlink prompt is not what these tests are about, and a
+        test that cannot run unattended is a test nobody runs.
+        """
+        monkeypatch.setattr("builtins.input", lambda *a: "n")
+        m._finalize_config(config)
+
+    def test_setup_preserves_a_chosen_position(self, tmp_data_dir, monkeypatch):
+        """Through the real path, not the helper.
+
+        setup rebuilds the config from scratch and saves it wholesale, so a key
+        missing from _PRESERVED_CONFIG_KEYS is erased on every re-run. The
+        earlier version of this test asked a helper whether a choice had been
+        made, which was true, while the save that followed threw the choice
+        away. Only going through _finalize_config catches that.
+        """
+        m.save_config(m.apply_encoding_preset("software", {}))
+        rebuilt = {"immich_url": "http://10.0.0.9:2283"}
+        self._finalize(rebuilt, monkeypatch)
+        assert m.encoding_preset() == "software", (
+            "a chosen position must survive re-running setup"
+        )
+
+    def test_env_is_preserved_across_setup(self, tmp_data_dir, monkeypatch):
+        m.save_config({"env": {"IMMICH_ACCEL_HW_VIDEO": "0"}, "api_key": "k"})
+        rebuilt = {"immich_url": "http://x"}
+        self._finalize(rebuilt, monkeypatch)
+        assert m.load_config()["env"]["IMMICH_ACCEL_HW_VIDEO"] == "0"
+
+    def test_setup_does_not_move_an_existing_install(self, tmp_data_dir, monkeypatch):
+        """An install from before these settings has no env block and must keep
+        it that way: turning on the AudioToolbox encoder under someone who
+        never asked changes the bytes of every video they process next."""
+        m.save_config({"immich_url": "http://x"})
+        rebuilt = {"immich_url": "http://x"}
+        self._finalize(rebuilt, monkeypatch)
+        assert "env" not in m.load_config(), (
+            "an existing install must not be given a position it never chose"
+        )
 
     def test_the_decode_switch_persists_too(self, tmp_data_dir):
         m.save_config({})

@@ -181,7 +181,13 @@ struct SettingsView: View {
                     // Turning this on remembers whatever SMB shares (e.g. a
                     // NAS backing a split deployment) are mounted right now;
                     // it doesn't ask which ones separately.
-                    Text("Remembers the SMB shares mounted right now and reconnects any that are missing on launch.")
+                    // Naming this "at login" is accurate for what the switch
+                    // does and misleading about the whole picture: the
+                    // accelerator watches the library mount the entire time it
+                    // runs and puts it back on its own. Someone reading only
+                    // this row would reasonably conclude a share dropping at
+                    // 2am is not handled until they log in again.
+                    Text("Remembers the SMB shares mounted right now and reconnects any that are missing on launch. Separately, while the accelerator is running it watches the mount holding your library and remounts it on its own, retrying with a backoff.")
                         .font(.rowDetail).foregroundStyle(.secondary)
                 }
             } header: {
@@ -389,9 +395,9 @@ struct SettingsView: View {
     /// rather than a fourth option tacked on the end, and a switch moved off
     /// either end lands there.
     private static let presets: [(name: String, title: String, engine: String?, detail: String)] = [
-        ("stock", "Stock", nil,
+        ("software", "Software", nil,
          "Transcoding done exactly as Immich's own container does it: software encoders, software decoding. Video and thumbnails are byte for byte what Docker produces. Uses the most CPU."),
-        ("apple-silicon", "Apple Silicon", nil,
+        ("hardware", "Hardware", nil,
          "VideoToolbox for decoding, video and audio. Much less CPU, so the Mac keeps up with everything else it is doing. Video is visually identical to Docker's; audio and 10-bit thumbnails differ byte for byte."),
     ]
 

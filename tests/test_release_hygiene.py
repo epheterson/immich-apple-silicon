@@ -167,11 +167,21 @@ def test_the_swift_preset_mirror_matches_the_python_one():
 
     import immich_accelerator.__main__ as m
 
-    swift = (
-        Path(__file__).parent.parent
-        / "menubar/Sources/AcceleratorBar/StatusModel.swift"
-    ).read_text()
+    root = Path(__file__).parent.parent
+    swift = (root / "menubar/Sources/AcceleratorBar/StatusModel.swift").read_text()
     table = swift[swift.index("encodingPresets:") : swift.index("encodingDefaultOff")]
+
+    # The pane keeps its own list of the same names, for titles and
+    # descriptions. Checking only StatusModel is why a rename landed in two of
+    # the three places and the suite stayed green over a settings control that
+    # matched nothing and sent the CLI a name it rejects.
+    pane = (root / "menubar/Sources/AcceleratorBar/SettingsView.swift").read_text()
+    pane_table = pane[pane.index("private static let presets:") : pane.index("private var presetEngine")]
+    pane_names = set(re.findall(r'\("([a-z-]+)",\s*"', pane_table)) - {"custom"}
+    assert pane_names == set(m.ENCODING_PRESETS), (
+        f"SettingsView names {sorted(pane_names)}, Python has "
+        f"{sorted(m.ENCODING_PRESETS)}"
+    )
 
     parsed = {}
     for entry in re.finditer(r'\("([a-z-]+)",\s*\[(.*?)\]\)', table, re.S):

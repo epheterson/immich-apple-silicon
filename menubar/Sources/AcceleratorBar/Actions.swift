@@ -249,7 +249,14 @@ enum Actions {
     static func setEncodingSwitch(_ name: String, _ on: Bool) async -> (ok: Bool, message: String) {
         guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
         let (code, out) = await run(cli, ["encoding", name, on ? "on" : "off"])
-        if code == 0 { return (true, "") }
+        if code == 0 {
+            // Same as setEncodingPreset. A switch here and a switch in the
+            // control above it must not differ in whether they take effect,
+            // and "changes nothing until you restart something" is not a
+            // behaviour a settings window should have at all.
+            await restartService()
+            return (true, "")
+        }
         let detail = out.split(separator: "\n")
             .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
             .map(String.init) ?? "exit \(code)"

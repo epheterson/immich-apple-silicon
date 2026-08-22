@@ -3127,11 +3127,22 @@ def _validate_connectivity(config: dict) -> bool:
 # deliberate: each setup path states whether it establishes a worker, so
 # re-running a full `setup` on an ml-only box is how you turn the worker back
 # on. `setup --ml-only` writes "worker": false itself.
-_PRESERVED_CONFIG_KEYS = ("api_key", "ml_url", "dashboard_port", "dashboard", "ml")
+# "env" belongs here for the same reason the rest do: setup rebuilds the config
+# from scratch and saves it wholesale, so a key absent from this list is erased
+# on every re-run. Leaving it out meant a user who chose software encoding for
+# Docker-identical output silently went back to VideoToolbox the next time they
+# ran the documented repair step.
+_PRESERVED_CONFIG_KEYS = (
+    "api_key", "ml_url", "dashboard_port", "dashboard", "ml", "env",
+)
 
 
 def _finalize_config(config: dict) -> None:
     """Carry over the user's own settings, save config, print next steps."""
+    # Whether this machine had an install before this run, captured before
+    # anything is written. Everything below rebuilds the config, so after
+    # save_config there is no way to tell a first install from a repair.
+    had_config_before = CONFIG_FILE.exists()
     try:
         existing = load_config()
         for key in _PRESERVED_CONFIG_KEYS:
@@ -3148,12 +3159,12 @@ def _finalize_config(config: dict) -> None:
         log.info('  Edit %s and add: "api_key": "your-key-here"', CONFIG_FILE)
         log.info("  Generate a key in Immich → Administration → API Keys")
 
-    # A fresh install starts at an end rather than in the middle. Without this
-    # it would land on custom, because hardware audio is off by default and a
-    # config that has hardware video without it is genuinely neither end. That
-    # is the right answer for someone upgrading, whose settings predate the
-    # choice, and the wrong first impression for someone who has none.
-    if not _has_chosen_processing():
+    # Only on a genuinely first install, meaning there was no config file at
+    # all when setup started. An existing install keeps what it has, even if
+    # that is "never chose", because it already has behaviour people depend on
+    # and turning on the AudioToolbox encoder under them would change the bytes
+    # of every video they process next.
+    if not had_config_before:
         apply_encoding_preset("hardware", config)
 
     save_config(config)
@@ -6981,27 +6992,6 @@ PRESET_DETAIL = {
 }
 
 
-def _has_chosen_processing() -> bool:
-    """Whether anyone has ever set one of these switches on this install.
-
-    Reads the file rather than the config being built. setup constructs a new
-    dict and carries only a handful of keys across (_PRESERVED_CONFIG_KEYS),
-    so anything asked of that dict says "never chosen" on every run, and
-    re-running setup would quietly reset a chosen position. Re-running setup is
-    the documented repair step, so that is a real path, not a corner.
-    """
-    if not CONFIG_FILE.exists():
-        return False
-    try:
-        on_disk = json.loads(CONFIG_FILE.read_text())
-    except (OSError, ValueError):
-        return False
-    env = on_disk.get("env")
-    return isinstance(env, dict) and any(
-        var in env for var, _ in ENCODING_SWITCHES.values()
-    )
-
-
 def encoding_preset(config: dict | None = None) -> str:
     """Which preset the current switches spell, or "custom".
 
@@ -7185,6 +7175,8 @@ def _comparison_page(rows: list[dict], out_dir: Path, source: str) -> Path:
     other. Plain HTML with no external anything: it opens from a file:// URL
     on a Mac with no network and nothing to install.
     """
+    from html import escape
+
     def cell(row: dict) -> str:
         img = (
             f'<img src="{row["frame"]}" alt="{row["label"]}">'
@@ -7194,7 +7186,7 @@ def _comparison_page(rows: list[dict], out_dir: Path, source: str) -> Path:
         return f"""<figure>
   {img}
   <figcaption>
-    <strong>{row["label"]}</strong>
+    <strong>{escape(row["label"])}</strong>
     <dl>
       <dt>Wall</dt><dd>{row["wall"]:.1f}s</dd>
       <dt>CPU</dt><dd>{row["cpu"]:.1f}s ({row["cores"]:.1f} cores)</dd>
@@ -7207,7 +7199,7 @@ def _comparison_page(rows: list[dict], out_dir: Path, source: str) -> Path:
     body = "\n".join(cell(r) for r in rows)
     html = f"""<!doctype html>
 <meta charset="utf-8">
-<title>Encoder comparison: {source}</title>
+<title>Encoder comparison: {escape(source)}</title>
 <style>
   :root {{ color-scheme: light dark; }}
   body {{ font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 2rem auto;
@@ -7227,7 +7219,7 @@ def _comparison_page(rows: list[dict], out_dir: Path, source: str) -> Path:
   dd {{ margin: 0; font-variant-numeric: tabular-nums; }}
 </style>
 <h1>Encoder comparison</h1>
-<p class="sub">{source} &middot; same frame from every encode, at full quality</p>
+<p class="sub">{escape(source)} &middot; same frame from every encode, at full quality</p>
 <div class="grid">
 {body}
 </div>
@@ -7281,7 +7273,7 @@ def cmd_compare(args):
 
     # Software first: it is the reference every other row is judged against.
     plans = [("Software (what Immich does)", ["-c:v", "libx264", "-preset",
-                                              _STOCK_PRESET, "-crf", str(args.crf)])]
+                                              preset, "-crf", str(args.crf)])]
     for q in args.quality:
         plans.append((f"VideoToolbox q:v {q}",
                       ["-c:v", "h264_videotoolbox", "-q:v", str(q)]))
@@ -7831,6 +7823,14 @@ def main():
         help="Encode one video every way this Mac can, with frames to look at",
     )
     all_p.add_argument("video", help="a video file of your own")
+    all_p.add_argument(
+        "--preset",
+        default=_STOCK_PRESET,
+        help=(
+            "x264 preset for the software side (default %(default)s, Immich's "
+            "own). Set this to whatever your Immich is configured for."
+        ),
+    )
     all_p.add_argument(
         "--crf", type=int, default=23, help="the CRF Immich is set to (default 23)"
     )
