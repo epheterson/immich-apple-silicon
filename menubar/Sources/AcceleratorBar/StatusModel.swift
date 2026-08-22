@@ -297,10 +297,10 @@ final class StatusModel: ObservableObject {
     /// show the current position without shelling out on every render. Keep the
     /// two tables in step; `ENCODING_PRESETS` in `__main__.py` is the original.
     nonisolated static let encodingPresets: [(name: String, switches: [String: Bool])] = [
-        ("stock", ["IMMICH_ACCEL_HW_VIDEO": false,
+        ("software", ["IMMICH_ACCEL_HW_VIDEO": false,
                    "IMMICH_ACCEL_HW_DECODE": false,
                    "IMMICH_ACCEL_HW_AUDIO": false]),
-        ("apple-silicon", ["IMMICH_ACCEL_HW_VIDEO": true,
+        ("hardware", ["IMMICH_ACCEL_HW_VIDEO": true,
                            "IMMICH_ACCEL_HW_DECODE": true,
                            "IMMICH_ACCEL_HW_AUDIO": true]),
     ]

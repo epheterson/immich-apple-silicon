@@ -2094,11 +2094,11 @@ class TestEncodingSwitches:
             config = m.apply_encoding_preset(name, {})
             assert m.encoding_preset(config) == name, name
 
-    def test_stock_turns_everything_off(self, tmp_data_dir):
-        """Stock is the pass-through position. Any hardware switch left on
+    def test_the_software_end_turns_everything_off(self, tmp_data_dir):
+        """The software end is the pass-through position. Any hardware switch left on
         means output that is not what Docker would have produced."""
-        config = m.apply_encoding_preset("stock", {})
-        for var in m.ENCODING_PRESETS["stock"]:
+        config = m.apply_encoding_preset("software", {})
+        for var in m.ENCODING_PRESETS["software"]:
             assert config["env"][var] == "0", var
 
     def test_a_preset_states_every_switch(self, tmp_data_dir):
@@ -2110,15 +2110,15 @@ class TestEncodingSwitches:
             }, f"{name} does not name every switch"
 
     def test_switching_by_hand_reports_custom(self, tmp_data_dir):
-        m.save_config(m.apply_encoding_preset("stock", {}))
+        m.save_config(m.apply_encoding_preset("software", {}))
         m.cmd_encoding(self._args("hardware-video", "on"))
         assert m.encoding_preset() == "custom"
 
     def test_a_preset_recovers_from_custom(self, tmp_data_dir):
-        m.save_config(m.apply_encoding_preset("stock", {}))
+        m.save_config(m.apply_encoding_preset("software", {}))
         m.cmd_encoding(self._args("hardware-video", "on"))
-        m.save_config(m.apply_encoding_preset("stock", m.load_config()))
-        assert m.encoding_preset() == "stock"
+        m.save_config(m.apply_encoding_preset("software", m.load_config()))
+        assert m.encoding_preset() == "software"
 
     def test_the_audio_switch_defaults_off(self, tmp_data_dir):
         """It changes output, so it only happens where it was asked for."""
@@ -2128,7 +2128,7 @@ class TestEncodingSwitches:
 
 
     def test_turning_off_one_switch_reads_as_custom(self, tmp_data_dir):
-        m.save_config(m.apply_encoding_preset("apple-silicon", {}))
+        m.save_config(m.apply_encoding_preset("hardware", {}))
         m.cmd_encoding(self._args("hardware-audio", "off"))
         assert m.encoding_preset() == "custom"
 
@@ -2145,8 +2145,8 @@ class TestEncodingSwitches:
         the file rather than hand the function a dict that already has the
         answer, which is exactly how the first version passed while broken.
         """
-        m.save_config(m.apply_encoding_preset("stock", {}))
-        assert m.encoding_preset() == "stock"
+        m.save_config(m.apply_encoding_preset("software", {}))
+        assert m.encoding_preset() == "software"
 
         # What setup does: a fresh dict, only a few keys preserved.
         rebuilt = {"immich_url": "http://x", "api_key": "k"}
@@ -2154,7 +2154,7 @@ class TestEncodingSwitches:
             "reading the rebuilt config instead of the file is the bug"
         )
         if not m._has_chosen_processing():
-            m.apply_encoding_preset("apple-silicon", rebuilt)
+            m.apply_encoding_preset("hardware", rebuilt)
         assert "env" not in rebuilt, "a chosen position must not be overwritten"
 
     def test_a_fresh_install_starts_at_a_named_end(self, tmp_data_dir):
@@ -2163,13 +2163,13 @@ class TestEncodingSwitches:
         m.save_config({})
         assert m._has_chosen_processing() is False
         config = m.load_config()
-        m.apply_encoding_preset("apple-silicon", config)
-        assert m.encoding_preset(config) == "apple-silicon"
+        m.apply_encoding_preset("hardware", config)
+        assert m.encoding_preset(config) == "hardware"
 
     def test_an_upgrade_is_not_treated_as_fresh(self, tmp_data_dir):
         """An install that already set one of these keeps what it had. Moving
         it would change output on someone who never asked."""
-        m.save_config(m.apply_encoding_preset("stock", {}))
+        m.save_config(m.apply_encoding_preset("software", {}))
         assert m._has_chosen_processing() is True
 
     def test_a_half_configured_install_counts_as_chosen(self, tmp_data_dir):

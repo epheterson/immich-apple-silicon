@@ -3154,7 +3154,7 @@ def _finalize_config(config: dict) -> None:
     # is the right answer for someone upgrading, whose settings predate the
     # choice, and the wrong first impression for someone who has none.
     if not _has_chosen_processing():
-        apply_encoding_preset("apple-silicon", config)
+        apply_encoding_preset("hardware", config)
 
     save_config(config)
 
@@ -6940,7 +6940,7 @@ _DEFAULT_OFF = {"IMMICH_ACCEL_HW_AUDIO"}
 # VideoToolbox name: hardware JPEG was measured slower than the software encoder
 # and is deliberately absent.
 ENCODING_PRESETS = {
-    "stock": {
+    "software": {
         "IMMICH_ACCEL_HW_VIDEO": False,
         "IMMICH_ACCEL_HW_DECODE": False,
         "IMMICH_ACCEL_HW_AUDIO": False,
@@ -6949,7 +6949,7 @@ ENCODING_PRESETS = {
     # an install upgrading from before these settings existed has hardware
     # video without hardware audio, so it reads as custom until someone picks
     # an end. That is true rather than tidy, and one click fixes it.
-    "apple-silicon": {
+    "hardware": {
         "IMMICH_ACCEL_HW_VIDEO": True,
         "IMMICH_ACCEL_HW_DECODE": True,
         "IMMICH_ACCEL_HW_AUDIO": True,
@@ -6958,25 +6958,26 @@ ENCODING_PRESETS = {
 
 
 PRESET_SUMMARY = {
-    "stock": "Output identical to Docker",
-    "apple-silicon": "Hardware and Apple frameworks throughout",
+    "software": "Transcode entirely in software",
+    "hardware": "Transcode on the video hardware",
 }
 
-# Shown before choosing, not after: the point of a two-ended setting is that a
-# person can see what each end costs them without having to try it.
+# Named for what they set, not for what they resemble. Calling the software end
+# "Stock" would claim that an install matches Immich's container everywhere,
+# and transcoding is only part of that: machine learning is chosen separately
+# and is not part of this. A label that overclaims is worse than a plain one.
 PRESET_DETAIL = {
-    "stock": (
-        "Video, thumbnails, faces and text produced exactly as Immich's own "
-        "container produces them. A library built here moves back to Docker "
-        "with no reprocessing. Uses the most CPU."
+    "software": (
+        "The encoders and decoders Immich's own container uses. Video and "
+        "thumbnails come out byte for byte what Docker produces. Uses the most "
+        "CPU of the three."
     ),
-    "apple-silicon": (
-        "VideoToolbox for video, Apple frameworks for machine learning. Much "
-        "less CPU, so the Mac keeps up with everything else it is doing. Video "
-        "is visually identical to Docker's; audio and 10-bit thumbnails differ "
-        "byte for byte."
+    "hardware": (
+        "VideoToolbox for decoding, video and audio. Much less CPU, so the Mac "
+        "keeps up with everything else it is doing. Video is visually identical "
+        "to Docker's; audio and 10-bit thumbnails differ byte for byte."
     ),
-    "custom": "Switches set individually.",
+    "custom": "Some on, some off. Set below.",
 }
 
 
@@ -7359,7 +7360,7 @@ def cmd_encode_compare(args):
                 "-c:v",
                 "libx264",
                 "-preset",
-                _STOCK_PRESET,
+                args.preset,
                 "-crf",
                 str(args.crf),
                 "-pix_fmt",
@@ -7374,7 +7375,7 @@ def cmd_encode_compare(args):
             return
         stock_ssim = _ssim_against(ffmpeg, stock, src)
         log.info("Software, as Immich would do it")
-        log.info("  x264 preset %s, CRF %d", _STOCK_PRESET, args.crf)
+        log.info("  x264 preset %s, CRF %d", args.preset, args.crf)
         _report(secs, size, stock_ssim, duration, cpu)
         stock_cpu, stock_wall = cpu, secs
         log.info("")
@@ -7842,6 +7843,15 @@ def main():
         help="Transcode one video both ways and report speed, size and quality",
     )
     cmp_p.add_argument("video", help="a video file to test with, ideally your own")
+    cmp_p.add_argument(
+        "--preset",
+        default=_STOCK_PRESET,
+        help=(
+            "x264 preset for the software side (default %(default)s, Immich's "
+            "own). Set this to whatever your Immich is configured for, or the "
+            "comparison answers a question about a setting you do not use."
+        ),
+    )
     cmp_p.add_argument(
         "--crf",
         type=int,

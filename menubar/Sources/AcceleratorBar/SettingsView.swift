@@ -420,6 +420,8 @@ struct SettingsView: View {
         Binding<String>(
             get: { currentPreset },
             set: { name in
+                // Selecting Custom would have nothing to apply: it describes a
+                // mixture rather than naming one, so it reports and never sets.
                 guard name != currentPreset, name != "custom",
                       applyingSwitch == nil else { return }
                 applyingSwitch = "preset"
