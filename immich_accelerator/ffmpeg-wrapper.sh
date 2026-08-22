@@ -260,17 +260,25 @@ if [[ "$IS_SINGLE_FRAME" == true && "$DECODE_REJECTED" == true && -n "$INPUT" \
         QL_RESULT=$(find "$QL_DIR" -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \) -print -quit)
         if [[ -n "$QL_RESULT" ]]; then
             # vips, not sips: sips cannot write webp, which this install uses.
-            if [[ "$SCALE_H" =~ ^[0-9]+$ ]]; then
-                RESIZE=("--height" "$SCALE_H")
-            else
-                RESIZE=("--width" "${SCALE_W:-$QL_SIZE}")
-            fi
-            # The whole array, not a slice of it. ":1:1" took the second
-            # element only, so vips got the number without its flag and read it
-            # as the positional width: a preview requested at height 1440 came
-            # back 1440 wide. The wrapper exits 0, so Immich recorded the asset
-            # as thumbnailed and never retried. Present since before 1.14.0.
-            if "$VIPS_BIN" thumbnail "$QL_RESULT" "$OUTPUT" "${RESIZE[@]}" >/dev/null 2>&1 \
+            # KNOWN DEFECT, deliberately left as it is for now.
+            #
+            # ":1:1" passes the number without its flag, so vips reads it as
+            # the positional width: a preview requested at height 1440 comes
+            # back 1440 wide rather than 1440 tall. That is wrong.
+            #
+            # It is not fixed here because the obvious fixes are worse.
+            # `vips thumbnail` requires a positional width, so passing
+            # "${RESIZE[@]}" alone exits "too few arguments" and the fallback
+            # produces nothing. Passing a large width with --height did not
+            # bound the result either: measured on a 1920x1080 source,
+            # `10000 --height 400` returned 10000x5625. Getting this right
+            # means computing the width from the QuickLook output's own aspect
+            # ratio, which needs its dimensions read back and deserves its own
+            # change with its own tests rather than a guess in a release.
+            #
+            # Only reached when ffmpeg cannot decode the stream at all, and it
+            # still produces a usable thumbnail, just at the wrong dimension.
+            if "$VIPS_BIN" thumbnail "$QL_RESULT" "$OUTPUT" "${RESIZE[@]:1:1}" >/dev/null 2>&1 \
                || "$VIPS_BIN" copy "$QL_RESULT" "$OUTPUT" >/dev/null 2>&1; then
                 echo "[immich-accelerator] ffmpeg couldn't decode $INPUT for a thumbnail; QuickLook/AVFoundation produced one instead" >&2
                 exit 0
