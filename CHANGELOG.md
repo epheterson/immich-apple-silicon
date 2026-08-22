@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.14.1 - 2026-08-22
+
+### Fixed
+- **`encode-compare` reported the last frame's SSIM as the mean.** The summary line carrying the mean is logged at info, which the command was discarding, while `stats_file=-` wrote per-frame numbers it then read the last of. A clip ending on black therefore reported perfect quality for every setting. By [@RxChi1d](https://github.com/RxChi1d) ([#160](https://github.com/epheterson/immich-apple-silicon/pull/160)).
+- **`encode-compare` reported the wrong setting's timings.** The closing wall-clock and CPU lines described whichever quality value encoded last rather than the one recommended, always the slowest and largest of the sweep, so the recommendation looked worse than it is. By [@RxChi1d](https://github.com/RxChi1d) ([#161](https://github.com/epheterson/immich-apple-silicon/pull/161)).
+- **HEVC lost its `hvc1` tag with hardware encoding switched off.** The tag is a property of the container rather than of the encoder, and libx265 defaults to `hev1`, which Apple's decoder rejects. By [@RxChi1d](https://github.com/RxChi1d) ([#159](https://github.com/epheterson/immich-apple-silicon/pull/159)).
+
+### Changed
+- The encoder quality figures in the docs and in the 1.14.0 notes were produced by the SSIM bug above and are corrected here: measured on real camera footage, software scores 0.967 and VideoToolbox 0.974, not 0.961 against 0.980. The conclusion is unchanged, hardware scores higher in about half the size, but the gap is roughly a third of what was published.
+
 ## 1.14.0 - 2026-08-20
 
 ### Added
@@ -15,7 +25,7 @@
 - **A split install read its configuration out of an unrelated Docker container,** refused to start over a version mismatch that did not exist, and copied that container's database credentials into its own config. `immich_url` now decides. Reported by [@RxChi1d](https://github.com/RxChi1d) ([#139](https://github.com/epheterson/immich-apple-silicon/issues/139)).
 
 ### Changed
-- **Encoder documentation corrected.** Immich asks for `preset ultrafast`, so software often finishes one file sooner. Measured on an M4 over 20 seconds of 1080p footage: software 12.5s cpu across about eight cores, hardware 5s across about two, SSIM 0.980 hardware against 0.961 software in half the size. The earlier figures came from a synthetic test pattern and were wrong.
+- **Encoder documentation corrected.** Immich asks for `preset ultrafast`, so software often finishes one file sooner. Measured on an M4 over 20 seconds of 1080p footage: software 12.5s cpu across about eight cores, hardware 5s across about two, SSIM 0.974 hardware against 0.967 software in half the size. The earlier figures came from a synthetic test pattern and were wrong.
 
 ## 1.13.0 - 2026-08-19
 
