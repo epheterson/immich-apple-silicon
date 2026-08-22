@@ -1786,6 +1786,42 @@ class TestEncodeCompare:
         ):
             assert m._ssim_against("/bin/ffmpeg", "/a.mp4", "/b.mp4") is None
 
+    def test_the_timings_reported_belong_to_the_recommended_setting(self, tmp_path):
+        """The closing lines follow the recommendation, so they read as a
+        description of it. They have to come from the q:v that was recommended
+        and not from whichever one the sweep happened to try last, which is the
+        slowest and largest of them under the default --quality."""
+        video = tmp_path / "in.mov"
+        video.write_text("")
+        ffmpeg = tmp_path / "ffmpeg"
+        ffmpeg.write_text("")
+        args = argparse.Namespace(video=str(video), crf=23, quality=[59, 65, 75])
+        with patch.object(m.shutil, "which", return_value=str(ffmpeg)), patch.object(
+            m, "CONFIG_FILE", tmp_path / "absent.json"
+        ), patch.object(m, "_ffprobe_duration", return_value=10.0), patch.object(
+            m,
+            "_encode_once",
+            side_effect=[
+                (10.0, 1000, 20.0),  # stock
+                (1.0, 100, 2.0),  # q:v 59
+                (2.0, 200, 4.0),  # q:v 65, the one that will be recommended
+                (3.0, 300, 6.0),  # q:v 75, tried last
+            ],
+        ), patch.object(
+            m, "_ssim_against", side_effect=[0.99, 0.90, 0.989, 0.80]
+        ), patch.object(
+            m, "log"
+        ) as log:
+            m.cmd_encode_compare(args)
+        said = [c.args for c in log.info.call_args_list]
+        recommended = next(c for c in said if "Closest to the software" in c[0])
+        assert recommended[1] == 65
+        wall = next(c for c in said if "finished sooner" in c[0])
+        assert sorted(a for a in wall if isinstance(a, float)) == [2.0, 10.0]
+        assert 65 in wall, "the line does not say which q:v it describes"
+        cpu = next(c for c in said if "of cpu against" in c[0])
+        assert sorted(a for a in cpu if isinstance(a, float)) == [4.0, 20.0]
+
     def test_unreadable_ssim_output_is_not_a_number(self):
         with patch.object(
             m.subprocess, "run", return_value=MagicMock(stdout="", stderr="")
