@@ -260,6 +260,11 @@ if [[ "$IS_SINGLE_FRAME" == true && "$DECODE_REJECTED" == true && -n "$INPUT" \
         QL_RESULT=$(find "$QL_DIR" -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \) -print -quit)
         if [[ -n "$QL_RESULT" ]]; then
             # vips, not sips: sips cannot write webp, which this install uses.
+            if [[ "$SCALE_H" =~ ^[0-9]+$ ]]; then
+                RESIZE=("--height" "$SCALE_H")
+            else
+                RESIZE=("--width" "${SCALE_W:-$QL_SIZE}")
+            fi
             # KNOWN DEFECT, deliberately left as it is for now.
             #
             # ":1:1" passes the number without its flag, so vips reads it as

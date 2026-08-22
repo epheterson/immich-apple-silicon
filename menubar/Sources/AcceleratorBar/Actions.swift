@@ -127,36 +127,49 @@ enum Actions {
     static func stopService() async { await run(brew, ["services", "stop", service]) }
     static func restartService() async { await run(brew, ["services", "restart", service]) }
 
-    /// Restart the accelerator, but only if it is actually running.
+    /// What happened when a setting tried to take effect.
+    enum ApplyResult {
+        case applied
+        case stopped
+        /// Alive, but not started by `brew services`. brew will not restart a
+        /// process it did not start, so the setting is saved while the running
+        /// accelerator keeps using the old one.
+        case runningOutsideBrew
+
+        var message: String {
+            switch self {
+            case .applied: return ""
+            case .stopped:
+                return "Saved. Takes effect when you start the accelerator."
+            case .runningOutsideBrew:
+                return "Saved. The accelerator is running outside brew services, so restart it there to pick this up."
+            }
+        }
+    }
+
+    /// Apply a configuration change to the running accelerator if that is
+    /// possible, and report which of the three cases happened.
     ///
-    /// `brew services restart` starts a stopped service, so using it to apply a
-    /// setting would take someone who deliberately stopped the accelerator and
-    /// start it transcoding because they flipped a switch.
-    ///
-    /// Liveness is judged the same way the rest of the app judges it: a live
-    /// pid. `brew services list` alone is narrower and disagrees with the
-    /// status shown in this very window for an accelerator started by hand or
-    /// by a launchd agent, which would leave the setting unapplied while the
-    /// pane reported success.
-    ///
-    /// Returns whether it restarted, so the caller can tell the user the truth.
+    /// `brew services restart` starts a stopped service, so it must never be
+    /// unconditional: a setting change would start an accelerator somebody
+    /// deliberately stopped, and start it processing.
     @discardableResult
-    static func restartIfRunning() async -> Bool {
+    static func applyToRunningService() async -> ApplyResult {
+        let (_, list) = await run(brew, ["services", "list"])
+        let brewStarted = list.split(separator: "\n").contains { line in
+            line.hasPrefix("immich-accelerator") && line.contains("started")
+        }
+        if brewStarted {
+            await restartService()
+            return .applied
+        }
         let alive = await withCheckedContinuation { cont in
             DispatchQueue.global().async {
                 cont.resume(returning: StatusModel.pidAlive("worker") != nil
                     || StatusModel.pidAlive("ml") != nil)
             }
         }
-        var running = alive
-        if !running {
-            let (_, out) = await run(brew, ["services", "list"])
-            running = out.split(separator: "\n").contains { line in
-                line.hasPrefix("immich-accelerator") && line.contains("started")
-            }
-        }
-        if running { await restartService() }
-        return running
+        return alive ? .runningOutsideBrew : .stopped
     }
 
     // Runs the CLI's real ML test and condenses the result to one line.
@@ -213,18 +226,23 @@ enum Actions {
 
     // Switch the ML engine by rewriting config.json (preserving every other
     // key) and restarting so it takes effect. User-initiated from Settings.
-    static func setMLEngine(_ engine: String) async {
+    @discardableResult
+    static func setMLEngine(_ engine: String) async -> (ok: Bool, message: String) {
         let url = Paths.configFile
         guard let data = try? Data(contentsOf: url),
               var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else { return }
+        else { return (false, "Could not read the configuration.") }
         obj["ml_engine"] = engine
         guard let out = try? JSONSerialization.data(
-            withJSONObject: obj, options: [.prettyPrinted]) else { return }
-        try? out.write(to: url, options: .atomic)
-        // Same rule as every other setting here: apply now if it is running,
-        // never start a stopped accelerator because a setting changed.
-        await restartIfRunning()
+            withJSONObject: obj, options: [.prettyPrinted])
+        else { return (false, "Could not encode the configuration.") }
+        do {
+            try out.write(to: url, options: .atomic)
+        } catch {
+            // Swallowed before, so a failed write read as success.
+            return (false, "Could not save: \(error.localizedDescription)")
+        }
+        return (true, await applyToRunningService().message)
     }
 
     // Enable/disable one component via the CLI, which flips its config key and
@@ -262,8 +280,7 @@ enum Actions {
         let (code, out) = await run(cli, ["encoding", "preset", name])
         if code == 0 {
             // Same rule as the individual switches.
-            let applied = await restartIfRunning()
-            return (true, applied ? "" : "Saved. Takes effect when you start the accelerator.")
+            return (true, await applyToRunningService().message)
         }
         let detail = out.split(separator: "\n")
             .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
@@ -284,8 +301,7 @@ enum Actions {
             // it if it is not. Saying so matters: the setting is saved either
             // way, and a pane that reports plain success would be claiming the
             // running behaviour changed when it did not.
-            let applied = await restartIfRunning()
-            return (true, applied ? "" : "Saved. Takes effect when you start the accelerator.")
+            return (true, await applyToRunningService().message)
         }
         let detail = out.split(separator: "\n")
             .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })

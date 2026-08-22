@@ -2375,6 +2375,49 @@ class TestFfmpegWrapperQuickLookFallback:
     # The real call is `"$VIPS_BIN" copy "$QL_RESULT" "$OUTPUT"`.
     _VIPS_COPY = 'cp "$2" "$3"\n'
 
+    # Records what vips was actually asked for. The copy stub above succeeds
+    # whatever arguments follow, which is how an edit that deleted the resize
+    # argument entirely left every QuickLook test green while the fallback
+    # started writing thumbnails at the source's own size.
+    _VIPS_RECORD = 'printf "%s\\n" "$@" > "$VIPS_ARGS_FILE"\ncp "$2" "$3"\n'
+
+    def test_the_quicklook_fallback_asks_vips_for_a_size(self, tmp_path):
+        """Not which size, which is a known defect tracked separately: that it
+        passes one at all. With none, vips exits 'too few arguments', the
+        `|| vips copy` branch writes the QuickLook output through at whatever
+        size QuickLook produced, and the wrapper still exits 0, so Immich
+        records the asset as thumbnailed and never retries.
+
+        The other fallback tests use a vips stub that copies regardless of its
+        arguments, so they stayed green when the resize argument was dropped.
+        """
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, self._DECODE_REJECTED_STDERR + "exit 69\n")
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
+        vips = tmp_path / "vips_stub.sh"
+        seen = tmp_path / "vips_args"
+        self._bash_stub(vips, f'printf "%s\\n" "$@" > {seen}\ncp "$2" "$3"\n')
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        output = tmp_path / "out.jpg"
+
+        subprocess.run(
+            ["/bin/bash", str(wrapper),
+             *self._thumbnail_args(tmp_path / "in.mp4", output)],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin",
+                 "IMMICH_ACCELERATOR_VIPS": str(vips)},
+            capture_output=True, text=True, timeout=10,
+        )
+
+        assert seen.is_file(), "vips was never called"
+        received = seen.read_text().split()
+        assert received[0] == "thumbnail", received
+        assert any(a.isdigit() for a in received[3:]), (
+            f"vips got no size argument, so it would exit 'too few arguments' "
+            f"and the copy fallback would write an unresized image: {received}"
+        )
+
+
     def test_successful_ffmpeg_call_passes_through_unchanged(self, tmp_path):
         ffmpeg = tmp_path / "ffmpeg"
         self._bash_stub(ffmpeg, "exit 0\n")

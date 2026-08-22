@@ -83,6 +83,9 @@ struct SettingsView: View {
     @State private var hardwareAudioOn = false
     @State private var applyingSwitch: String?
     @State private var encodingError: String?
+    // Separate from encodingError: "saved, not yet live" is information, and
+    // showing it in red alongside real failures teaches people to ignore both.
+    @State private var encodingNotice: String?
     @State private var comparing = false
     @State private var compareResult: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
@@ -333,13 +336,28 @@ struct SettingsView: View {
                             Button(applying ? "Applying…" : "Apply") {
                                 applying = true
                                 Task {
-                                    await Actions.setMLEngine(engine)
-                                    savedEngine = engine
+                                    let result = await Actions.setMLEngine(engine)
+                                    if result.ok {
+                                        savedEngine = engine
+                                        encodingError = nil
+                                        encodingNotice = result.message.isEmpty
+                                            ? nil : result.message
+                                    } else {
+                                        // Was Void, so a failed write left the
+                                        // picker claiming the new engine.
+                                        encodingError = result.message
+                                        engine = savedEngine
+                                    }
                                     await model.refresh()
                                     applying = false
                                 }
                             }
-                            .disabled(applying)
+                            // Also blocked while a preset or switch write
+                            // is in flight: setMLEngine rewrites the whole
+                            // config in process, so overlapping with a CLI
+                            // write loses whichever landed first.
+                            .disabled(applying || applyingSwitch != nil
+                                      || applyingComponent != nil)
                         }
                     }
                     LabeledContent("Self-test") {
@@ -383,6 +401,15 @@ struct SettingsView: View {
                     Label(message, systemImage: "exclamationmark.triangle.fill")
                         .font(.rowDetail)
                         .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if let notice = encodingNotice, encodingError == nil, componentError == nil {
+                Section {
+                    Label(notice, systemImage: "info.circle")
+                        .font(.rowDetail)
+                        .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -436,9 +463,9 @@ struct SettingsView: View {
                 applyingSwitch = "preset"
                 Task {
                     let result = await Actions.setEncodingPreset(name)
-                    // message is also set on success when the accelerator was
-                    // not running, to say the setting is saved but not live.
-                    encodingError = result.message.isEmpty ? nil : result.message
+                    encodingError = result.ok ? nil : result.message
+                    encodingNotice = result.ok && !result.message.isEmpty
+                        ? result.message : nil
                     config = StatusModel.readConfig()
                     loadSwitches()
                     // Re-seed everything the write could have moved, not just
@@ -532,6 +559,7 @@ struct SettingsView: View {
                         binding.wrappedValue = !on
                     } else {
                         encodingError = nil
+                        encodingNotice = result.message.isEmpty ? nil : result.message
                         config = StatusModel.readConfig()
                     }
                     applyingSwitch = nil
