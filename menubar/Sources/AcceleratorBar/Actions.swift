@@ -98,6 +98,9 @@ enum Actions {
     static let brew = "/opt/homebrew/bin/brew"
     static let cli = "/opt/homebrew/opt/immich-accelerator/bin/immich-accelerator"
     static let service = "epheterson/immich-accelerator/immich-accelerator"
+    /// What `brew services list` prints in its Name column. brew accepts
+    /// the tap path as an argument but never echoes it back.
+    static let listedService = "immich-accelerator"
 
     @discardableResult
     static func run(_ tool: String, _ args: [String]) async -> (Int32, String) {
@@ -159,13 +162,44 @@ enum Actions {
     /// stopped service, so changing a setting would start the accelerator and
     /// set it processing. Applying a setting must never be the thing that
     /// starts work.
+    /// Whether `brew services list` says our service is started.
+    ///
+    /// Split out and reachable from the command line (`AcceleratorBar
+    /// brew-parse`, the same affordance as `parse-mounts`) because the
+    /// decision not to restart rests entirely on reading brew's table
+    /// correctly, and the table's shape is a property of the installed brew
+    /// rather than of anything in this repository. Reading the code proves
+    /// nothing about it; feeding it the real output does.
+    ///
+    /// Matched against `listedService`, not `service`: `brew services` takes
+    /// the fully qualified tap path as an argument but prints the short
+    /// formula name, so comparing against the tap path matches nothing and
+    /// reports every install as stopped.
+    ///
+    /// Name and status are compared as whole fields, and the column runs are
+    /// several spaces wide. Measured on the release Mac:
+    ///
+    ///     immich-accelerator started         elp  ~/Library/LaunchAgents/...
+    ///     immich-accelerator none
+    ///
+    /// A stopped service reads `none`, and its row ends after the status, so
+    /// nothing may assume a User or File column is present. `run` also merges
+    /// stderr into this text, and brew emits unrelated deprecation warnings
+    /// from other taps on every invocation, so the match has to be anchored on
+    /// the name rather than on finding a word anywhere in the output.
+    static func brewHasItStarted(_ list: String) -> Bool {
+        list.split(separator: "\n").contains { line in
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+            return fields.count > 1
+                && fields[0] == listedService
+                && fields[1] == "started"
+        }
+    }
+
     @discardableResult
     static func applyToRunningService() async -> ApplyResult {
         let (_, list) = await run(brew, ["services", "list"])
-        let brewStarted = list.split(separator: "\n").contains { line in
-            line.hasPrefix("immich-accelerator") && line.contains("started")
-        }
-        if brewStarted {
+        if brewHasItStarted(list) {
             await restartService()
             return .applied
         }

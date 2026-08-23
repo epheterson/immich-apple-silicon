@@ -221,3 +221,40 @@ def test_no_file_ships_git_conflict_markers():
                     break
 
     assert not offenders, "unresolved conflict markers:\n  " + "\n  ".join(offenders)
+
+
+def test_settings_never_restart_the_service_unconditionally():
+    """`brew services restart` starts a stopped service.
+
+    So a settings change that calls it directly does not apply a setting, it
+    starts an accelerator somebody deliberately stopped and sets it
+    processing. That shipped once and was reintroduced hours after being
+    fixed, both times by someone reaching for the obvious verb. The only
+    caller allowed to restart without checking first is the menu's explicit
+    Restart command, which is a person asking for exactly that.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).parent.parent / "menubar/Sources/AcceleratorBar"
+    allowed = {
+        # The menu's Restart item: the user asked to restart.
+        "MenuView.swift",
+        # Declares it, and calls it only inside applyToRunningService, which
+        # has already established that brew has the service started.
+        "Actions.swift",
+    }
+    for swift in sorted(root.glob("*.swift")):
+        if swift.name in allowed:
+            continue
+        assert "restartService" not in swift.read_text(), (
+            f"{swift.name} restarts the service directly. Apply changes "
+            f"through Actions.applyToRunningService, which restarts only "
+            f"when brew already has it running."
+        )
+
+    actions = (root / "Actions.swift").read_text()
+    body = actions[actions.index("static func applyToRunningService"):]
+    body = body[:body.index("\n    /// ", 1)]
+    assert "brewHasItStarted" in body and "await restartService()" in body, (
+        "applyToRunningService must gate its restart on brewHasItStarted"
+    )
