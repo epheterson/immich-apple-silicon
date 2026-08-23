@@ -7,25 +7,18 @@
 - **Software and Hardware, with Custom between them.** One control sets decoding, video and audio together. Software is the encoders and decoders Immich's own container uses, so video and thumbnails come out byte for byte what Docker produces. Hardware is VideoToolbox throughout, for much less CPU. Both are described in the pane before you choose, rather than after. Setting switches individually reads as Custom, which is a place you can be rather than an error.
 - **Hardware audio encoding** with AudioToolbox, measured at about a third less CPU than the software encoder and faster besides. Part of the Hardware end; it changes the bytes, so it is not on by default for anyone upgrading.
 - **`immich-accelerator compare <video>`** encodes one of your files every way this Mac can and writes a page with the numbers and a frame from each, side by side. A table cannot tell you whether you will notice a difference and pictures cannot tell you what it costs.
-- **`--preset` on both compare commands.** They fixed the software side at `ultrafast`, which is Immich's default and also x264's least efficient setting, so the comparison depended on a constant it never mentioned. Measured here on real footage: `ultrafast` gives 66.2 MB at SSIM 0.967 where `veryfast` gives 32.9 MB at 0.972, half the bytes for higher quality. Raised by [@RxChi1d](https://github.com/RxChi1d) ([#162](https://github.com/epheterson/immich-apple-silicon/issues/162)).
-
-### Fixed
-- **Re-running `setup` no longer discards your encoding settings.** It rebuilds the config from scratch and saves it wholesale, and the `env` block was not on the list of keys carried across, so the documented repair step quietly reverted a chosen position.
-- **Settings changes take effect when you make them**, rather than being written and reported as successful while the running accelerator carries on with the old ones. Changing a setting while the accelerator is stopped saves it and says so, because applying a setting must never be the thing that starts processing.
-
-### Changed
-- The mount switch now says what the whole system does: it remembers SMB shares and reconnects them at login, and separately the accelerator watches the mount holding your library the entire time it runs and remounts it on its own.
-
-
-## 1.14.1 - 2026-08-22
+- **`--preset` on both compare commands.** They fixed the software side at `ultrafast`, which is Immich's default and also x264's least efficient setting, so the comparison depended on a constant it never mentioned. Measured here on real footage: `ultrafast` gives 66.6 MB at SSIM 0.967 where `veryfast` gives 33.2 MB at 0.972, half the bytes for higher quality. Raised by [@RxChi1d](https://github.com/RxChi1d) ([#162](https://github.com/epheterson/immich-apple-silicon/issues/162)).
 
 ### Fixed
 - **`encode-compare` reported the last frame's SSIM as the mean.** The summary line carrying the mean is logged at info, which the command was discarding, while `stats_file=-` wrote per-frame numbers it then read the last of. A clip ending on black therefore reported perfect quality for every setting. By [@RxChi1d](https://github.com/RxChi1d) ([#160](https://github.com/epheterson/immich-apple-silicon/pull/160)).
 - **`encode-compare` reported the wrong setting's timings.** The closing wall-clock and CPU lines described whichever quality value encoded last rather than the one recommended, always the slowest and largest of the sweep, so the recommendation looked worse than it is. By [@RxChi1d](https://github.com/RxChi1d) ([#161](https://github.com/epheterson/immich-apple-silicon/pull/161)).
 - **HEVC lost its `hvc1` tag with hardware encoding switched off.** The tag is a property of the container rather than of the encoder, and libx265 defaults to `hev1`, which Apple's decoder rejects. By [@RxChi1d](https://github.com/RxChi1d) ([#159](https://github.com/epheterson/immich-apple-silicon/pull/159)).
+- **Re-running `setup` no longer discards your encoding settings.** It rebuilds the config from scratch and saves it wholesale, and the `env` block was not on the list of keys carried across, so the documented repair step quietly reverted a chosen position.
+- **Settings changes take effect when you make them**, rather than being written and reported as successful while the running accelerator carries on with the old ones. Changing a setting while the accelerator is stopped saves it and says so, because applying a setting must never be the thing that starts processing.
 
 ### Changed
 - The encoder quality figures in the docs and in the 1.14.0 notes were produced by the SSIM bug above and are corrected here: measured on real camera footage, software scores 0.967 and VideoToolbox 0.974, not 0.961 against 0.980. The conclusion is unchanged, hardware scores higher in about half the size, but the gap is roughly a third of what was published.
+- The mount switch now says what the whole system does: it remembers SMB shares and reconnects them at login, and separately the accelerator watches the mount holding your library the entire time it runs and remounts it on its own.
 
 ## 1.14.0 - 2026-08-20
 

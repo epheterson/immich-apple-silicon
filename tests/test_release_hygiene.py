@@ -187,6 +187,20 @@ def test_the_swift_preset_names_match_the_python_ones():
     assert names, "could not parse SettingsView's list; update this test"
     assert names == expected, f"SettingsView has {sorted(names)}, Python {sorted(expected)}"
 
+    # The same sentences are shown by the CLI and by the pane, so they are
+    # written twice and drifted the first time one was edited: the CLI still
+    # said "the most CPU of the three" after there stopped being three.
+    described = dict(
+        re.findall(r'\("([a-z]+)",\s*"[A-Za-z]+",\s*\n?\s*"((?:[^"\\]|\\.)*)"\)', listing)
+    )
+    assert set(described) == expected | {"custom"}, (
+        f"could not parse SettingsView's descriptions; got {sorted(described)}"
+    )
+    for name, text in described.items():
+        assert text.replace("\\'", "'") == m.PRESET_DETAIL[name], (
+            f"the pane and the CLI describe {name} differently"
+        )
+
 
 def test_no_file_ships_git_conflict_markers():
     """An unresolved merge left conflict markers in docs/usage.md and

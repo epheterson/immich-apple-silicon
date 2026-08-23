@@ -6949,11 +6949,11 @@ _DEFAULT_OFF = {"IMMICH_ACCEL_HW_AUDIO"}
 # this install is willing to move. Each names every switch, so a preset is a
 # complete statement rather than a diff against whatever was set before.
 #
-# Stock is not "hardware off as a preference". It is the position where the
+# Software is not "hardware off as a preference". It is the position where the
 # ffmpeg wrapper passes Immich's arguments through untouched, so a library
 # built here is byte-identical to one built by Docker and can move back.
 #
-# Maximum is what the hardware is measurably good at, not everything carrying a
+# Hardware is what the hardware is measurably good at, not everything carrying a
 # VideoToolbox name: hardware JPEG was measured slower than the software encoder
 # and is deliberately absent.
 ENCODING_PRESETS = {
@@ -6987,7 +6987,7 @@ PRESET_DETAIL = {
     "software": (
         "The encoders and decoders Immich's own container uses. Video and "
         "thumbnails come out byte for byte what Docker produces. Uses the most "
-        "CPU of the three."
+        "CPU."
     ),
     "hardware": (
         "VideoToolbox for decoding, video and audio. Much less CPU, so the Mac "
@@ -7053,9 +7053,10 @@ def bool_setting(name: str, default: bool = True, config: dict | None = None) ->
 def encoding_switch_on(switch: str, config: dict | None = None) -> bool:
     """Whether one encoding switch is currently on.
 
-    Most default on. The ones that change output default off (_DEFAULT_OFF), so
-    an install nobody has configured sits at Balanced rather than somewhere it
-    was never asked to be.
+    Most default on. The ones that change output default off (_DEFAULT_OFF),
+    which is why an install that predates these settings reads as Custom rather
+    than as either end: decoding and video were already on, audio was not, and
+    saying so is better than claiming a position it never chose.
     """
     name, _ = ENCODING_SWITCHES[switch]
     return bool_setting(name, name not in _DEFAULT_OFF, config)

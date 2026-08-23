@@ -72,7 +72,8 @@ _norm() {
 }
 _off() { local v; v=$(_norm "$1"); [[ "$v" == "0" || "$v" == "false" || "$v" == "no" ]]; }
 # Default-off counterpart, for switches that change output and so are only
-# reached from the Maximum position. Anything unrecognised stays off.
+# reached from the Hardware position or by being set by hand. Anything
+# unrecognised stays off.
 _on() { local v; v=$(_norm "$1"); [[ "$v" == "1" || "$v" == "true" || "$v" == "yes" ]]; }
 HW_VIDEO=true
 _off "${IMMICH_ACCEL_HW_VIDEO:-1}" && HW_VIDEO=false

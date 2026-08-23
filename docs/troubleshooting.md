@@ -88,6 +88,7 @@ Using the fully-qualified name (`brew install epheterson/immich-accelerator/immi
 
 </details>
 
+<a id="brew-upgrade-never-finds-a-new-version"></a>
 <details>
 <summary><b><code>brew upgrade</code> never finds a new version</b></summary>
 
