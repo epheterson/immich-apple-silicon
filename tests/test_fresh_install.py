@@ -2080,6 +2080,156 @@ class TestEncodingSwitches:
         m.cmd_encoding(self._args())
         assert m.load_config() == before
 
+    def test_an_install_from_before_these_settings_reads_as_custom(self, tmp_data_dir):
+        """Hardware video without hardware audio is genuinely neither end, and
+        saying so is better than pretending. One click moves it to an end."""
+        m.save_config({})
+        assert m.encoding_preset() == "custom"
+
+    def test_every_preset_round_trips(self, tmp_data_dir):
+        """Applying a preset must make encoding_preset name that same preset.
+        Derived state and written state disagreeing is how a UI ends up
+        showing 'custom' immediately after you picked something."""
+        for name in m.ENCODING_PRESETS:
+            config = m.apply_encoding_preset(name, {})
+            assert m.encoding_preset(config) == name, name
+
+    def test_the_software_end_turns_everything_off(self, tmp_data_dir):
+        """The software end is the pass-through position. Any hardware switch left on
+        means output that is not what Docker would have produced."""
+        config = m.apply_encoding_preset("software", {})
+        for var in m.ENCODING_PRESETS["software"]:
+            assert config["env"][var] == "0", var
+
+    def test_a_preset_states_every_switch(self, tmp_data_dir):
+        """A preset that only wrote the switches it cared about would leave a
+        hand-set switch in place under a name that denies it."""
+        for name, wanted in m.ENCODING_PRESETS.items():
+            assert set(wanted) == {
+                var for var, _ in m.ENCODING_SWITCHES.values()
+            }, f"{name} does not name every switch"
+
+    def test_switching_by_hand_reports_custom(self, tmp_data_dir):
+        m.save_config(m.apply_encoding_preset("software", {}))
+        m.cmd_encoding(self._args("hardware-video", "on"))
+        assert m.encoding_preset() == "custom"
+
+    def test_a_preset_recovers_from_custom(self, tmp_data_dir):
+        m.save_config(m.apply_encoding_preset("software", {}))
+        m.cmd_encoding(self._args("hardware-video", "on"))
+        m.save_config(m.apply_encoding_preset("software", m.load_config()))
+        assert m.encoding_preset() == "software"
+
+    def test_the_audio_switch_defaults_off(self, tmp_data_dir):
+        """It changes output, so it only happens where it was asked for."""
+        m.save_config({})
+        assert m.encoding_switch_on("hardware-audio") is False
+
+
+
+    def test_turning_off_one_switch_reads_as_custom(self, tmp_data_dir):
+        m.save_config(m.apply_encoding_preset("hardware", {}))
+        m.cmd_encoding(self._args("hardware-audio", "off"))
+        assert m.encoding_preset() == "custom"
+
+
+
+
+
+
+
+
+    def test_the_comparison_page_shows_every_encode(self, tmp_path):
+        """The page is the deliverable: if a row is dropped the person is
+        comparing against something that is not there."""
+        rows = [
+            {"label": "Original", "wall": 0.0, "cpu": 0.0, "cores": 0.0,
+             "mb": 50.0, "ssim": None, "frame": "frame-original.png"},
+            {"label": "Software (what Immich does)", "wall": 1.5, "cpu": 12.8,
+             "cores": 8.5, "mb": 66.6, "ssim": 0.966586, "frame": "a.png"},
+            {"label": "VideoToolbox q:v 59", "wall": 2.7, "cpu": 5.3,
+             "cores": 2.0, "mb": 32.3, "ssim": 0.974089, "frame": "b.png"},
+        ]
+        page = m._comparison_page(rows, tmp_path, "clip.mp4")
+        html = page.read_text()
+        for row in rows:
+            assert row["label"] in html
+        assert "0.966586" in html and "0.974089" in html
+        assert "frame-original.png" in html and "b.png" in html
+        # No network anything: this opens from file:// on a Mac with no
+        # connection, and a remote stylesheet would silently strip the layout.
+        assert "http://" not in html and "https://" not in html
+
+    def test_a_row_with_no_frame_still_appears(self, tmp_path):
+        """A failed frame extraction must not remove the measurements: the
+        numbers are still the answer to half the question."""
+        rows = [{"label": "VideoToolbox q:v 59", "wall": 2.7, "cpu": 5.3,
+                 "cores": 2.0, "mb": 32.3, "ssim": 0.97, "frame": None}]
+        html = m._comparison_page(rows, tmp_path, "clip.mp4").read_text()
+        assert "VideoToolbox q:v 59" in html and "no frame" in html
+
+    def test_a_missing_ssim_reads_as_unavailable(self, tmp_path):
+        rows = [{"label": "X", "wall": 1.0, "cpu": 1.0, "cores": 1.0,
+                 "mb": 1.0, "ssim": None, "frame": None}]
+        html = m._comparison_page(rows, tmp_path, "c.mp4").read_text()
+        assert "n/a" in html
+
+    def _finalize(self, config, monkeypatch):
+        """_finalize_config with its interactive tail stubbed.
+
+        The /build firmlink prompt is not what these tests are about, and a
+        test that cannot run unattended is a test nobody runs.
+        """
+        monkeypatch.setattr("builtins.input", lambda *a: "n")
+        m._finalize_config(config)
+
+    def test_a_first_install_lands_on_a_position(self, tmp_data_dir, monkeypatch):
+        """Nothing asserted this before, which is how a path that never applies
+        one went unnoticed."""
+        rebuilt = {"immich_url": "http://x"}
+        self._finalize(rebuilt, monkeypatch)
+        assert m.encoding_preset() == "hardware"
+
+    def test_the_manual_template_lands_on_a_position_too(self, tmp_data_dir):
+        """setup --manual writes its template and never reaches
+        _finalize_config, so a manual install would open on Custom."""
+        template = {"immich_url": "http://x"}
+        m.apply_encoding_preset("hardware", template)
+        assert m.encoding_preset(template) == "hardware"
+
+    def test_setup_preserves_a_chosen_position(self, tmp_data_dir, monkeypatch):
+        """Through the real path, not the helper.
+
+        setup rebuilds the config from scratch and saves it wholesale, so a key
+        missing from _PRESERVED_CONFIG_KEYS is erased on every re-run. The
+        earlier version of this test asked a helper whether a choice had been
+        made, which was true, while the save that followed threw the choice
+        away. Only going through _finalize_config catches that.
+        """
+        m.save_config(m.apply_encoding_preset("software", {}))
+        rebuilt = {"immich_url": "http://10.0.0.9:2283"}
+        self._finalize(rebuilt, monkeypatch)
+        assert m.encoding_preset() == "software", (
+            "a chosen position must survive re-running setup"
+        )
+
+    def test_env_is_preserved_across_setup(self, tmp_data_dir, monkeypatch):
+        m.save_config({"env": {"IMMICH_ACCEL_HW_VIDEO": "0"}, "api_key": "k"})
+        rebuilt = {"immich_url": "http://x"}
+        self._finalize(rebuilt, monkeypatch)
+        assert m.load_config()["env"]["IMMICH_ACCEL_HW_VIDEO"] == "0"
+
+    def test_setup_does_not_move_an_existing_install(self, tmp_data_dir, monkeypatch):
+        """An install from before these settings has no env block and must keep
+        it that way: turning on the AudioToolbox encoder under someone who
+        never asked changes the bytes of every video they process next."""
+        m.save_config({"immich_url": "http://x"})
+        rebuilt = {"immich_url": "http://x"}
+        self._finalize(rebuilt, monkeypatch)
+        assert "env" not in m.load_config(), (
+            "an existing install must not be given a position it never chose"
+        )
+
     def test_the_decode_switch_persists_too(self, tmp_data_dir):
         m.save_config({})
         m.cmd_encoding(self._args("hardware-decode", "off"))
@@ -2115,7 +2265,16 @@ class TestEncodingSwitches:
             ["-i", "in.mov", "-frames:v", "1", "out.jpg"],
             "-hwaccel",
         ),
+        "IMMICH_ACCEL_HW_AUDIO": (
+            ["-i", "in.mov", "-c:a", "aac", "out.mp4"],
+            "aac_at",
+        ),
     }
+
+    # Which switches are off unless asked for. The truthiness rule inverts with
+    # the default in both implementations, so an unrecognised value keeps the
+    # safer position rather than flipping behaviour.
+    DEFAULT_OFF = {"IMMICH_ACCEL_HW_AUDIO"}
 
     def test_every_switch_means_the_same_thing_to_the_cli_and_the_wrapper(
         self, tmp_path
@@ -2127,9 +2286,16 @@ class TestEncodingSwitches:
                 f"switch and the wrapper agree"
             )
             args, marker = self.PROBES[variable]
-            for value in ("0", "false", "no", "1", "true", "yes", "", "off", "banana"):
+            # Mixed case and surrounding space included: the two
+            # implementations used to disagree on exactly these, and a test
+            # that only tries already-lowercase values never notices.
+            for value in (
+                "0", "false", "no", "1", "true", "yes", "", "off", "banana",
+                "FALSE", "True", " 0", " YES ", "No", "1 ",
+            ):
+                default_on = variable not in self.DEFAULT_OFF
                 python_says_on = m.bool_setting(
-                    variable, True, {"env": {variable: value}}
+                    variable, default_on, {"env": {variable: value}}
                 )
                 out = wrapper._run(tmp_path, args, env={variable: value})
                 wrapper_says_on = marker in out
@@ -2208,6 +2374,49 @@ class TestFfmpegWrapperQuickLookFallback:
 
     # The real call is `"$VIPS_BIN" copy "$QL_RESULT" "$OUTPUT"`.
     _VIPS_COPY = 'cp "$2" "$3"\n'
+
+    # Records what vips was actually asked for. The copy stub above succeeds
+    # whatever arguments follow, which is how an edit that deleted the resize
+    # argument entirely left every QuickLook test green while the fallback
+    # started writing thumbnails at the source's own size.
+    _VIPS_RECORD = 'printf "%s\\n" "$@" > "$VIPS_ARGS_FILE"\ncp "$2" "$3"\n'
+
+    def test_the_quicklook_fallback_asks_vips_for_a_size(self, tmp_path):
+        """Not which size, which is a known defect tracked separately: that it
+        passes one at all. With none, vips exits 'too few arguments', the
+        `|| vips copy` branch writes the QuickLook output through at whatever
+        size QuickLook produced, and the wrapper still exits 0, so Immich
+        records the asset as thumbnailed and never retries.
+
+        The other fallback tests use a vips stub that copies regardless of its
+        arguments, so they stayed green when the resize argument was dropped.
+        """
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, self._DECODE_REJECTED_STDERR + "exit 69\n")
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
+        vips = tmp_path / "vips_stub.sh"
+        seen = tmp_path / "vips_args"
+        self._bash_stub(vips, f'printf "%s\\n" "$@" > {seen}\ncp "$2" "$3"\n')
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        output = tmp_path / "out.jpg"
+
+        subprocess.run(
+            ["/bin/bash", str(wrapper),
+             *self._thumbnail_args(tmp_path / "in.mp4", output)],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin",
+                 "IMMICH_ACCELERATOR_VIPS": str(vips)},
+            capture_output=True, text=True, timeout=10,
+        )
+
+        assert seen.is_file(), "vips was never called"
+        received = seen.read_text().split()
+        assert received[0] == "thumbnail", received
+        assert any(a.isdigit() for a in received[3:]), (
+            f"vips got no size argument, so it would exit 'too few arguments' "
+            f"and the copy fallback would write an unresized image: {received}"
+        )
+
 
     def test_successful_ffmpeg_call_passes_through_unchanged(self, tmp_path):
         ffmpeg = tmp_path / "ffmpeg"
@@ -2576,125 +2785,6 @@ class TestFfmpegWrapperQuickLookFallback:
                 "23",
                 str(tmp_path / "out.webm"),
             ],
-        )
-        # No assertion about -hwaccel. This test arrived (#154) when hardware
-        # decode was still tied to the encoder remap, so "not remapped" and
-        # "no -hwaccel" were the same statement. #153 separated them: decode
-        # is now requested for every input, including the ones encoded in
-        # software, which is the entire point of it. Whether -hwaccel is
-        # present is covered by the decode switch's own tests.
-        assert "-q:v" not in received
-        assert received[received.index("-crf") + 1] == "23"
-
-    def test_thumbnail_job_gets_hardware_decode(self, tmp_path):
-        """Immich's thumbnail and preview jobs send no -c:v at all, so there is
-        no encoder to remap. Hardware decode still has to be injected."""
-        ffmpeg = tmp_path / "ffmpeg"
-        seen_args = tmp_path / "seen_args"
-        self._bash_stub(ffmpeg, f'printf "%s\\n" "$@" > {seen_args}\nexit 0\n')
-        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
-        args = self._thumbnail_args(tmp_path / "in.mov", tmp_path / "out.jpg")
-
-        result = subprocess.run(
-            ["/bin/bash", str(wrapper), *args],
-            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert result.returncode == 0, result.stderr
-        received = seen_args.read_text().splitlines()
-        assert received[:2] == ["-hwaccel", "videotoolbox"], (
-            f"-hwaccel must be injected as an input option, before -i; got {received}"
-        )
-        # Nothing else may change: no encoder was requested, so none is invented.
-        assert not any(a.endswith("_videotoolbox") for a in received[2:])
-        assert received[2:] == args, "the remaining arguments must pass through verbatim"
-
-    def _capture_ffmpeg_args(self, tmp_path, args):
-        """Run the wrapper against a stub ffmpeg that records its argv."""
-        ffmpeg = tmp_path / "ffmpeg"
-        seen_args = tmp_path / "seen_args"
-        self._bash_stub(ffmpeg, f'printf "%s\\n" "$@" > {seen_args}\nexit 0\n')
-        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
-        result = subprocess.run(
-            ["/bin/bash", str(wrapper), *args],
-            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert result.returncode == 0, result.stderr
-        return seen_args.read_text().splitlines()
-
-    def _quality_value(self, received):
-        assert received.count("-q:v") == 1, received
-        return received[received.index("-q:v") + 1]
-
-    # Immich's quality setting is a CRF number, 0-51, lower is better. The
-    # VideoToolbox encoders ignore -crf outright and read -q:v on a 0-100
-    # scale where higher is better, so the wrapper translates the number.
-    # CRF 23 (Immich's default) maps to 59; the median matched quality
-    # measured across six clips and five metrics at CRF 23 was 58.9.
-    def test_crf_is_translated_for_videotoolbox(self, tmp_path):
-        received = self._capture_ffmpeg_args(
-            tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
-             "-preset", "ultrafast", "-crf", "23", str(tmp_path / "out.mp4")],
-        )
-        assert "-crf" not in received, "-crf means nothing to h264_videotoolbox"
-        assert self._quality_value(received) == "59"
-
-        # A leading zero must not be read as octal.
-        received = self._capture_ffmpeg_args(
-            tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
-             "-preset", "ultrafast", "-crf", "08", str(tmp_path / "out.mp4")],
-        )
-        assert self._quality_value(received) == "88"
-
-    def test_incoming_quality_flag_is_rewritten_to_the_encoder_scale(self, tmp_path):
-        """With CQ mode set to CQP, Immich sends `-q:v N` carrying the same
-        CRF-scale number. Passed through untouched it inverts the setting:
-        CRF 23 would execute as quality 23 out of 100."""
-        received = self._capture_ffmpeg_args(
-            tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
-             "-q:v", "23", str(tmp_path / "out.mp4")],
-        )
-        assert self._quality_value(received) == "59"
-
-        # The stream-specific spelling carries the same number.
-        received = self._capture_ffmpeg_args(
-            tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "h264",
-             "-q:v:0", "23", str(tmp_path / "out.mp4")],
-        )
-        assert self._quality_value(received) == "59"
-
-    def test_translated_quality_stays_inside_the_encoder_scale(self, tmp_path):
-        """VideoToolbox rejects a quality outside 0-100. Values outside the
-        0-51 range Immich's UI offers clamp to the ends of the scale."""
-        best = self._capture_ffmpeg_args(
-            tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "hevc",
-             "-crf", "0", str(tmp_path / "out.mp4")],
-        )
-        assert self._quality_value(best) == "100"
-        worst = self._capture_ffmpeg_args(
-            tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "hevc",
-             "-crf", "63", str(tmp_path / "out.mp4")],
-        )
-        assert self._quality_value(worst) == "1"
-
-    def test_software_encode_keeps_its_own_crf(self, tmp_path):
-        """The translation is only correct for VideoToolbox. An encoder the
-        wrapper doesn't remap keeps the arguments Immich sent."""
-        received = self._capture_ffmpeg_args(
-            tmp_path,
-            ["-i", str(tmp_path / "in.mov"), "-c:v", "libvpx-vp9",
-             "-crf", "23", str(tmp_path / "out.webm")],
         )
         # No -hwaccel assertion. It was equivalent to "not remapped" until #153
         # separated decode from encode; decode is now requested for every input,

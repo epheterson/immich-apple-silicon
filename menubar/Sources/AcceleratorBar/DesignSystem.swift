@@ -32,7 +32,10 @@ enum Metrics {
     /// run past it and scroll: it is a list of facts that grows with the number
     /// of checks, and scrolling a list is not a defect.
     static let settingsWidth: CGFloat = 700
-    static let settingsHeight: CGFloat = 480
+    // Tall enough that Processing, which now carries every toggle, does
+    // not open already scrolled. The window is fixed, so this is the
+    // whole budget.
+    static let settingsHeight: CGFloat = 640
     /// Wide enough for "Machine Learning" beside its glyph. At 190 it
     /// truncated to "Machine Le...", which is the sort of thing that only
     /// shows up when you render the window and look at it.

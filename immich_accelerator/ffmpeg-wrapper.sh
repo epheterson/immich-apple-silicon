@@ -56,11 +56,34 @@ fi
 # roughly one core where software uses every core it can reach, which is what
 # matters when the worker is running several jobs and the ML engine at once.
 # `immich-accelerator encode-compare` measures both on your own footage.
-_off() { [[ "$1" == "0" || "$1" == "false" || "$1" == "no" ]]; }
+# Trimmed and lowercased before comparing, because the Python side does the
+# same and the two must not disagree: " FALSE" read as off by the CLI and on
+# by the wrapper means the settings screen and the actual encode differ.
+# tr, not ${v:l} (zsh only) or ${v,,} (bash 4; macOS ships 3.2). Both expand
+# to the string unchanged here, which would make this normalisation a no-op
+# that still looks correct.
+# Ends only, matching Python's str.strip(). Deleting interior whitespace made
+# the two disagree on exactly the values this exists to keep aligned.
+_norm() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    printf '%s' "$v" | tr '[:upper:]' '[:lower:]'
+}
+_off() { local v; v=$(_norm "$1"); [[ "$v" == "0" || "$v" == "false" || "$v" == "no" ]]; }
+# Default-off counterpart, for switches that change output and so are only
+# reached from the Hardware position or by being set by hand. Anything
+# unrecognised stays off.
+_on() { local v; v=$(_norm "$1"); [[ "$v" == "1" || "$v" == "true" || "$v" == "yes" ]]; }
 HW_VIDEO=true
 _off "${IMMICH_ACCEL_HW_VIDEO:-1}" && HW_VIDEO=false
 HW_DECODE=true
 _off "${IMMICH_ACCEL_HW_DECODE:-1}" && HW_DECODE=false
+# AudioToolbox AAC. Off by default: measured a third less CPU than the software
+# encoder and faster besides, but it is a different encoder, so the bytes differ
+# from what Docker produces and that is only acceptable where it was asked for.
+HW_AUDIO=false
+_on "${IMMICH_ACCEL_HW_AUDIO:-0}" && HW_AUDIO=true
 
 ARGS=("$@")
 USE_HW_ENCODER=false
@@ -120,6 +143,18 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
         next="${ARGS[$((i+1))]:-}"
         if [[ "$next" =~ ^[0-9]+$ ]]; then
             NEW_ARGS+=("-q:v" "$(_crf_to_quality "$next")")
+            ((i++))
+            continue
+        fi
+    fi
+
+    # Remap the audio encoder to AudioToolbox. Same codec and same container,
+    # so nothing downstream changes shape; only the encoder differs. Left alone
+    # for `copy`, which is not an encode at all.
+    if [[ "$HW_AUDIO" == true && ( "$arg" == "-c:a" || "$arg" == "-acodec" ) ]]; then
+        next="${ARGS[$((i+1))]:-}"
+        if [[ "$next" == "aac" ]]; then
+            NEW_ARGS+=("$arg" "aac_at")
             ((i++))
             continue
         fi
@@ -231,6 +266,24 @@ if [[ "$IS_SINGLE_FRAME" == true && "$DECODE_REJECTED" == true && -n "$INPUT" \
             else
                 RESIZE=("--width" "${SCALE_W:-$QL_SIZE}")
             fi
+            # KNOWN DEFECT, deliberately left as it is for now.
+            #
+            # ":1:1" passes the number without its flag, so vips reads it as
+            # the positional width: a preview requested at height 1440 comes
+            # back 1440 wide rather than 1440 tall. That is wrong.
+            #
+            # It is not fixed here because the obvious fixes are worse.
+            # `vips thumbnail` requires a positional width, so passing
+            # "${RESIZE[@]}" alone exits "too few arguments" and the fallback
+            # produces nothing. Passing a large width with --height did not
+            # bound the result either: measured on a 1920x1080 source,
+            # `10000 --height 400` returned 10000x5625. Getting this right
+            # means computing the width from the QuickLook output's own aspect
+            # ratio, which needs its dimensions read back and deserves its own
+            # change with its own tests rather than a guess in a release.
+            #
+            # Only reached when ffmpeg cannot decode the stream at all, and it
+            # still produces a usable thumbnail, just at the wrong dimension.
             if "$VIPS_BIN" thumbnail "$QL_RESULT" "$OUTPUT" "${RESIZE[@]:1:1}" >/dev/null 2>&1 \
                || "$VIPS_BIN" copy "$QL_RESULT" "$OUTPUT" >/dev/null 2>&1; then
                 echo "[immich-accelerator] ffmpeg couldn't decode $INPUT for a thumbnail; QuickLook/AVFoundation produced one instead" >&2

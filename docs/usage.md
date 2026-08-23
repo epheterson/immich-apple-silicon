@@ -21,6 +21,10 @@ Every command is prefixed with `immich-accelerator` (e.g. `immich-accelerator se
 | `dashboard` | Web UI at http://localhost:8420 |
 | `component [name] [on\|off]` | Turn the [worker, ML, or dashboard](#choosing-what-runs) on or off (no args lists them) |
 | `ml-test` | Diagnose the ML service (health + CLIP + OCR round-trip) |
+| `encoding` | Show the hardware transcoding switches, or set one: `encoding hardware-video off` (see [below](#hardware-transcoding)) |
+| `encoding preset [software\|hardware]` | Move every switch to one end at once |
+| `compare <video>` | Encode one of your own files every way this Mac can and open a page with the numbers and a frame from each |
+| `encode-compare <video>` | The same comparison as text, and the VideoToolbox quality closest to what Immich produces on its own |
 | `uninstall` | Remove services, data, and launchd config |
 
 If a command isn't behaving as documented here, see [troubleshooting.md](troubleshooting.md).
@@ -156,7 +160,6 @@ The cap is close to free, because the parallelism saturates early. On an M4 with
 
 ## Configuration details
 
-<<<<<<< HEAD
 ### Setting `IMMICH_ACCEL*` variables
 
 Put them in the `env` block of `~/.immich-accelerator/config.json`:
@@ -177,17 +180,50 @@ A real environment variable still wins, so running the accelerator by hand with 
 Setting them in the shell environment does not work on a Homebrew install, which is why this exists: `brew services` generates the launch agent, it carries no environment, `launchctl setenv` does not reach it, and editing the plist is undone the next time the service restarts.
 
 Only `IMMICH_ACCEL*` names are accepted. Everything else a service needs is worked out at startup, and anything else in that block is ignored with a warning.
-=======
-### Hardware video encoding
 
-On by default. Set `IMMICH_ACCEL_HW_VIDEO=0` to keep Immich's own software encoder instead.
+### Hardware transcoding
 
-Worth knowing what the switch trades, because "hardware" does not simply mean "faster". Immich asks ffmpeg for `preset ultrafast`, which is genuinely quick, so on an idle Mac the software encoder often finishes a single file sooner. What VideoToolbox buys is the rest of the machine. Measured on an M4 over 20 seconds of 1080p camera footage: software finished in 1.5 seconds but spent 12.5 seconds of CPU across about eight cores, while VideoToolbox took 2.8 seconds of wall clock and 5 seconds of CPU across about two. On a Mac also running Immich's other jobs and the machine learning engine, that is usually the trade you want.
+Three switches decide how much of transcoding runs on the video hardware rather than on the CPU. Settings shows them under Hardware Transcoding; the CLI sets the same values.
 
-Quality is not the thing you give up, and on real footage it often goes the other way. `preset ultrafast` disables most of what x264 is good at, which shows up badly on grainy or high-motion video: on that same footage the software encode scored SSIM 0.961 against the original while the hardware encode scored 0.980 in half the file size. On synthetic test patterns the ranking reverses, which is exactly why the numbers below come from a command you run on your own files rather than from a table here.
+| Switch | Variable | Default | What it does |
+| ------ | -------- | ------- | ------------ |
+| Decoding | `IMMICH_ACCEL_HW_DECODE` | on | Decodes video, thumbnails and previews with VideoToolbox |
+| Video Encoding | `IMMICH_ACCEL_HW_VIDEO` | on | Encodes H.264 and HEVC with VideoToolbox |
+| Audio Encoding | `IMMICH_ACCEL_HW_AUDIO` | on for new installs, off for upgrades | Encodes AAC with AudioToolbox (`aac_at`) |
 
-`immich-accelerator encode-compare <video>` runs both on a file of yours and prints the numbers, including which hardware quality setting lands closest to what Immich would have produced on its own.
->>>>>>> feat/encoder-toggles
+Set one at a time:
+
+```bash
+immich-accelerator encoding                      # show all three
+immich-accelerator encoding hardware-video off
+```
+
+Or move all three at once. **Software** turns everything off, which is exactly what Immich's own container does, so video and thumbnails come out byte for byte what Docker produces. **Hardware** turns everything on:
+
+```bash
+immich-accelerator encoding preset software
+immich-accelerator encoding preset hardware
+```
+
+Any other combination is a valid place to be, and both Settings and the CLI call it Custom.
+
+Audio is the one switch that is off for anyone upgrading. `aac_at` is faster and uses about a third less CPU, but the bytes differ from Docker's, so an existing install is never moved onto it without being asked. A new install starts at Hardware.
+
+### What the hardware actually buys you
+
+"Hardware" does not simply mean "faster". Immich asks ffmpeg for `preset ultrafast`, which is genuinely quick, so on an idle Mac the software encoder often finishes a single file sooner. What VideoToolbox buys is the rest of the machine. Measured on an M4 over 20 seconds of 1080p camera footage: software finished in 1.5 seconds but spent 12.5 seconds of CPU across about eight cores, while VideoToolbox took 2.8 seconds of wall clock and 5 seconds of CPU across about two. On a Mac also running Immich's other jobs and the machine learning engine, that is usually the trade you want.
+
+Quality is not the thing you give up, and on real footage it often goes the other way. `preset ultrafast` disables most of what x264 is good at, which shows up badly on grainy or high-motion video: on that same footage the software encode scored SSIM 0.967 against the original while the hardware encode scored 0.974 in half the file size. On synthetic test patterns the ranking reverses, which is exactly why these numbers are worth re-measuring on your own files rather than trusting a table here.
+
+`preset ultrafast` is also the assumption both comparison commands make about your software side, because it is what Immich ships. If you have configured Immich for a different x264 preset, tell them so, or the comparison is against something you do not run:
+
+```bash
+immich-accelerator compare ~/Movies/clip.mov --preset veryfast
+```
+
+That one matters more than it sounds. On the footage above, `ultrafast` produced 66.6 MB at SSIM 0.967 while `veryfast` produced 33.2 MB at 0.972: half the bytes at higher quality, from the same encoder. Which end of the comparison you are standing on changes the answer.
+
+`compare` writes a page with a frame from each encode next to the measurements, since a table cannot tell you whether you would notice the difference. `encode-compare` prints the same measurements as text.
 
 ### Understanding `IMMICH_MEDIA_LOCATION`
 

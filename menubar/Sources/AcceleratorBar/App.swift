@@ -20,6 +20,17 @@ struct AcceleratorBarMain {
         // Exposes the mount parser to the shell so it can be checked against
         // real `mount` output rather than an invented sample. The two bugs
         // fixed in it were both only visible in real output.
+        // Reads `brew services list` from stdin and prints started/stopped,
+        // so the decision that keeps a settings change from starting a
+        // stopped accelerator can be checked against a real brew's real
+        // output rather than against a string in a test.
+        if CommandLine.arguments.contains("brew-parse") {
+            let input = String(data: FileHandle.standardInput.readDataToEndOfFile(),
+                               encoding: .utf8) ?? ""
+            print(Actions.brewHasItStarted(input) ? "started" : "not-started")
+            exit(0)
+        }
+
         if CommandLine.arguments.contains("parse-mounts") {
             let out = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
             for share in MountSharesAtLogin.shares(fromMountOutput: out) {

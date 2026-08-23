@@ -14,6 +14,12 @@ The native worker runs Immich's unmodified code. The ffmpeg and image processing
 | **HEIC decode** | libvips built with libde265 | Homebrew `vips` (libvips + libde265), then Sharp | Sharp's prebuilt libvips on macOS has no HEVC decoder, so iPhone HEICs are pre-decoded by the Homebrew `vips` (the same libvips + libde265 Docker uses) before Sharp processes them. Works headless; pixels match Docker. Apple ImageIO (`sips`) is a last-resort fallback for a logged-in desktop only. |
 | **Camera RAW decode** | libvips with fuller libtiff/libjpeg + libraw | Homebrew `vips`, then Sharp | Sharp's prebuilt libvips on macOS lacks old-style-JPEG and dcraw/libraw support, so Canon CR2/CR3, Nikon NEF, Sony ARW, Adobe DNG and other RAW originals fail thumbnail generation (`tiff2vips: Old-style JPEG compression support is not configured`, or a `multiband -> srgb` colourspace error). They are pre-decoded by the Homebrew `vips` (fuller libtiff/libjpeg for TIFF-based RAW, plus libraw for the rest), the same libvips Docker uses, before Sharp. Works headless; matches Docker. |
 
+### Audio on a new install
+
+A new install starts at the Hardware position, which encodes audio with AudioToolbox (`aac_at`) rather than ffmpeg's own AAC encoder. It is faster and uses about a third less CPU, and the result is still AAC, but the bytes are not identical to Docker's. Switch the position to Software in Settings, or run `immich-accelerator encoding preset software`, if you need audio that matches byte for byte.
+
+An install that existed before this setting is left exactly as it was.
+
 ## What this means in practice
 
 - **Thumbnails, previews, and video**: Same jellyfin-ffmpeg binary, same `tonemapx` HDR tone mapping. VideoToolbox hardware encoding is faster but visually equivalent. Hardware decode delivers 10-bit frames as `p010le` where Docker's software decode delivers `yuv420p10le`, so a video thumbnail from a 10-bit source is not byte-identical to Docker's; measured at 55.3 dB PSNR on a 4K60 HLG clip. An 8-bit source produces an identical file.
