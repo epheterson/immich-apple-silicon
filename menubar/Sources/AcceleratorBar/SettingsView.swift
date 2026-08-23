@@ -78,14 +78,15 @@ struct SettingsView: View {
     // into a contradictory config.
     @State private var applyingComponent: String?
     @State private var componentError: String?
-    @State private var hardwareVideoOn = true
     @State private var hardwareDecodeOn = true
+    @State private var hardwareVideoOn = true
     @State private var hardwareAudioOn = false
     @State private var applyingSwitch: String?
     @State private var encodingError: String?
-    // Separate from encodingError: "saved, not yet live" is information, and
-    // showing it in red alongside real failures teaches people to ignore both.
-    @State private var encodingNotice: String?
+    // Saved-but-not-live. A separate channel from encodingError on
+    // purpose: see the spec. Showing it in red beside real failures
+    // teaches people to ignore both.
+    @State private var notice: String?
     @State private var comparing = false
     @State private var compareResult: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
@@ -155,7 +156,11 @@ struct SettingsView: View {
         workerOn = StatusModel.componentEnabled("worker", config)
         mlOn = StatusModel.componentEnabled("ml", config)
         dashboardOn = StatusModel.componentEnabled("dashboard", config)
-        loadSwitches()
+        hardwareDecodeOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_DECODE", config)
+        hardwareVideoOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_VIDEO", config)
+        hardwareAudioOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_AUDIO", config)
+        hardwareVideoOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_VIDEO", config)
+        hardwareDecodeOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_DECODE", config)
     }
 
     // MARK: - General
@@ -184,13 +189,7 @@ struct SettingsView: View {
                     // Turning this on remembers whatever SMB shares (e.g. a
                     // NAS backing a split deployment) are mounted right now;
                     // it doesn't ask which ones separately.
-                    // Naming this "at login" is accurate for what the switch
-                    // does and misleading about the whole picture: the
-                    // accelerator watches the library mount the entire time it
-                    // runs and puts it back on its own. Someone reading only
-                    // this row would reasonably conclude a share dropping at
-                    // 2am is not handled until they log in again.
-                    Text("Remembers the SMB shares mounted right now and reconnects any that are missing on launch. Separately, while the accelerator is running it watches the mount holding your library and remounts it on its own, retrying with a backoff.")
+                    Text("Remembers the SMB shares mounted right now and reconnects any that are missing on launch.")
                         .font(.rowDetail).foregroundStyle(.secondary)
                 }
             } header: {
@@ -239,61 +238,13 @@ struct SettingsView: View {
 
     /// Everything this Mac does to a photo or video, on one screen.
     ///
-    /// The preset is the top control because it is the only decision most
-    /// people need to make: how far from Docker's output this install is
-    /// willing to move. The switches below are the same setting at a finer
-    /// grain, shown rather than hidden so the preset is never a black box.
+    /// Section order and gating follow docs/plans/2026-08-22-processing-pane-spec.md.
+    /// A control that writes switches only the worker uses is hidden when no
+    /// worker runs, because it would be a control over nothing.
     private var processingTab: some View {
         Form {
             if workerOn {
-            Section {
-                // Centred, and no section header: the control is the first
-                // thing in the pane and a word above it saying "Output" only
-                // repeats what the descriptions underneath already say.
-                HStack {
-                    Spacer()
-                    Picker("", selection: presetBinding) {
-                        ForEach(Self.visiblePresets(current: currentPreset),
-                                id: \.name) { preset in
-                            Text(preset.title).tag(preset.name)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .fixedSize()
-                    .disabled(applyingSwitch != nil)
-                    Spacer()
-                }
-
-                // Laid out where the ends sit on the control: Stock on the
-                // left, Apple Silicon on the right, so the description a
-                // person reads is under the choice it belongs to.
-                HStack(alignment: .top, spacing: Metrics.lg) {
-                    ForEach(Self.visiblePresets(current: currentPreset),
-                            id: \.name) { preset in
-                        VStack(alignment: .leading, spacing: Metrics.xs) {
-                            HStack(spacing: Metrics.md) {
-                                Text(preset.title)
-                                    .font(.rowDetail)
-                                    .foregroundStyle(
-                                        preset.name == currentPreset ? .primary : .secondary)
-                                if let engine = preset.engine {
-                                    BadgeLabel(text: engine,
-                                               tint: engine == "NATIVE" ? .green : .orange)
-                                }
-                            }
-                            Text(preset.detail)
-                                .font(.rowDetail).foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-
-                Text("This covers transcoding. Machine learning is chosen separately below.")
-                    .font(.rowDetail).foregroundStyle(.secondary)
-            }
-
+                positionSection
             }
 
             Section("Services") {
@@ -307,95 +258,26 @@ struct SettingsView: View {
 
             if workerOn {
                 Section("Hardware Transcoding") {
-                    encodingToggle(
-                        "hardware-decode", $hardwareDecodeOn, "Decoding",
-                        "Video, thumbnails and previews")
-                    encodingToggle(
-                        "hardware-video", $hardwareVideoOn, "Video Encoding",
-                        "H.264 and HEVC on VideoToolbox")
-                    encodingToggle(
-                        "hardware-audio", $hardwareAudioOn, "Audio Encoding",
-                        "AAC on AudioToolbox")
+                    encodingToggle("hardware-decode", $hardwareDecodeOn,
+                                   "Decoding", "Video, thumbnails and previews")
+                    encodingToggle("hardware-video", $hardwareVideoOn,
+                                   "Video Encoding", "H.264 and HEVC on VideoToolbox")
+                    encodingToggle("hardware-audio", $hardwareAudioOn,
+                                   "Audio Encoding", "AAC on AudioToolbox")
                 }
             }
 
             if mlOn {
-                Section("Machine Learning Engine") {
-                    Picker("Engine", selection: $engine) {
-                        ForEach(["native", "python"], id: \.self) { value in
-                            BadgeLabel(text: value == "native" ? "NATIVE" : "PYTHON",
-                                       tint: value == "native" ? .green : .orange)
-                                .tag(value)
-                        }
-                    }
-                    if engine != savedEngine {
-                        HStack(spacing: Metrics.md) {
-                            Text("Restarts the accelerator.")
-                                .font(.rowDetail).foregroundStyle(.secondary)
-                            Spacer()
-                            Button(applying ? "Applying…" : "Apply") {
-                                applying = true
-                                Task {
-                                    let result = await Actions.setMLEngine(engine)
-                                    if result.ok {
-                                        savedEngine = engine
-                                        encodingError = nil
-                                        encodingNotice = result.message.isEmpty
-                                            ? nil : result.message
-                                    } else {
-                                        // Was Void, so a failed write left the
-                                        // picker claiming the new engine.
-                                        encodingError = result.message
-                                        engine = savedEngine
-                                    }
-                                    await model.refresh()
-                                    applying = false
-                                }
-                            }
-                            // Also blocked while a preset or switch write
-                            // is in flight: setMLEngine rewrites the whole
-                            // config in process, so overlapping with a CLI
-                            // write loses whichever landed first.
-                            .disabled(applying || applyingSwitch != nil
-                                      || applyingComponent != nil)
-                        }
-                    }
-                    LabeledContent("Self-test") {
-                        Button(testing ? "Running…" : "Run") { runMLTest() }
-                            .disabled(testing || !model.snap.mlHealthy)
-                    }
-                    if let result = model.lastMLTest {
-                        let passed = result.contains("OK") || result.contains("passed")
-                        Label(result, systemImage: passed
-                              ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(passed ? .green : .red)
-                            .font(.rowDetail)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
+                engineSection
             }
 
             if workerOn {
-                Section {
-                    LabeledContent("Compare encoders") {
-                        Button(comparing ? "Comparing…" : "Choose Video…") { compareEncoders() }
-                            .disabled(comparing)
-                    }
-                    if let compareResult {
-                        ScrollView {
-                            Text(compareResult)
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(maxHeight: Metrics.compareResultHeight)
-                    }
-                } footer: {
-                    Text("Runs both encoders on a file of yours and reports the difference.")
-                        .font(.rowDetail).foregroundStyle(.secondary)
-                }
+                compareSection
             }
 
+            // Failures in red, then saved-but-not-live in secondary text. Two
+            // channels on purpose: showing "saved, takes effect later" in red
+            // beside real errors teaches people to ignore both.
             if let message = encodingError ?? componentError {
                 Section {
                     Label(message, systemImage: "exclamationmark.triangle.fill")
@@ -404,8 +286,7 @@ struct SettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-
-            if let notice = encodingNotice, encodingError == nil, componentError == nil {
+            if let notice, encodingError == nil, componentError == nil {
                 Section {
                     Label(notice, systemImage: "info.circle")
                         .font(.rowDetail)
@@ -417,74 +298,240 @@ struct SettingsView: View {
         .formStyle(.grouped)
     }
 
-    /// Two ends and the middle you land in by setting switches yourself.
-    /// `engine` is the machine learning engine the end requires, shown as a
-    /// pill so Stock moving you to the Python engine is never a surprise.
-    /// Order is the order on the control: Stock on the left, Custom between
-    /// them, Apple Silicon on the right. Custom is the middle of the range
-    /// rather than a fourth option tacked on the end, and a switch moved off
-    /// either end lands there.
-    private static let presets: [(name: String, title: String, engine: String?, detail: String)] = [
-        ("software", "Software", nil,
-         "Transcoding done exactly as Immich's own container does it: software encoders, software decoding. Video and thumbnails are byte for byte what Docker produces. Uses the most CPU."),
-        ("hardware", "Hardware", nil,
+    /// Software / Custom / Hardware, with both named ends described where they
+    /// sit on the control, so the choice can be made before making it.
+    private var positionSection: some View {
+        Section {
+            HStack {
+                Spacer()
+                Picker("", selection: positionBinding) {
+                    // Custom appears only while it is the state. It reports a
+                    // mixture rather than naming one, so there is nothing to
+                    // apply and it must not look like something you can pick.
+                    // Marking the segment disabled does not work: the macOS
+                    // segmented style renders every label identically no
+                    // matter what, measured at the same pixel value as its
+                    // neighbours, so the only honest way to say "not a choice"
+                    // is to leave it out until it is the answer. Same rule the
+                    // descriptions below already follow.
+                    ForEach(Self.visiblePositions(current: currentPosition), id: \.name) { position in
+                        Text(position.title)
+                            .tag(position.name)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .disabled(writeInFlight)
+                Spacer()
+            }
+
+            HStack(alignment: .top, spacing: Metrics.lg) {
+                ForEach(Self.visiblePositions(current: currentPosition), id: \.name) { position in
+                    VStack(alignment: .leading, spacing: Metrics.xs) {
+                        Text(position.title)
+                            .font(.rowDetail)
+                            .foregroundStyle(position.name == currentPosition ? .primary : .secondary)
+                        Text(position.detail)
+                            .font(.rowDetail).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+
+            Text("This covers transcoding. Machine learning is chosen separately below.")
+                .font(.rowDetail).foregroundStyle(.secondary)
+        }
+    }
+
+    private var engineSection: some View {
+        Section("Machine Learning Engine") {
+            Picker("Engine", selection: $engine) {
+                ForEach(["native", "python"], id: \.self) { value in
+                    BadgeLabel(text: value == "native" ? "NATIVE" : "PYTHON",
+                               tint: value == "native" ? .green : .orange)
+                        .tag(value)
+                }
+            }
+            if engine != savedEngine {
+                HStack(spacing: Metrics.md) {
+                    Text("Restarts the accelerator.")
+                        .font(.rowDetail).foregroundStyle(.secondary)
+                    Spacer()
+                    Button(applying ? "Applying…" : "Apply") { applyEngine() }
+                        // One guard for the whole pane: setMLEngine rewrites
+                        // the config in process while everything else goes
+                        // through the CLI, so an overlap loses a write.
+                        .disabled(writeInFlight)
+                }
+            }
+            LabeledContent("Self-test") {
+                Button(testing ? "Running…" : "Run") { runMLTest() }
+                    .disabled(testing || !model.snap.mlHealthy)
+            }
+            if let result = model.lastMLTest {
+                let passed = result.contains("OK") || result.contains("passed")
+                Label(result, systemImage: passed
+                      ? "checkmark.circle.fill" : "xmark.circle.fill")
+                    .foregroundStyle(passed ? .green : .red)
+                    .font(.rowDetail)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var compareSection: some View {
+        Section {
+            LabeledContent("Compare encoders") {
+                Button(comparing ? "Comparing…" : "Choose Video…") { compareEncoders() }
+                    .disabled(comparing)
+            }
+            if let compareResult {
+                ScrollView {
+                    Text(compareResult)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: Metrics.compareResultHeight)
+            }
+        } footer: {
+            Text("Runs every encoder on a file of yours and reports the difference.")
+                .font(.rowDetail).foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Processing state
+
+    /// The two named positions and the derived middle, in control order.
+    static let positions: [(name: String, title: String, detail: String)] = [
+        ("software", "Software",
+         "The encoders and decoders Immich's own container uses. Video and thumbnails come out byte for byte what Docker produces. Uses the most CPU."),
+        ("custom", "Custom", "Some on, some off. Set below."),
+        ("hardware", "Hardware",
          "VideoToolbox for decoding, video and audio. Much less CPU, so the Mac keeps up with everything else it is doing. Video is visually identical to Docker's; audio and 10-bit thumbnails differ byte for byte."),
     ]
 
-    /// Inserted between the two ends when the switches spell neither.
-    private static let customPreset = (
-        name: "custom", title: "Custom", engine: String?.none,
-        detail: "Switches set individually, below.")
-
-    /// The ends, with Custom in the middle only while it is the current state.
-    private static func visiblePresets(current: String)
-        -> [(name: String, title: String, engine: String?, detail: String)] {
-        guard current == "custom" else { return presets }
-        return [presets[0], customPreset, presets[1]]
+    /// The positions to show, in control order. The control and the
+    /// descriptions under it read from this one function so they cannot drift
+    /// into showing different sets, which is what they did when each filtered
+    /// for itself.
+    static func visiblePositions(current: String)
+        -> [(name: String, title: String, detail: String)]
+    {
+        positions.filter { $0.name != "custom" || current == "custom" }
     }
 
-    private var presetEngine: String? {
-        Self.visiblePresets(current: currentPreset)
-            .first { $0.name == currentPreset }?.engine
+    private var currentPosition: String { StatusModel.encodingPreset(config) }
+
+    /// True while any write is in flight, anywhere on the pane.
+    private var writeInFlight: Bool {
+        applying || applyingSwitch != nil || applyingComponent != nil
     }
 
-    private var currentPreset: String { StatusModel.encodingPreset(config) }
-
-    /// Reads the derived preset, writes through the CLI. Selecting the position
-    /// already active is ignored, so re-rendering cannot trigger a write.
-    private var presetBinding: Binding<String> {
+    /// Reads the derived position, writes through the CLI. Selecting the
+    /// position already active does nothing, so a redraw cannot cause a write.
+    private var positionBinding: Binding<String> {
         Binding<String>(
-            get: { currentPreset },
+            get: { currentPosition },
             set: { name in
-                // Selecting Custom would have nothing to apply: it describes a
-                // mixture rather than naming one, so it reports and never sets.
-                guard name != currentPreset, name != "custom",
-                      applyingSwitch == nil else { return }
-                applyingSwitch = "preset"
+                guard name != currentPosition, name != "custom", !writeInFlight else { return }
+                applyingSwitch = "position"
                 Task {
-                    let result = await Actions.setEncodingPreset(name)
-                    encodingError = result.ok ? nil : result.message
-                    encodingNotice = result.ok && !result.message.isEmpty
-                        ? result.message : nil
-                    config = StatusModel.readConfig()
-                    loadSwitches()
-                    // Re-seed everything the write could have moved, not just
-                    // the switches. Leaving the engine picker on its old value
-                    // means an Apply there writes the stale engine back.
-                    savedEngine = (config["ml_engine"] as? String) ?? "native"
-                    engine = savedEngine
+                    record(await Actions.setEncodingPreset(name))
+                    reload()
                     applyingSwitch = nil
                 }
             })
     }
 
-    private func loadSwitches() {
-        hardwareVideoOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_VIDEO", config)
-        hardwareDecodeOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_DECODE", config)
-        hardwareAudioOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_AUDIO", config)
+    private func applyEngine() {
+        applying = true
+        Task {
+            let result = await Actions.setMLEngine(engine)
+            if result.ok {
+                savedEngine = engine
+                record(result)
+            } else {
+                // Put the picker back: it must not claim an engine that was
+                // never written.
+                encodingError = result.message
+                engine = savedEngine
+            }
+            await model.refresh()
+            applying = false
+        }
     }
 
-    // MARK: - Processing helpers
+    /// Route one result into the two channels the spec defines.
+    private func record(_ result: (ok: Bool, message: String)) {
+        encodingError = result.ok ? nil : result.message
+        notice = result.ok && !result.message.isEmpty ? result.message : nil
+    }
+
+    /// Re-read everything a write could have moved. Leaving the engine picker
+    /// stale means an Apply there writes the old value back.
+    private func reload() {
+        config = StatusModel.readConfig()
+        workerOn = StatusModel.componentEnabled("worker", config)
+        mlOn = StatusModel.componentEnabled("ml", config)
+        dashboardOn = StatusModel.componentEnabled("dashboard", config)
+        hardwareDecodeOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_DECODE", config)
+        hardwareVideoOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_VIDEO", config)
+        hardwareAudioOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_AUDIO", config)
+        savedEngine = (config["ml_engine"] as? String) ?? "native"
+        engine = savedEngine
+    }
+
+    /// One encoding switch. Optimistic, and put back if the CLI refuses, so a
+    /// switch never claims something the accelerator did not do.
+    private func encodingToggle(
+        _ name: String, _ binding: Binding<Bool>, _ title: String, _ caption: String
+    ) -> some View {
+        let action = Binding<Bool>(
+            get: { binding.wrappedValue },
+            set: { on in
+                guard !writeInFlight else { return }
+                binding.wrappedValue = on
+                applyingSwitch = name
+                Task {
+                    let result = await Actions.setEncodingSwitch(name, on)
+                    if !result.ok { binding.wrappedValue = !on }
+                    record(result)
+                    if result.ok { reload() }
+                    applyingSwitch = nil
+                }
+            })
+
+        return Toggle(isOn: action) {
+            VStack(alignment: .leading, spacing: Metrics.xs) {
+                HStack(spacing: Metrics.md) {
+                    Text(title)
+                    if applyingSwitch == name {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                Text(caption).font(.rowDetail).foregroundStyle(.secondary)
+            }
+        }
+        .toggleStyle(.switch)
+        .disabled(writeInFlight)
+    }
+
+    private func compareEncoders() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.movie, .video, .quickTimeMovie, .mpeg4Movie]
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Compare"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        comparing = true
+        compareResult = nil
+        Task {
+            compareResult = await Actions.encodeCompare(url.path)
+            comparing = false
+        }
+    }
 
     private func componentToggle(
         _ name: String, _ binding: Binding<Bool>, _ title: String, _ caption: String
@@ -541,58 +588,6 @@ struct SettingsView: View {
         if !model.snap.dashboardEnabled { return "Off" }
         return model.snap.dashboardUp
             ? "Running on localhost:\(model.snap.dashboardPort)" : "Starting…"
-    }
-
-    private func encodingToggle(
-        _ name: String, _ binding: Binding<Bool>, _ title: String, _ caption: String
-    ) -> some View {
-        let action = Binding<Bool>(
-            get: { binding.wrappedValue },
-            set: { on in
-                guard applyingSwitch == nil else { return }
-                binding.wrappedValue = on
-                applyingSwitch = name
-                Task {
-                    let result = await Actions.setEncodingSwitch(name, on)
-                    if !result.ok {
-                        encodingError = result.message
-                        binding.wrappedValue = !on
-                    } else {
-                        encodingError = nil
-                        encodingNotice = result.message.isEmpty ? nil : result.message
-                        config = StatusModel.readConfig()
-                    }
-                    applyingSwitch = nil
-                }
-            })
-
-        return Toggle(isOn: action) {
-            VStack(alignment: .leading, spacing: Metrics.xs) {
-                HStack(spacing: Metrics.md) {
-                    Text(title)
-                    if applyingSwitch == name {
-                        ProgressView().controlSize(.small)
-                    }
-                }
-                Text(caption).font(.rowDetail).foregroundStyle(.secondary)
-            }
-        }
-        .toggleStyle(.switch)
-        .disabled(applyingSwitch != nil)
-    }
-
-    private func compareEncoders() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.movie, .video, .quickTimeMovie, .mpeg4Movie]
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Compare"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        comparing = true
-        compareResult = nil
-        Task {
-            compareResult = await Actions.encodeCompare(url.path)
-            comparing = false
-        }
     }
 
     private func runMLTest() {
