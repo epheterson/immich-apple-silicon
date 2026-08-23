@@ -284,31 +284,48 @@ final class StatusModel: ObservableObject {
     // Whether a component is switched on. Mirrors __main__._component_enabled:
     // absent means enabled, and an explicit key beats the legacy "ml_only"
     // preset so a box can be switched back without hand-editing config.json.
-    nonisolated static func componentEnabled(_ name: String, _ config: [String: Any]) -> Bool {
-        if let explicit = config[name] as? Bool { return explicit }
-        if (config["ml_only"] as? Bool) == true { return name != "worker" }
-        return true
-    }
-
-    /// The switches each preset sets, and their default when nothing is set.
+    /// The named positions and the switches each one sets.
     ///
-    /// The CLI is authoritative: it applies presets and `encoding_preset` there
-    /// decides the name. This mirror exists only so the settings window can
-    /// show the current position without shelling out on every render. Keep the
-    /// two tables in step; `ENCODING_PRESETS` in `__main__.py` is the original.
+    /// A copy of ENCODING_PRESETS in __main__.py, which is authoritative. It
+    /// exists only so the pane can render without shelling out on every
+    /// redraw. A hygiene test parses this table and the one in SettingsView
+    /// and fails if either drifts from the Python one, because they already
+    /// drifted once and shipped a control that matched nothing.
     nonisolated static let encodingPresets: [(name: String, switches: [String: Bool])] = [
-        ("software", ["IMMICH_ACCEL_HW_VIDEO": false,
-                   "IMMICH_ACCEL_HW_DECODE": false,
-                   "IMMICH_ACCEL_HW_AUDIO": false]),
-        ("hardware", ["IMMICH_ACCEL_HW_VIDEO": true,
-                           "IMMICH_ACCEL_HW_DECODE": true,
-                           "IMMICH_ACCEL_HW_AUDIO": true]),
+        ("software", ["IMMICH_ACCEL_HW_DECODE": false,
+                      "IMMICH_ACCEL_HW_VIDEO": false,
+                      "IMMICH_ACCEL_HW_AUDIO": false]),
+        ("hardware", ["IMMICH_ACCEL_HW_DECODE": true,
+                      "IMMICH_ACCEL_HW_VIDEO": true,
+                      "IMMICH_ACCEL_HW_AUDIO": true]),
     ]
 
     /// Switches that are off unless asked for, because they change output.
     nonisolated static let encodingDefaultOff: Set<String> = ["IMMICH_ACCEL_HW_AUDIO"]
 
-    /// Which preset the current switches spell, or "custom".
+    /// Whether one switch reads as on.
+    ///
+    /// Truthiness follows the default and mirrors ffmpeg-wrapper.sh exactly:
+    /// trimmed at both ends and lowercased, a default-on switch off only for
+    /// an explicit off word, a default-off switch on only for an explicit on
+    /// word, and anything unrecognised keeping the default.
+    nonisolated static func encodingSwitchOn(_ name: String, _ config: [String: Any]) -> Bool {
+        let defaultOn = !encodingDefaultOff.contains(name)
+        guard let env = config["env"] as? [String: Any], let raw = env[name] else {
+            return defaultOn
+        }
+        let value = String(describing: raw)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return defaultOn
+            ? !["0", "false", "no"].contains(value)
+            : ["1", "true", "yes"].contains(value)
+    }
+
+    /// Which position the switches currently spell, or "custom".
+    ///
+    /// Derived, never stored: a stored name goes stale the moment a switch is
+    /// flipped from the CLI or overridden in the environment.
     nonisolated static func encodingPreset(_ config: [String: Any]) -> String {
         for preset in encodingPresets
         where preset.switches.allSatisfy({ encodingSwitchOn($0.key, config) == $0.value }) {
@@ -317,22 +334,10 @@ final class StatusModel: ObservableObject {
         return "custom"
     }
 
-    /// Whether an encoding switch reads as on, from the config `env` block.
-    ///
-    /// Mirrors the CLI's bool_setting: unset means on, and only these three
-    /// spellings mean off. A real environment variable also wins at read time,
-    /// but that is the background service's environment rather than this app's,
-    /// so it cannot be checked from here; the CLI says so when it applies one.
-    nonisolated static func encodingSwitchOn(_ name: String, _ config: [String: Any]) -> Bool {
-        let defaultOn = !encodingDefaultOff.contains(name)
-        guard let env = config["env"] as? [String: Any],
-              let raw = env[name] else { return defaultOn }
-        let value = String(describing: raw).trimmingCharacters(in: .whitespaces).lowercased()
-        // Truthiness follows the default, matching bool_setting and the
-        // wrapper: an unrecognised value keeps the safer position either way.
-        return defaultOn
-            ? !["0", "false", "no"].contains(value)
-            : ["1", "true", "yes"].contains(value)
+    nonisolated static func componentEnabled(_ name: String, _ config: [String: Any]) -> Bool {
+        if let explicit = config[name] as? Bool { return explicit }
+        if (config["ml_only"] as? Bool) == true { return name != "worker" }
+        return true
     }
 
     // Blocking pidfile/ps/config probes, gathered off the main actor. Confirms

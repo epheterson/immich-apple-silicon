@@ -123,36 +123,42 @@ enum Actions {
         }
     }
 
-    static func startService() async { await run(brew, ["services", "start", service]) }
-    static func stopService() async { await run(brew, ["services", "stop", service]) }
-    static func restartService() async { await run(brew, ["services", "restart", service]) }
-
     /// What happened when a setting tried to take effect.
+    ///
+    /// Three outcomes, not two. Collapsing them is what let the pane report a
+    /// change as applied while the running accelerator carried on with the old
+    /// setting, and separately what let a settings change start an accelerator
+    /// somebody had deliberately stopped.
     enum ApplyResult {
+        /// Restarted, so the running accelerator uses the new setting now.
         case applied
+        /// Nothing running, so there is nothing to apply yet.
         case stopped
-        /// Alive, but not started by `brew services`. brew will not restart a
-        /// process it did not start, so the setting is saved while the running
-        /// accelerator keeps using the old one.
+        /// Alive, but not started by `brew services`, which is the only lever
+        /// available here: brew will not restart a process it did not start.
         case runningOutsideBrew
 
+        /// Empty when there is nothing to tell the user.
         var message: String {
             switch self {
-            case .applied: return ""
+            case .applied:
+                return ""
             case .stopped:
                 return "Saved. Takes effect when you start the accelerator."
             case .runningOutsideBrew:
-                return "Saved. The accelerator is running outside brew services, so restart it there to pick this up."
+                return "Saved. The accelerator is running outside brew services, "
+                    + "so restart it there to pick this up."
             }
         }
     }
 
-    /// Apply a configuration change to the running accelerator if that is
+    /// Apply a configuration change to the running accelerator where that is
     /// possible, and report which of the three cases happened.
     ///
-    /// `brew services restart` starts a stopped service, so it must never be
-    /// unconditional: a setting change would start an accelerator somebody
-    /// deliberately stopped, and start it processing.
+    /// Deliberately not `brew services restart` on its own: that starts a
+    /// stopped service, so changing a setting would start the accelerator and
+    /// set it processing. Applying a setting must never be the thing that
+    /// starts work.
     @discardableResult
     static func applyToRunningService() async -> ApplyResult {
         let (_, list) = await run(brew, ["services", "list"])
@@ -163,6 +169,8 @@ enum Actions {
             await restartService()
             return .applied
         }
+        // Not brew's to restart. A live pid still means it is running, and
+        // saying "takes effect when you start it" would be wrong.
         let alive = await withCheckedContinuation { cont in
             DispatchQueue.global().async {
                 cont.resume(returning: StatusModel.pidAlive("worker") != nil
@@ -171,6 +179,50 @@ enum Actions {
         }
         return alive ? .runningOutsideBrew : .stopped
     }
+
+    /// Move every encoding switch to a named position, through the CLI, which
+    /// is what defines the position.
+    static func setEncodingPreset(_ name: String) async -> (ok: Bool, message: String) {
+        await runEncoding(["encoding", "preset", name])
+    }
+
+    /// Flip one encoding switch, through the same CLI.
+    static func setEncodingSwitch(_ name: String, _ on: Bool) async -> (ok: Bool, message: String) {
+        await runEncoding(["encoding", name, on ? "on" : "off"])
+    }
+
+    private static func runEncoding(_ args: [String]) async -> (ok: Bool, message: String) {
+        guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
+        let (code, out) = await run(cli, args)
+        guard code == 0 else {
+            let detail = out.split(separator: "\n")
+                .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+                .map(String.init) ?? "exit \(code)"
+            return (false, detail)
+        }
+        // Success, with a message only when the change is saved but not live.
+        return (true, await applyToRunningService().message)
+    }
+
+    /// Transcode one file every way this Mac can and return the report.
+    static func encodeCompare(_ path: String) async -> String {
+        guard isBrewInstall else { return "Could not reach the accelerator CLI." }
+        let (_, out) = await run(cli, ["compare", path, "--no-open"])
+        let cleaned = out.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> String in
+                let s = String(line)
+                guard let r = s.range(of: #"^\d\d:\d\d:\d\d (INFO|WARNING|ERROR)\s+"#,
+                                      options: .regularExpression) else { return s }
+                return String(s[r.upperBound...])
+            }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "No output." : cleaned
+    }
+
+    static func startService() async { await run(brew, ["services", "start", service]) }
+    static func stopService() async { await run(brew, ["services", "stop", service]) }
+    static func restartService() async { await run(brew, ["services", "restart", service]) }
 
     // Runs the CLI's real ML test and condenses the result to one line.
     static func mlTest() async -> String {
@@ -226,6 +278,10 @@ enum Actions {
 
     // Switch the ML engine by rewriting config.json (preserving every other
     // key) and restarting so it takes effect. User-initiated from Settings.
+    /// Write the chosen engine and apply it, reporting what happened.
+    ///
+    /// Returning Void made a failed read, a failed encode, a failed write and
+    /// a change made while stopped all look identical to success.
     @discardableResult
     static func setMLEngine(_ engine: String) async -> (ok: Bool, message: String) {
         let url = Paths.configFile
@@ -239,74 +295,9 @@ enum Actions {
         do {
             try out.write(to: url, options: .atomic)
         } catch {
-            // Swallowed before, so a failed write read as success.
             return (false, "Could not save: \(error.localizedDescription)")
         }
         return (true, await applyToRunningService().message)
-    }
-
-    // Enable/disable one component via the CLI, which flips its config key and
-    // starts/stops it now. The other components are untouched, so no full
-    // service restart is needed. Returns false when the CLI is missing or the
-    // command failed, so the caller can undo the switch instead of showing a
-    // state the accelerator never reached.
-    // Returns the CLI's own output on failure rather than a generic message:
-    // turning the worker back on runs a full `start`, which can fail for real
-    // reasons (Docker down, media not mounted, sharp needs a rebuild), and the
-    // CLI already explains each one better than the UI could.
-    /// Transcode one file both ways and return the report as text. Slow by
-    /// nature (it runs five real encodes), so the caller shows a busy state.
-    static func encodeCompare(_ path: String) async -> String {
-        guard isBrewInstall else { return "Could not reach the accelerator CLI." }
-        let (_, out) = await run(cli, ["encode-compare", path])
-        // The CLI logs with a timestamp prefix, which is noise in a window
-        // that is not a log.
-        let cleaned = out.split(separator: "\n", omittingEmptySubsequences: false)
-            .map { line -> String in
-                let s = String(line)
-                guard let r = s.range(of: #"^\d\d:\d\d:\d\d (INFO|WARNING|ERROR)\s+"#,
-                                      options: .regularExpression) else { return s }
-                return String(s[r.upperBound...])
-            }
-            .joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned.isEmpty ? "No output." : cleaned
-    }
-
-    /// Move every encoding switch to a named position. The CLI owns what each
-    /// position means, so the app never has to spell out a preset itself.
-    static func setEncodingPreset(_ name: String) async -> (ok: Bool, message: String) {
-        guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
-        let (code, out) = await run(cli, ["encoding", "preset", name])
-        if code == 0 {
-            // Same rule as the individual switches.
-            return (true, await applyToRunningService().message)
-        }
-        let detail = out.split(separator: "\n")
-            .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
-            .map(String.init) ?? "exit \(code)"
-        return (false, detail)
-    }
-
-    /// Flip one encoding switch through the CLI, which owns what a switch
-    /// means and which variable it writes. Deliberately not a direct
-    /// config.json write like setMLEngine: the value has to agree with what
-    /// ffmpeg-wrapper.sh reads, and there is a test pinning the CLI to the
-    /// wrapper. A second implementation here would not be covered by it.
-    static func setEncodingSwitch(_ name: String, _ on: Bool) async -> (ok: Bool, message: String) {
-        guard isBrewInstall else { return (false, "Could not reach the accelerator CLI.") }
-        let (code, out) = await run(cli, ["encoding", name, on ? "on" : "off"])
-        if code == 0 {
-            // Applies now if the accelerator is running, and does not start
-            // it if it is not. Saying so matters: the setting is saved either
-            // way, and a pane that reports plain success would be claiming the
-            // running behaviour changed when it did not.
-            return (true, await applyToRunningService().message)
-        }
-        let detail = out.split(separator: "\n")
-            .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
-            .map(String.init) ?? "exit \(code)"
-        return (false, detail)
     }
 
     static func setComponent(_ name: String, _ on: Bool) async -> (ok: Bool, message: String) {

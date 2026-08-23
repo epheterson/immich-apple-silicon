@@ -152,15 +152,12 @@ def test_no_test_is_shadowed_by_a_later_definition():
 
 
 
-def test_the_swift_preset_mirror_matches_the_python_one():
-    """The app keeps its own copy of the preset table so the settings window
-    can show the current position without shelling out on every render.
+def test_the_swift_preset_names_match_the_python_ones():
+    """Two Swift files name the positions, and both must agree with Python.
 
-    A copy drifts. It already has, twice: once shipping a pane that would
-    report Stock, asserting output identical to Docker, on an install running
-    Vision and mlx, and once showing Apple Silicon selected on a config the CLI
-    called custom. Nothing but this test connects the two files, so parse the
-    Swift and compare rather than trusting a comment to be read.
+    Checking only StatusModel is how a rename landed in two of three places
+    and shipped a control that matched nothing and sent the CLI a name it
+    rejected, while this suite stayed green.
     """
     import re
     from pathlib import Path
@@ -168,35 +165,27 @@ def test_the_swift_preset_mirror_matches_the_python_one():
     import immich_accelerator.__main__ as m
 
     root = Path(__file__).parent.parent
-    swift = (root / "menubar/Sources/AcceleratorBar/StatusModel.swift").read_text()
-    table = swift[swift.index("encodingPresets:") : swift.index("encodingDefaultOff")]
+    expected = set(m.ENCODING_PRESETS)
 
-    # The pane keeps its own list of the same names, for titles and
-    # descriptions. Checking only StatusModel is why a rename landed in two of
-    # the three places and the suite stayed green over a settings control that
-    # matched nothing and sent the CLI a name it rejects.
-    pane = (root / "menubar/Sources/AcceleratorBar/SettingsView.swift").read_text()
-    pane_table = pane[pane.index("private static let presets:") : pane.index("private var presetEngine")]
-    pane_names = set(re.findall(r'\("([a-z-]+)",\s*"', pane_table)) - {"custom"}
-    assert pane_names == set(m.ENCODING_PRESETS), (
-        f"SettingsView names {sorted(pane_names)}, Python has "
-        f"{sorted(m.ENCODING_PRESETS)}"
-    )
-
-    parsed = {}
+    model = (root / "menubar/Sources/AcceleratorBar/StatusModel.swift").read_text()
+    table = model[model.index("encodingPresets:"):model.index("encodingDefaultOff")]
+    mirror = {}
     for entry in re.finditer(r'\("([a-z-]+)",\s*\[(.*?)\]\)', table, re.S):
         name, switches = entry.groups()
-        parsed[name] = {
+        mirror[name] = {
             k: v == "true"
             for k, v in re.findall(r'"(\w+)":\s*(true|false)', switches)
         }
-
-    assert parsed, "could not parse the Swift preset table; update this test"
-    assert set(parsed) == set(m.ENCODING_PRESETS), (
-        f"Swift has {sorted(parsed)}, Python has {sorted(m.ENCODING_PRESETS)}"
-    )
-    for name, switches in parsed.items():
+    assert mirror, "could not parse StatusModel's table; update this test"
+    assert set(mirror) == expected, f"StatusModel has {sorted(mirror)}"
+    for name, switches in mirror.items():
         assert switches == m.ENCODING_PRESETS[name], name
+
+    pane = (root / "menubar/Sources/AcceleratorBar/SettingsView.swift").read_text()
+    listing = pane[pane.index("static let positions:"):pane.index("private var currentPosition")]
+    names = set(re.findall(r'\("([a-z-]+)",\s*"', listing)) - {"custom"}
+    assert names, "could not parse SettingsView's list; update this test"
+    assert names == expected, f"SettingsView has {sorted(names)}, Python {sorted(expected)}"
 
 
 def test_no_file_ships_git_conflict_markers():
