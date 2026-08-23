@@ -272,3 +272,37 @@ def test_settings_never_restart_the_service_unconditionally():
     assert "brewHasItStarted" in body and "await restartService()" in body, (
         "applyToRunningService must gate its restart on brewHasItStarted"
     )
+
+
+def test_no_photograph_is_embedded_in_the_tree():
+    """render-formula.sh installs this tree wholesale, so anything committed
+    here is redistributed to every Homebrew user.
+
+    A base64 photograph of identifiable people shipped in v1.15.0 that way,
+    with no source and no licence recorded, and was only caught by a
+    contributor reading the diff (#167). Test images are fetched on demand and
+    cached outside the repo instead. The two embedded JPEGs that remain are
+    synthetic: a generated text strip and a gradient, neither depicting anyone.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).parent.parent
+    # A JPEG this large is a photograph. The synthetic ones are ~2KB of base64;
+    # the photograph that prompted this was 27KB of bytes, 36KB encoded.
+    limit = 8000
+    for path in sorted((root / "scripts").glob("*.py")):
+        text = path.read_text()
+        for name, literal in re.findall(
+            r"^(_\w*JPEG\w*|_\w*IMAGE\w*)\s*=\s*(.+?)(?=^\w|\Z)",
+            text,
+            re.M | re.S,
+        ):
+            encoded = "".join(re.findall(r'"([A-Za-z0-9+/=]{40,})"', literal))
+            assert len(encoded) < limit, (
+                f"{path.name}: {name} embeds {len(encoded)} base64 characters. "
+                f"An image that size is a photograph, and committing it here "
+                f"redistributes it to every Homebrew user. Fetch it on demand "
+                f"and cache it outside the repo, the way FACE_IMAGE and "
+                f"native-ml-full-benchmark.py's IMAGE_SOURCES do, and record "
+                f"where it came from."
+            )
