@@ -310,7 +310,18 @@ def test_no_photograph_is_embedded_in_the_tree():
     # A JPEG this large is a photograph. The synthetic ones are ~2KB of base64;
     # the photograph that prompted this was 27KB of bytes, 36KB encoded.
     limit = 8000
-    for path in sorted((root / "scripts").glob("*.py")):
+    # Every directory the formula installs, not just scripts/. The docstring
+    # above is the argument for the wider net: render-formula.sh takes the
+    # tree wholesale, so a photograph under immich_accelerator/ or tests/
+    # ships exactly as readily and would have passed this untouched.
+    shipped = [
+        p
+        for sub in ("scripts", "immich_accelerator", "tests", "menubar/Sources")
+        for p in sorted((root / sub).rglob("*"))
+        if p.suffix in {".py", ".sh", ".swift"} and p.is_file()
+    ]
+    assert len(shipped) > 10, f"found only {len(shipped)} files to scan"
+    for path in shipped:
         text = path.read_text()
         for name, literal in re.findall(
             r"^(_\w*JPEG\w*|_\w*IMAGE\w*)\s*=\s*(.+?)(?=^\w|\Z)",
@@ -642,3 +653,35 @@ def test_a_failed_fetch_is_fatal_and_leaves_no_partial_file(tmp_path):
     )
     leftovers = list(m.FACE_CACHE.glob("*")) if m.FACE_CACHE.exists() else []
     assert not leftovers, f"a failed fetch left {leftovers} behind"
+
+
+def test_a_non_image_response_is_never_cached(tmp_path, monkeypatch):
+    """A captive portal answering the image URL with an HTML login page is a
+    200, and caching it poisons every later run: the faces check then fails
+    with "found no faces in an image that contains one", which reads as a
+    detector regression on the one gate that must not cry wolf.
+    """
+    import urllib.request
+
+    m = _preflight()
+    m.FACE_IMAGE = ("http://example.invalid/face.jpg", "test")
+    m.FACE_CACHE = tmp_path / "cache"
+
+    class FakePortal:
+        def read(self):
+            return b"<!doctype html><title>Sign in to the wifi</title>"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: FakePortal())
+
+    with pytest.raises(RuntimeError) as caught:
+        m.face_jpeg()
+    assert "did not return a JPEG" in str(caught.value)
+    assert not list(m.FACE_CACHE.glob("*")), (
+        "the non-image response was cached, so every later run reads it back"
+    )

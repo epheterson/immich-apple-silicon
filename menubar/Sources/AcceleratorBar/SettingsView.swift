@@ -234,9 +234,19 @@ struct SettingsView: View {
                             Button(trusting ? "Trusting…" : "Trust the Tap") {
                                 trusting = true
                                 Task {
-                                    _ = await Actions.trustTap()
+                                    // A refused write looked identical to a
+                                    // successful one that did not take: the
+                                    // button flipped back and the same warning
+                                    // sat there. brew's own text says why.
+                                    let result = await Actions.trustTap()
                                     updatesBlocked = await Actions.brewRefusesTap()
                                     trusting = false
+                                    if !result.ok || updatesBlocked {
+                                        record((ok: false,
+                                                message: result.output.isEmpty
+                                                    ? "brew trust did not take effect."
+                                                    : result.output))
+                                    }
                                 }
                             }
                             .disabled(trusting)

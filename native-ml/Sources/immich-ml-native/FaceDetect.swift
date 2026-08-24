@@ -38,12 +38,19 @@ func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [
     let req = VNDetectFaceLandmarksRequest()
     req.inputFaceObservations = detected
     try? VNImageRequestHandler(data: imageData, options: [:]).perform([req])
-    // Falling back to the detections rather than dropping them: a face without
-    // landmarks is still a face, and losing it here would undo the point.
-    let observations = (req.results as? [VNFaceObservation]) ?? detected
+    let landmarked = (req.results as? [VNFaceObservation]) ?? []
 
+    // Walk the detections, not the landmark results, and take landmarks by
+    // position where they exist. `?? detected` only covered a failed cast: a
+    // non-nil empty array, or a short one, would have dropped detected faces
+    // and left this worse than the single-request code it replaces, in exactly
+    // the small-face range the change is for. Measured across 30 images the
+    // landmarks pass returned every face it was seeded with, so this is
+    // insurance rather than an observed failure, but the cost of being wrong
+    // is a face silently missing from someone's library.
     var faces: [DetectedFace] = []
-    for obs in observations {
+    for (i, detection) in detected.enumerated() {
+        let obs = i < landmarked.count ? landmarked[i] : detection
         let bb = obs.boundingBox   // normalized, bottom-left origin
         let x1 = bb.origin.x * Double(W)
         let y1 = (1.0 - bb.origin.y - bb.height) * Double(H)

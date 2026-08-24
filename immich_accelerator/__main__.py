@@ -5890,20 +5890,41 @@ def cmd_stop(_args):
 # Mac by removing the tap from trust.json: `brew outdated --formula
 # immich-accelerator` prints "Refusing to load formula ... from untrusted tap"
 # and `brew info --json` returns no formula at all.
-_BREW = "/opt/homebrew/bin/brew"
 _TAP = "epheterson/immich-accelerator"
+
+
+def _brew_path() -> str | None:
+    """Where brew is, both places it can be.
+
+    /opt/homebrew is Apple Silicon's prefix and /usr/local is the x86 one,
+    which is a real configuration here: an x86 brew under Rosetta. Checking
+    only the first is how a warning ends up unable to fire for the users who
+    need it, which is indistinguishable from not having written it.
+    """
+    for candidate in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+        if os.path.isfile(candidate):
+            return candidate
+    return shutil.which("brew")
 
 
 def brew_refuses_our_tap() -> bool:
     """True when Homebrew will not load our formula because the tap is
     untrusted. False for any other reason, including brew not being installed:
     a non-brew install has nothing to say here."""
-    if not os.path.isfile(_BREW):
+    brew = _brew_path()
+    if not brew:
         return False
     try:
         out = subprocess.run(
-            [_BREW, "outdated", "--formula", "immich-accelerator"],
-            capture_output=True, text=True, timeout=60,
+            [brew, "outdated", "--formula", "immich-accelerator"],
+            capture_output=True, text=True, timeout=10,
+            # `brew outdated` is on Homebrew's auto-update path: once a day it
+            # git-fetches every tap first. Measured at 68 seconds. `status` is
+            # a question, not a maintenance task, and the run that paid that
+            # cost was also the one that timed out and reported nothing.
+            env={**os.environ,
+                 "HOMEBREW_NO_AUTO_UPDATE": "1",
+                 "HOMEBREW_NO_ENV_HINTS": "1"},
         )
     except (OSError, subprocess.SubprocessError):
         return False

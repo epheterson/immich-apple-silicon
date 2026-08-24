@@ -105,12 +105,19 @@ enum Actions {
     static let tap = "epheterson/immich-accelerator"
 
     @discardableResult
-    static func run(_ tool: String, _ args: [String]) async -> (Int32, String) {
+    static func run(_ tool: String, _ args: [String],
+                    env: [String: String] = [:]) async -> (Int32, String) {
         await withCheckedContinuation { cont in
             DispatchQueue.global().async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: tool)
                 p.arguments = args
+                if !env.isEmpty {
+                    // Overlay, not replacement: the child still needs PATH and
+                    // the rest of the inherited environment to find its tools.
+                    p.environment = ProcessInfo.processInfo.environment
+                        .merging(env) { _, new in new }
+                }
                 let out = Pipe()
                 p.standardOutput = out
                 p.standardError = out
@@ -178,7 +185,15 @@ enum Actions {
     /// The words are the same two the CLI matches, pinned by a test.
     static func brewRefusesTap() async -> Bool {
         guard isBrewInstall else { return false }
-        let (_, out) = await run(brew, ["outdated", "--formula", listedService])
+        // HOMEBREW_NO_AUTO_UPDATE, because `brew outdated` git-fetches every
+        // tap once a day before answering, measured at 68 seconds. This runs
+        // whenever the Settings window opens, so without it opening Settings
+        // can stall on a network fetch nobody asked for. App.swift already
+        // guards coreOutdated() for the same cost, but that path is
+        // conditional and this one is a routine user action.
+        let (_, out) = await run(
+            brew, ["outdated", "--formula", listedService],
+            env: ["HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1"])
         let blob = out.lowercased()
         return blob.contains("untrusted tap")
             || blob.contains("refusing to load formula")
@@ -186,9 +201,11 @@ enum Actions {
 
     /// Trust the tap, which is what the button offers to do. Only ever from an
     /// explicit click: it changes the user's Homebrew configuration.
-    static func trustTap() async -> Bool {
-        let (code, _) = await run(brew, ["trust", tap])
-        return code == 0
+    static func trustTap() async -> (ok: Bool, output: String) {
+        let (code, out) = await run(
+            brew, ["trust", tap],
+            env: ["HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1"])
+        return (code == 0, out)
     }
 
     /// Whether `brew services list` says our service is started.

@@ -149,6 +149,18 @@ def face_jpeg(override: str | None = None) -> bytes:
             f"Pass --face-image PATH to run the gate offline; it needs a "
             f"photograph containing a face the detector can find."
         ) from exc
+    # A JPEG starts FF D8 FF. Without this check a captive portal or proxy
+    # answering with a 200 HTML login page gets cached under a .jpg name, and
+    # every later run short-circuits to it and fails the faces check with
+    # "found no faces in an image that contains one" -- a red on the mlx gate
+    # that looks exactly like a detector regression and is not one.
+    if not data.startswith(b"\xff\xd8\xff"):
+        raise RuntimeError(
+            f"{url} did not return a JPEG (got {len(data)} bytes starting "
+            f"{data[:8]!r}). Nothing was cached. A captive portal or proxy "
+            f"answering for it is the usual cause; --face-image PATH works "
+            f"offline."
+        )
     # Written via a temporary name so an interrupted download cannot leave a
     # truncated file that every later run then reads as valid.
     tmp = cached.with_suffix(cached.suffix + ".part")

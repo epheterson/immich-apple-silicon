@@ -3245,7 +3245,7 @@ class TestUntrustedTapIsReported:
 
     def test_a_refusal_is_recognised(self, tmp_path, monkeypatch):
         brew = self._brew_stub(tmp_path, stderr=self.REFUSAL, code=1)
-        monkeypatch.setattr(m, "_BREW", str(brew))
+        monkeypatch.setattr(m, "_brew_path", lambda: str(brew))
         assert m.brew_refuses_our_tap() is True
 
     def test_an_ordinary_up_to_date_answer_is_not_a_refusal(
@@ -3254,18 +3254,57 @@ class TestUntrustedTapIsReported:
         """The case that must not false-positive: brew prints nothing at all
         when the formula is current, which is the common state."""
         brew = self._brew_stub(tmp_path)
-        monkeypatch.setattr(m, "_BREW", str(brew))
+        monkeypatch.setattr(m, "_brew_path", lambda: str(brew))
         assert m.brew_refuses_our_tap() is False
 
     def test_an_available_upgrade_is_not_a_refusal(self, tmp_path, monkeypatch):
         brew = self._brew_stub(tmp_path, stdout="immich-accelerator\n")
-        monkeypatch.setattr(m, "_BREW", str(brew))
+        monkeypatch.setattr(m, "_brew_path", lambda: str(brew))
         assert m.brew_refuses_our_tap() is False
 
-    def test_no_brew_is_not_a_refusal(self, tmp_path, monkeypatch):
+    def test_no_brew_is_not_a_refusal(self, monkeypatch):
         """A source install has no brew and nothing to say about trust."""
-        monkeypatch.setattr(m, "_BREW", str(tmp_path / "does-not-exist"))
+        monkeypatch.setattr(m, "_brew_path", lambda: None)
         assert m.brew_refuses_our_tap() is False
+
+    def test_brew_is_looked_for_in_both_prefixes(self, tmp_path, monkeypatch):
+        """/opt/homebrew is the Apple Silicon prefix and /usr/local the x86
+        one. An x86 brew under Rosetta is a real configuration, and checking
+        only the first made this warning unable to fire there at all."""
+        seen = []
+
+        def fake_isfile(path):
+            seen.append(path)
+            return path == "/usr/local/bin/brew"
+
+        monkeypatch.setattr(m.os.path, "isfile", fake_isfile)
+        assert m._brew_path() == "/usr/local/bin/brew"
+        assert "/opt/homebrew/bin/brew" in seen and "/usr/local/bin/brew" in seen
+
+    def test_the_check_does_not_let_brew_auto_update(self, tmp_path, monkeypatch):
+        """`brew outdated` git-fetches every tap once a day, measured at 68
+        seconds. `status` is a question, not a maintenance task, and the run
+        that paid that cost was also the one that timed out reporting nothing.
+
+        The stub refuses to answer unless the environment says not to
+        auto-update, so this asserts on the child's environment rather than
+        on ours.
+        """
+        brew = tmp_path / "brew"
+        brew.write_text(
+            "#!/bin/bash\n"
+            'if [ "$HOMEBREW_NO_AUTO_UPDATE" != "1" ]; then\n'
+            '  echo "would auto-update" >&2; exit 3\n'
+            "fi\n"
+            "cat >&2 <<'ERR'\n" + self.REFUSAL + "ERR\n"
+            "exit 1\n"
+        )
+        brew.chmod(0o755)
+        monkeypatch.setattr(m, "_brew_path", lambda: str(brew))
+        assert m.brew_refuses_our_tap() is True, (
+            "the refusal was missed, so the child ran without "
+            "HOMEBREW_NO_AUTO_UPDATE and the stub declined to answer"
+        )
 
     def test_status_tells_the_user_and_names_the_command(
         self, tmp_data_dir, tmp_path, monkeypatch, caplog
@@ -3273,7 +3312,7 @@ class TestUntrustedTapIsReported:
         """Through cmd_status, not the helper: a detector nothing calls is
         worth nothing, and the whole defect is that the user is never told."""
         brew = self._brew_stub(tmp_path, stderr=self.REFUSAL, code=1)
-        monkeypatch.setattr(m, "_BREW", str(brew))
+        monkeypatch.setattr(m, "_brew_path", lambda: str(brew))
         m.save_config({"version": "1.16.0"})
         monkeypatch.setattr(m, "read_pid", lambda name: 4242)
         with caplog.at_level("WARNING"):
