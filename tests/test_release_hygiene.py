@@ -181,6 +181,25 @@ def test_the_swift_preset_names_match_the_python_ones():
     for name, switches in mirror.items():
         assert switches == m.ENCODING_PRESETS[name], name
 
+    # The slice above stops at `encodingDefaultOff`, so the two things that
+    # decide how a switch reads are outside it: which switches default off,
+    # and the words the wrapper accepts as on and as off. Both were pinned by
+    # nothing, and emptying the set left the whole suite green while the pane
+    # would have shown hardware audio on by default and the CLI off.
+    default_off = re.search(r"encodingDefaultOff: Set<String> = \[(.*?)\]", model)
+    assert default_off, "could not parse StatusModel's default-off set; update this test"
+    mirrored_off = set(re.findall(r'"(\w+)"', default_off.group(1)))
+    assert mirrored_off == set(m._DEFAULT_OFF), f"StatusModel has {sorted(mirrored_off)}"
+
+    # The negated branch is written first, so the first list is the off words.
+    # Which list is which is the meaning; the order inside one is not.
+    words = [
+        set(re.findall(r'"([a-z0-9]+)"', group))
+        for group in re.findall(r'\[((?:\s*"[a-z0-9]+",?)+)\]\.contains\(value\)', model)
+    ]
+    assert len(words) == 2, "could not parse StatusModel's truth words; update this test"
+    assert words == [set(m._ENV_OFF), set(m._ENV_ON)], f"StatusModel has {words}"
+
     pane = (root / "menubar/Sources/AcceleratorBar/SettingsView.swift").read_text()
     listing = pane[pane.index("static let positions:"):pane.index("private var currentPosition")]
     names = set(re.findall(r'\("([a-z-]+)",\s*"', listing)) - {"custom"}
