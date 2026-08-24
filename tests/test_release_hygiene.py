@@ -298,9 +298,9 @@ def test_no_photograph_is_embedded_in_the_tree():
     """render-formula.sh installs this tree wholesale, so anything committed
     here is redistributed to every Homebrew user.
 
-    A base64 photograph of identifiable people shipped in v1.15.0 that way,
-    with no source and no licence recorded, and was only caught by a
-    contributor reading the diff (#167). Test images are fetched on demand and
+    A base64 photograph shipped in v1.15.0 that way, with no source and no
+    licence recorded, and was only caught by a contributor reading the
+    diff (#167). Test images are fetched on demand and
     cached outside the repo instead. The two embedded JPEGs that remain are
     synthetic: a generated text strip and a gradient, neither depicting anyone.
     """
