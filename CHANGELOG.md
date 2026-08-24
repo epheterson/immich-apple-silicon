@@ -1,24 +1,34 @@
 # Changelog
 
+## 1.16.0 - 2026-08-23
+
+### Fixed
+- **The QuickLook thumbnail fallback ignored the size Immich asked for.** When ffmpeg cannot decode a file at all, the wrapper falls back to QuickLook; the resize argument was passed without its flag, so a preview requested at 1440 tall came back 1440 wide. Immich records that as a success, so the wrong size stayed until the asset was reprocessed. Measured on a 1920x1080 source: 1440x810 before, 2560x1440 after.
+- **`status` now says when Homebrew is refusing to load the formula.** An untrusted tap makes `brew upgrade` and `brew outdated` do nothing and say nothing, which is indistinguishable from being up to date, so an install can sit on an old version indefinitely with no signal. It now names the one command that fixes it.
+- **`ml-preflight.py` no longer carries a photograph.** It embedded a real image as base64, and the formula installs this tree wholesale, so v1.15.0 redistributed it with no source or licence recorded. The image is now fetched once and cached outside the repository. Raised by [@RxChi1d](https://github.com/RxChi1d) ([#167](https://github.com/epheterson/immich-apple-silicon/issues/167)).
+
+### Changed
+- **The Software position now names what it does not cover.** It is described as byte-for-byte identical to Docker, and the QuickLook fallback is not gated on any hardware switch, so a file ffmpeg cannot decode gets a thumbnail ffmpeg did not produce. Said in all four places the claim appears. Raised by [@RxChi1d](https://github.com/RxChi1d) ([#166](https://github.com/epheterson/immich-apple-silicon/issues/166)).
+
 ## 1.15.0 - 2026-08-22
 
 ### Added
-- **One Processing screen instead of three.** Components, Machine Learning and Encoding described one decision between them, so they are now a single pane: Services at the top, then Hardware Transcoding, then the machine learning engine. Sections appear only when the thing they configure is running, since hardware encoding is a control over nothing on a machine with no worker.
-- **Software and Hardware, with Custom between them.** One control sets decoding, video and audio together. Software is the encoders and decoders Immich's own container uses, so video and thumbnails come out byte for byte what Docker produces, except for a file ffmpeg cannot decode at all, whose thumbnail comes from QuickLook. Hardware is VideoToolbox throughout, for much less CPU. Both are described in the pane before you choose, rather than after. Setting switches individually reads as Custom, which is a place you can be rather than an error.
-- **Hardware audio encoding** with AudioToolbox, measured at about a third less CPU than the software encoder and faster besides. Part of the Hardware end; it changes the bytes, so it is not on by default for anyone upgrading.
-- **`immich-accelerator compare <video>`** encodes one of your files every way this Mac can and writes a page with the numbers and a frame from each, side by side. A table cannot tell you whether you will notice a difference and pictures cannot tell you what it costs.
-- **`--preset` on both compare commands.** They fixed the software side at `ultrafast`, which is Immich's default and also x264's least efficient setting, so the comparison depended on a constant it never mentioned. Measured here on real footage: `ultrafast` gives 66.6 MB at SSIM 0.967 where `veryfast` gives 33.2 MB at 0.972, half the bytes for higher quality. Raised by [@RxChi1d](https://github.com/RxChi1d) ([#162](https://github.com/epheterson/immich-apple-silicon/issues/162)).
+- **One Processing pane in Settings**, replacing the Components, Machine Learning and Encoding panes. Each section shows only when the thing it configures is enabled.
+- **Software and Hardware positions.** Software turns hardware decoding, video and audio off, which is what Immich's own container does, so video and thumbnails come out byte for byte what Docker produces, except for a file ffmpeg cannot decode at all, whose thumbnail comes from QuickLook. Hardware turns all three on. Any other combination reads as Custom.
+- **Hardware audio encoding** with AudioToolbox (`aac_at`), about a third less CPU. On for new installs, off for upgrades, since it changes the bytes.
+- **`immich-accelerator compare <video>`.** Encodes one of your files every way this Mac can and opens a page with the numbers and a frame from each.
+- **`--preset` on `compare` and `encode-compare`**, for when your Immich is not on x264 `ultrafast`. On real footage `ultrafast` gives 66.6 MB at SSIM 0.967 where `veryfast` gives 33.2 MB at 0.972. Raised by [@RxChi1d](https://github.com/RxChi1d) ([#162](https://github.com/epheterson/immich-apple-silicon/issues/162)).
 
 ### Fixed
-- **`encode-compare` reported the last frame's SSIM as the mean.** The summary line carrying the mean is logged at info, which the command was discarding, while `stats_file=-` wrote per-frame numbers it then read the last of. A clip ending on black therefore reported perfect quality for every setting. By [@RxChi1d](https://github.com/RxChi1d) ([#160](https://github.com/epheterson/immich-apple-silicon/pull/160)).
-- **`encode-compare` reported the wrong setting's timings.** The closing wall-clock and CPU lines described whichever quality value encoded last rather than the one recommended, always the slowest and largest of the sweep, so the recommendation looked worse than it is. By [@RxChi1d](https://github.com/RxChi1d) ([#161](https://github.com/epheterson/immich-apple-silicon/pull/161)).
-- **HEVC lost its `hvc1` tag with hardware encoding switched off.** The tag is a property of the container rather than of the encoder, and libx265 defaults to `hev1`, which Apple's decoder rejects. By [@RxChi1d](https://github.com/RxChi1d) ([#159](https://github.com/epheterson/immich-apple-silicon/pull/159)).
-- **Re-running `setup` no longer discards your encoding settings.** It rebuilds the config from scratch and saves it wholesale, and the `env` block was not on the list of keys carried across, so the documented repair step quietly reverted a chosen position.
-- **Settings changes take effect when you make them**, rather than being written and reported as successful while the running accelerator carries on with the old ones. Changing a setting while the accelerator is stopped saves it and says so, because applying a setting must never be the thing that starts processing.
+- `encode-compare` reported the last frame's SSIM as the mean, so a clip ending on black scored perfectly at every setting. By [@RxChi1d](https://github.com/RxChi1d) ([#160](https://github.com/epheterson/immich-apple-silicon/pull/160)).
+- `encode-compare` reported the timings of the wrong setting. By [@RxChi1d](https://github.com/RxChi1d) ([#161](https://github.com/epheterson/immich-apple-silicon/pull/161)).
+- HEVC lost its `hvc1` tag with hardware encoding off, which Apple's decoder rejects. By [@RxChi1d](https://github.com/RxChi1d) ([#159](https://github.com/epheterson/immich-apple-silicon/pull/159)).
+- Re-running `setup` discarded your encoding settings.
+- Settings changes did not reach a running accelerator, and applying one could start an accelerator you had stopped.
 
 ### Changed
-- The encoder quality figures in the docs and in the 1.14.0 notes were produced by the SSIM bug above and are corrected here: measured on real camera footage, software scores 0.967 and VideoToolbox 0.974, not 0.961 against 0.980. The conclusion is unchanged, hardware scores higher in about half the size, but the gap is roughly a third of what was published.
-- The mount switch now says what the whole system does: it remembers SMB shares and reconnects them at login, and separately the accelerator watches the mount holding your library the entire time it runs and remounts it on its own.
+- Encoder quality figures corrected for the SSIM bug above: software 0.967 and VideoToolbox 0.974, published in 1.14.0 as 0.961 and 0.980. Hardware still scores higher in about half the size; the gap is a third of what was printed.
+- The mount switch describes both behaviours: SMB shares reconnect at login, and the accelerator watches the mount holding your library the whole time it runs.
 
 ## 1.14.0 - 2026-08-20
 
