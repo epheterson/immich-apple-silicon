@@ -5882,6 +5882,35 @@ def cmd_stop(_args):
         log.info("Nothing running")
 
 
+# Homebrew refuses to load a formula from a tap the user has not trusted, and
+# that refusal is indistinguishable from "nothing to upgrade" to anything that
+# only reads the exit status. `brew upgrade` then does nothing, `brew outdated`
+# reports nothing, and the menu bar app offers nothing, so an install sits on
+# an old version indefinitely with no signal anywhere. Measured on the release
+# Mac by removing the tap from trust.json: `brew outdated --formula
+# immich-accelerator` prints "Refusing to load formula ... from untrusted tap"
+# and `brew info --json` returns no formula at all.
+_BREW = "/opt/homebrew/bin/brew"
+_TAP = "epheterson/immich-accelerator"
+
+
+def brew_refuses_our_tap() -> bool:
+    """True when Homebrew will not load our formula because the tap is
+    untrusted. False for any other reason, including brew not being installed:
+    a non-brew install has nothing to say here."""
+    if not os.path.isfile(_BREW):
+        return False
+    try:
+        out = subprocess.run(
+            [_BREW, "outdated", "--formula", "immich-accelerator"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    blob = (out.stdout + out.stderr).lower()
+    return "untrusted tap" in blob or "refusing to load formula" in blob
+
+
 def cmd_status(_args):
     worker_pid = read_pid("worker")
     ml_pid = read_pid("ml")
@@ -5917,6 +5946,13 @@ def cmd_status(_args):
         log.info("Version:    %s", config.get("version", "?"))
         if config.get("ffmpeg_path"):
             log.info("FFmpeg:     %s (VideoToolbox)", config["ffmpeg_path"])
+
+    if brew_refuses_our_tap():
+        log.warning("Updates:    blocked. Homebrew will not load the formula "
+                    "until the tap is trusted,")
+        log.warning("            so `brew upgrade` silently leaves you on this "
+                    "version. Run once:")
+        log.warning("              brew trust %s", _TAP)
 
 
 def cmd_logs(args):

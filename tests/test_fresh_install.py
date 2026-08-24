@@ -3205,3 +3205,74 @@ class TestJobRetryShim:
         # past where run1 left off instead of restarting at the same value.
         assert "DELAY:4000" in run1.stdout, run1.stdout
         assert "DELAY:4000" in run2.stdout, run2.stdout
+
+
+class TestUntrustedTapIsReported:
+    """Homebrew refuses to load a formula from an untrusted tap, and that
+    refusal looks exactly like "nothing to upgrade" to anything reading only
+    the exit status. The install then sits on an old version forever with no
+    signal: `brew upgrade` does nothing, `brew outdated` reports nothing, and
+    the menu bar app's only update path is `brew outdated`.
+
+    Verified against a real Homebrew by removing the tap from trust.json on the
+    release Mac: `brew outdated --formula immich-accelerator` prints "Refusing
+    to load formula ... from untrusted tap".
+    """
+
+    REFUSAL = (
+        "Error: Refusing to load formula epheterson/immich-accelerator/"
+        "immich-accelerator from untrusted tap epheterson/immich-accelerator.\n"
+        "Run `brew trust epheterson/immich-accelerator` to trust it.\n"
+    )
+
+    def _brew_stub(self, tmp_path, stdout="", stderr="", code=0):
+        brew = tmp_path / "brew"
+        brew.write_text(
+            "#!/bin/bash\n"
+            f"cat <<'OUT'\n{stdout}OUT\n"
+            f"cat >&2 <<'ERR'\n{stderr}ERR\n"
+            f"exit {code}\n"
+        )
+        brew.chmod(0o755)
+        return brew
+
+    def test_a_refusal_is_recognised(self, tmp_path, monkeypatch):
+        brew = self._brew_stub(tmp_path, stderr=self.REFUSAL, code=1)
+        monkeypatch.setattr(m, "_BREW", str(brew))
+        assert m.brew_refuses_our_tap() is True
+
+    def test_an_ordinary_up_to_date_answer_is_not_a_refusal(
+        self, tmp_path, monkeypatch
+    ):
+        """The case that must not false-positive: brew prints nothing at all
+        when the formula is current, which is the common state."""
+        brew = self._brew_stub(tmp_path)
+        monkeypatch.setattr(m, "_BREW", str(brew))
+        assert m.brew_refuses_our_tap() is False
+
+    def test_an_available_upgrade_is_not_a_refusal(self, tmp_path, monkeypatch):
+        brew = self._brew_stub(tmp_path, stdout="immich-accelerator\n")
+        monkeypatch.setattr(m, "_BREW", str(brew))
+        assert m.brew_refuses_our_tap() is False
+
+    def test_no_brew_is_not_a_refusal(self, tmp_path, monkeypatch):
+        """A source install has no brew and nothing to say about trust."""
+        monkeypatch.setattr(m, "_BREW", str(tmp_path / "does-not-exist"))
+        assert m.brew_refuses_our_tap() is False
+
+    def test_status_tells_the_user_and_names_the_command(
+        self, tmp_data_dir, tmp_path, monkeypatch, caplog
+    ):
+        """Through cmd_status, not the helper: a detector nothing calls is
+        worth nothing, and the whole defect is that the user is never told."""
+        brew = self._brew_stub(tmp_path, stderr=self.REFUSAL, code=1)
+        monkeypatch.setattr(m, "_BREW", str(brew))
+        m.save_config({"version": "1.16.0"})
+        monkeypatch.setattr(m, "read_pid", lambda name: 4242)
+        with caplog.at_level("WARNING"):
+            m.cmd_status(None)
+        out = caplog.text
+        assert "blocked" in out, out
+        assert "brew trust epheterson/immich-accelerator" in out, (
+            f"the user must be given the exact command: {out}"
+        )
