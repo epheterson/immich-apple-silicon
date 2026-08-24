@@ -7,6 +7,8 @@
 - **`status` now says when Homebrew is refusing to load the formula.** An untrusted tap makes `brew upgrade` and `brew outdated` do nothing and say nothing, which is indistinguishable from being up to date, so an install can sit on an old version indefinitely with no signal. It now names the one command that fixes it.
 - **`ml-preflight.py` no longer carries a photograph.** It embedded a real image as base64, and the formula installs this tree wholesale, so v1.15.0 redistributed it with no source or licence recorded. The image is now fetched once and cached outside the repository. Raised by [@RxChi1d](https://github.com/RxChi1d) ([#167](https://github.com/epheterson/immich-apple-silicon/issues/167)).
 
+- **The Swift mirror of the encoding settings was only half checked.** The test stopped at the default-off set, so which switches default off and the words the wrapper reads as on and off were pinned by nothing; emptying the set left the suite green while the pane would have shown hardware audio on by default. By [@RxChi1d](https://github.com/RxChi1d) ([#165](https://github.com/epheterson/immich-apple-silicon/pull/165)).
+
 ### Changed
 - **The Software position now names what it does not cover.** It is described as byte-for-byte identical to Docker, and the QuickLook fallback is not gated on any hardware switch, so a file ffmpeg cannot decode gets a thumbnail ffmpeg did not produce. Said in all four places the claim appears. Raised by [@RxChi1d](https://github.com/RxChi1d) ([#166](https://github.com/epheterson/immich-apple-silicon/issues/166)).
 
