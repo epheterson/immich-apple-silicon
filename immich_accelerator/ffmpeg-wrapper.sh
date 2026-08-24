@@ -278,7 +278,8 @@ if [[ "$IS_SINGLE_FRAME" == true && "$DECODE_REJECTED" == true && -n "$INPUT" \
             # passed the number without its flag, so vips read a requested
             # height as the positional width and a 1440-tall preview came back
             # 1440 wide. Immich records that as a success, so the wrong size is
-            # permanent until the asset is reprocessed. Raised in #21.
+            # permanent until the asset is reprocessed. Noted alongside
+            # #166, which is about what the position claims, not this.
             if "$VIPS_BIN" thumbnail "$QL_RESULT" "$OUTPUT" "${RESIZE[@]}" >/dev/null 2>&1 \
                || "$VIPS_BIN" copy "$QL_RESULT" "$OUTPUT" >/dev/null 2>&1; then
                 echo "[immich-accelerator] ffmpeg couldn't decode $INPUT for a thumbnail; QuickLook/AVFoundation produced one instead" >&2

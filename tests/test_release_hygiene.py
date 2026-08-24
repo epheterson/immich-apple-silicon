@@ -385,3 +385,82 @@ def test_the_untrusted_tap_words_match_between_swift_and_python():
         f"Swift matches {sorted(swift_words)}, Python matches "
         f"{sorted(python_words)}"
     )
+
+
+# What a "#N" in the tree has to survive to count as an issue citation. Both
+# exclusions are structural rather than a list of known values: the first
+# version of this listed one grey by value and promptly missed the four-digit
+# one with an alpha channel on the very next line of the same stylesheet.
+_CSS_PROPERTY = re.compile(r"\b(color|background|border|shadow|fill|stroke)\b")
+
+
+def _is_citation(ref: str, line: str) -> bool:
+    # A CSS hex colour in the dashboard's inline stylesheet. An all-digit grey
+    # is indistinguishable from an issue number on its own, so the declaration
+    # around it is what settles it.
+    if _CSS_PROPERTY.search(line) and re.fullmatch(r"#[0-9a-fA-F]{3,8}", ref):
+        return False
+    # ffmpeg's stream syntax, "#0:0", inside test fixtures. There is no issue
+    # zero, so this needs no context to rule out.
+    return ref != "#0"
+
+
+def _issue_citations():
+    from pathlib import Path
+
+    root = Path(__file__).parent.parent
+    found = {}
+    for sub in ("immich_accelerator", "menubar/Sources", "tests", "scripts"):
+        for path in sorted((root / sub).rglob("*")):
+            if path.suffix not in {".py", ".sh", ".swift"} or not path.is_file():
+                continue
+            for n, line in enumerate(path.read_text().splitlines(), 1):
+                for ref in re.findall(r"#[0-9a-fA-F]{1,8}\b", line):
+                    if not _is_citation(ref, line):
+                        continue
+                    if not ref.lstrip("#").isdigit():
+                        continue
+                    found.setdefault(ref, []).append(
+                        f"{path.relative_to(root)}:{n}"
+                    )
+    return found
+
+
+@pytest.mark.slow
+def test_every_issue_reference_points_at_a_real_issue():
+    """A comment citing an issue number is a claim about where a defect was
+    reported, and a wrong number sends the next reader somewhere unrelated.
+
+    This shipped: the QuickLook dimension defect was cited as "#21", which is
+    an internal task number here and a merged PR about fresh-install dashboard
+    regressions on GitHub. The number resolved, so nothing looked broken.
+
+    Existence is all this can check. It cannot tell that a real number is the
+    wrong one, so the rule that matters is still not to write a number down
+    without opening it.
+    """
+    import json
+    import shutil
+    import subprocess
+
+    if not shutil.which("gh"):
+        pytest.skip("gh is not installed")
+
+    missing = []
+    for ref, sites in sorted(_issue_citations().items()):
+        number = ref.lstrip("#")
+        proc = subprocess.run(
+            ["gh", "issue", "view", number, "--json", "number"],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            proc = subprocess.run(
+                ["gh", "pr", "view", number, "--json", "number"],
+                capture_output=True, text=True,
+            )
+        if proc.returncode != 0:
+            if "rate limit" in (proc.stderr or "").lower():
+                pytest.skip("GitHub rate limit")
+            missing.append(f"{ref} cited at {', '.join(sites)}")
+
+    assert not missing, "these reference nothing that exists:\n  " + "\n  ".join(missing)

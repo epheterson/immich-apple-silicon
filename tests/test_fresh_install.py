@@ -2445,7 +2445,7 @@ class TestFfmpegWrapperQuickLookFallback:
         the --height flag and left the bare number, which vips reads as the
         positional width. A 1440-tall preview came back 1440 wide, and Immich
         records that as a success, so the wrong size is permanent until the
-        asset is reprocessed (#21).
+        asset is reprocessed.
 
         `vips thumbnail` fits the image inside WIDTH x HEIGHT, so the height
         only binds if the width cannot: hence the sentinel width, asserted
