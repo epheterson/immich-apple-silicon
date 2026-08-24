@@ -306,3 +306,32 @@ def test_no_photograph_is_embedded_in_the_tree():
                 f"native-ml-full-benchmark.py's IMAGE_SOURCES do, and record "
                 f"where it came from."
             )
+
+
+def test_the_byte_for_byte_claim_names_its_exception():
+    """The Software position is described as byte-identical to Docker in four
+    places, and the QuickLook thumbnail fallback is not gated on any of the
+    hardware switches, so it is live in Software exactly as in Hardware.
+
+    When it fires the thumbnail did not come from ffmpeg at all. A claim that
+    does not say so overclaims, which is worse than a plainer one. Raised by
+    @RxChi1d in #166.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).parent.parent
+    for rel in (
+        "immich_accelerator/__main__.py",
+        "menubar/Sources/AcceleratorBar/SettingsView.swift",
+        "docs/usage.md",
+        "CHANGELOG.md",
+    ):
+        text = (root / rel).read_text()
+        # Normalised, because three of the four wrap the sentence across lines.
+        flat = " ".join(text.split())
+        if "byte for byte what Docker produces" not in flat:
+            continue
+        assert "QuickLook" in flat, (
+            f"{rel} claims byte-for-byte output but never mentions the "
+            f"QuickLook fallback, which produces thumbnails ffmpeg did not."
+        )

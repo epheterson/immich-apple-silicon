@@ -6986,8 +6986,9 @@ PRESET_SUMMARY = {
 PRESET_DETAIL = {
     "software": (
         "The encoders and decoders Immich's own container uses. Video and "
-        "thumbnails come out byte for byte what Docker produces. Uses the most "
-        "CPU."
+        "thumbnails come out byte for byte what Docker produces, except for "
+        "a file ffmpeg cannot decode at all, whose thumbnail comes from "
+        "QuickLook. Uses the most CPU."
     ),
     "hardware": (
         "VideoToolbox for decoding, video and audio. Much less CPU, so the Mac "

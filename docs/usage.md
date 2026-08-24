@@ -207,6 +207,8 @@ immich-accelerator encoding preset hardware
 
 Any other combination is a valid place to be, and both Settings and the CLI call it Custom.
 
+One exception, in either position: if ffmpeg cannot decode a file at all, the wrapper falls back to QuickLook for that one thumbnail, so it did not come from ffmpeg and Docker on the same file would either produce a different thumbnail or fail outright. Nothing turns that off, because the alternative is no thumbnail. It is reached only when ffmpeg rejects the stream outright, which in practice means some HDR10 phone footage.
+
 Audio is the one switch that is off for anyone upgrading. `aac_at` is faster and uses about a third less CPU, but the bytes differ from Docker's, so an existing install is never moved onto it without being asked. A new install starts at Hardware.
 
 ### What the hardware actually buys you

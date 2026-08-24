@@ -407,7 +407,7 @@ struct SettingsView: View {
     /// The two named positions and the derived middle, in control order.
     static let positions: [(name: String, title: String, detail: String)] = [
         ("software", "Software",
-         "The encoders and decoders Immich's own container uses. Video and thumbnails come out byte for byte what Docker produces. Uses the most CPU."),
+         "The encoders and decoders Immich's own container uses. Video and thumbnails come out byte for byte what Docker produces, except for a file ffmpeg cannot decode at all, whose thumbnail comes from QuickLook. Uses the most CPU."),
         ("custom", "Custom", "Some on, some off. Set below."),
         ("hardware", "Hardware",
          "VideoToolbox for decoding, video and audio. Much less CPU, so the Mac keeps up with everything else it is doing. Video is visually identical to Docker's; audio and 10-bit thumbnails differ byte for byte."),
