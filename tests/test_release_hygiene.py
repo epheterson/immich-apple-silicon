@@ -579,3 +579,66 @@ def test_face_detection_does_not_go_back_to_detecting_with_the_landmarks_pass():
             < body.index("VNDetectFaceLandmarksRequest")), (
         "the rectangles request must run first and feed the landmarks pass"
     )
+
+
+def _preflight():
+    """Load scripts/ml-preflight.py as a module. Importing it must not reach
+    the network: the fetch belongs to face_jpeg, not to import."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parent.parent / "scripts" / "ml-preflight.py"
+    spec = importlib.util.spec_from_file_location("ml_preflight", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_offline_face_image_override_is_used_verbatim(tmp_path):
+    """--face-image is the escape hatch for running the gate without network.
+
+    Untested, it would be discovered broken by the person who needed it most:
+    someone on a machine that cannot reach the internet, mid-release.
+    """
+    m = _preflight()
+    supplied = tmp_path / "mine.jpg"
+    supplied.write_bytes(b"\xff\xd8\xff not-really-a-jpeg")
+
+    # A cache directory that does not exist, so anything but the override
+    # would have to hit the network and would fail the test loudly.
+    m.FACE_CACHE = tmp_path / "cache-that-is-not-there"
+    m.FACE_IMAGE = ("http://127.0.0.1:9/unreachable.jpg", "test")
+
+    assert m.face_jpeg(str(supplied)) == supplied.read_bytes()
+    assert not m.FACE_CACHE.exists(), (
+        "an override must not populate the cache; the next run would then "
+        "silently use someone's one-off image as the gate's face"
+    )
+
+
+def test_a_cached_face_image_is_reused_without_fetching(tmp_path):
+    m = _preflight()
+    m.FACE_IMAGE = ("http://127.0.0.1:9/unreachable.jpg", "test")
+    m.FACE_CACHE = tmp_path / "cache"
+    m.FACE_CACHE.mkdir()
+    (m.FACE_CACHE / "unreachable.jpg").write_bytes(b"cached-bytes")
+
+    # The URL is unroutable, so this can only pass by reading the cache.
+    assert m.face_jpeg() == b"cached-bytes"
+
+
+def test_a_failed_fetch_is_fatal_and_leaves_no_partial_file(tmp_path):
+    """A truncated cache file would be read as valid by every later run, and
+    the gate would be testing the detector against a broken image."""
+    m = _preflight()
+    m.FACE_IMAGE = ("http://127.0.0.1:9/unreachable.jpg", "test")
+    m.FACE_CACHE = tmp_path / "cache"
+
+    with pytest.raises(RuntimeError) as caught:
+        m.face_jpeg()
+    assert "--face-image" in str(caught.value), (
+        "the error must name the way out, since this fires on a machine "
+        "with no network"
+    )
+    leftovers = list(m.FACE_CACHE.glob("*")) if m.FACE_CACHE.exists() else []
+    assert not leftovers, f"a failed fetch left {leftovers} behind"
