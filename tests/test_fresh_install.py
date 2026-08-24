@@ -2427,15 +2427,22 @@ class TestFfmpegWrapperQuickLookFallback:
         seen = tmp_path / "vips_args"
         self._bash_stub(vips, f'printf "%s\\n" "$@" > {seen}\ncp "$2" "$3"\n')
         wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
-        subprocess.run(
+        # 60s, not 10: the wrapper forks bash, mktemp, qlmanage and vips, and
+        # this failed once on a machine running four ML engines and a Swift
+        # build at the same time. The fallback has its own 30s cap on
+        # qlmanage, so a real hang still fails rather than hanging here.
+        proc = subprocess.run(
             ["/bin/bash", str(wrapper),
              *self._thumbnail_args(tmp_path / "in.mp4", tmp_path / "out.jpg",
                                    scale=scale)],
             env={"PATH": f"{tmp_path}:/usr/bin:/bin",
                  "IMMICH_ACCELERATOR_VIPS": str(vips)},
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=60,
         )
-        assert seen.is_file(), "vips was never called"
+        assert seen.is_file(), (
+            f"vips was never called, so the fallback did not reach it. "
+            f"wrapper rc={proc.returncode} stderr={proc.stderr[-300:]!r}"
+        )
         return seen.read_text().split()
 
     def test_a_requested_height_reaches_vips_as_a_height(self, tmp_path):
