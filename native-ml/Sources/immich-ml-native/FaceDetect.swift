@@ -12,13 +12,38 @@ struct DetectedFace {
 }
 
 func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [DetectedFace] {
+    // Detect and landmark in two stages, because the landmarks request is a
+    // worse detector than the rectangles request and reports a useless score.
+    //
+    // Asking VNDetectFaceLandmarksRequest to do both, which is what this did,
+    // costs faces outright: measured across 24 images it found nothing on
+    // several where the rectangles request finds a face, and against Immich's
+    // own detector it found 20 of 48 faces. It also reported confidence 1.000
+    // for every face ever returned, so Immich's minScore had nothing to filter
+    // on. The rectangles request returns real values (0.610, 0.654, 0.879 on
+    // the same images).
+    //
+    // inputFaceObservations is the supported way to join them: the landmarks
+    // pass runs on exactly the observations the detector found, so the 5 points
+    // the aligner needs still come back for every face, and the confidence
+    // survives.
+    let rects = VNDetectFaceRectanglesRequest()
+    // Raw image bytes, not a pre-decoded CGImage: the Python fork feeds
+    // VNImageRequestHandler initWithData and Vision produces slightly
+    // different landmarks otherwise.
+    try? VNImageRequestHandler(data: imageData, options: [:]).perform([rects])
+    let detected = (rects.results as? [VNFaceObservation]) ?? []
+    guard !detected.isEmpty else { return [] }
+
     let req = VNDetectFaceLandmarksRequest()
-    // Match the Python fork: feed raw image bytes (VNImageRequestHandler initWithData),
-    // not a pre-decoded CGImage — Vision produces slightly different landmarks otherwise.
-    let handler = VNImageRequestHandler(data: imageData, options: [:])
-    try? handler.perform([req])
+    req.inputFaceObservations = detected
+    try? VNImageRequestHandler(data: imageData, options: [:]).perform([req])
+    // Falling back to the detections rather than dropping them: a face without
+    // landmarks is still a face, and losing it here would undo the point.
+    let observations = (req.results as? [VNFaceObservation]) ?? detected
+
     var faces: [DetectedFace] = []
-    for obs in (req.results ?? []) {
+    for obs in observations {
         let bb = obs.boundingBox   // normalized, bottom-left origin
         let x1 = bb.origin.x * Double(W)
         let y1 = (1.0 - bb.origin.y - bb.height) * Double(H)
