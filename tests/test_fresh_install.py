@@ -2382,8 +2382,7 @@ class TestFfmpegWrapperQuickLookFallback:
     _VIPS_RECORD = 'printf "%s\\n" "$@" > "$VIPS_ARGS_FILE"\ncp "$2" "$3"\n'
 
     def test_the_quicklook_fallback_asks_vips_for_a_size(self, tmp_path):
-        """Not which size, which is a known defect tracked separately: that it
-        passes one at all. With none, vips exits 'too few arguments', the
+        """With no size argument vips exits 'too few arguments', the
         `|| vips copy` branch writes the QuickLook output through at whatever
         size QuickLook produced, and the wrapper still exits 0, so Immich
         records the asset as thumbnailed and never retries.
@@ -2417,6 +2416,65 @@ class TestFfmpegWrapperQuickLookFallback:
             f"and the copy fallback would write an unresized image: {received}"
         )
 
+
+    def _vips_argv_for(self, tmp_path, scale):
+        """Drive the fallback and return the exact argv vips received."""
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, self._DECODE_REJECTED_STDERR + "exit 69\n")
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
+        vips = tmp_path / "vips_stub.sh"
+        seen = tmp_path / "vips_args"
+        self._bash_stub(vips, f'printf "%s\\n" "$@" > {seen}\ncp "$2" "$3"\n')
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        subprocess.run(
+            ["/bin/bash", str(wrapper),
+             *self._thumbnail_args(tmp_path / "in.mp4", tmp_path / "out.jpg",
+                                   scale=scale)],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin",
+                 "IMMICH_ACCELERATOR_VIPS": str(vips)},
+            capture_output=True, text=True, timeout=10,
+        )
+        assert seen.is_file(), "vips was never called"
+        return seen.read_text().split()
+
+    def test_a_requested_height_reaches_vips_as_a_height(self, tmp_path):
+        """Immich's `scale=-2:H` means "H tall, whatever width keeps the shape".
+
+        The argument list was previously sliced to one element, which dropped
+        the --height flag and left the bare number, which vips reads as the
+        positional width. A 1440-tall preview came back 1440 wide, and Immich
+        records that as a success, so the wrong size is permanent until the
+        asset is reprocessed (#21).
+
+        `vips thumbnail` fits the image inside WIDTH x HEIGHT, so the height
+        only binds if the width cannot: hence the sentinel width, asserted
+        here so it cannot quietly become a real one.
+        """
+        received = self._vips_argv_for(tmp_path, "-2:1440")
+        assert received[0] == "thumbnail", received
+        assert "--height" in received, (
+            f"a requested height must reach vips as --height, not as the "
+            f"positional width: {received}"
+        )
+        assert received[received.index("--height") + 1] == "1440", received
+        width = received[3]
+        assert width.isdigit() and int(width) >= 100000, (
+            f"the positional width must be unreachable so the height binds, "
+            f"got {width}: {received}"
+        )
+
+    def test_a_requested_width_reaches_vips_as_the_width(self, tmp_path):
+        """The other half of `scale`: `W:-2` means "W wide". vips takes the
+        width positionally, so this one needs no flag and must not carry a
+        height that would fight it.
+        """
+        received = self._vips_argv_for(tmp_path, "640:-2")
+        assert received[3] == "640", received
+        assert "--height" not in received, (
+            f"a width-only request must not also constrain the height: "
+            f"{received}"
+        )
 
     def test_successful_ffmpeg_call_passes_through_unchanged(self, tmp_path):
         ffmpeg = tmp_path / "ffmpeg"
