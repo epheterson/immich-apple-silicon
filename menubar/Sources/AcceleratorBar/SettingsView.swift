@@ -90,6 +90,10 @@ struct SettingsView: View {
     @State private var comparing = false
     @State private var compareResult: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
+    // Homebrew refusing to load the formula, which reads identically to
+    // "you are up to date" everywhere else in the app.
+    @State private var updatesBlocked = false
+    @State private var trusting = false
     @State private var mountSharesAtLogin = MountSharesAtLogin.isEnabled
 
     var body: some View {
@@ -159,8 +163,9 @@ struct SettingsView: View {
         hardwareDecodeOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_DECODE", config)
         hardwareVideoOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_VIDEO", config)
         hardwareAudioOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_AUDIO", config)
-        hardwareVideoOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_VIDEO", config)
-        hardwareDecodeOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_DECODE", config)
+        // Off the main thread: this shells out to brew, which on a cold cache
+        // takes seconds, and the window must not wait on it to draw.
+        Task { updatesBlocked = await Actions.brewRefusesTap() }
     }
 
     // MARK: - General
@@ -213,6 +218,38 @@ struct SettingsView: View {
                 // they have actually drifted, and then it matters a lot.
                 if let drifted = driftedCoreVersion {
                     LabeledContent("Background service", value: drifted)
+                }
+                if updatesBlocked {
+                    VStack(alignment: .leading, spacing: Metrics.xs) {
+                        Label("Updates are blocked", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        // What is happening and what it costs, before the fix.
+                        // "Untrusted tap" alone reads like a warning about us.
+                        Text("Homebrew will not load the formula until you trust the tap, so "
+                             + "brew upgrade leaves this Mac on the version it already has, "
+                             + "and says nothing.")
+                            .font(.rowDetail).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: Metrics.md) {
+                            Button(trusting ? "Trusting…" : "Trust the Tap") {
+                                trusting = true
+                                Task {
+                                    _ = await Actions.trustTap()
+                                    updatesBlocked = await Actions.brewRefusesTap()
+                                    trusting = false
+                                }
+                            }
+                            .disabled(trusting)
+                            // Shown as well as offered: this changes the
+                            // user's Homebrew configuration, so anyone who
+                            // would rather run it themselves can read it and
+                            // copy it.
+                            Text("brew trust \(Actions.tap)")
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
                 }
                 Button("Check for Updates…") { UpdaterModel.shared.checkForUpdates() }
             }

@@ -12,6 +12,7 @@ simulating the awk in ci.yml, which is not a control.
 from __future__ import annotations
 
 import os
+import inspect
 import re
 import subprocess
 from pathlib import Path
@@ -354,3 +355,33 @@ def test_the_byte_for_byte_claim_names_its_exception():
             f"{rel} claims byte-for-byte output but never mentions the "
             f"QuickLook fallback, which produces thumbnails ffmpeg did not."
         )
+
+
+def test_the_untrusted_tap_words_match_between_swift_and_python():
+    """The CLI and the app each decide independently whether Homebrew is
+    refusing to load our formula, by matching text in brew's output.
+
+    If one recognises a refusal the other does not, the app tells the user
+    updates are fine while `status` says they are blocked, or the reverse.
+    The words are brew's, not ours, so they are a fact about the environment
+    and both copies have to agree on it.
+    """
+    from pathlib import Path
+
+    import immich_accelerator.__main__ as m
+
+    root = Path(__file__).parent.parent
+    actions = (root / "menubar/Sources/AcceleratorBar/Actions.swift").read_text()
+    body = actions[actions.index("static func brewRefusesTap"):]
+    body = body[:body.index("\n    }")]
+    swift_words = set(re.findall(r'contains\("([^"]+)"\)', body))
+    assert swift_words, "could not parse the Swift matcher; update this test"
+
+    source = inspect.getsource(m.brew_refuses_our_tap)
+    python_words = set(re.findall(r'"([a-z ]+)" in blob', source))
+    assert python_words, "could not parse the Python matcher; update this test"
+
+    assert swift_words == python_words, (
+        f"Swift matches {sorted(swift_words)}, Python matches "
+        f"{sorted(python_words)}"
+    )

@@ -101,6 +101,8 @@ enum Actions {
     /// What `brew services list` prints in its Name column. brew accepts
     /// the tap path as an argument but never echoes it back.
     static let listedService = "immich-accelerator"
+    /// The tap, as `brew trust` wants it named.
+    static let tap = "epheterson/immich-accelerator"
 
     @discardableResult
     static func run(_ tool: String, _ args: [String]) async -> (Int32, String) {
@@ -162,6 +164,33 @@ enum Actions {
     /// stopped service, so changing a setting would start the accelerator and
     /// set it processing. Applying a setting must never be the thing that
     /// starts work.
+    /// Whether Homebrew is refusing to load our formula because the tap is
+    /// untrusted.
+    ///
+    /// This is not the same as "no update available", and telling them apart
+    /// is the whole point: `brew outdated` prints nothing in both cases, so
+    /// coreOutdated() returns nil either way and the app offered nothing while
+    /// the Mac sat on an old version indefinitely. Measured on the release Mac
+    /// by removing the tap from trust.json: brew prints "Refusing to load
+    /// formula ... from untrusted tap" and `brew info --json` returns no
+    /// formula at all.
+    ///
+    /// The words are the same two the CLI matches, pinned by a test.
+    static func brewRefusesTap() async -> Bool {
+        guard isBrewInstall else { return false }
+        let (_, out) = await run(brew, ["outdated", "--formula", listedService])
+        let blob = out.lowercased()
+        return blob.contains("untrusted tap")
+            || blob.contains("refusing to load formula")
+    }
+
+    /// Trust the tap, which is what the button offers to do. Only ever from an
+    /// explicit click: it changes the user's Homebrew configuration.
+    static func trustTap() async -> Bool {
+        let (code, _) = await run(brew, ["trust", tap])
+        return code == 0
+    }
+
     /// Whether `brew services list` says our service is started.
     ///
     /// Split out and reachable from the command line (`AcceleratorBar
