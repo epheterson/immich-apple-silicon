@@ -464,3 +464,118 @@ def test_every_issue_reference_points_at_a_real_issue():
             missing.append(f"{ref} cited at {', '.join(sites)}")
 
     assert not missing, "these reference nothing that exists:\n  " + "\n  ".join(missing)
+
+
+def _parity():
+    """Load scripts/ml-parity.py as a module; it is a script, not a package."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parent.parent / "scripts" / "ml-parity.py"
+    spec = importlib.util.spec_from_file_location("ml_parity", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_parity_cosine_is_actually_cosine():
+    """Every parity number reported so far rests on this function.
+
+    A similarity that is subtly wrong would have been reported as fact, and
+    "our embeddings agree with Docker's at 0.97" is exactly the kind of claim
+    nobody re-derives.
+    """
+    m = _parity()
+    assert m.cosine([1.0, 0.0], [1.0, 0.0]) == pytest.approx(1.0)
+    assert m.cosine([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
+    assert m.cosine([1.0, 0.0], [-1.0, 0.0]) == pytest.approx(-1.0)
+    # Scale must not matter: embeddings from two runtimes differ in magnitude.
+    assert m.cosine([3.0, 4.0], [30.0, 40.0]) == pytest.approx(1.0)
+    with pytest.raises(RuntimeError):
+        m.cosine([1.0, 0.0], [1.0, 0.0, 0.0])
+    with pytest.raises(RuntimeError):
+        m.cosine([0.0, 0.0], [1.0, 0.0])
+
+
+def test_parity_iou_is_actually_iou():
+    m = _parity()
+    box = {"x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 10.0}
+    assert m.iou(box, box) == pytest.approx(1.0)
+    # Half overlap: intersection 50, union 150.
+    half = {"x1": 5.0, "y1": 0.0, "x2": 15.0, "y2": 10.0}
+    assert m.iou(box, half) == pytest.approx(50 / 150)
+    apart = {"x1": 20.0, "y1": 20.0, "x2": 30.0, "y2": 30.0}
+    assert m.iou(box, apart) == 0.0
+    # Touching edges are not overlapping.
+    touching = {"x1": 10.0, "y1": 0.0, "x2": 20.0, "y2": 10.0}
+    assert m.iou(box, touching) == 0.0
+
+
+def test_parity_does_not_call_two_faces_a_match_just_because_the_counts_agree():
+    """The trap this function exists to avoid: one face each, in different
+    places, is not agreement, and a count comparison would call it that."""
+    m = _parity()
+
+    def face(x):
+        return {"boundingBox": {"x1": x, "y1": 0.0, "x2": x + 10, "y2": 10.0}}
+
+    same = m.compare_faces([face(0)], [face(0)])
+    assert same["matched"] == 1 and same["mean_iou"] == pytest.approx(1.0)
+
+    elsewhere = m.compare_faces([face(0)], [face(100)])
+    assert elsewhere["ref_count"] == elsewhere["count"] == 1
+    assert elsewhere["matched"] == 0, "boxes that do not overlap are not a match"
+    assert elsewhere["mean_iou"] == 0.0
+
+    # One reference face must not be matched twice by two of ours.
+    two = m.compare_faces([face(0)], [face(0), face(1)])
+    assert two["matched"] == 1
+
+
+def test_parity_ocr_compares_the_words():
+    m = _parity()
+    same = m.compare_ocr({"text": ["Exit", "42B"]}, {"text": ["exit ", "42b"]})
+    assert same["shared"] == 2, "case and padding are not a real difference"
+    assert not same["only_ref"] and not same["only_other"]
+
+    missed = m.compare_ocr({"text": ["Exit", "42B"]}, {"text": ["Exit"]})
+    assert missed["shared"] == 1 and missed["only_ref"] == ["42b"]
+
+
+def test_face_detection_does_not_go_back_to_detecting_with_the_landmarks_pass():
+    """native-ml has no test target, so this is the only thing standing
+    between a refactor and silently losing half the faces again.
+
+    Structural, because the real check needs Vision, real images and an
+    Apple Silicon machine: that is scripts/native-ml-preflight.py and
+    scripts/ml-parity.py, neither of which runs in CI. What this pins is the
+    shape the measurement depended on. Using VNDetectFaceLandmarksRequest to
+    do the detecting found 20 of 48 reference faces and reported confidence
+    1.000 for every one of them; detecting with VNDetectFaceRectanglesRequest
+    and landmarking those observations found 25 of 48 with real scores.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).parent.parent
+           / "native-ml/Sources/immich-ml-native/FaceDetect.swift").read_text()
+    # Comments stripped first. The comment above this code explains what the
+    # landmarks request used to do, so a naive search finds that class name
+    # before the rectangles one and the ordering check fails on prose.
+    code = "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("//")
+    )
+    body = code[code.index("func detectFacesWithLandmarks"):]
+
+    assert "VNDetectFaceRectanglesRequest" in body, (
+        "detection must run as a rectangles request; the landmarks request "
+        "finds fewer faces and reports confidence 1.000 for all of them"
+    )
+    assert "inputFaceObservations" in body, (
+        "the landmarks pass must run on the detected observations, or the "
+        "aligner loses the five points it needs"
+    )
+    # Order matters: rectangles first, then landmarks seeded from it.
+    assert (body.index("VNDetectFaceRectanglesRequest")
+            < body.index("VNDetectFaceLandmarksRequest")), (
+        "the rectangles request must run first and feed the landmarks pass"
+    )
