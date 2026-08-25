@@ -1952,22 +1952,88 @@ class TestEnsureMediaReady:
             os.chmod(media, 0o755)
 
 
+class TestWhereOurOwnInstallLives:
+    """One rule for which Homebrew prefix holds this install.
+
+    /usr/local is a real configuration here: an x86 brew under Rosetta, and
+    Macs migrated from Intel end up carrying both prefixes. Everything that
+    locates our own files derives from the same answer, so one half of a
+    feature cannot end up reading the other half's tree.
+    """
+
+    def test_the_prefix_holding_the_accelerator_beats_the_first_brew(
+        self, tmp_path, fake_mac
+    ):
+        """The defect this replaces: picking the first brew that *exists* asked
+        the Apple Silicon brew about a formula only the x86 brew had installed.
+        It answers "No available formula", which reads as "nothing is wrong"."""
+        import immich_accelerator.__main__ as m
+
+        with fake_mac(tmp_path, brew_in=("arm", "x86"), accelerator_in="x86") as (
+            arm,
+            x86,
+        ):
+            assert m._brew_prefix() == x86
+            assert m._brew_path() == f"{x86}/bin/brew"
+            assert not str(m._opt_dir()).startswith(arm)
+
+    def test_falls_back_to_the_prefix_that_has_a_brew_at_all(self, tmp_path, fake_mac):
+        import immich_accelerator.__main__ as m
+
+        with fake_mac(tmp_path, brew_in=("x86",)) as (_arm, x86):
+            assert m._brew_prefix() == x86
+
+    def test_every_lookup_for_our_own_files_agrees_on_one_prefix(
+        self, tmp_path, fake_mac
+    ):
+        """The invariant, stated as a test: one answer, not three resolvers
+        with two rules between them."""
+        import immich_accelerator.__main__ as m
+
+        with fake_mac(tmp_path, brew_in=("arm", "x86"), accelerator_in="x86") as (
+            arm,
+            x86,
+        ):
+            opt = m._opt_dir()
+            assert str(opt).startswith(x86)
+
+            (opt / "libexec").mkdir(parents=True)
+            (opt / "libexec/VERSION").write_text("9.9.9\n")
+            assert m._installed_version() == "9.9.9"
+
+            native = opt / "libexec/native-ml"
+            native.mkdir()
+            (native / "immich-ml-native").write_text("")
+            assert m._native_bundle_dir({}) == native
+
+            ml = opt / "libexec/ml"
+            (ml / "src").mkdir(parents=True)
+            (ml / "src/main.py").write_text("")
+            (ml / "venv/bin").mkdir(parents=True)
+            (ml / "venv/bin/python3").write_text("")
+            assert m._find_ml_dir() == ml
+
+            # Nothing resolved into the other prefix.
+            for found in (opt, native, ml):
+                assert arm not in str(found)
+
+
 class TestInstalledVersion:
     """Detect a `brew upgrade` while watch runs old code, so it can relaunch
     into the new code and reload the worker (otherwise a detached worker keeps
     running stale code after an upgrade)."""
 
     def test_reads_opt_symlink_version(self, tmp_path):
-        vf = tmp_path / "VERSION"
-        vf.write_text("9.9.9\n")
-        with patch("immich_accelerator.__main__._OPT_VERSION_FILES", [vf]):
+        (tmp_path / "libexec").mkdir()
+        (tmp_path / "libexec/VERSION").write_text("9.9.9\n")
+        with patch("immich_accelerator.__main__._opt_dir", return_value=tmp_path):
             assert _installed_version() == "9.9.9"
 
     def test_falls_back_to_running_version_when_absent(self, tmp_path):
         from immich_accelerator.__main__ import __version__ as running
 
         with patch(
-            "immich_accelerator.__main__._OPT_VERSION_FILES", [tmp_path / "nope"]
+            "immich_accelerator.__main__._opt_dir", return_value=tmp_path / "nope"
         ):
             assert _installed_version() == running
 
@@ -2145,7 +2211,8 @@ class TestStopAllFast:
             "immich_accelerator.__main__.read_pid",
             side_effect=lambda n: {"ml": 222}.get(n),
         ), patch("os.getsid", return_value=900), patch(
-            "os.getpgid", return_value=222  # a shell job: group leader is not the session leader
+            "os.getpgid",
+            return_value=222,  # a shell job: group leader is not the session leader
         ), patch(
             "os.killpg", side_effect=lambda pgid, sig: by_group.append(pgid)
         ), patch(
@@ -3643,9 +3710,9 @@ class TestSwitchingMlOffSaysImmichStillPointsHere:
 
         with caplog.at_level("WARNING"):
             m._set_component("ml", False)
-        assert "immich-machine-learning" not in caplog.text, (
-            "told a working split setup to point at a container it does not use"
-        )
+        assert (
+            "immich-machine-learning" not in caplog.text
+        ), "told a working split setup to point at a container it does not use"
 
     def test_turning_ml_on_does_not_warn(self, tmp_data_dir, monkeypatch, caplog):
         """The warning is about a URL pointing at nothing. Turning it on makes

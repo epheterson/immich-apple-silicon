@@ -14,6 +14,7 @@ import datetime
 import contextlib
 import ctypes
 import fcntl
+import functools
 import json
 import logging
 import os
@@ -60,27 +61,54 @@ WORKER_VERSION_FILE = PID_DIR / "worker.version"
 # swaps the Cellar. Reading VERSION through Homebrew's version-independent opt
 # symlink lets it notice it's now stale and relaunch into the new code. Absent
 # on non-Homebrew (git) installs, where __version__ is authoritative.
-#
-# Both prefixes, for the same reason _brew_path checks both: /usr/local is an
-# x86 brew under Rosetta, a real configuration here. Hardcoding the Apple
-# Silicon prefix left `watch` on those installs reading its own __version__
-# forever, so it never saw an upgrade and never relaunched into the new code,
-# which is the exact failure this lookup exists to prevent.
-_OPT_VERSION_FILES = [
-    Path(prefix) / "opt/immich-accelerator/libexec/VERSION"
-    for prefix in ("/opt/homebrew", "/usr/local")
-]
+
+# The two prefixes Homebrew installs under: /opt/homebrew on Apple Silicon and
+# /usr/local on x86, which is a real configuration here (an x86 brew under
+# Rosetta, and Macs migrated from Intel that end up carrying both).
+_BREW_PREFIXES = ("/opt/homebrew", "/usr/local")
+
+
+@functools.cache
+def _brew_prefix() -> str:
+    """The prefix this install belongs to.
+
+    "Which prefix exists" is a different question with a different answer, and
+    on a Mac carrying both it names the one Homebrew would prefer rather than
+    the one we were installed into. Everything that locates our own files has
+    to agree on this or the halves of a feature end up reading different
+    trees, so decide it once, and decide it by where this very file is, which
+    is the one answer that cannot be wrong.
+
+    Cached so that all callers get the same answer even if an upgrade moves
+    things underneath a running process.
+    """
+    here = str(Path(__file__).resolve())
+    for prefix in _BREW_PREFIXES:
+        if here.startswith(f"{prefix}/"):
+            return prefix
+    # Not running from under a prefix at all: a git checkout, or a venv. Fall
+    # back to wherever an accelerator is installed, then to wherever brew is.
+    for prefix in _BREW_PREFIXES:
+        if (Path(prefix) / "opt/immich-accelerator/bin/immich-accelerator").exists():
+            return prefix
+    for prefix in _BREW_PREFIXES:
+        if (Path(prefix) / "bin/brew").is_file():
+            return prefix
+    return _BREW_PREFIXES[0]
+
+
+def _opt_dir() -> Path:
+    """Our Homebrew opt dir. Version-independent, so it survives an upgrade."""
+    return Path(_brew_prefix()) / "opt/immich-accelerator"
 
 
 def _installed_version() -> str:
     """The version currently installed on disk (via the stable opt symlink),
     which can differ from __version__ when watch is running post-upgrade."""
-    for path in _OPT_VERSION_FILES:
-        try:
-            return path.read_text().strip()
-        except OSError:
-            continue
-    return __version__
+    try:
+        return (_opt_dir() / "libexec/VERSION").read_text().strip()
+    except OSError:
+        return __version__
 
 
 # Service logs are opened in append mode and the worker can spew stack traces
@@ -4544,7 +4572,7 @@ def _native_bundle_dir(config: dict) -> Path | None:
     candidates = []
     if config.get("native_ml_dir"):
         candidates.append(Path(config["native_ml_dir"]))
-    candidates.append(Path("/opt/homebrew/opt/immich-accelerator/libexec/native-ml"))
+    candidates.append(_opt_dir() / "libexec/native-ml")
     candidates.append(Path.home() / ".immich-accelerator" / "native-ml")
     return next((b for b in candidates if (b / "immich-ml-native").exists()), None)
 
@@ -5137,7 +5165,7 @@ def _find_ml_dir() -> Path | None:
 
     Candidate priority:
     1. Homebrew's stable opt symlink — survives ``brew upgrade`` because
-       Homebrew maintains ``/opt/homebrew/opt/immich-accelerator`` as a
+       Homebrew maintains ``<prefix>/opt/immich-accelerator`` as a
        symlink to the current Cellar version. The versioned Cellar path
        itself (e.g., ``.../Cellar/immich-accelerator/1.4.4/libexec/ml``)
        is ephemeral: ``brew upgrade`` deletes it, and ``config.json``
@@ -5148,7 +5176,7 @@ def _find_ml_dir() -> Path | None:
     3. Home-directory fallback for legacy standalone ml clones.
     """
     candidates = [
-        Path("/opt/homebrew/opt/immich-accelerator/libexec/ml"),
+        _opt_dir() / "libexec/ml",
         Path(__file__).parent.parent / "ml",
         Path.home() / "immich-ml-metal",
     ]
@@ -5977,16 +6005,17 @@ _TAP = "epheterson/immich-accelerator"
 
 
 def _brew_path() -> str | None:
-    """Where brew is, both places it can be.
+    """The brew that manages *this* install.
 
-    /opt/homebrew is Apple Silicon's prefix and /usr/local is the x86 one,
-    which is a real configuration here: an x86 brew under Rosetta. Checking
-    only the first is how a warning ends up unable to fire for the users who
-    need it, which is indistinguishable from not having written it.
+    Not the first brew that exists: on a Mac carrying both prefixes that is
+    the wrong one half the time, and asking the Apple Silicon brew about a
+    formula the x86 brew installed gets "No available formula" rather than
+    the refusal we are looking for. A warning that cannot fire for the users
+    who need it is indistinguishable from not having written it.
     """
-    for candidate in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
-        if os.path.isfile(candidate):
-            return candidate
+    candidate = Path(_brew_prefix()) / "bin/brew"
+    if candidate.is_file():
+        return str(candidate)
     return shutil.which("brew")
 
 

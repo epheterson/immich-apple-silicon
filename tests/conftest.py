@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -9,6 +10,44 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+
+@pytest.fixture
+def fake_mac():
+    """Build a Mac carrying both Homebrew prefixes, Apple Silicon listed first.
+
+    Shared rather than copied because the thing under test is that *one* rule
+    decides which prefix holds this install. Two copies of the setup is how
+    the halves drift apart again.
+
+    *brew_in* names the prefixes that have a brew binary, *accelerator_in* the
+    one (if any) our formula is installed into. Yields the two prefix paths.
+    """
+
+    @contextlib.contextmanager
+    def _build(tmp_path, *, brew_in=(), accelerator_in=None):
+        import immich_accelerator.__main__ as m
+
+        for name in ("arm", "x86"):
+            (tmp_path / name / "bin").mkdir(parents=True, exist_ok=True)
+        for name in brew_in:
+            brew = tmp_path / name / "bin" / "brew"
+            brew.write_text("#!/bin/sh\n")
+            brew.chmod(0o755)
+        if accelerator_in:
+            d = tmp_path / accelerator_in / "opt/immich-accelerator/bin"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "immich-accelerator").write_text("#!/bin/sh\n")
+
+        prefixes = (str(tmp_path / "arm"), str(tmp_path / "x86"))
+        m._brew_prefix.cache_clear()
+        with patch.object(m, "_BREW_PREFIXES", prefixes):
+            try:
+                yield prefixes
+            finally:
+                m._brew_prefix.cache_clear()
+
+    return _build
 
 
 @pytest.fixture(autouse=True)

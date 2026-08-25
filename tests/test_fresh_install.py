@@ -3267,19 +3267,23 @@ class TestUntrustedTapIsReported:
         monkeypatch.setattr(m, "_brew_path", lambda: None)
         assert m.brew_refuses_our_tap() is False
 
-    def test_brew_is_looked_for_in_both_prefixes(self, tmp_path, monkeypatch):
-        """/opt/homebrew is the Apple Silicon prefix and /usr/local the x86
-        one. An x86 brew under Rosetta is a real configuration, and checking
-        only the first made this warning unable to fire there at all."""
-        seen = []
+    def test_the_brew_asked_is_the_one_that_installed_us(self, tmp_path, fake_mac):
+        """An x86 brew under Rosetta is a real configuration, and a Mac
+        migrated from Intel carries both prefixes at once.
 
-        def fake_isfile(path):
-            seen.append(path)
-            return path == "/usr/local/bin/brew"
-
-        monkeypatch.setattr(m.os.path, "isfile", fake_isfile)
-        assert m._brew_path() == "/usr/local/bin/brew"
-        assert "/opt/homebrew/bin/brew" in seen and "/usr/local/bin/brew" in seen
+        Taking the first brew that merely *exists* is not enough, and was the
+        original defect: on a dual-prefix Mac it asks the Apple Silicon brew
+        about a formula only the x86 brew ever installed. That answers "No
+        available formula" rather than the refusal, so no line matches, the
+        warning never fires, and the user it was written for sits on an old
+        version with nothing on screen to explain why.
+        """
+        with fake_mac(tmp_path, brew_in=("arm", "x86"), accelerator_in="x86") as (
+            arm,
+            x86,
+        ):
+            assert m._brew_path() == f"{x86}/bin/brew"
+            assert m._brew_path() != f"{arm}/bin/brew"
 
     def test_the_check_does_not_let_brew_auto_update(self, tmp_path, monkeypatch):
         """`brew outdated` git-fetches every tap once a day, measured at 68
