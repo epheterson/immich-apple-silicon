@@ -60,16 +60,27 @@ WORKER_VERSION_FILE = PID_DIR / "worker.version"
 # swaps the Cellar. Reading VERSION through Homebrew's version-independent opt
 # symlink lets it notice it's now stale and relaunch into the new code. Absent
 # on non-Homebrew (git) installs, where __version__ is authoritative.
-_OPT_VERSION_FILE = Path("/opt/homebrew/opt/immich-accelerator/libexec/VERSION")
+#
+# Both prefixes, for the same reason _brew_path checks both: /usr/local is an
+# x86 brew under Rosetta, a real configuration here. Hardcoding the Apple
+# Silicon prefix left `watch` on those installs reading its own __version__
+# forever, so it never saw an upgrade and never relaunched into the new code,
+# which is the exact failure this lookup exists to prevent.
+_OPT_VERSION_FILES = [
+    Path(prefix) / "opt/immich-accelerator/libexec/VERSION"
+    for prefix in ("/opt/homebrew", "/usr/local")
+]
 
 
 def _installed_version() -> str:
     """The version currently installed on disk (via the stable opt symlink),
     which can differ from __version__ when watch is running post-upgrade."""
-    try:
-        return _OPT_VERSION_FILE.read_text().strip()
-    except OSError:
-        return __version__
+    for path in _OPT_VERSION_FILES:
+        try:
+            return path.read_text().strip()
+        except OSError:
+            continue
+    return __version__
 
 
 # Service logs are opened in append mode and the worker can spew stack traces
@@ -1839,125 +1850,49 @@ def _adopt_live_worker() -> int | None:
 
 
 def _same_start_time(current: str, stored: str) -> bool:
-    """Do these two `ps` start times describe the same instant?
+    """Do these two `ps` start times describe the same process?
 
-    Exact string equality, except that a pidfile written before ps was pinned
-    to LC_ALL=C holds a locale-formatted time. The fields are the same, the
-    order and the words differ:
+    `current` is always the C form now that ps is pinned to LC_ALL=C:
 
-        C       Sat Aug 22 23:07:37 2026
-        en_AU   Sat 22 Aug 23:07:37 2026
-        de_DE   Sa 22 Aug 23:07:37 2026
-        fr_FR   sam. 22 aout 23:07:37 2026
+        Tue Aug 25 09:12:50 2026
 
-    Comparing those as strings makes the upgrade that fixes the locale bug fire
-    it once, for exactly the users it helps, and ml and dashboard have no
-    _adopt_live_worker to recover with.
+    `stored` is that too, unless the pidfile predates the pin, in which case it
+    holds whatever the writer's locale produced. Across the 83 UTF-8 locales on
+    this machine that includes day-first ordering, non-English month names, a
+    month written as "8/25", dot-separated clocks, trailing dots on the day and
+    year, and at least one locale with no month word at all.
 
-    Not strptime: %a and %b resolve against the process's LC_TIME and nothing
-    here calls setlocale, so it only ever parses English and the first version
-    of this fixed en_AU while leaving de_DE, fr_FR and ja_JP broken. Compared
-    by tokens instead: the clock, the day and the year are numeric and
-    language-independent, and the month is whatever alphabetic token both
-    sides carry, which matches as long as the same locale wrote both. A
-    weekday token is redundant given a full date, so it is dropped.
+    So this does not try to parse them. Every attempt to did the same thing:
+    fixed the locales it was tested against and broke others, most sharply by
+    reading Finnish "Mar" (marraskuu, November) as March and by rejecting
+    locales whose format lacked a field it expected. Both directions land on
+    the same failure, which is that read_pid deletes the pidfile of a healthy
+    service and ml and dashboard have no adopt-live path to recover with.
 
-    Fails closed: anything that does not yield the same numeric triple is a
-    mismatch, which is the safe answer, since a wrongly kept pidfile names a
-    process that is not ours.
+    Instead it asks one question it can answer exactly: is `stored` in our own
+    format? We know that format, because we write it.
+
+      - Equal strings: the same process.
+      - `stored` parses as the C form and differs: genuinely a different
+        process, so the pidfile is stale. This is every pidfile written from
+        1.16 onward.
+      - `stored` is not the C form: written before the pin, by a locale we
+        cannot read. Accept it and move on, and restamp the file in the C
+        form so the next read is a strict one.
+
+    The last case is the only give: a PID reused between that old write and
+    this read is adopted. It is the behaviour every release before 1.16 had for
+    these users anyway, the restamp in read_pid closes it after a single
+    read, and it is a far smaller risk than stopping a healthy service on
+    upgrade.
     """
     if current == stored:
         return True
-
-    def parts(value: str):
-        tokens = value.split()
-        # An AM/PM token means a 12-hour clock, and "09:12:50" then matches a
-        # time twelve hours away. Refuse rather than guess: this direction has
-        # to fail closed, because a false match keeps a pidfile naming another
-        # process and the accelerator will later signal it.
-        if any(t.upper() in ("AM", "PM") for t in tokens):
-            return None
-        clock = next((t for t in tokens if t.count(":") == 2), None)
-        if clock is None:
-            return None
-        numbers = [t for t in tokens if t.isdigit()]
-        year = next((n for n in numbers if len(n) == 4), None)
-        # Day and month, however this locale writes them. Real ps output:
-        #   en_AU  Tue 25 Aug 09:12:50 2026
-        #   de_DE  Di 25 Aug 09:12:50 2026
-        #   fr_FR  Mar 25 aou 09:12:50 2026
-        #   es_ES  mar 25 ago 09:12:50 2026
-        #   ja_JP  Hi  8/25 09:12:50 2026      <- month/day in one token
-        day = next(
-            (n for n in numbers if len(n) <= 2 and 1 <= int(n) <= 31), None
-        )
-        month = None
-        slashed = next(
-            (t for t in tokens
-             if t.count("/") == 1 and all(x.isdigit() for x in t.split("/"))),
-            None,
-        )
-        if slashed:
-            month, day = slashed.split("/")
-        else:
-            # The month is the alphabetic token that is not the weekday. The
-            # weekday comes first in every form ps produces, so drop it and
-            # take the next one. Compared as an opaque string: it only has to
-            # match the other side, not be understood.
-            words = [t for t in tokens if not t.isdigit() and ":" not in t]
-            month = words[1].strip(".").lower() if len(words) > 1 else None
-        if day is None or year is None or month is None:
-            return None
-        return (clock, int(day), int(year), str(month).lower())
-
-    a, b = parts(current), parts(stored)
-    if a is None or b is None:
-        return False
-    if a[:3] != b[:3]:
-        return False  # clock, day or year differ: a different process
-
-    # The month is the one field that cannot always be compared. `current` is
-    # always the C form since ps was pinned, while `stored` carries whatever
-    # locale wrote it, so "aug" and "aou" are the same month in different
-    # languages and there is no table here that says so. Compare it only when
-    # both sides are the same kind of token: both numeric, or both alphabetic.
-    # Otherwise the clock, day and year have already matched to the second, and
-    # insisting on the month would fail closed for exactly the non-English
-    # users this function exists to protect.
-    #
-    # The residual risk is a PID reused at the same second of the same day of
-    # the same year in a different month, and only on the single read that
-    # follows the upgrade, because write_pid then stores the C form. That is
-    # narrow enough to accept; requiring the month is not, because it breaks
-    # every locale that is not English.
-    # The month, as far as it can be compared. `current` is always the C form
-    # since ps was pinned, so its month is an English abbreviation and can be
-    # turned into a number. The stored side is whatever locale wrote it:
-    #
-    #   numeric ("8/25", ja_JP)      -> compare the numbers
-    #   English ("Aug", en_AU/C)     -> compare the numbers
-    #   another language ("aou")     -> not comparable, and there is no table
-    #                                   here that says aou is August
-    #
-    # For that last case the clock, day and year have already matched to the
-    # second, and insisting on the month would fail closed for exactly the
-    # non-English users this exists to protect. The residual risk is a PID
-    # reused at the same second of the same day of the same year in a different
-    # month, on the one read that follows the upgrade, since write_pid then
-    # stores the C form.
-    months = ("jan", "feb", "mar", "apr", "may", "jun",
-              "jul", "aug", "sep", "oct", "nov", "dec")
-
-    def as_number(token: str):
-        if token.isdigit():
-            return int(token)
-        head = token[:3].lower()
-        return months.index(head) + 1 if head in months else None
-
-    num_a, num_b = as_number(a[3]), as_number(b[3])
-    if num_a is not None and num_b is not None:
-        return num_a == num_b
-    return True
+    try:
+        datetime.datetime.strptime(" ".join(stored.split()), "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return True  # not our format: pre-pin, unreadable, accept once
+    return False  # our format and different: a different process
 
 
 def read_pid(name: str) -> int | None:
@@ -1979,6 +1914,15 @@ def read_pid(name: str) -> int | None:
                 if name == "worker":
                     return _adopt_live_worker()
                 return None
+            if current_start and current_start != lines[1]:
+                # Accepted on the strength of being unreadable rather than of
+                # matching: a pidfile written before ps was pinned to LC_ALL=C.
+                # Restamp it in the form we can actually compare, so the next
+                # read is a strict one. Without this the file keeps its old
+                # string until the service restarts, and every read in between
+                # is another one that cannot detect PID reuse.
+                with contextlib.suppress(OSError):
+                    pid_file.write_text(f"{pid}\n{current_start}")
         return pid
     except (ValueError, OSError):
         pid_file.unlink(missing_ok=True)

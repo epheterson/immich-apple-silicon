@@ -330,11 +330,14 @@ class TestPidManagement:
     def test_read_pid_detects_pid_reuse(self, tmp_data_dir):
         current_pid = os.getpid()
         pid_file = tmp_data_dir["pid_dir"] / "worker.pid"
-        pid_file.write_text(f"{current_pid}\nOLD START TIME")
+        # Real `ps -o lstart=` output, not a sentinel. "OLD START TIME" is a
+        # string no ps emits and no comparison can read, so this test passed
+        # under any rule, including one that never rejected anything at all.
+        pid_file.write_text(f"{current_pid}\nSat Aug 22 23:07:37 2026")
 
         with patch(
             "immich_accelerator.__main__._get_process_start_time",
-            return_value="DIFFERENT START TIME",
+            return_value="Sat Aug 22 23:09:14 2026",
         ):
             result = read_pid("worker")
             assert result is None
@@ -1957,13 +1960,15 @@ class TestInstalledVersion:
     def test_reads_opt_symlink_version(self, tmp_path):
         vf = tmp_path / "VERSION"
         vf.write_text("9.9.9\n")
-        with patch("immich_accelerator.__main__._OPT_VERSION_FILE", vf):
+        with patch("immich_accelerator.__main__._OPT_VERSION_FILES", [vf]):
             assert _installed_version() == "9.9.9"
 
     def test_falls_back_to_running_version_when_absent(self, tmp_path):
         from immich_accelerator.__main__ import __version__ as running
 
-        with patch("immich_accelerator.__main__._OPT_VERSION_FILE", tmp_path / "nope"):
+        with patch(
+            "immich_accelerator.__main__._OPT_VERSION_FILES", [tmp_path / "nope"]
+        ):
             assert _installed_version() == running
 
 
@@ -3731,32 +3736,74 @@ class TestUpgradingDoesNotFireTheLocaleBugItFixes:
 
     def test_a_genuinely_different_start_is_still_a_mismatch(self):
         """The whole point of the field is catching PID reuse. Every one of
-        these differs from the reference in exactly one component."""
+        these is in our own format and differs in exactly one component, which
+        is every pidfile written from 1.16 onward."""
         import immich_accelerator.__main__ as m
 
         for other in (
             "Tue Aug 25 09:12:51 2026",   # one second later
             "Tue Aug 26 09:12:50 2026",   # next day
             "Tue Aug 25 09:12:50 2025",   # last year
-            "Di 26 Aug 09:12:50 2026",    # another locale, different day
-            # The month, which the first version never compared at all: it
+            # The month, which an earlier version never compared at all: it
             # returned the clock, day and year only, so a process a month old
             # read as the same one and would have been signalled.
             "Tue Jun 25 09:12:50 2026",
-            "Di 25 Jun 09:12:50 2026",
-            "\u706b  6/25 09:12:50 2026",   # ja_JP writes the month numerically
-            # A 12-hour clock matches a time twelve hours away on the numbers
-            # alone, so an AM/PM token is refused rather than guessed at.
-            "Tue Aug 25 09:12:50 PM 2026",
         ):
             assert not m._same_start_time(self.C_FORM, other), other
 
-    def test_something_unparseable_is_treated_as_different(self):
-        """Fail closed: a wrongly kept pidfile names a process that is not
-        ours, which is worse than re-adopting."""
+    def test_the_cost_a_pre_pin_pidfile_whose_pid_was_reused(self):
+        """What the design gives up, written down rather than left implicit.
+
+        These are pre-pin forms that are also genuinely different processes.
+        They cannot be told from a pre-pin form of the *same* process without
+        reading the locale that wrote them, and every attempt to do that
+        misread some other locale in the far more damaging direction: Finnish
+        "Mar" is marraskuu, November, which a month table reads as March, and
+        se_NO's ps prints no month word for a table to look up at all. Those
+        mistakes stop a healthy service for every user of the locale, on
+        upgrade, every time.
+
+        This one needs a pidfile written before 1.16, that pid reused by a
+        live process, and the read to land in the single window before
+        read_pid restamps the file. It is also exactly what 1.15.0 and every
+        release before it did for these users.
+        """
         import immich_accelerator.__main__ as m
 
-        assert not m._same_start_time("Sat Aug 22 23:07:37 2026", "garbage")
+        for other in (
+            "Di 26 Aug 09:12:50 2026",      # de_DE, next day
+            "Di 25 Jun 09:12:50 2026",      # de_DE, three months back
+            "\u706b  6/25 09:12:50 2026",    # ja_JP writes the month numerically
+        ):
+            assert m._same_start_time(self.C_FORM, other), other
+
+    def test_a_form_we_cannot_read_is_accepted_exactly_once(self, tmp_data_dir):
+        """Anything not in our own format was written before ps was pinned, by
+        a locale we cannot parse. Rejecting it stops a healthy service, so it
+        is accepted, and read_pid restamps the file so the next read is strict.
+        Without the restamp the pidfile keeps its unreadable string until the
+        service next restarts, and every read in between is fail-open.
+        """
+        import immich_accelerator.__main__ as m
+
+        assert m._same_start_time("Sat Aug 22 23:07:37 2026", "garbage")
+
+        pid_file = tmp_data_dir["pid_dir"] / "ml.pid"
+        pid_file.write_text(f"{os.getpid()}\nSat 22 Aug 23:07:37 2026")
+        with patch(
+            "immich_accelerator.__main__._get_process_start_time",
+            return_value="Sat Aug 22 23:07:37 2026",
+        ):
+            assert m.read_pid("ml") == os.getpid()
+        assert pid_file.read_text().endswith("Sat Aug 22 23:07:37 2026")
+
+        # Same file, same pid, now a genuinely different process. The
+        # restamped form is comparable, so this one is caught.
+        with patch(
+            "immich_accelerator.__main__._get_process_start_time",
+            return_value="Sat Aug 22 23:09:14 2026",
+        ):
+            assert m.read_pid("ml") is None
 
     def test_a_pidfile_from_the_previous_version_survives(
         self, tmp_data_dir, monkeypatch
