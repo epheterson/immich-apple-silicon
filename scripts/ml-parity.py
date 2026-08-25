@@ -143,11 +143,25 @@ def iou(a: dict, b: dict) -> float:
     return inter / union if union else 0.0
 
 
+# The overlap two boxes need before they are called the same face. 0.5 is what
+# COCO and WIDER FACE use, and every detection number this script reports is a
+# public claim, so it uses the convention a reader would assume rather than one
+# of our own.
+#
+# It used to accept any overlap above zero. A box on someone's shoulder that
+# clipped the edge of Immich's box on a face counted as a face we found, which
+# inflated the recall figure, and the accompanying "worst overlap 0.393" was
+# itself the evidence: pairs well below any accepted threshold were in the
+# population being averaged.
+MATCH_IOU = 0.5
+
+
 def compare_faces(ref: list, other: list) -> dict:
     """Match boxes greedily by overlap and report how well they line up.
 
     Counts alone are not enough: two engines can each find one face in
-    different places, and a count comparison calls that agreement.
+    different places, and a count comparison calls that agreement. Overlap
+    alone is not enough either, which is what MATCH_IOU is for.
     """
     ref_boxes = [f["boundingBox"] for f in ref]
     other_boxes = [f["boundingBox"] for f in other]
@@ -163,7 +177,8 @@ def compare_faces(ref: list, other: list) -> dict:
     )
     used_ref, used_other, overlaps = set(), set(), []
     for score, i, j in pairs:
-        if score <= 0:
+        # Sorted best-first, so the first pair below the bar ends the walk.
+        if score < MATCH_IOU:
             break
         if i in used_ref or j in used_other:
             continue

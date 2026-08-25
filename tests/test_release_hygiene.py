@@ -556,6 +556,43 @@ def test_parity_does_not_call_two_faces_a_match_just_because_the_counts_agree():
     assert two["matched"] == 1
 
 
+def test_parity_needs_real_overlap_before_calling_two_boxes_the_same_face():
+    """Every detection number this script produces is a public claim.
+
+    The greedy walk used to stop only at zero overlap, so a box on someone's
+    shoulder that clipped the edge of Immich's box on a face was recorded as a
+    face we found, and entered the mean overlap too. That inflates the recall
+    figure in the release notes and in docs/known-differences.md. The reported
+    "worst overlap 0.393" was itself the evidence that sub-threshold pairs
+    were in the population.
+
+    0.5 is the bar COCO and WIDER FACE use, so it is what a reader assumes.
+    """
+    m = _parity()
+
+    def face(x, w=10):
+        return {"boundingBox": {"x1": x, "y1": 0.0, "x2": x + w, "y2": 10.0}}
+
+    assert m.MATCH_IOU == 0.5
+
+    # Boxes 9 units apart on a 10-unit box: they touch, IoU is about 0.05.
+    sliver = m.compare_faces([face(0)], [face(9)])
+    assert m.iou(face(0)["boundingBox"], face(9)["boundingBox"]) > 0
+    assert sliver["matched"] == 0, (
+        "a box that merely clips the reference is being counted as the same "
+        "face, which is what inflated the published recall number"
+    )
+    assert sliver["mean_iou"] == 0.0
+
+    # A genuine match is still a match, and still weighted by its real overlap.
+    good = m.compare_faces([face(0)], [face(1)])
+    assert good["matched"] == 1
+    assert good["mean_iou"] == pytest.approx(90 / 110)
+
+    # Nothing below the bar can reach the reported minimum.
+    assert good["min_iou"] >= m.MATCH_IOU
+
+
 def test_parity_ocr_compares_the_words():
     m = _parity()
     same = m.compare_ocr({"text": ["Exit", "42B"]}, {"text": ["exit ", "42b"]})
