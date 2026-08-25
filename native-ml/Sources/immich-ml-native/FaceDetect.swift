@@ -33,6 +33,10 @@ struct DetectedFace {
     let landmarks: [[Double]]?   // [left_eye, right_eye, nose, left_mouth, right_mouth] pixels
 }
 
+/// Set once the landmark-pairing warning has been written, so a long run does
+/// not put a line in ml.log for every image.
+private nonisolated(unsafe) var warnedAboutLandmarkPairing = false
+
 func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [DetectedFace] {
     // Detect and landmark in two stages, because the landmarks request is a
     // worse detector than the rectangles request and reports a useless score.
@@ -94,9 +98,28 @@ func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [
     // forbids index pairing on a short array, and the first version of this
     // fallback did it anyway: `obs` supplies the reported bounding box, so a
     // short `landmarked` put one face's confidence on another face's box.
-    let byIndex = matched == 0 && landmarked.count == detected.count
+    // Equal counts do not mean equal order. The order of the landmarks results
+    // relative to inputFaceObservations is exactly as undocumented as the uuid
+    // propagation this fallback exists to work around, so require the boxes to
+    // agree too: a permutation would otherwise put face i's confidence on face
+    // j's box, which is the harm the comment above says this prevents.
+    let byIndex = matched == 0
+        && landmarked.count == detected.count
+        && zip(detected, landmarked).allSatisfy { d, l in
+            let a = d.boundingBox, b = l.boundingBox
+            return abs(a.origin.x - b.origin.x) < 0.01
+                && abs(a.origin.y - b.origin.y) < 0.01
+                && abs(a.width - b.width) < 0.01
+                && abs(a.height - b.height) < 0.01
+        }
 
-    if matched < detected.count {
+    // Once per process. This fires whenever any single face missed landmarks,
+    // which a group shot with small background faces does routinely, and it
+    // runs per /predict in a long-lived service whose stderr is ml.log. A line
+    // per image would be an unbounded write in the hot path, and it would bury
+    // the "last 30 lines of ml.log" that the CLI prints to explain a failure.
+    if matched < detected.count && !warnedAboutLandmarkPairing {
+        warnedAboutLandmarkPairing = true
         // Every unmatched detection falls through to the rectangles
         // observation, which has no landmarks, so embedFaces takes the padded
         // crop instead of an ArcFace normCrop and those embeddings will not
@@ -107,11 +130,13 @@ func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [
         // perform fails, `try?` swallows it and results is nil, which is the
         // most likely wholesale failure and the previous condition excluded
         // exactly that case.
-        let how = byIndex ? "pairing by position" : "using unaligned crops"
+        let detail = byIndex
+            ? "pairing by position instead; boxes agree, so this should be safe"
+            : "the rest use unaligned crops, and those embeddings may not "
+              + "cluster with existing ones"
         FileHandle.standardError.write(Data(
             ("[native-ml] landmarks matched \(matched) of \(detected.count) "
-             + "detections; \(how). Face embeddings for the rest may not "
-             + "cluster with existing ones.\n").utf8))
+             + "detections; \(detail). Reported once per run.\n").utf8))
     }
 
     var faces: [DetectedFace] = []

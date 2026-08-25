@@ -140,7 +140,20 @@ struct ProcessProbe: Sendable {
 enum Paths {
     static let dataDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".immich-accelerator")
-    static let optDir = URL(fileURLWithPath: "/opt/homebrew/opt/immich-accelerator")
+    /// Both prefixes, like Actions.cli. Fixing that one alone left this: on an
+    /// x86 brew under Rosetta, isInstalled was false, so onboarding offered to
+    /// install an accelerator that was already installed and the version row
+    /// came back blank.
+    static let optDir: URL = {
+        for prefix in ["/opt/homebrew", "/usr/local"] {
+            let candidate = URL(fileURLWithPath: "\(prefix)/opt/immich-accelerator")
+            if FileManager.default.fileExists(
+                atPath: candidate.appendingPathComponent("bin/immich-accelerator").path) {
+                return candidate
+            }
+        }
+        return URL(fileURLWithPath: "/opt/homebrew/opt/immich-accelerator")
+    }()
     static let configFile = dataDir.appendingPathComponent("config.json")
 
     // Is the accelerator CLI installed (via Homebrew)?
@@ -494,6 +507,14 @@ final class StatusModel: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
         p.arguments = ["-p", "\(pid)", "-o", field]
+        // LC_ALL=C, because ps formats lstart through the caller's locale and
+        // this is compared byte for byte against a pidfile the CLI now writes
+        // under C. Without it, an app launched with a LANG set reads
+        // "Tue 25 Aug" against a stored "Tue Aug 25" and reports a running
+        // worker as stopped. Same defect as #169, in the sibling
+        // implementation.
+        p.environment = ProcessInfo.processInfo.environment
+            .merging(["LC_ALL": "C"]) { _, new in new }
         let out = Pipe()
         p.standardOutput = out
         try? p.run()

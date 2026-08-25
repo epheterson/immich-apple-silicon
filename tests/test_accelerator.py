@@ -3739,6 +3739,15 @@ class TestUpgradingDoesNotFireTheLocaleBugItFixes:
             "Tue Aug 26 09:12:50 2026",   # next day
             "Tue Aug 25 09:12:50 2025",   # last year
             "Di 26 Aug 09:12:50 2026",    # another locale, different day
+            # The month, which the first version never compared at all: it
+            # returned the clock, day and year only, so a process a month old
+            # read as the same one and would have been signalled.
+            "Tue Jun 25 09:12:50 2026",
+            "Di 25 Jun 09:12:50 2026",
+            "\u706b  6/25 09:12:50 2026",   # ja_JP writes the month numerically
+            # A 12-hour clock matches a time twelve hours away on the numbers
+            # alone, so an AM/PM token is refused rather than guessed at.
+            "Tue Aug 25 09:12:50 PM 2026",
         ):
             assert not m._same_start_time(self.C_FORM, other), other
 

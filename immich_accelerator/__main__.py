@@ -1871,35 +1871,93 @@ def _same_start_time(current: str, stored: str) -> bool:
 
     def parts(value: str):
         tokens = value.split()
+        # An AM/PM token means a 12-hour clock, and "09:12:50" then matches a
+        # time twelve hours away. Refuse rather than guess: this direction has
+        # to fail closed, because a false match keeps a pidfile naming another
+        # process and the accelerator will later signal it.
+        if any(t.upper() in ("AM", "PM") for t in tokens):
+            return None
         clock = next((t for t in tokens if t.count(":") == 2), None)
         if clock is None:
             return None
         numbers = [t for t in tokens if t.isdigit()]
         year = next((n for n in numbers if len(n) == 4), None)
-        # Day, however this locale writes it. Measured with real ps output:
-        #   en_AU  Tue 25 Aug 09:12:29 2026
-        #   de_DE  Di 25 Aug 09:12:29 2026
-        #   fr_FR  Mar 25 aou 09:12:29 2026
-        #   es_ES  mar 25 ago 09:12:29 2026
-        #   ja_JP  Hi  8/25 09:12:29 2026      <- month/day in one token
+        # Day and month, however this locale writes them. Real ps output:
+        #   en_AU  Tue 25 Aug 09:12:50 2026
+        #   de_DE  Di 25 Aug 09:12:50 2026
+        #   fr_FR  Mar 25 aou 09:12:50 2026
+        #   es_ES  mar 25 ago 09:12:50 2026
+        #   ja_JP  Hi  8/25 09:12:50 2026      <- month/day in one token
         day = next(
             (n for n in numbers if len(n) <= 2 and 1 <= int(n) <= 31), None
         )
-        if day is None:
-            slashed = next(
-                (t for t in tokens
-                 if t.count("/") == 1
-                 and all(part.isdigit() for part in t.split("/"))),
-                None,
-            )
-            if slashed:
-                day = slashed.split("/")[1]
-        if day is None or year is None:
+        month = None
+        slashed = next(
+            (t for t in tokens
+             if t.count("/") == 1 and all(x.isdigit() for x in t.split("/"))),
+            None,
+        )
+        if slashed:
+            month, day = slashed.split("/")
+        else:
+            # The month is the alphabetic token that is not the weekday. The
+            # weekday comes first in every form ps produces, so drop it and
+            # take the next one. Compared as an opaque string: it only has to
+            # match the other side, not be understood.
+            words = [t for t in tokens if not t.isdigit() and ":" not in t]
+            month = words[1].strip(".").lower() if len(words) > 1 else None
+        if day is None or year is None or month is None:
             return None
-        return (clock, int(day), int(year))
+        return (clock, int(day), int(year), str(month).lower())
 
     a, b = parts(current), parts(stored)
-    return a is not None and a == b
+    if a is None or b is None:
+        return False
+    if a[:3] != b[:3]:
+        return False  # clock, day or year differ: a different process
+
+    # The month is the one field that cannot always be compared. `current` is
+    # always the C form since ps was pinned, while `stored` carries whatever
+    # locale wrote it, so "aug" and "aou" are the same month in different
+    # languages and there is no table here that says so. Compare it only when
+    # both sides are the same kind of token: both numeric, or both alphabetic.
+    # Otherwise the clock, day and year have already matched to the second, and
+    # insisting on the month would fail closed for exactly the non-English
+    # users this function exists to protect.
+    #
+    # The residual risk is a PID reused at the same second of the same day of
+    # the same year in a different month, and only on the single read that
+    # follows the upgrade, because write_pid then stores the C form. That is
+    # narrow enough to accept; requiring the month is not, because it breaks
+    # every locale that is not English.
+    # The month, as far as it can be compared. `current` is always the C form
+    # since ps was pinned, so its month is an English abbreviation and can be
+    # turned into a number. The stored side is whatever locale wrote it:
+    #
+    #   numeric ("8/25", ja_JP)      -> compare the numbers
+    #   English ("Aug", en_AU/C)     -> compare the numbers
+    #   another language ("aou")     -> not comparable, and there is no table
+    #                                   here that says aou is August
+    #
+    # For that last case the clock, day and year have already matched to the
+    # second, and insisting on the month would fail closed for exactly the
+    # non-English users this exists to protect. The residual risk is a PID
+    # reused at the same second of the same day of the same year in a different
+    # month, on the one read that follows the upgrade, since write_pid then
+    # stores the C form.
+    months = ("jan", "feb", "mar", "apr", "may", "jun",
+              "jul", "aug", "sep", "oct", "nov", "dec")
+
+    def as_number(token: str):
+        if token.isdigit():
+            return int(token)
+        head = token[:3].lower()
+        return months.index(head) + 1 if head in months else None
+
+    num_a, num_b = as_number(a[3]), as_number(b[3])
+    if num_a is not None and num_b is not None:
+        return num_a == num_b
+    return True
 
 
 def read_pid(name: str) -> int | None:
