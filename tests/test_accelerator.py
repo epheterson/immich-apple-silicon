@@ -3559,3 +3559,86 @@ class TestWorkerConfigGate:
         guarded = set(re.findall(r'config\.get\("([a-z_]+)"', src))
         missing = reads - guarded - set(m._WORKER_CONFIG_KEYS)
         assert not missing, f"cmd_start dereferences ungated keys: {sorted(missing)}"
+
+
+class TestSwitchingMlOffSaysImmichStillPointsHere:
+    """Setup points Immich's IMMICH_MACHINE_LEARNING_URL at this Mac and never
+    edits anyone's docker-compose.yml, by design: "nothing inside Docker is
+    modified" is the promise on the front of the README.
+
+    So switching our ML off cannot put that URL back, and if it says nothing
+    the toggle looks like it worked while every search, face and OCR job fails
+    against a service that stopped listening. The reason then lives only in
+    Immich's logs, which is the last place anyone looks.
+    """
+
+    def test_turning_ml_off_warns_and_names_the_setting(
+        self, tmp_data_dir, monkeypatch, caplog
+    ):
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"ml": True, "ml_url": "http://host.internal:3003"})
+        monkeypatch.setattr(m, "reconcile_ml", lambda *a, **k: None)
+        monkeypatch.setattr(m, "read_pid", lambda name: None)
+        monkeypatch.setattr(m, "_restart_worker", lambda *a, **k: True)
+
+        with caplog.at_level("WARNING"):
+            m._set_component("ml", False)
+
+        out = caplog.text
+        assert "IMMICH_MACHINE_LEARNING_URL" in out, out
+        assert "http://host.internal:3003" in out, "the current value is the fact"
+        assert "immich-machine-learning" in out, "say what to point it back to"
+
+    def test_turning_ml_on_does_not_warn(self, tmp_data_dir, monkeypatch, caplog):
+        """The warning is about a URL pointing at nothing. Turning it on makes
+        that URL correct, so saying it there would be noise."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"ml": False, "ml_url": "http://host.internal:3003"})
+        monkeypatch.setattr(m, "reconcile_ml", lambda *a, **k: None)
+        monkeypatch.setattr(m, "read_pid", lambda name: 4242)
+        monkeypatch.setattr(m, "_restart_worker", lambda *a, **k: True)
+
+        with caplog.at_level("WARNING"):
+            m._set_component("ml", True)
+        assert "IMMICH_MACHINE_LEARNING_URL" not in caplog.text
+
+    def test_it_still_warns_when_no_url_was_recorded(
+        self, tmp_data_dir, monkeypatch, caplog
+    ):
+        """A split install set up before ml_url was recorded still has Immich
+        pointed here. Saying nothing because we cannot quote the value is the
+        wrong way round."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"ml": True})
+        monkeypatch.setattr(m, "reconcile_ml", lambda *a, **k: None)
+        monkeypatch.setattr(m, "read_pid", lambda name: None)
+        monkeypatch.setattr(m, "_restart_worker", lambda *a, **k: True)
+
+        with caplog.at_level("WARNING"):
+            m._set_component("ml", False)
+        assert "still pointed at this Mac" in caplog.text
+
+    def test_nothing_writes_to_a_compose_file(self, tmp_data_dir, monkeypatch):
+        """The guard on the promise: this path must not open, let alone edit,
+        anyone's docker-compose.yml."""
+        import immich_accelerator.__main__ as m
+
+        opened = []
+        real_open = open
+
+        def watched_open(path, *a, **kw):
+            if "compose" in str(path):
+                opened.append(str(path))
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", watched_open)
+        monkeypatch.setattr(m, "reconcile_ml", lambda *a, **k: None)
+        monkeypatch.setattr(m, "read_pid", lambda name: None)
+        monkeypatch.setattr(m, "_restart_worker", lambda *a, **k: True)
+        m.save_config({"ml": True, "ml_url": "http://host.internal:3003"})
+
+        m._set_component("ml", False)
+        assert not opened, f"touched a compose file: {opened}"

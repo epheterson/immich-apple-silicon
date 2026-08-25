@@ -194,20 +194,6 @@ struct SettingsView: View {
                 Toggle("Launch menu bar at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
 
-                VStack(alignment: .leading, spacing: Metrics.xs) {
-                    Toggle("Reconnect SMB shares at launch", isOn: $mountSharesAtLogin)
-                        .onChange(of: mountSharesAtLogin) { _, on in
-                            Task { await MountSharesAtLogin.set(on) }
-                        }
-                    // Turning this on remembers whatever SMB shares (e.g. a
-                    // NAS backing a split deployment) are mounted right now;
-                    // it doesn't ask which ones separately.
-                    // Says which shares, and says it only covers launch, because
-                    // the accelerator remounts the library on its own the whole
-                    // time it runs and the two were easy to confuse.
-                    Text("Remembers every SMB share mounted when you switch this on, this Mac's own as well as Immich's, and reconnects any that have gone missing the next time this app launches. Your Immich library does not need this: the accelerator records how it is mounted and puts it back on its own, the whole time it runs.")
-                        .font(.rowDetail).foregroundStyle(.secondary)
-                }
             } header: {
                 Text("Startup")
             } footer: {
@@ -215,7 +201,7 @@ struct SettingsView: View {
                 // about the menu bar icon, not about whether photos get
                 // processed. The background service is brew's, and it runs
                 // whether or not anyone is logged in.
-                Text("The accelerator itself runs as a background service and is unaffected by this.")
+                Text("The accelerator runs as a background service, separately.")
                     .font(.rowDetail).foregroundStyle(.secondary)
             }
 
@@ -236,9 +222,8 @@ struct SettingsView: View {
                             .foregroundStyle(.orange)
                         // What is happening and what it costs, before the fix.
                         // "Untrusted tap" alone reads like a warning about us.
-                        Text("Homebrew will not load the formula until you trust the tap, so "
-                             + "brew upgrade leaves this Mac on the version it already has, "
-                             + "and says nothing.")
+                        Text("Homebrew will not load the formula until the tap is "
+                             + "trusted, so upgrades do nothing and say nothing.")
                             .font(.rowDetail).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         HStack(spacing: Metrics.md) {
@@ -344,8 +329,7 @@ struct SettingsView: View {
                 compareSection
             } else {
                 Section {
-                    Text("The worker is switched off, so nothing on this Mac is "
-                         + "transcoding. Turn it on under Services.")
+                    Text("The worker is off. Turn it on in Services.")
                         .font(.rowDetail).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -371,7 +355,7 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        if let note = notice ?? encodingNotice {
+        if let note = notice {
             Section {
                 Label(note, systemImage: "info.circle")
                     .font(.rowDetail)
@@ -391,41 +375,57 @@ struct SettingsView: View {
     /// remounted continuously by the accelerator and may not even be SMB. On
     /// the release Mac it is NFS, so that toggle never touched it.
     private var libraryTab: some View {
+        // Split into two sections rather than one Form body: as a single
+        // expression the type-checker gave up on it.
         Form {
-            Section("Library") {
-                LabeledContent("Location", value: libraryPath)
-                if let recipe = libraryMount {
-                    LabeledContent("Mounted", value: recipe)
-                }
-                LabeledContent("State") {
-                    HStack(spacing: Metrics.md) {
-                        Text(libraryState.label)
-                        StatusDot(state: libraryState.dot)
-                    }
-                }
-            } footer: {
-                Text("The accelerator checks this every 30 seconds while it "
-                     + "runs. If the mount goes away it pauses the worker and "
-                     + "puts the mount back, retrying at 1, 5 and 15 minutes, "
-                     + "and stops for good if the server rejects the "
-                     + "credentials rather than locking the account out.")
-                    .font(.rowDetail).foregroundStyle(.secondary)
-            }
-
-            Section("Other Shares") {
-                Toggle("Reconnect SMB shares at launch", isOn: $mountSharesAtLogin)
-                    .onChange(of: mountSharesAtLogin) { _, on in
-                        Task { await MountSharesAtLogin.set(on) }
-                    }
-            } footer: {
-                Text("Remembers every SMB share mounted when you switch this "
-                     + "on, and reconnects any that have gone missing the next "
-                     + "time this app launches. Separate from the library "
-                     + "above, which needs no help.")
-                    .font(.rowDetail).foregroundStyle(.secondary)
-            }
+            librarySection
+            otherSharesSection
         }
         .formStyle(.grouped)
+    }
+
+    private var librarySection: some View {
+        // header:/footer: closures, not Section("title"){} footer:{}: that
+        // overload does not exist and the compiler's complaint about it is a
+        // type-check timeout rather than a missing-initializer error.
+        Section {
+            LabeledContent("Location", value: libraryPath)
+            if let recipe = libraryMount {
+                LabeledContent("Mounted", value: recipe)
+            }
+            libraryStateRow
+        } header: {
+            Text("Library")
+        } footer: {
+            Text("Checked every 30 seconds. If it drops, the worker pauses "
+                 + "and the mount is retried until it comes back.")
+                .font(.rowDetail).foregroundStyle(.secondary)
+        }
+    }
+
+    private var libraryStateRow: some View {
+        let state = libraryState
+        return LabeledContent("State") {
+            HStack(spacing: Metrics.md) {
+                Text(state.label)
+                StatusDot(state: state.dot)
+            }
+        }
+    }
+
+    private var otherSharesSection: some View {
+        Section {
+            Toggle("Reconnect SMB shares at launch", isOn: $mountSharesAtLogin)
+                .onChange(of: mountSharesAtLogin) { _, on in
+                    Task { await MountSharesAtLogin.set(on) }
+                }
+        } header: {
+            Text("Other Shares")
+        } footer: {
+            Text("Remembers the SMB shares mounted now, and reconnects any "
+                 + "that are missing when this app launches.")
+                .font(.rowDetail).foregroundStyle(.secondary)
+        }
     }
 
     private var positionSection: some View {
@@ -468,7 +468,7 @@ struct SettingsView: View {
                 }
             }
 
-            Text("This covers transcoding. Machine learning is chosen separately below.")
+            Text("Transcoding only. The machine learning engine is under Services.")
                 .font(.rowDetail).foregroundStyle(.secondary)
         }
     }
@@ -535,10 +535,10 @@ struct SettingsView: View {
     /// The two named positions and the derived middle, in control order.
     static let positions: [(name: String, title: String, detail: String)] = [
         ("software", "Software",
-         "The encoders and decoders Immich's own container uses. Video and thumbnails come out byte for byte what Docker produces, except for a file ffmpeg cannot decode at all, whose thumbnail comes from QuickLook. Uses the most CPU."),
+         "Immich's own encoders. Byte for byte what Docker produces, except thumbnails for files ffmpeg cannot decode, which come from QuickLook. Most CPU."),
         ("custom", "Custom", "Some on, some off. Set below."),
         ("hardware", "Hardware",
-         "VideoToolbox for decoding, video and audio. Much less CPU, so the Mac keeps up with everything else it is doing. Video is visually identical to Docker's; audio and 10-bit thumbnails differ byte for byte."),
+         "VideoToolbox for decoding, video and audio. Much less CPU. Video looks identical to Docker's; audio and 10-bit thumbnails differ byte for byte."),
     ]
 
     /// The positions to show, in control order. The control and the
@@ -824,17 +824,31 @@ struct SettingsView: View {
     }
 
     /// Reachable, or not, and whether that has already stopped the worker.
-    /// FileManager, not a mount table parse: the question is whether the
-    /// directory the worker reads is actually there.
-    private var libraryState: (label: String, dot: StatusModel.State) {
+    ///
+    /// paused.json is the accelerator's own answer, written by the watch loop
+    /// at the moment it stops the worker, so it is asked first: it knows why,
+    /// and this pane should not be guessing at a reason the other side already
+    /// recorded. Falling back to whether the directory is there, which is what
+    /// a person would check.
+    private var libraryState: (label: String, dot: ServiceState) {
         let path = libraryPath
-        guard path != "not configured" else { return ("Not configured", .off) }
-        if let paused = model.snap.pausedReason, paused.contains("library") {
-            return ("Missing, worker paused", .bad)
+        guard path != "not configured" else { return ("Not configured", .stopped) }
+        if pausedReason == "library-unreachable" {
+            return ("Missing, worker paused", .degraded)
         }
         return FileManager.default.fileExists(atPath: path)
-            ? ("Reachable", .good)
-            : ("Missing", .bad)
+            ? ("Reachable", .running)
+            : ("Missing", .degraded)
+    }
+
+    /// Why the watch loop paused the worker, if it has.
+    private var pausedReason: String? {
+        let file = Paths.dataDir.appendingPathComponent("paused.json")
+        guard let data = try? Data(contentsOf: file),
+              let obj = try? JSONSerialization.jsonObject(with: data)
+                  as? [String: Any]
+        else { return nil }
+        return obj["reason"] as? String
     }
 
     private var appVersion: String {
