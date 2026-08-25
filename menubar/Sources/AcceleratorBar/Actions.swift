@@ -95,32 +95,14 @@ enum MountSharesAtLogin {
 
 // Daily actions, shelling out to the same commands a user would run.
 enum Actions {
-    /// Both prefixes, like the CLI's _brew_path. /opt/homebrew is Apple
-    /// Silicon's and /usr/local is x86's, and an x86 brew under Rosetta is a
-    /// real configuration: with only the first, the CLI printed "Updates:
-    /// blocked" while this pane showed nothing, so the two halves of one
-    /// feature disagreed on whether the check ran at all.
-    static let brew: String = {
-        for candidate in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
-        where FileManager.default.isExecutableFile(atPath: candidate) {
-            return candidate
-        }
-        return "/opt/homebrew/bin/brew"
-    }()
-    /// Both prefixes, for the same reason `brew` checks both. Fixing `brew`
-    /// alone changed nothing: every entry point here is gated on
-    /// `isBrewInstall`, which tests this path, so on an x86 install the new
-    /// `brew` value was never reached and the pane still said nothing while
-    /// the CLI said "Updates: blocked".
-    static let cli: String = {
-        for prefix in ["/opt/homebrew", "/usr/local"] {
-            let candidate = "\(prefix)/opt/immich-accelerator/bin/immich-accelerator"
-            if FileManager.default.isExecutableFile(atPath: candidate) {
-                return candidate
-            }
-        }
-        return "/opt/homebrew/opt/immich-accelerator/bin/immich-accelerator"
-    }()
+    /// Both derived from Paths.brewPrefix, which is what decides which
+    /// Homebrew this install belongs to. These used to resolve themselves,
+    /// with two different rules between them; see brewPrefix for what that
+    /// cost on a machine with both prefixes.
+    static var brew: String { "\(Paths.brewPrefix)/bin/brew" }
+    static var cli: String {
+        "\(Paths.brewPrefix)/opt/immich-accelerator/bin/immich-accelerator"
+    }
     static let service = "epheterson/immich-accelerator/immich-accelerator"
     /// What `brew services list` prints in its Name column. brew accepts
     /// the tap path as an argument but never echoes it back.
@@ -128,7 +110,7 @@ enum Actions {
     /// The tap, as `brew trust` wants it named.
     static let tap = "epheterson/immich-accelerator"
 
-    /// The environment every brew call gets.
+    /// The environment for brew calls that only read local state.
     ///
     /// No auto-update, because `brew outdated` git-fetches every tap once a
     /// day before answering and this runs when a window opens. No analytics,
@@ -139,8 +121,22 @@ enum Actions {
     ///
     /// One constant rather than a literal at each call site: it was set on two
     /// of eight brew invocations when written out by hand.
+    ///
+    /// NOT for the two calls that ask whether a new version exists. A tap is a
+    /// local git clone, and nothing but that fetch refreshes it, so suppressing
+    /// it there made `brew outdated` permanently answer "nothing to do":
+    /// Sparkle would update this app and the CLI core would never follow.
+    /// Those use `brewEnvAllowingFetch`.
     static let brewEnv = [
         "HOMEBREW_NO_AUTO_UPDATE": "1",
+        "HOMEBREW_NO_ANALYTICS": "1",
+        "HOMEBREW_NO_ENV_HINTS": "1",
+    ]
+
+    /// For `outdated` and `upgrade`, which have to see the tap's new commits.
+    /// Analytics and hints are still off: those only add output and a detached
+    /// curl that holds our pipe open.
+    static let brewEnvAllowingFetch = [
         "HOMEBREW_NO_ANALYTICS": "1",
         "HOMEBREW_NO_ENV_HINTS": "1",
     ]
@@ -471,7 +467,7 @@ enum Actions {
     static func coreOutdated() async -> String? {
         let (code, out) = await run(
             brew, ["outdated", "--formula", "--verbose", "immich-accelerator"],
-            env: brewEnv)
+            env: brewEnvAllowingFetch)
         guard code == 0, let r = out.range(of: "< ") else { return nil }
         let v = out[r.upperBound...]
             .prefix { !$0.isWhitespace }
@@ -484,7 +480,7 @@ enum Actions {
     // the standard launchd install.
     @discardableResult
     static func upgradeCore() async -> Bool {
-        let (code, _) = await run(brew, ["upgrade", "immich-accelerator"], env: brewEnv)
+        let (code, _) = await run(brew, ["upgrade", "immich-accelerator"], env: brewEnvAllowingFetch)
         return code == 0
     }
 

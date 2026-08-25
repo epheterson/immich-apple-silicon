@@ -736,3 +736,58 @@ def test_parity_headline_iou_weights_by_faces_not_by_image():
     assert faces["mean_iou"] == pytest.approx((1.0 * 1 + 0.5 * 9) / 10), (
         f"got {faces['mean_iou']:.4f}; an unweighted mean would be 0.75"
     )
+
+
+def test_the_two_brew_calls_that_check_for_updates_may_still_fetch():
+    """A tap is a local git clone. `brew outdated` refreshing it is the only
+    thing that does, so suppressing the auto-update on the update check makes
+    it permanently answer "nothing to do": Sparkle updates the app and the CLI
+    core never follows it. Setting one constant on all eight brew calls did
+    exactly that, which is why the two groups are now named apart.
+    """
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "menubar/Sources/AcceleratorBar/Actions.swift").read_text()
+
+    def env_block(name: str) -> str:
+        start = src.index(f"static let {name} = [")
+        return src[start:src.index("]", start)]
+
+    assert "HOMEBREW_NO_AUTO_UPDATE" in env_block("brewEnv")
+    assert "HOMEBREW_NO_AUTO_UPDATE" not in env_block("brewEnvAllowingFetch"), (
+        "the update check is back to never seeing a new version in the tap"
+    )
+
+    # The two that ask what version exists must use the fetching environment.
+    for func in ("coreOutdated", "upgradeCore"):
+        start = src.index(f"func {func}(")
+        body = src[start:src.index("\n    }", start)]
+        assert "brewEnvAllowingFetch" in body, (
+            f"{func} cannot see a new formula, so upgrades stop happening"
+        )
+
+    # And no brew call may go out with neither, which is how two of the eight
+    # ended up without the environment when it was written by hand.
+    calls = re.findall(r"run\(\s*brew,.*?\n(?:.*?\n)??.*?\)", src, re.S)
+    assert len(calls) >= 8, f"only found {len(calls)} brew calls; update this test"
+    for call in calls:
+        assert "brewEnv" in call, f"brew call with no environment at all:\n{call}"
+
+
+def test_the_app_and_the_cli_agree_on_reading_a_pidfile_start_time():
+    """Both read the same pidfiles, so a rule that holds on one side and not
+    the other means Settings and `status` disagree about whether a service is
+    running. Pinning ps to LC_ALL=C fixes what is read, not what is already
+    stored, so a byte-for-byte compare against a pidfile written before the
+    pin is a guaranteed mismatch rather than an intermittent one.
+    """
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "menubar/Sources/AcceleratorBar/StatusModel.swift").read_text()
+
+    assert "func sameStart(" in src, "the Swift side has no comparison rule"
+    start = src.index("static func pidAlive(")
+    body = src[start:src.index("\n    }", start)]
+    assert "sameStart(actualStart, storedStart)" in body
+    assert "actualStart != storedStart" not in body, (
+        "back to comparing byte for byte, which deletes healthy pidfiles "
+        "written before 1.16 by any locale that is not C"
+    )
