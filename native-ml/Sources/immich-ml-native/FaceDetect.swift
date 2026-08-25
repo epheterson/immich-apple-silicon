@@ -5,6 +5,15 @@ import CoreGraphics
 // Face detection + 5-point landmarks via Vision's VNDetectFaceLandmarksRequest,
 // replicating the Python fork's face_detect exactly: pixel bbox (Y-flipped) and
 // the same landmark picks (eye centers, nose last point, outer-lip x-extremes).
+/// The confidence below which a Vision detection is discarded.
+///
+/// Vision's own floor: it does not emit anything below about 0.6 on real
+/// photographs, so this only catches genuine junk rather than trimming the
+/// distribution. Deliberately not Immich's minScore, which is calibrated for
+/// buffalo_l and drops a quarter of our detections when applied to Vision's
+/// numbers. See the note at the call site in Predict.swift.
+let VISION_FACE_FLOOR = 0.5
+
 struct DetectedFace {
     let x1: Int, y1: Int, x2: Int, y2: Int
     let score: Float
@@ -48,17 +57,30 @@ func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [
     // landmarks pass returned every face it was seeded with, so this is
     // insurance rather than an observed failure, but the cost of being wrong
     // is a face silently missing from someone's library.
+    // Keyed by uuid, which Vision preserves on the derived observation, not by
+    // array position: position only defends against a short tail. If the
+    // landmarks pass ever returned results for faces 0, 1 and 3 of four, index
+    // pairing would report face 2 with face 3's box and landmarks, drop a real
+    // face, and report one box twice.
+    var byID: [UUID: VNFaceObservation] = [:]
+    for obs in landmarked { byID[obs.uuid] = obs }
+
     var faces: [DetectedFace] = []
-    for (i, detection) in detected.enumerated() {
-        let obs = i < landmarked.count ? landmarked[i] : detection
+    for detection in detected {
+        let obs = byID[detection.uuid] ?? detection
         let bb = obs.boundingBox   // normalized, bottom-left origin
         let x1 = bb.origin.x * Double(W)
         let y1 = (1.0 - bb.origin.y - bb.height) * Double(H)
         let x2 = (bb.origin.x + bb.width) * Double(W)
         let y2 = (1.0 - bb.origin.y) * Double(H)
         let lm = obs.landmarks.flatMap { extractFive($0, bb: bb, W: W, H: H) }
+        // detection.confidence, not obs.confidence: the landmarks pass is the
+        // one that reports 1.0 for everything, which is the defect this change
+        // exists to fix. Reading it back off the derived observation would
+        // undo the fix on every face that got landmarks, and score two faces
+        // in one image on different scales when one did not.
         faces.append(DetectedFace(x1: Int(x1), y1: Int(y1), x2: Int(x2), y2: Int(y2),
-                                  score: obs.confidence, landmarks: lm))
+                                  score: detection.confidence, landmarks: lm))
     }
     return faces
 }

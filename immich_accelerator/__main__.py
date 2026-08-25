@@ -5931,8 +5931,13 @@ def brew_refuses_our_tap() -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    blob = (out.stdout + out.stderr).lower()
-    return "untrusted tap" in blob or "refusing to load formula" in blob
+    # On the line that names us: brew refuses for other untrusted taps too, and
+    # matching anywhere in the output made someone else's tap print our fix.
+    return any(
+        "immich-accelerator" in line
+        and ("untrusted tap" in line or "refusing to load formula" in line)
+        for line in (out.stdout + out.stderr).lower().splitlines()
+    )
 
 
 def cmd_status(_args):
@@ -6742,24 +6747,26 @@ def _restart_worker(reason: str) -> bool:
 
 
 def _warn_immich_still_points_here(config: dict) -> None:
-    """Say that Immich is still configured to ask this Mac for machine learning.
+    """Say that nothing else is configured to do machine learning.
 
-    Setup does not edit anyone's docker-compose.yml and this must not either:
-    "nothing inside Docker is modified" is the promise on the front of the
-    README, and silently rewriting a URL in a file we told people we do not
-    touch would be worse than the problem. So this only tells them, with the
-    line to change.
+    Only when there is genuinely nowhere else to go. `ml_url` is the engine
+    the worker falls back to when ours is off (see the branch in the worker's
+    environment setup), so on a two-Mac split it names the other Mac and
+    everything is fine. Warning unconditionally told those users their search
+    was about to break and pointed them at immich-machine-learning:3003, which
+    would have broken the working configuration they had.
 
-    Without it, switching machine learning off looks like it worked and then
-    every search, face and OCR job fails against a service that is no longer
-    listening, with the reason living only in Immich's own logs.
+    Not a fix, a warning: setup does not edit anyone's docker-compose.yml and
+    this must not either. "Nothing inside Docker is modified" is the promise on
+    the front of the README, and quietly rewriting a URL in a file we say we
+    never touch is worse than the problem.
     """
-    url = config.get("ml_url") or ""
-    log.warning("Immich is still pointed at this Mac for machine learning.")
-    if url:
-        log.warning("  Its IMMICH_MACHINE_LEARNING_URL is %s.", url)
+    if config.get("ml_url"):
+        return  # somewhere else is configured; the worker will use it
+    log.warning("Machine learning is off here and no other engine is set.")
     log.warning(
-        "  Until that points somewhere else, search, faces and text will fail."
+        "  Immich's own IMMICH_MACHINE_LEARNING_URL governs now. If it still "
+        "points at this Mac, search, faces and text will fail."
     )
     log.warning(
         "  Point it back at your own container (usually "

@@ -71,9 +71,23 @@ func processPredict(entries: [String: Any], imageData: Data?, text: String?, mod
         let cfg = cfgAny as? [String: Any] ?? [:]
         timed("faces") {
             guard let data = imageData, let rgb = rgb, let ort = models.arcface() else { return false }
-            let minScore = optDouble(cfg, "detection", "minScore") ?? 0.7
+            // Immich's minScore is calibrated for buffalo_l, and this is
+            // Vision, whose confidences live on a different scale: measured
+            // across 24 images ours run 0.61 to 0.93 with nothing below 0.61,
+            // while buffalo_l spreads from 0.34 up. Applying Immich's 0.7 to
+            // Vision's numbers drops a quarter of what we detect and makes
+            // detection worse than it was when this returned a fabricated 1.0
+            // for everything: measured 20 of 48 reference faces before, 19
+            // after, with the 20-40px band falling from 60% to 47%.
+            //
+            // So the threshold is ours, on our scale, and the real confidence
+            // still goes back in the response where Immich can show it. A
+            // knob that reads as a probability but is not comparable between
+            // engines is worse than one that is honestly ignored, and this is
+            // recorded in docs/known-differences.md rather than left for
+            // someone to discover from their face count.
             let faces = detectFacesWithLandmarks(imageData: data, width: W, height: H)
-                .filter { Double($0.score) >= minScore }
+                .filter { Double($0.score) >= VISION_FACE_FLOOR }
             let embs = embedFaces(srcRGB: rgb, w: W, h: H, faces: faces, model: ort)
             var out: [[String: Any]] = []
             for (f, e) in zip(faces, embs) {

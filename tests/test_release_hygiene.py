@@ -385,11 +385,16 @@ def test_the_untrusted_tap_words_match_between_swift_and_python():
     actions = (root / "menubar/Sources/AcceleratorBar/Actions.swift").read_text()
     body = actions[actions.index("static func brewRefusesTap"):]
     body = body[:body.index("\n    }")]
-    swift_words = set(re.findall(r'contains\("([^"]+)"\)', body))
+    # Both sides also match the formula name to anchor the refusal to our own
+    # tap; that is not one of the phrases being compared here.
+    swift_words = {
+        w for w in re.findall(r'contains\("([^"]+)"\)', body)
+        if " " in w
+    }
     assert swift_words, "could not parse the Swift matcher; update this test"
 
     source = inspect.getsource(m.brew_refuses_our_tap)
-    python_words = set(re.findall(r'"([a-z ]+)" in blob', source))
+    python_words = set(re.findall(r'"([a-z ]+)" in line', source))
     assert python_words, "could not parse the Python matcher; update this test"
 
     assert swift_words == python_words, (
@@ -684,4 +689,50 @@ def test_a_non_image_response_is_never_cached(tmp_path, monkeypatch):
     assert "did not return a JPEG" in str(caught.value)
     assert not list(m.FACE_CACHE.glob("*")), (
         "the non-image response was cached, so every later run reads it back"
+    )
+
+
+def test_parity_matching_prefers_the_best_overlap_not_list_order():
+    """Walking the reference list in order let a poor early match consume the
+    box a later reference face overlapped almost exactly, understating both
+    the match count and the mean overlap the docs quote."""
+    m = _parity()
+
+    def face(x, w=10):
+        return {"boundingBox": {"x1": x, "y1": 0.0, "x2": x + w, "y2": 10.0}}
+
+    # A overlaps X slightly; B overlaps X almost exactly. A comes first.
+    result = m.compare_faces([face(0, 40), face(30)], [face(30)])
+    assert result["matched"] == 1
+    assert result["mean_iou"] > 0.9, (
+        f"matched the wrong pair: mean IoU {result['mean_iou']:.3f} means the "
+        f"first reference face consumed the box the second one fits"
+    )
+
+
+def test_parity_ocr_recall_does_not_punish_repeated_words():
+    """A sign reading EXIT twice, read correctly twice, is a perfect read.
+    Counting duplicates in the denominator but not the numerator scored it
+    0.5 while also calling the two sets identical."""
+    m = _parity()
+    both = {"text": ["EXIT", "EXIT"]}
+    r = m.compare_ocr(both, both)
+    assert r["shared"] == r["ref_count"] == 2
+    assert not r["only_ref"] and not r["only_other"]
+
+
+def test_parity_headline_iou_weights_by_faces_not_by_image():
+    """The published average overlap is over matched faces. A mean of
+    per-image means gives a one-face photo the same weight as a group shot."""
+    m = _parity()
+    rows = [
+        {"engine": "ours", "task": "faces", "ref_count": 1, "count": 1,
+         "matched": 1, "mean_iou": 1.0, "min_iou": 1.0},
+        {"engine": "ours", "task": "faces", "ref_count": 9, "count": 9,
+         "matched": 9, "mean_iou": 0.5, "min_iou": 0.5},
+    ]
+    summary = m.summarise(rows, {"ours": {"faces": []}}, "stock")
+    faces = next(s for s in summary if s["task"] == "faces")
+    assert faces["mean_iou"] == pytest.approx((1.0 * 1 + 0.5 * 9) / 10), (
+        f"got {faces['mean_iou']:.4f}; an unweighted mean would be 0.75"
     )

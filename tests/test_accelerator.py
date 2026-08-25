@@ -3577,7 +3577,7 @@ class TestSwitchingMlOffSaysImmichStillPointsHere:
     ):
         import immich_accelerator.__main__ as m
 
-        m.save_config({"ml": True, "ml_url": "http://host.internal:3003"})
+        m.save_config({"ml": True})
         monkeypatch.setattr(m, "reconcile_ml", lambda *a, **k: None)
         monkeypatch.setattr(m, "read_pid", lambda name: None)
         monkeypatch.setattr(m, "_restart_worker", lambda *a, **k: True)
@@ -3587,8 +3587,27 @@ class TestSwitchingMlOffSaysImmichStillPointsHere:
 
         out = caplog.text
         assert "IMMICH_MACHINE_LEARNING_URL" in out, out
-        assert "http://host.internal:3003" in out, "the current value is the fact"
         assert "immich-machine-learning" in out, "say what to point it back to"
+
+    def test_a_split_setup_with_another_engine_is_not_warned(
+        self, tmp_data_dir, monkeypatch, caplog
+    ):
+        """ml_url is the engine the worker falls back to, so on a two-Mac
+        split it names the other Mac and nothing is wrong. Warning here told
+        a working setup its search was about to break, and pointed it at a
+        container that would have broken it."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"ml": True, "ml_url": "http://macmini2:3003"})
+        monkeypatch.setattr(m, "reconcile_ml", lambda *a, **k: None)
+        monkeypatch.setattr(m, "read_pid", lambda name: None)
+        monkeypatch.setattr(m, "_restart_worker", lambda *a, **k: True)
+
+        with caplog.at_level("WARNING"):
+            m._set_component("ml", False)
+        assert "immich-machine-learning" not in caplog.text, (
+            "told a working split setup to point at a container it does not use"
+        )
 
     def test_turning_ml_on_does_not_warn(self, tmp_data_dir, monkeypatch, caplog):
         """The warning is about a URL pointing at nothing. Turning it on makes
@@ -3619,7 +3638,7 @@ class TestSwitchingMlOffSaysImmichStillPointsHere:
 
         with caplog.at_level("WARNING"):
             m._set_component("ml", False)
-        assert "still pointed at this Mac" in caplog.text
+        assert "no other engine is set" in caplog.text
 
     def test_nothing_writes_to_a_compose_file(self, tmp_data_dir, monkeypatch):
         """The guard on the promise: this path must not open, let alone edit,

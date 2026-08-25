@@ -105,8 +105,14 @@ enum Actions {
     static let tap = "epheterson/immich-accelerator"
 
     @discardableResult
+    /// `timeout` kills the child and returns non-zero rather than waiting for
+    /// ever. Off by default so long-running commands (ml-test, an upgrade) are
+    /// unaffected; the brew calls reachable from opening a window or clicking a
+    /// button pass one, because brew takes a lock and a held lock is otherwise
+    /// a button stuck on "Trusting..." with no way back.
     static func run(_ tool: String, _ args: [String],
-                    env: [String: String] = [:]) async -> (Int32, String) {
+                    env: [String: String] = [:],
+                    timeout: TimeInterval? = nil) async -> (Int32, String) {
         await withCheckedContinuation { cont in
             DispatchQueue.global().async {
                 let p = Process()
@@ -129,6 +135,18 @@ enum Actions {
                 // against our waitUntilExit.
                 let text = String(
                     data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                if let timeout {
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while p.isRunning && Date() < deadline {
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                    if p.isRunning {
+                        p.terminate()
+                        cont.resume(returning: (
+                            -1, text + "\ntimed out after \(Int(timeout))s"))
+                        return
+                    }
+                }
                 p.waitUntilExit()
                 cont.resume(returning: (p.terminationStatus, text))
             }
@@ -193,10 +211,17 @@ enum Actions {
         // conditional and this one is a routine user action.
         let (_, out) = await run(
             brew, ["outdated", "--formula", listedService],
-            env: ["HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1"])
-        let blob = out.lowercased()
-        return blob.contains("untrusted tap")
-            || blob.contains("refusing to load formula")
+            env: ["HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1"],
+            timeout: 20)
+        // On the line that names us. brew emits refusals for other untrusted
+        // taps too, and matching anywhere in the output meant someone else's
+        // tap put "Updates are blocked" on our pane, with a button that
+        // succeeds and changes nothing.
+        return out.lowercased().split(separator: "\n").contains { line in
+            line.contains(listedService)
+                && (line.contains("untrusted tap")
+                    || line.contains("refusing to load formula"))
+        }
     }
 
     /// Trust the tap, which is what the button offers to do. Only ever from an
@@ -204,7 +229,8 @@ enum Actions {
     static func trustTap() async -> (ok: Bool, output: String) {
         let (code, out) = await run(
             brew, ["trust", tap],
-            env: ["HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1"])
+            env: ["HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1"],
+            timeout: 20)
         return (code == 0, out)
     }
 

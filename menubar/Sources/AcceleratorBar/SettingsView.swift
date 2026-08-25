@@ -260,6 +260,12 @@ struct SettingsView: View {
                 Button("Check for Updates…") { UpdaterModel.shared.checkForUpdates() }
             }
 
+            // The Trust button writes here, and without this its failure went
+            // to a channel only Services and Transcoding render: the user
+            // clicked, nothing happened, and brew's reason appeared later
+            // under Hardware Transcoding with no context.
+            messageSections
+
             Section {
                 LabeledContent("Files") {
                     HStack(spacing: Metrics.md) {
@@ -825,20 +831,60 @@ struct SettingsView: View {
 
     /// Reachable, or not, and whether that has already stopped the worker.
     ///
-    /// paused.json is the accelerator's own answer, written by the watch loop
-    /// at the moment it stops the worker, so it is asked first: it knows why,
-    /// and this pane should not be guessing at a reason the other side already
-    /// recorded. Falling back to whether the directory is there, which is what
-    /// a person would check.
+    /// Never stats the library path. On a hard NFS or SMB mount whose server
+    /// has gone away, stat does not time out, it blocks forever, and this runs
+    /// during body evaluation on the main thread: the app would beachball for
+    /// exactly the person who opened this pane to find out why their photos
+    /// stopped. The Python side learned this the same way, which is why the
+    /// watch loop reads the mount table rather than the mount (see
+    /// mount_recipe_for's comment about taking the whole watcher down with the
+    /// NAS).
+    ///
+    /// Two sources that cannot block, both local: paused.json, which the watch
+    /// loop writes at the moment it stops the worker and which knows why, and
+    /// the mount table.
     private var libraryState: (label: String, dot: ServiceState) {
-        let path = libraryPath
-        guard path != "not configured" else { return ("Not configured", .stopped) }
+        guard libraryPath != "not configured" else {
+            return ("Not configured", .stopped)
+        }
         if pausedReason == "library-unreachable" {
             return ("Missing, worker paused", .degraded)
         }
-        return FileManager.default.fileExists(atPath: path)
-            ? ("Reachable", .running)
-            : ("Missing", .degraded)
+        guard let mounted = libraryIsMounted else {
+            // No recorded mount: a local disk, or never seen healthy. Either
+            // way there is no absence to report.
+            return ("Reachable", .running)
+        }
+        return mounted ? ("Reachable", .running) : ("Missing", .degraded)
+    }
+
+    /// Whether the recorded mount point is in the mount table, or nil when no
+    /// mount was ever recorded.
+    ///
+    /// getmntinfo, not a URL resource query and certainly not stat: the kernel
+    /// hands back its own table without touching any filesystem, so a mount
+    /// whose server has gone away answers instantly instead of blocking. A
+    /// resource query on the mount point would have wedged in exactly the case
+    /// this pane exists to report.
+    private var libraryIsMounted: Bool? {
+        guard let recipe = config["mount_recipe"] as? [String: Any],
+              let point = recipe["mountpoint"] as? String, !point.isEmpty
+        else { return nil }
+
+        var buffer: UnsafeMutablePointer<statfs>?
+        let count = getmntinfo(&buffer, MNT_NOWAIT)
+        guard count > 0, let mounts = buffer else { return false }
+        for i in 0..<Int(count) {
+            var entry = mounts[i].f_mntonname
+            let path = withUnsafePointer(to: &entry) {
+                $0.withMemoryRebound(to: CChar.self,
+                                     capacity: Int(MAXPATHLEN)) {
+                    String(cString: $0)
+                }
+            }
+            if path == point { return true }
+        }
+        return false
     }
 
     /// Why the watch loop paused the worker, if it has.

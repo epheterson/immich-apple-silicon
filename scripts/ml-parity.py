@@ -45,6 +45,7 @@ models differ and the comparison is measuring the wrong thing.
 from __future__ import annotations
 
 import argparse
+import collections
 import html
 import json
 import math
@@ -150,16 +151,25 @@ def compare_faces(ref: list, other: list) -> dict:
     """
     ref_boxes = [f["boundingBox"] for f in ref]
     other_boxes = [f["boundingBox"] for f in other]
-    remaining = list(range(len(other_boxes)))
-    overlaps = []
-    for rb in ref_boxes:
-        if not remaining:
+    # Best overlap first, not reference order. Walking the reference list let
+    # face A take our box X on a 0.20 overlap while face B, which overlapped X
+    # at 0.90, went unmatched: both the match count and the mean were then
+    # understated, and that mean is what the docs quote.
+    pairs = sorted(
+        ((iou(rb, ob), i, j)
+         for i, rb in enumerate(ref_boxes)
+         for j, ob in enumerate(other_boxes)),
+        reverse=True,
+    )
+    used_ref, used_other, overlaps = set(), set(), []
+    for score, i, j in pairs:
+        if score <= 0:
             break
-        best = max(remaining, key=lambda i: iou(rb, other_boxes[i]))
-        score = iou(rb, other_boxes[best])
-        if score > 0:
-            overlaps.append(score)
-            remaining.remove(best)
+        if i in used_ref or j in used_other:
+            continue
+        used_ref.add(i)
+        used_other.add(j)
+        overlaps.append(score)
     return {
         "ref_count": len(ref),
         "count": len(other),
@@ -176,13 +186,17 @@ def compare_ocr(ref: dict, other: dict) -> dict:
         return [t.strip().lower() for t in (d.get("text") or []) if t.strip()]
 
     a, b = norm(ref), norm(other)
-    shared = set(a) & set(b)
+    # Multisets. len(a) counted duplicates while the intersection could not, so
+    # an engine that read the same two words the reference did scored 0.5
+    # recall while also being reported as an identical read.
+    ca, cb = collections.Counter(a), collections.Counter(b)
+    shared = sum((ca & cb).values())
     return {
         "ref_count": len(a),
         "count": len(b),
-        "shared": len(shared),
-        "only_ref": sorted(set(a) - set(b))[:5],
-        "only_other": sorted(set(b) - set(a))[:5],
+        "shared": shared,
+        "only_ref": sorted((ca - cb).elements())[:5],
+        "only_other": sorted((cb - ca).elements())[:5],
     }
 
 
@@ -262,8 +276,15 @@ def summarise(rows, timings, reference):
                 line["count_matches"] = sum(
                     1 for r in ok if r["ref_count"] == r["count"]
                 )
-                ious = [r["mean_iou"] for r in ok if r["matched"]]
-                line["mean_iou"] = statistics.fmean(ious) if ious else 0.0
+                # Weighted by matched faces. A mean of per-image means gives a
+                # one-face image the same weight as a ten-face one, and the
+                # published figure claims to be the average overlap of matched
+                # boxes, which is a different number.
+                matched_total = sum(r["matched"] for r in ok)
+                line["mean_iou"] = (
+                    sum(r["mean_iou"] * r["matched"] for r in ok) / matched_total
+                    if matched_total else 0.0
+                )
                 line["worst_iou"] = min(
                     (r["min_iou"] for r in ok if r["matched"]), default=0.0
                 )
