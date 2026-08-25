@@ -95,7 +95,18 @@ enum MountSharesAtLogin {
 
 // Daily actions, shelling out to the same commands a user would run.
 enum Actions {
-    static let brew = "/opt/homebrew/bin/brew"
+    /// Both prefixes, like the CLI's _brew_path. /opt/homebrew is Apple
+    /// Silicon's and /usr/local is x86's, and an x86 brew under Rosetta is a
+    /// real configuration: with only the first, the CLI printed "Updates:
+    /// blocked" while this pane showed nothing, so the two halves of one
+    /// feature disagreed on whether the check ran at all.
+    static let brew: String = {
+        for candidate in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+        where FileManager.default.isExecutableFile(atPath: candidate) {
+            return candidate
+        }
+        return "/opt/homebrew/bin/brew"
+    }()
     static let cli = "/opt/homebrew/opt/immich-accelerator/bin/immich-accelerator"
     static let service = "epheterson/immich-accelerator/immich-accelerator"
     /// What `brew services list` prints in its Name column. brew accepts
@@ -130,25 +141,51 @@ enum Actions {
                 do { try p.run() } catch {
                     cont.resume(returning: (-1, "\(error)")); return
                 }
-                // Drain the pipe BEFORE waiting: a child that fills the 64KB
-                // pipe buffer (ml-test output does) would otherwise deadlock
-                // against our waitUntilExit.
-                let text = String(
-                    data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+                // Read on another thread, not here. The first version of the
+                // timeout put the deadline loop after readDataToEndOfFile,
+                // which returns only at EOF, i.e. when the child closes stdout.
+                // A brew waiting on the Homebrew lock holds it open and writes
+                // nothing, so the read never returned and the deadline was
+                // never reached: the timeout could not fire in the one case it
+                // was written for. Reading off-thread also keeps the original
+                // reason this was drained before waiting, which is that a child
+                // filling the 64KB pipe buffer deadlocks against waitUntilExit.
+                let buffer = NSMutableData()
+                let lock = NSLock()
+                let reading = DispatchSemaphore(value: 0)
+                DispatchQueue.global().async {
+                    let data = out.fileHandleForReading.readDataToEndOfFile()
+                    lock.lock(); buffer.append(data); lock.unlock()
+                    reading.signal()
+                }
+
+                func text() -> String {
+                    lock.lock(); defer { lock.unlock() }
+                    return String(data: buffer as Data, encoding: .utf8) ?? ""
+                }
+
                 if let timeout {
-                    let deadline = Date().addingTimeInterval(timeout)
-                    while p.isRunning && Date() < deadline {
-                        Thread.sleep(forTimeInterval: 0.05)
-                    }
-                    if p.isRunning {
+                    if reading.wait(timeout: .now() + timeout) == .timedOut {
+                        // SIGTERM, then SIGKILL if it is ignored: returning
+                        // while the child is still alive would leave brew
+                        // running unsupervised after the caller was told the
+                        // command finished.
                         p.terminate()
+                        if reading.wait(timeout: .now() + 2) == .timedOut {
+                            kill(p.processIdentifier, SIGKILL)
+                            _ = reading.wait(timeout: .now() + 2)
+                        }
+                        p.waitUntilExit()
                         cont.resume(returning: (
-                            -1, text + "\ntimed out after \(Int(timeout))s"))
+                            -1, text() + "\ntimed out after \(Int(timeout))s"))
                         return
                     }
+                } else {
+                    reading.wait()
                 }
                 p.waitUntilExit()
-                cont.resume(returning: (p.terminationStatus, text))
+                cont.resume(returning: (p.terminationStatus, text()))
             }
         }
     }

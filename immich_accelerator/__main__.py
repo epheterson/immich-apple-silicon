@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import contextlib
 import ctypes
 import fcntl
@@ -1837,6 +1838,33 @@ def _adopt_live_worker() -> int | None:
     return pid
 
 
+def _same_start_time(current: str, stored: str) -> bool:
+    """Do these two `ps` start times describe the same instant?
+
+    Exact string equality, except that a pidfile written before ps was pinned
+    to LC_ALL=C holds a locale-formatted time: "Sat 22 Aug 23:07:37 2026" where
+    C gives "Sat Aug 22 23:07:37 2026". Comparing those as strings makes the
+    upgrade that fixes the locale bug fire it once, for exactly the users it
+    helps, and ml and dashboard have no _adopt_live_worker to recover with.
+
+    So a mismatch is retried by parsing both. Anything that does not parse
+    falls back to inequality, which is the safe answer: a wrongly kept pidfile
+    names a process that is not ours.
+    """
+    if current == stored:
+        return True
+    formats = ("%a %b %d %H:%M:%S %Y", "%a %d %b %H:%M:%S %Y")
+    def parse(value: str):
+        for fmt in formats:
+            try:
+                return datetime.datetime.strptime(" ".join(value.split()), fmt)
+            except ValueError:
+                continue
+        return None
+    a, b = parse(current), parse(stored)
+    return a is not None and a == b
+
+
 def read_pid(name: str) -> int | None:
     pid_file = PID_DIR / f"{name}.pid"
     if not pid_file.exists():
@@ -1850,7 +1878,7 @@ def read_pid(name: str) -> int | None:
         # Verify start time matches to detect PID reuse
         if len(lines) > 1 and lines[1]:
             current_start = _get_process_start_time(pid)
-            if current_start and current_start != lines[1]:
+            if current_start and not _same_start_time(current_start, lines[1]):
                 log.debug("PID %d reused (start time mismatch), cleaning up", pid)
                 pid_file.unlink(missing_ok=True)
                 if name == "worker":
@@ -5949,7 +5977,12 @@ def brew_refuses_our_tap() -> bool:
     return any(
         "immich-accelerator" in line
         and ("untrusted tap" in line or "refusing to load formula" in line)
-        for line in (out.stdout + out.stderr).lower().splitlines()
+        # Joined with a newline, not concatenated: stdout's last line often has
+        # no trailing newline, and gluing it to stderr's first makes a line
+        # that can carry our formula name from one stream and the refusal from
+        # the other, which is the cross-tap false positive this anchoring is
+        # for.
+        for line in "\n".join((out.stdout, out.stderr)).lower().splitlines()
     )
 
 

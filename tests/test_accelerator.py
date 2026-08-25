@@ -3694,3 +3694,60 @@ class TestSwitchingMlOffSaysImmichStillPointsHere:
 
         m._set_component("ml", False)
         assert not opened, f"touched a compose file: {opened}"
+
+
+class TestUpgradingDoesNotFireTheLocaleBugItFixes:
+    """Pinning ps to LC_ALL=C changes the string every pidfile already holds.
+
+    A pidfile written by the previous version from a terminal under en_AU says
+    "Sat 22 Aug 23:07:37 2026"; the reader now gets "Sat Aug 22 23:07:37 2026".
+    Compared as strings that is a mismatch, so read_pid deletes the pidfile of
+    a healthy service -- and ml and dashboard have no _adopt_live_worker to
+    recover with. The fix would have fired the bug once, for exactly the users
+    it helps.
+    """
+
+    def test_the_same_instant_in_two_locales_is_not_a_mismatch(self):
+        import immich_accelerator.__main__ as m
+
+        assert m._same_start_time(
+            "Sat Aug 22 23:07:37 2026", "Sat 22 Aug 23:07:37 2026"
+        )
+
+    def test_a_genuinely_different_start_is_still_a_mismatch(self):
+        """The whole point of the field is catching PID reuse. One second
+        apart is a different process."""
+        import immich_accelerator.__main__ as m
+
+        assert not m._same_start_time(
+            "Sat Aug 22 23:07:37 2026", "Sat Aug 22 23:07:38 2026"
+        )
+
+    def test_something_unparseable_is_treated_as_different(self):
+        """Fail closed: a wrongly kept pidfile names a process that is not
+        ours, which is worse than re-adopting."""
+        import immich_accelerator.__main__ as m
+
+        assert not m._same_start_time("Sat Aug 22 23:07:37 2026", "garbage")
+
+    def test_a_pidfile_from_the_previous_version_survives(
+        self, tmp_data_dir, monkeypatch
+    ):
+        """Through read_pid, not the helper: the helper being right is worth
+        nothing if the caller still unlinks the file."""
+        import immich_accelerator.__main__ as m
+
+        m.PID_DIR.mkdir(parents=True, exist_ok=True)
+        pid_file = m.PID_DIR / "ml.pid"
+        # Written by 1.15.0 under en_AU, day before month.
+        pid_file.write_text("4242\nSat 22 Aug 23:07:37 2026")
+        monkeypatch.setattr(m.os, "kill", lambda *a: None)
+        monkeypatch.setattr(
+            m, "_get_process_start_time", lambda pid: "Sat Aug 22 23:07:37 2026"
+        )
+
+        assert m.read_pid("ml") == 4242
+        assert pid_file.exists(), (
+            "deleted the pidfile of a healthy service on upgrade, which is the "
+            "bug the locale fix exists to prevent"
+        )

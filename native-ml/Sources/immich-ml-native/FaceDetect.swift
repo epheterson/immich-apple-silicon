@@ -7,12 +7,25 @@ import CoreGraphics
 // the same landmark picks (eye centers, nose last point, outer-lip x-extremes).
 /// The confidence below which a Vision detection is discarded.
 ///
-/// Vision's own floor: it does not emit anything below about 0.6 on real
-/// photographs, so this only catches genuine junk rather than trimming the
-/// distribution. Deliberately not Immich's minScore, which is calibrated for
-/// buffalo_l and drops a quarter of our detections when applied to Vision's
-/// numbers. See the note at the call site in Predict.swift.
-let VISION_FACE_FLOOR = 0.5
+/// Immich's minScore is calibrated for buffalo_l and is not comparable with
+/// Vision's numbers: applying its 0.7 default here dropped a quarter of what
+/// we detect. But replacing it with a constant lower than anything Vision
+/// emits is not a threshold either, it is the absence of one, and it left this
+/// engine with no working confidence knob at all.
+///
+/// So the knob is ours, on our scale, and it is real. The default is 0.6,
+/// just inside the range measured across 24 images (0.61 to 0.93), so it
+/// discards genuine junk without trimming that distribution. Raise it with
+/// IMMICH_ACCEL_FACE_MIN_SCORE if false positives matter more than recall;
+/// the value is a Vision confidence, not an Immich one, which is why it has
+/// its own name rather than borrowing minScore's.
+let VISION_FACE_FLOOR: Double = {
+    let raw = ProcessInfo.processInfo.environment["IMMICH_ACCEL_FACE_MIN_SCORE"]
+    guard let raw, let value = Double(raw), (0...1).contains(value) else {
+        return 0.6
+    }
+    return value
+}()
 
 struct DetectedFace {
     let x1: Int, y1: Int, x2: Int, y2: Int
@@ -36,17 +49,20 @@ func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [
     // pass runs on exactly the observations the detector found, so the 5 points
     // the aligner needs still come back for every face, and the confidence
     // survives.
+    // One handler for both passes. Raw image bytes, not a pre-decoded CGImage:
+    // the Python fork feeds VNImageRequestHandler initWithData and Vision
+    // produces slightly different landmarks otherwise. Two handlers decoded
+    // the same image twice on every face request.
+    let handler = VNImageRequestHandler(data: imageData, options: [:])
+
     let rects = VNDetectFaceRectanglesRequest()
-    // Raw image bytes, not a pre-decoded CGImage: the Python fork feeds
-    // VNImageRequestHandler initWithData and Vision produces slightly
-    // different landmarks otherwise.
-    try? VNImageRequestHandler(data: imageData, options: [:]).perform([rects])
+    try? handler.perform([rects])
     let detected = (rects.results as? [VNFaceObservation]) ?? []
     guard !detected.isEmpty else { return [] }
 
     let req = VNDetectFaceLandmarksRequest()
     req.inputFaceObservations = detected
-    try? VNImageRequestHandler(data: imageData, options: [:]).perform([req])
+    try? handler.perform([req])
     let landmarked = (req.results as? [VNFaceObservation]) ?? []
 
     // Walk the detections, not the landmark results, and take landmarks by
@@ -65,9 +81,27 @@ func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [
     var byID: [UUID: VNFaceObservation] = [:]
     for obs in landmarked { byID[obs.uuid] = obs }
 
+    // A uuid miss is not a harmless fallback. The rectangles observation has no
+    // landmarks, so embedFaces takes the padded-bbox crop instead of an ArcFace
+    // normCrop, and those embeddings do not cluster against aligned ones. The
+    // counts, boxes and scores all still look right, so a wholesale failure
+    // here would degrade recognition across an entire library invisibly.
+    // uuid propagation through inputFaceObservations is undocumented, so if it
+    // ever matches nothing, fall back to position and say so.
+    let matched = detected.filter { byID[$0.uuid] != nil }.count
+    var byIndex = false
+    if matched == 0 && !landmarked.isEmpty {
+        FileHandle.standardError.write(Data(
+            ("[native-ml] landmark observations carry no matching uuids; "
+             + "pairing by position. Face embeddings may be unaligned.\n").utf8))
+        byIndex = true
+    }
+
     var faces: [DetectedFace] = []
-    for detection in detected {
-        let obs = byID[detection.uuid] ?? detection
+    for (i, detection) in detected.enumerated() {
+        let obs = byIndex
+            ? (i < landmarked.count ? landmarked[i] : detection)
+            : (byID[detection.uuid] ?? detection)
         let bb = obs.boundingBox   // normalized, bottom-left origin
         let x1 = bb.origin.x * Double(W)
         let y1 = (1.0 - bb.origin.y - bb.height) * Double(H)

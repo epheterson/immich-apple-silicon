@@ -858,6 +858,17 @@ struct SettingsView: View {
         return mounted ? ("Reachable", .running) : ("Missing", .degraded)
     }
 
+    /// Is `point` the mount that would provide `root`: the path itself, or an
+    /// ancestor of it? Mirrors _mount_covers in the CLI.
+    private func mountCovers(_ point: String, _ root: String) -> Bool {
+        guard !point.isEmpty, !root.isEmpty else { return false }
+        let p = URL(fileURLWithPath: point).standardizedFileURL.path
+        let r = URL(fileURLWithPath: root).standardizedFileURL.path
+        if p == r { return true }
+        // Component-wise, so /nas does not "cover" /nastyname.
+        return r.hasPrefix(p.hasSuffix("/") ? p : p + "/")
+    }
+
     /// Whether the recorded mount point is in the mount table, or nil when no
     /// mount was ever recorded.
     ///
@@ -868,7 +879,15 @@ struct SettingsView: View {
     /// this pane exists to report.
     private var libraryIsMounted: Bool? {
         guard let recipe = config["mount_recipe"] as? [String: Any],
-              let point = recipe["mountpoint"] as? String, !point.isEmpty
+              let point = recipe["mountpoint"] as? String, !point.isEmpty,
+              // Only while it still covers the configured library, which is
+              // what library_mount checks on the Python side and this did not.
+              // The recipe is written once and never cleared, so a library
+              // moved from a NAS to a local disk keeps naming the old share:
+              // this pane then reported Missing, with a footer promising the
+              // worker would be paused, while the accelerator correctly did
+              // nothing at all.
+              mountCovers(point, libraryPath)
         else { return nil }
 
         var buffer: UnsafeMutablePointer<statfs>?
