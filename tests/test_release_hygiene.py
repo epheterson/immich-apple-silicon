@@ -822,6 +822,59 @@ def test_the_update_check_does_not_read_brews_exit_code():
     )
 
 
+def test_the_mlx_gate_cannot_fail_because_of_the_network():
+    """The one gate that must never cry wolf.
+
+    The face image used to be fetched lazily from inside predict_task, which
+    runs in the thread pool. A slow link, flaky DNS or a captive portal came
+    out as "FAIL - 1/27 predict calls errored" and exit 1, which this script's
+    own docstring defines as "do NOT ship this mlx". That is indistinguishable
+    at a glance from the SIGABRT the gate exists to catch, so it either blocks
+    a good release or teaches whoever runs it that a red here is worth
+    re-running. The 60s urlopen also ran alongside the CLIP pressure, altering
+    the concurrency profile the crash detection depends on.
+
+    Checked against the parsed module rather than its text, so reformatting or
+    renaming a local cannot quietly retire it.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parent.parent
+    tree = ast.parse((root / "scripts/ml-preflight.py").read_text())
+
+    def fn(name):
+        found = next(
+            (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name),
+            None,
+        )
+        assert found is not None, f"ml-preflight.py has no {name}(); update this test"
+        return found
+
+    def calls(node):
+        return {
+            c.func.id
+            for c in ast.walk(node)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+        }
+
+    assert "face_jpeg" not in calls(fn("predict_task")), (
+        "predict_task fetches the face image again, putting a network round "
+        "trip inside the thread pool where a fetch failure reads as an mlx crash"
+    )
+    assert "face_jpeg" in calls(
+        fn("main")
+    ), "nothing resolves the face image up front any more"
+
+    # Not reaching the network must be a different answer from failing.
+    main_src = ast.get_source_segment(
+        (root / "scripts/ml-preflight.py").read_text(), fn("main")
+    )
+    assert "return 2" in main_src, (
+        "the cannot-run path no longer has its own exit code, so an "
+        "unreachable network is indistinguishable from 'do not ship this mlx'"
+    )
+
+
 def test_a_success_notice_never_shares_a_pane_with_a_failure():
     """Settings has two message channels and they are mutually exclusive.
 

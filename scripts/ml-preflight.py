@@ -235,12 +235,19 @@ def check_response(task: str, result: dict) -> str:
 
 
 def predict_task(base: str, image: bytes, task: str = "clip",
-                 face_override: str | None = None) -> str:
-    """One real /predict call, multipart, matching immich-accelerator ml-test."""
+                 face_image: bytes | None = None) -> str:
+    """One real /predict call, multipart, matching immich-accelerator ml-test.
+
+    The face image arrives already resolved. Fetching it here put a network
+    round trip inside the thread pool, where failing to reach the network was
+    indistinguishable from the inference crash this gate exists to find.
+    """
     if task == "ocr":
         image = text_jpeg()
     elif task == "faces":
-        image = face_jpeg(face_override)
+        if face_image is None:
+            raise RuntimeError("faces task reached without a resolved image")
+        image = face_image
     boundary = "----iac-ml-preflight"
     body = b"".join(
         [
@@ -318,6 +325,30 @@ def main() -> int:
         "ML_FACE_MODEL": "buffalo_l",  # load face too: the #103 crash had both models in-process
         "ML_LOG_REQUESTS": "true",
     }
+    # Resolve the face image before anything else, and treat not getting it as
+    # a different outcome from failing the gate.
+    #
+    # It used to be fetched lazily from inside predict_task, which runs in the
+    # thread pool. A slow link, flaky DNS or a captive portal therefore came
+    # out as "FAIL - 1/27 predict calls errored" with exit 1, which this
+    # script's own docstring defines as "do NOT ship this mlx". That is
+    # indistinguishable at a glance from the SIGABRT this gate exists to
+    # catch, so it either blocks a good release or, worse, teaches whoever is
+    # running it that a red here is worth re-running -- on the one gate that
+    # must never cry wolf. The 60s urlopen also ran concurrently with the CLIP
+    # pressure, altering the very concurrency profile the crash detection
+    # depends on.
+    try:
+        face_image = face_jpeg(args.face_image)
+    except Exception as exc:
+        print(f"[preflight] CANNOT RUN — {exc}", flush=True)
+        print(
+            "[preflight] This is not a verdict on mlx: the gate never started. "
+            "Exit 2 means inconclusive, not 'do not ship'.",
+            flush=True,
+        )
+        return 2
+
     err = open(os.path.join("/tmp", f"ml-preflight-{args.port}.err"), "w+b")
     print(
         f"[preflight] booting real ML service on {base} with STUB_MODE=false ...",
@@ -357,7 +388,7 @@ def main() -> int:
                 for _ in range(args.requests)
             ]
             futs += [
-                ex.submit(predict_task, base, image, task, args.face_image)
+                ex.submit(predict_task, base, image, task, face_image)
                 for task in TASKS
                 if task != "clip"
             ]
