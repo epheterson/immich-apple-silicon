@@ -6741,6 +6741,32 @@ def _restart_worker(reason: str) -> bool:
     return True
 
 
+def _warn_immich_still_points_here(config: dict) -> None:
+    """Say that Immich is still configured to ask this Mac for machine learning.
+
+    Setup does not edit anyone's docker-compose.yml and this must not either:
+    "nothing inside Docker is modified" is the promise on the front of the
+    README, and silently rewriting a URL in a file we told people we do not
+    touch would be worse than the problem. So this only tells them, with the
+    line to change.
+
+    Without it, switching machine learning off looks like it worked and then
+    every search, face and OCR job fails against a service that is no longer
+    listening, with the reason living only in Immich's own logs.
+    """
+    url = config.get("ml_url") or ""
+    log.warning("Immich is still pointed at this Mac for machine learning.")
+    if url:
+        log.warning("  Its IMMICH_MACHINE_LEARNING_URL is %s.", url)
+    log.warning(
+        "  Until that points somewhere else, search, faces and text will fail."
+    )
+    log.warning(
+        "  Point it back at your own container (usually "
+        "http://immich-machine-learning:3003) and restart the Immich stack."
+    )
+
+
 def _set_component(name: str, on: bool) -> bool:
     """Record that a component should be on or off, and converge toward it.
 
@@ -6785,6 +6811,8 @@ def _set_component(name: str, on: bool) -> bool:
         # worker keeps talking to an engine we just killed, failing every CLIP,
         # face and OCR job, or ignoring one we just started.
         ok = _restart_worker("to pick up the new ML setting") and ok
+        if not on:
+            _warn_immich_still_points_here(config)
     elif name == "worker":
         if not on:
             if read_pid("worker"):
@@ -7057,15 +7085,14 @@ PRESET_SUMMARY = {
 # and is not part of this. A label that overclaims is worse than a plain one.
 PRESET_DETAIL = {
     "software": (
-        "The encoders and decoders Immich's own container uses. Video and "
-        "thumbnails come out byte for byte what Docker produces, except for "
-        "a file ffmpeg cannot decode at all, whose thumbnail comes from "
-        "QuickLook. Uses the most CPU."
+        "Immich's own encoders. Byte for byte what Docker produces, except "
+        "thumbnails for files ffmpeg cannot decode, which come from "
+        "QuickLook. Most CPU."
     ),
     "hardware": (
-        "VideoToolbox for decoding, video and audio. Much less CPU, so the Mac "
-        "keeps up with everything else it is doing. Video is visually identical "
-        "to Docker's; audio and 10-bit thumbnails differ byte for byte."
+        "VideoToolbox for decoding, video and audio. Much less CPU. Video "
+        "looks identical to Docker's; audio and 10-bit thumbnails differ "
+        "byte for byte."
     ),
     "custom": "Some on, some off. Set below.",
 }
