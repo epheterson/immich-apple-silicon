@@ -1,6 +1,10 @@
 # Changelog
 
-## 1.16.0 - 2026-08-23
+## 1.16.0 - 2026-08-25
+
+### Added
+- **A Library pane in Settings**, and five panes in place of three: General, Services, Transcoding, Library, Diagnostics. Library shows where your photos are, how that directory is mounted, and whether it is reachable right now.
+- **`scripts/ml-parity.py`.** Sends the same images to Immich's own container and to whichever engines you name, then reports cosine similarity for search, box overlap for faces, and the text each one read. Every machine learning figure in these notes comes from it rather than from an assertion.
 
 ### Fixed
 - **`status` reported a running service as stopped outside US locales, and deleted its pidfile.** `ps` formats process start times through the caller's locale, and the writer (launchd, no `LANG`) and the reader (your terminal) are different processes: the same live process reads `Tue Aug 25` under `C` and `Tue 25 Aug` under `en_AU` or `en_GB`. The mismatch looked like PID reuse, so the pidfile was deleted, `stop` became a no-op that orphaned the service, and `start` collided on port 3003. Machine learning was the visible casualty because the worker has a fallback and it does not. By [@hiisukun](https://github.com/hiisukun) ([#169](https://github.com/epheterson/immich-apple-silicon/pull/169)).
@@ -10,6 +14,8 @@
 - **Settings and `status` now say when Homebrew is refusing to load the formula.** An untrusted tap makes `brew upgrade` and `brew outdated` do nothing and say nothing, which is indistinguishable from being up to date, so an install can sit on an old version indefinitely with no signal. Settings shows it under Software Update with a button that runs `brew trust`, and `status` prints the same command.
 - **`ml-preflight.py` no longer carries a photograph.** It embedded a real image as base64, and the formula installs this tree wholesale, so v1.15.0 redistributed it with no source or licence recorded. The image is now fetched once and cached outside the repository. Raised by [@RxChi1d](https://github.com/RxChi1d) ([#167](https://github.com/epheterson/immich-apple-silicon/issues/167)).
 
+- **On an x86 Homebrew, `watch` never noticed an upgrade.** It reads the installed VERSION through Homebrew's version independent `opt` symlink to tell that the code it is running has been replaced, and that path was written for `/opt/homebrew` only. Under an x86 brew at `/usr/local`, which is a real configuration on this machine under Rosetta, the read always failed and fell back to the version compiled into the running process, so it compared itself against itself and kept executing the old code until something restarted it.
+- **On an x86 Homebrew, the menu bar app and the CLI disagreed about the install.** The app resolved Homebrew's location three separate times by two different rules. Two looked for the prefix holding the accelerator and one took the first `brew` binary that exists, so on a machine with both prefixes an accelerator under `/usr/local` was managed with the Apple Silicon brew, which has never heard of it. The version row came back blank, onboarding offered to install something already installed, and the CLI printed "Updates: blocked" while Settings showed nothing. There is now one answer that all three derive from, and it is decided by where the accelerator actually is.
 - **The Swift mirror of the encoding settings was only half checked.** The test stopped at the default-off set, so which switches default off and the words the wrapper reads as on and off were pinned by nothing; emptying the set left the suite green while the pane would have shown hardware audio on by default. By [@RxChi1d](https://github.com/RxChi1d) ([#165](https://github.com/epheterson/immich-apple-silicon/pull/165)).
 
 ### Changed

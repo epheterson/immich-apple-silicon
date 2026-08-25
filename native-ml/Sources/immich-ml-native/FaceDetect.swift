@@ -1,5 +1,6 @@
 import Foundation
 import Vision
+import os
 import CoreGraphics
 
 // Face detection + 5-point landmarks via Vision's VNDetectFaceLandmarksRequest,
@@ -35,7 +36,22 @@ struct DetectedFace {
 
 /// Set once the landmark-pairing warning has been written, so a long run does
 /// not put a line in ml.log for every image.
-private nonisolated(unsafe) var warnedAboutLandmarkPairing = false
+///
+/// Locked rather than a bare `nonisolated(unsafe) var`: /predict is served
+/// concurrently, so the plain read-then-write was a data race, and the
+/// "unsafe" in that spelling is a claim the author makes, not one the compiler
+/// checks. The cost of losing the race is only a duplicate log line, but a
+/// race on a Bool is still undefined behaviour and the sanitizer flags it.
+private let landmarkWarning = OSAllocatedUnfairLock(initialState: false)
+
+/// True exactly once across every thread, for the caller that gets there first.
+private func claimLandmarkWarning() -> Bool {
+    landmarkWarning.withLock { alreadyWarned in
+        if alreadyWarned { return false }
+        alreadyWarned = true
+        return true
+    }
+}
 
 func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [DetectedFace] {
     // Detect and landmark in two stages, because the landmarks request is a
@@ -105,8 +121,7 @@ func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [
     // detection is honest instead: the box and score are still correct and
     // only the alignment is lost, which the warning says.
     let matched = detected.filter { byID[$0.uuid] != nil }.count
-    if matched < detected.count && !warnedAboutLandmarkPairing {
-        warnedAboutLandmarkPairing = true
+    if matched < detected.count, claimLandmarkWarning() {
         // Unmatched detections get the padded-bbox crop rather than an ArcFace
         // normCrop, so their embeddings will not cluster with the rest of the
         // library. Counts, boxes and scores all still look right, which makes
