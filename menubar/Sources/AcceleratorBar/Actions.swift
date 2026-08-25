@@ -158,11 +158,13 @@ enum Actions {
     /// closed a file handle another thread was reading, which raises an
     /// Objective-C exception Swift cannot catch.
     ///
-    /// It was there for a brew blocked on the Homebrew lock, which nobody has
-    /// reported. Three attempts produced a crash path, a wrong answer and a
-    /// one-second tax on opening a window, which is a far worse trade than the
-    /// hang it was insuring against. If it comes back it wants dispatch I/O
-    /// and its own queue, not a deadline bolted onto a blocking read.
+    /// It was there for a brew blocked on the Homebrew lock. The waiting is
+    /// now the caller's problem rather than this function's: the Trust button
+    /// says "Trusting...", says "Still working..." after ten seconds, and
+    /// settles on the real answer whenever it arrives (see startTrust in
+    /// SettingsView). Nothing is cancelled, so brew is never signalled halfway
+    /// through writing trust.json, and a command that succeeds slowly is
+    /// reported as the success it was.
     static func run(_ tool: String, _ args: [String],
                     env: [String: String] = [:]) async -> (Int32, String) {
         await withCheckedContinuation { cont in

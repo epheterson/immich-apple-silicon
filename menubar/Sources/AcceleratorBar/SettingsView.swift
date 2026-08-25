@@ -100,6 +100,8 @@ struct SettingsView: View {
     // "you are up to date" everywhere else in the app.
     @State private var updatesBlocked = false
     @State private var trusting = false
+    // Ten seconds in, the label says more. Never changes the outcome.
+    @State private var trustSlow = false
     @State private var mountSharesAtLogin = MountSharesAtLogin.isEnabled
 
     var body: some View {
@@ -151,6 +153,50 @@ struct SettingsView: View {
         case .library: libraryTab
         case .diagnostics: diagnosticsTab
         default: generalTab
+        }
+    }
+
+    /// The button's own text, which is the whole waiting story.
+    ///
+    /// There is no deadline on the subprocess. `brew` takes a lock and can sit
+    /// behind another brew for a long time, and every attempt to cancel it from
+    /// here went wrong in a different way: a deadline that could not fire, one
+    /// that fired on the wrong event and killed a command that had succeeded,
+    /// and one that signalled a PID the kernel had already reassigned. Killing
+    /// brew halfway through writing trust.json is worse than waiting for it.
+    ///
+    /// So nothing is cancelled. The button says what is happening, says more
+    /// after ten seconds, and settles on the real answer whenever it arrives.
+    private var trustLabel: String {
+        if !trusting { return "Trust the Tap" }
+        return trustSlow ? "Still working…" : "Trusting…"
+    }
+
+    private func startTrust() {
+        trusting = true
+        trustSlow = false
+
+        // Not a timeout: a label change. It never affects the result.
+        let slow = Task {
+            try? await Task.sleep(for: .seconds(10))
+            if !Task.isCancelled { trustSlow = true }
+        }
+
+        Task {
+            // A refused write looks identical to a successful one that did not
+            // take, so re-read the state rather than believing the exit code,
+            // and show brew's own text when it disagrees.
+            let result = await Actions.trustTap()
+            updatesBlocked = await Actions.brewRefusesTap()
+            slow.cancel()
+            trusting = false
+            trustSlow = false
+            if !result.ok || updatesBlocked {
+                record((ok: false,
+                        message: result.output.isEmpty
+                            ? "brew trust did not take effect."
+                            : result.output))
+            }
         }
     }
 
@@ -227,25 +273,8 @@ struct SettingsView: View {
                             .font(.rowDetail).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         HStack(spacing: Metrics.md) {
-                            Button(trusting ? "Trusting…" : "Trust the Tap") {
-                                trusting = true
-                                Task {
-                                    // A refused write looked identical to a
-                                    // successful one that did not take: the
-                                    // button flipped back and the same warning
-                                    // sat there. brew's own text says why.
-                                    let result = await Actions.trustTap()
-                                    updatesBlocked = await Actions.brewRefusesTap()
-                                    trusting = false
-                                    if !result.ok || updatesBlocked {
-                                        record((ok: false,
-                                                message: result.output.isEmpty
-                                                    ? "brew trust did not take effect."
-                                                    : result.output))
-                                    }
-                                }
-                            }
-                            .disabled(trusting)
+                            Button(trustLabel) { startTrust() }
+                                .disabled(trusting)
                             // Shown as well as offered: this changes the
                             // user's Homebrew configuration, so anyone who
                             // would rather run it themselves can read it and
