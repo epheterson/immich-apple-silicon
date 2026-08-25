@@ -773,6 +773,47 @@ def test_the_two_brew_calls_that_check_for_updates_may_still_fetch():
         assert "brewEnv" in call, f"brew call with no environment at all:\n{call}"
 
 
+def test_the_update_check_does_not_read_brews_exit_code():
+    """`brew outdated` with a *named* formula is an assertion, not a report.
+
+    Homebrew sets a failure status when the formula it was asked about is the
+    one that turns out to be outdated (cmd/outdated.rb: `Homebrew.failed =
+    args.named.present? && outdated.present?`). Measured on a real Homebrew
+    6.0.19:
+
+        $ brew outdated --formula --verbose git
+        git (2.46.0) < 2.55.0
+        $ echo $?
+        1
+
+    So `guard code == 0` discarded the answer in precisely the case that
+    matters, and an app kept current by Sparkle went on running whatever CLI
+    core it had, forever and silently. It also made the fetching environment
+    added in the same release pointless: the tap refreshed, then the result
+    was thrown away one line later.
+    """
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "menubar/Sources/AcceleratorBar/Actions.swift").read_text()
+
+    start = src.index("static func coreOutdated(")
+    body = src[start:src.index("\n    }", start)]
+
+    # Positive form: the exit code is discarded at the binding, so reading it
+    # again means binding it again and tripping this.
+    assert "let (_, out) = await run(" in body, (
+        "coreOutdated is binding brew's exit code; it is 1 whenever an "
+        "upgrade is available, so any check on it reports 'nothing to do'"
+    )
+    assert "code == 0" not in body, "back to gating the answer on the exit code"
+
+    # run() folds stderr into the same string, so the version has to be read
+    # off the line that names our formula rather than the first "< " anywhere.
+    assert 'contains("immich-accelerator")' in body, (
+        "the version is parsed from unanchored output, which can lift a "
+        "number out of a message about something else"
+    )
+
+
 def test_the_app_and_the_cli_agree_on_reading_a_pidfile_start_time():
     """Both read the same pidfiles, so a rule that holds on one side and not
     the other means Settings and `status` disagree about whether a service is

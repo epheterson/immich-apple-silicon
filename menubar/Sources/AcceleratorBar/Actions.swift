@@ -464,12 +464,29 @@ enum Actions {
     // `brew outdated --verbose` prints "immich-accelerator (1.7.1) < 1.7.2" and
     // stays silent for an up-to-date OR pinned formula, so nil correctly means
     // "do not run an upgrade".
+    //
+    // The exit code is deliberately not consulted. `brew outdated` with a named
+    // formula is an assertion, not a report: Homebrew sets a failure status when
+    // the formula it was asked about IS outdated (cmd/outdated.rb, `Homebrew.
+    // failed = args.named.present? && outdated.present?`). Measured on this
+    // machine: `brew outdated --formula --verbose git` prints
+    // "git (2.46.0) < 2.55.0" and exits 1. Guarding on `code == 0` therefore
+    // threw the answer away in precisely the case that matters, and an app
+    // updated by Sparkle went on running the old CLI core forever.
     static func coreOutdated() async -> String? {
-        let (code, out) = await run(
+        let (_, out) = await run(
             brew, ["outdated", "--formula", "--verbose", "immich-accelerator"],
             env: brewEnvAllowingFetch)
-        guard code == 0, let r = out.range(of: "< ") else { return nil }
-        let v = out[r.upperBound...]
+        // Anchored to the line naming the formula. run() merges stderr into
+        // this string, so a bare search for "< " can lift a version out of a
+        // message about something else entirely.
+        guard
+            let line = out.split(separator: "\n").first(where: {
+                $0.contains("immich-accelerator") && $0.contains("< ")
+            }),
+            let r = line.range(of: "< ")
+        else { return nil }
+        let v = line[r.upperBound...]
             .prefix { !$0.isWhitespace }
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return v.isEmpty ? nil : v
