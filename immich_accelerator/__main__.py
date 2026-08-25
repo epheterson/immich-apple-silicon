@@ -2211,6 +2211,9 @@ _REMOUNTABLE_FS = {"smbfs", "nfs", "afpfs"}
 # should not be probed every 30s, and an SMB server should never be hit with a
 # tight retry loop; repeated failed auth is how accounts get locked.
 _REMOUNT_BACKOFF = (0, 60, 300, 900)
+# Watch cycles between advisory reads of the library. The loop runs every 30s,
+# so ten cycles is five minutes.
+MEDIA_IO_EVERY = 10
 
 
 def mount_recipe_for(root: str) -> dict | None:
@@ -6310,6 +6313,7 @@ def _watch_worker(config: dict) -> str | None:
     media_paused = False
     remount_state: dict = {}  # {attempts, last, blocked} for the remount backoff
     media_down_since: float | None = None  # first failed probe of a run
+    media_io_countdown = 0  # cycles until the next advisory read of the mount
     backend_down_since: float | None = None  # first cycle Postgres/Redis went quiet
     backend_paused = False
     # This loop's state starts clean, so any marker from a previous run is
@@ -6517,7 +6521,18 @@ def _watch_worker(config: dict) -> str | None:
                                 )
                             worker_handled = True
 
-                healthy, detail = media_io_healthy(config)
+                # This one reads a marker file on the mount, so unlike the
+                # mount-table check above it is real I/O against the NAS. It is
+                # advisory and never stops the worker, so it does not need to
+                # run on every 30s cycle: once every ten of them is five
+                # minutes, which is often enough for something nobody acts on
+                # automatically. Skipped entirely when no worker is running,
+                # because then nothing is reading the library anyway.
+                media_io_countdown -= 1
+                healthy, detail = True, ""
+                if read_pid("worker") and media_io_countdown <= 0:
+                    media_io_countdown = MEDIA_IO_EVERY
+                    healthy, detail = media_io_healthy(config)
                 if not healthy and detail and detail not in shown_media_warnings:
                     shown_media_warnings.add(detail)
                     log.warning(

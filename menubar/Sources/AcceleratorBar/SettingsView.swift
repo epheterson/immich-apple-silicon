@@ -24,7 +24,7 @@ struct SettingsView: View {
     /// thing that makes a sidebar read as macOS settings rather than as a
     /// generic list, and System Settings gives every pane one.
     private enum Pane: String, Hashable, CaseIterable, Identifiable {
-        case general, processing, diagnostics
+        case general, services, transcoding, library, diagnostics
 
         // Identity is the case itself, so List's selection binding is a Pane?
         // rather than the String? an id-of-String would demand. Getting this
@@ -35,21 +35,27 @@ struct SettingsView: View {
         var title: String {
             switch self {
             case .general: return "General"
-            case .processing: return "Processing"
+            case .services: return "Services"
+            case .transcoding: return "Transcoding"
+            case .library: return "Library"
             case .diagnostics: return "Diagnostics"
             }
         }
         var symbol: String {
             switch self {
             case .general: return "gearshape.fill"
-            case .processing: return "cpu.fill"
+            case .services: return "square.stack.3d.up.fill"
+            case .transcoding: return "film.fill"
+            case .library: return "photo.on.rectangle.angled"
             case .diagnostics: return "stethoscope"
             }
         }
         var tint: Color {
             switch self {
             case .general: return .gray
-            case .processing: return .indigo
+            case .services: return .indigo
+            case .transcoding: return .purple
+            case .library: return .orange
             case .diagnostics: return .teal
             }
         }
@@ -140,7 +146,9 @@ struct SettingsView: View {
     @ViewBuilder
     private var detail: some View {
         switch pane {
-        case .processing: processingTab
+        case .services: servicesTab
+        case .transcoding: transcodingTab
+        case .library: libraryTab
         case .diagnostics: diagnosticsTab
         default: generalTab
         }
@@ -187,14 +195,17 @@ struct SettingsView: View {
                     .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
 
                 VStack(alignment: .leading, spacing: Metrics.xs) {
-                    Toggle("Mount NAS shares at login", isOn: $mountSharesAtLogin)
+                    Toggle("Reconnect SMB shares at launch", isOn: $mountSharesAtLogin)
                         .onChange(of: mountSharesAtLogin) { _, on in
                             Task { await MountSharesAtLogin.set(on) }
                         }
                     // Turning this on remembers whatever SMB shares (e.g. a
                     // NAS backing a split deployment) are mounted right now;
                     // it doesn't ask which ones separately.
-                    Text("Remembers the SMB shares mounted right now and reconnects any that are missing on launch.")
+                    // Says which shares, and says it only covers launch, because
+                    // the accelerator remounts the library on its own the whole
+                    // time it runs and the two were easy to confuse.
+                    Text("Remembers every SMB share mounted when you switch this on, this Mac's own as well as Immich's, and reconnects any that have gone missing the next time this app launches. Your Immich library does not need this: the accelerator records how it is mounted and puts it back on its own, the whole time it runs.")
                         .font(.rowDetail).foregroundStyle(.secondary)
                 }
             } header: {
@@ -281,19 +292,16 @@ struct SettingsView: View {
         return model.snap.immichVersion.isEmpty ? url : "v\(model.snap.immichVersion) · \(url)"
     }
 
-    // MARK: - Processing
+    // MARK: - Services
 
-    /// Everything this Mac does to a photo or video, on one screen.
+    /// What runs on this Mac, and which engine does the machine learning.
     ///
-    /// Section order and gating follow docs/plans/2026-08-22-processing-pane-spec.md.
-    /// A control that writes switches only the worker uses is hidden when no
-    /// worker runs, because it would be a control over nothing.
-    private var processingTab: some View {
+    /// Split from Transcoding because they answer different questions: this
+    /// one is "is it on", that one is "how does it encode". They were one
+    /// screen and it ran long enough that the controls at the bottom were
+    /// below the fold on an unmodified window.
+    private var servicesTab: some View {
         Form {
-            if workerOn {
-                positionSection
-            }
-
             Section("Services") {
                 componentToggle("worker", $workerOn, "Worker",
                                 "Thumbnails, video, metadata")
@@ -303,7 +311,27 @@ struct SettingsView: View {
                                 dashboardStatus)
             }
 
+            if mlOn {
+                engineSection
+            }
+
+            messageSections
+        }
+        .formStyle(.grouped)
+    }
+
+    // MARK: - Transcoding
+
+    /// How this Mac encodes video, and the tool for deciding.
+    ///
+    /// Every control here writes switches only the worker reads, so with no
+    /// worker there is nothing to configure and the pane says so rather than
+    /// showing controls over nothing.
+    private var transcodingTab: some View {
+        Form {
             if workerOn {
+                positionSection
+
                 Section("Hardware Transcoding") {
                     encodingToggle("hardware-decode", $hardwareDecodeOn,
                                    "Decoding", "Video, thumbnails and previews")
@@ -312,41 +340,94 @@ struct SettingsView: View {
                     encodingToggle("hardware-audio", $hardwareAudioOn,
                                    "Audio Encoding", "AAC on AudioToolbox")
                 }
-            }
 
-            if mlOn {
-                engineSection
-            }
-
-            if workerOn {
                 compareSection
+            } else {
+                Section {
+                    Text("The worker is switched off, so nothing on this Mac is "
+                         + "transcoding. Turn it on under Services.")
+                        .font(.rowDetail).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
-            // Failures in red, then saved-but-not-live in secondary text. Two
-            // channels on purpose: showing "saved, takes effect later" in red
-            // beside real errors teaches people to ignore both.
-            if let message = encodingError ?? componentError {
-                Section {
-                    Label(message, systemImage: "exclamationmark.triangle.fill")
-                        .font(.rowDetail)
-                        .foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            messageSections
+        }
+        .formStyle(.grouped)
+    }
+
+    /// Failures in red, then saved-but-not-live in secondary text.
+    ///
+    /// Two channels on purpose: showing "saved, takes effect later" in red
+    /// beside real errors teaches people to ignore both. Shared by every pane
+    /// that can write, so a message cannot appear on one and not the other.
+    @ViewBuilder
+    private var messageSections: some View {
+        if let message = encodingError ?? componentError {
+            Section {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.rowDetail)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            if let notice, encodingError == nil, componentError == nil {
-                Section {
-                    Label(notice, systemImage: "info.circle")
-                        .font(.rowDetail)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+        }
+        if let note = notice ?? encodingNotice {
+            Section {
+                Label(note, systemImage: "info.circle")
+                    .font(.rowDetail)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // MARK: - Library
+
+    /// Where the photos are, how they are reached, and whether that is working.
+    ///
+    /// This exists because the mount story was split across a caption in
+    /// General and nothing at all: the SMB toggle there is launch-only and
+    /// covers every share on the Mac, while the library is watched and
+    /// remounted continuously by the accelerator and may not even be SMB. On
+    /// the release Mac it is NFS, so that toggle never touched it.
+    private var libraryTab: some View {
+        Form {
+            Section("Library") {
+                LabeledContent("Location", value: libraryPath)
+                if let recipe = libraryMount {
+                    LabeledContent("Mounted", value: recipe)
                 }
+                LabeledContent("State") {
+                    HStack(spacing: Metrics.md) {
+                        Text(libraryState.label)
+                        StatusDot(state: libraryState.dot)
+                    }
+                }
+            } footer: {
+                Text("The accelerator checks this every 30 seconds while it "
+                     + "runs. If the mount goes away it pauses the worker and "
+                     + "puts the mount back, retrying at 1, 5 and 15 minutes, "
+                     + "and stops for good if the server rejects the "
+                     + "credentials rather than locking the account out.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
+            }
+
+            Section("Other Shares") {
+                Toggle("Reconnect SMB shares at launch", isOn: $mountSharesAtLogin)
+                    .onChange(of: mountSharesAtLogin) { _, on in
+                        Task { await MountSharesAtLogin.set(on) }
+                    }
+            } footer: {
+                Text("Remembers every SMB share mounted when you switch this "
+                     + "on, and reconnects any that have gone missing the next "
+                     + "time this app launches. Separate from the library "
+                     + "above, which needs no help.")
+                    .font(.rowDetail).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
     }
 
-    /// Software / Custom / Hardware, with both named ends described where they
-    /// sit on the control, so the choice can be made before making it.
     private var positionSection: some View {
         Section {
             HStack {
@@ -512,6 +593,19 @@ struct SettingsView: View {
     }
 
     /// Route one result into the two channels the spec defines.
+
+    /// A spinner that occupies its space whether or not it is spinning.
+    ///
+    /// Inserting one shifts every row below it, which lands at the exact
+    /// moment someone is reaching for the next control. A settings window
+    /// must not move under the pointer.
+    private func spinnerSlot(_ active: Bool) -> some View {
+        ProgressView()
+            .controlSize(.small)
+            .opacity(active ? 1 : 0)
+            .frame(width: 16, height: 16)
+    }
+
     private func record(_ result: (ok: Bool, message: String)) {
         encodingError = result.ok ? nil : result.message
         notice = result.ok && !result.message.isEmpty ? result.message : nil
@@ -555,9 +649,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: Metrics.xs) {
                 HStack(spacing: Metrics.md) {
                     Text(title)
-                    if applyingSwitch == name {
-                        ProgressView().controlSize(.small)
-                    }
+                    spinnerSlot(applyingSwitch == name)
                 }
                 Text(caption).font(.rowDetail).foregroundStyle(.secondary)
             }
@@ -615,16 +707,17 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: Metrics.xs) {
                 HStack(spacing: Metrics.md) {
                     Text(title)
-                    // Turning the worker on runs a full start (extract, verify
-                    // sharp, preflight) and can take minutes. A row that just
-                    // went dead with no explanation reads as a hang.
-                    if applyingComponent == name {
-                        ProgressView().controlSize(.small)
-                        Text(binding.wrappedValue ? "Starting…" : "Stopping…")
-                            .font(.rowDetail).foregroundStyle(.secondary)
-                    }
+                    spinnerSlot(applyingComponent == name)
                 }
-                Text(caption).font(.rowDetail).foregroundStyle(.secondary)
+                // Turning the worker on runs a full start (extract, verify
+                // sharp, preflight) and can take minutes, so a row that just
+                // went dead with no explanation reads as a hang. The progress
+                // word replaces the caption rather than joining it: the line
+                // is already there, so swapping its text moves nothing.
+                Text(applyingComponent == name
+                     ? (binding.wrappedValue ? "Starting…" : "Stopping…")
+                     : caption)
+                    .font(.rowDetail).foregroundStyle(.secondary)
             }
         }
         .toggleStyle(.switch)
@@ -712,6 +805,37 @@ struct SettingsView: View {
     // MARK: - helpers
 
     private var apiKey: String { config["api_key"] as? String ?? "" }
+
+    // MARK: - Library facts
+
+    private var libraryPath: String {
+        (config["upload_mount"] as? String) ?? "not configured"
+    }
+
+    /// "nfs from 10.0.0.14:/volume1/ELP NAS", when the accelerator has
+    /// recorded how the mount is put together. It records it while the mount
+    /// is up, because it cannot be read back once the mount is gone.
+    private var libraryMount: String? {
+        guard let recipe = config["mount_recipe"] as? [String: Any],
+              let fstype = recipe["fstype"] as? String,
+              let spec = recipe["spec"] as? String
+        else { return nil }
+        return "\(fstype) from \(spec)"
+    }
+
+    /// Reachable, or not, and whether that has already stopped the worker.
+    /// FileManager, not a mount table parse: the question is whether the
+    /// directory the worker reads is actually there.
+    private var libraryState: (label: String, dot: StatusModel.State) {
+        let path = libraryPath
+        guard path != "not configured" else { return ("Not configured", .off) }
+        if let paused = model.snap.pausedReason, paused.contains("library") {
+            return ("Missing, worker paused", .bad)
+        }
+        return FileManager.default.fileExists(atPath: path)
+            ? ("Reachable", .good)
+            : ("Missing", .bad)
+    }
 
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
