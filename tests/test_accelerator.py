@@ -22,6 +22,7 @@ from immich_accelerator.__main__ import (
     write_pid,
     read_pid,
     kill_pid,
+    _get_process_start_time,
     detect_immich,
     _docker_is_running,
     _find_running_docker,
@@ -350,6 +351,38 @@ class TestPidManagement:
         ):
             result = read_pid("worker")
             assert result == current_pid
+
+    def test_start_time_is_locale_independent(self):
+        """ps formats lstart through the caller's locale, so an unpinned
+        locale makes the same live process read back differently depending
+        on who asked: "Sat Aug 22 23:07:37 2026" under C/en_US but "Sat 22
+        Aug 23:07:37 2026" under en_AU/en_GB. launchd (brew services)
+        passes no LANG while a Terminal inherits the user's region, so the
+        writer and the reader of a pidfile disagreed, read_pid called it a
+        reused PID, and deleted the pidfile of a healthy service."""
+        baseline = _get_process_start_time(os.getpid())
+        assert baseline, "ps gave no start time for our own pid"
+
+        for lang in ("en_AU.UTF-8", "en_GB.UTF-8", "en_US.UTF-8", "C"):
+            with patch.dict(os.environ, {"LANG": lang, "LC_TIME": lang}):
+                assert _get_process_start_time(os.getpid()) == baseline, (
+                    f"start time changed under LANG={lang} — the ps call "
+                    "is not pinned to a fixed locale"
+                )
+
+    def test_pidfile_survives_a_reader_in_a_different_locale(self, tmp_data_dir):
+        """End-to-end guard for the deletion: write the pidfile as one
+        process would, then read it back as a differently-localed process
+        (launchd vs Terminal). The pid must still resolve and the file must
+        still be there."""
+        current_pid = os.getpid()
+        with patch.dict(os.environ, {"LANG": "C", "LC_TIME": "C"}):
+            write_pid("worker", current_pid)
+
+        pid_file = tmp_data_dir["pid_dir"] / "worker.pid"
+        with patch.dict(os.environ, {"LANG": "en_AU.UTF-8", "LC_TIME": "en_AU.UTF-8"}):
+            assert read_pid("worker") == current_pid
+        assert pid_file.exists(), "a differently-localed reader deleted the pidfile"
 
     def test_kill_pid_returns_false_when_not_running(self, tmp_data_dir):
         assert kill_pid("worker") is False
