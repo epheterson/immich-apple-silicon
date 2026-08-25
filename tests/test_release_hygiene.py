@@ -814,6 +814,46 @@ def test_the_update_check_does_not_read_brews_exit_code():
     )
 
 
+def test_a_success_notice_never_shares_a_pane_with_a_failure():
+    """Settings has two message channels and they are mutually exclusive.
+
+    The doc comment on messageSections says why: showing "saved, takes effect
+    later" in secondary text beside a real error in red teaches people to
+    ignore both. Factoring the two sections out of the panes so every pane
+    could share them dropped the guard that enforced it, leaving the comment
+    describing an invariant the code no longer had. Because the sections are
+    now shared by four panes, a stale success notice from one follows the
+    user onto the pane where something actually failed.
+    """
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "menubar/Sources/AcceleratorBar/SettingsView.swift").read_text()
+
+    start = src.index("private var messageSections:")
+    body = src[start : src.index("\n    }", start)]
+    assert (
+        "if let note = notice, encodingError == nil, componentError == nil" in body
+    ), (
+        "the notice channel is unguarded again, so a success message can "
+        "render beside an unrelated red failure"
+    )
+
+
+def test_a_successful_trust_clears_the_banner_a_failed_one_left():
+    """record() is only reached on the failure path, so nothing reset the
+    error when a retry worked: "Updates are blocked" disappeared, proving the
+    action succeeded, while the red text beside it still said it had not.
+    Shared message sections carry that contradiction onto three panes."""
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "menubar/Sources/AcceleratorBar/SettingsView.swift").read_text()
+
+    start = src.index("private func startTrust()")
+    body = src[start : src.index("\n    }\n", start)]
+    assert 'record((ok: true, message: ""))' in body, (
+        "startTrust has no success path that clears the error, so a failed "
+        "attempt followed by a successful one still reads as failed"
+    )
+
+
 def test_the_app_and_the_cli_agree_on_reading_a_pidfile_start_time():
     """Both read the same pidfiles, so a rule that holds on one side and not
     the other means Settings and `status` disagree about whether a service is

@@ -196,6 +196,16 @@ struct SettingsView: View {
                         message: result.output.isEmpty
                             ? "brew trust did not take effect."
                             : result.output))
+            } else {
+                // Clear the banner a previous failed attempt left behind.
+                // Without this, a first Trust that fails (brew held the lock,
+                // say) leaves red text that the retry never removes: the
+                // "Updates are blocked" block disappears, so the action
+                // plainly worked, while the error beside it still says it
+                // did not. These sections are shared by General, Services
+                // and Transcoding, so the stale message follows the user
+                // onto all three.
+                record((ok: true, message: ""))
             }
         }
     }
@@ -390,7 +400,11 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        if let note = notice {
+        // Only when nothing is wrong. The two channels are mutually exclusive
+        // by design (see above), and factoring these sections out of the panes
+        // dropped the guard that enforced it: a success notice from one pane
+        // then sat beside an unrelated red failure on another.
+        if let note = notice, encodingError == nil, componentError == nil {
             Section {
                 Label(note, systemImage: "info.circle")
                     .font(.rowDetail)
