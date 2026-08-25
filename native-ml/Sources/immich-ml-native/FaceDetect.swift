@@ -92,58 +92,36 @@ func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [
     // here would degrade recognition across an entire library invisibly.
     // uuid propagation through inputFaceObservations is undocumented, so if it
     // ever matches nothing, fall back to position and say so.
+    // Measured on 24 images, 25 faces: every uuid the detector produced came
+    // back from the landmarks pass, and so did every bounding box. What did
+    // NOT come back was the order, on 10 of those 25. So the uuid is the key,
+    // and pairing by position is wrong in ordinary use rather than in some
+    // undocumented edge case.
+    //
+    // An earlier version had a position-pairing fallback for the case where
+    // uuids stop matching. It has been removed: on this evidence uuids always
+    // match, and if they ever stop, position is not the answer, since the same
+    // measurement shows the order is not preserved. Falling through to the
+    // detection is honest instead: the box and score are still correct and
+    // only the alignment is lost, which the warning says.
     let matched = detected.filter { byID[$0.uuid] != nil }.count
-
-    // Position pairing only when the arrays line up exactly. The comment above
-    // forbids index pairing on a short array, and the first version of this
-    // fallback did it anyway: `obs` supplies the reported bounding box, so a
-    // short `landmarked` put one face's confidence on another face's box.
-    // Equal counts do not mean equal order. The order of the landmarks results
-    // relative to inputFaceObservations is exactly as undocumented as the uuid
-    // propagation this fallback exists to work around, so require the boxes to
-    // agree too: a permutation would otherwise put face i's confidence on face
-    // j's box, which is the harm the comment above says this prevents.
-    let byIndex = matched == 0
-        && landmarked.count == detected.count
-        && zip(detected, landmarked).allSatisfy { d, l in
-            let a = d.boundingBox, b = l.boundingBox
-            return abs(a.origin.x - b.origin.x) < 0.01
-                && abs(a.origin.y - b.origin.y) < 0.01
-                && abs(a.width - b.width) < 0.01
-                && abs(a.height - b.height) < 0.01
-        }
-
-    // Once per process. This fires whenever any single face missed landmarks,
-    // which a group shot with small background faces does routinely, and it
-    // runs per /predict in a long-lived service whose stderr is ml.log. A line
-    // per image would be an unbounded write in the hot path, and it would bury
-    // the "last 30 lines of ml.log" that the CLI prints to explain a failure.
     if matched < detected.count && !warnedAboutLandmarkPairing {
         warnedAboutLandmarkPairing = true
-        // Every unmatched detection falls through to the rectangles
-        // observation, which has no landmarks, so embedFaces takes the padded
-        // crop instead of an ArcFace normCrop and those embeddings will not
-        // cluster with the rest of the library. Counts, boxes and scores all
-        // still look right, so this line is the only symptom there is.
-        //
-        // landmarked.isEmpty is included deliberately: if the landmarks
-        // perform fails, `try?` swallows it and results is nil, which is the
-        // most likely wholesale failure and the previous condition excluded
-        // exactly that case.
-        let detail = byIndex
-            ? "pairing by position instead; boxes agree, so this should be safe"
-            : "the rest use unaligned crops, and those embeddings may not "
-              + "cluster with existing ones"
+        // Unmatched detections get the padded-bbox crop rather than an ArcFace
+        // normCrop, so their embeddings will not cluster with the rest of the
+        // library. Counts, boxes and scores all still look right, which makes
+        // this line the only symptom there is. Once per run: a group shot with
+        // small background faces hits it routinely, and ml.log is what the CLI
+        // prints to explain failures.
         FileHandle.standardError.write(Data(
             ("[native-ml] landmarks matched \(matched) of \(detected.count) "
-             + "detections; \(detail). Reported once per run.\n").utf8))
+             + "detections; the rest use unaligned crops and may not cluster "
+             + "with existing faces. Reported once per run.\n").utf8))
     }
 
     var faces: [DetectedFace] = []
-    for (i, detection) in detected.enumerated() {
-        let obs = byIndex
-            ? (i < landmarked.count ? landmarked[i] : detection)
-            : (byID[detection.uuid] ?? detection)
+    for detection in detected {
+        let obs = byID[detection.uuid] ?? detection
         let bb = obs.boundingBox   // normalized, bottom-left origin
         let x1 = bb.origin.x * Double(W)
         let y1 = (1.0 - bb.origin.y - bb.height) * Double(H)
