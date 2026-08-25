@@ -1743,13 +1743,26 @@ def load_config() -> dict:
 
 
 def _get_process_start_time(pid: int) -> str | None:
-    """Get process start time via ps. Used to detect PID reuse."""
+    """Get process start time via ps. Used to detect PID reuse.
+
+    LC_ALL=C is required, not cosmetic: ps formats lstart through the
+    caller's locale, so the same process reads back as "Sat Aug 22
+    23:07:37 2026" under C/en_US but "Sat 22 Aug 23:07:37 2026" under
+    en_AU/en_GB. Our writer and reader are frequently different processes
+    with different locales — launchd (brew services) passes no LANG at
+    all, while a Terminal session inherits the user's region — so an
+    unpinned locale makes read_pid see a start-time mismatch, conclude
+    the PID was reused, and delete a pidfile whose service is healthy.
+    Downstream that reports a running service as stopped, makes stop a
+    no-op that orphans it, and makes start try to spawn a duplicate.
+    """
     try:
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "lstart="],
             capture_output=True,
             text=True,
             timeout=5,
+            env={**os.environ, "LC_ALL": "C"},
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
