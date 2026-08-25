@@ -360,8 +360,16 @@ def test_the_byte_for_byte_claim_names_its_exception():
         text = (root / rel).read_text()
         # Normalised, because three of the four wrap the sentence across lines.
         flat = " ".join(text.split())
-        if "byte for byte what Docker produces" not in flat:
-            continue
+        # Case-folded, and asserted rather than skipped. The commit that added
+        # the qualifier also capitalised the claim at the start of a sentence
+        # in two of these four files, and the `continue` excused exactly those
+        # two: the test went on passing while guarding half of what it names.
+        # A missing anchor has to be louder than a passing test.
+        assert "byte for byte what docker produces" in flat.lower(), (
+            f"{rel} no longer carries the byte-for-byte claim this test "
+            f"guards. If the wording moved, update the phrase here; if the "
+            f"claim is gone, drop {rel} from the list."
+        )
         assert "QuickLook" in flat, (
             f"{rel} claims byte-for-byte output but never mentions the "
             f"QuickLook fallback, which produces thumbnails ffmpeg did not."
