@@ -3872,6 +3872,47 @@ class TestUpgradingDoesNotFireTheLocaleBugItFixes:
         ):
             assert m.read_pid("ml") is None
 
+    def test_a_restamp_is_never_visible_as_an_empty_file(self, tmp_data_dir):
+        """The restamp rewrites a file that `watch`, `status` and the menu bar
+        app (every 3s) are all reading concurrently.
+
+        ``write_text`` opens with O_TRUNC and then writes, so an in-place
+        rewrite is zero bytes on disk for a moment. A reader landing in that
+        window parses ``int("")``, raises, and unlinks the pidfile of a
+        healthy service: reported stopped, ``stop`` becomes a no-op that
+        orphans it, and the next ``start`` collides on the port. That is the
+        failure the start-time check exists to prevent, reintroduced by the
+        fix for it as a race. os.replace closes the window.
+        """
+        import threading
+
+        import immich_accelerator.__main__ as m
+
+        pid_file = tmp_data_dir["pid_dir"] / "ml.pid"
+        pid_file.write_text("4242\nSat Aug 22 23:07:37 2026")
+
+        bad = []
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    if not pid_file.read_text().strip():
+                        bad.append("empty")
+                except OSError:
+                    bad.append("absent")
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        try:
+            for i in range(4000):
+                m._write_pid_file(pid_file, 4242, f"Sat Aug 22 23:07:{i % 60:02d} 2026")
+        finally:
+            stop.set()
+            t.join(timeout=5)
+
+        assert not bad, f"a concurrent reader saw {len(bad)} unusable pidfiles"
+
     def test_a_pidfile_from_the_previous_version_survives(
         self, tmp_data_dir, monkeypatch
     ):

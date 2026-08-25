@@ -1811,10 +1811,35 @@ def _get_process_start_time(pid: int) -> str | None:
     return None
 
 
+def _write_pid_file(pid_file: Path, pid: int, start_time: str) -> None:
+    """Replace a pidfile in one step.
+
+    ``write_text`` opens with O_TRUNC and then writes, so between those two
+    syscalls the file is zero bytes on disk. That window is not theoretical
+    here: ``watch``, ``status`` and the menu bar app (every 3s) all read these
+    files concurrently, and a reader landing inside it parses ``int("")``,
+    raises, and deletes the pidfile of a perfectly healthy service. The
+    service is then reported stopped, ``stop`` becomes a no-op that orphans
+    it, and the next ``start`` collides on the port. Write a sibling and
+    rename: ``os.replace`` is atomic within a directory, so a reader sees
+    either the old contents or the new ones and never nothing.
+
+    The temp name carries our PID so two processes restamping at once cannot
+    tread on each other's partial file.
+    """
+    tmp = pid_file.with_name(f"{pid_file.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(f"{pid}\n{start_time}")
+        os.replace(tmp, pid_file)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def write_pid(name: str, pid: int) -> None:
     PID_DIR.mkdir(parents=True, exist_ok=True)
     start_time = _get_process_start_time(pid) or ""
-    (PID_DIR / f"{name}.pid").write_text(f"{pid}\n{start_time}")
+    _write_pid_file(PID_DIR / f"{name}.pid", pid, start_time)
 
 
 _WORKER_CMD_RE = re.compile(
@@ -1950,7 +1975,7 @@ def read_pid(name: str) -> int | None:
                 # string until the service restarts, and every read in between
                 # is another one that cannot detect PID reuse.
                 with contextlib.suppress(OSError):
-                    pid_file.write_text(f"{pid}\n{current_start}")
+                    _write_pid_file(pid_file, pid, current_start)
         return pid
     except (ValueError, OSError):
         pid_file.unlink(missing_ok=True)
