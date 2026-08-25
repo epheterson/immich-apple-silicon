@@ -3707,21 +3707,40 @@ class TestUpgradingDoesNotFireTheLocaleBugItFixes:
     it helps.
     """
 
-    def test_the_same_instant_in_two_locales_is_not_a_mismatch(self):
+    # Real `ps -o lstart=` output for one process, captured under each locale.
+    # The first version of this parsed with strptime, whose %a and %b resolve
+    # against LC_TIME, so it fixed en_AU while leaving German, French, Spanish
+    # and Japanese users still losing a healthy pidfile on upgrade.
+    C_FORM = "Tue Aug 25 09:12:50 2026"
+    LOCALE_FORMS = {
+        "en_AU": "Tue 25 Aug 09:12:50 2026",
+        "de_DE": "Di 25 Aug 09:12:50 2026",
+        "fr_FR": "Mar 25 ao\u00fb 09:12:50 2026",
+        "es_ES": "mar 25 ago 09:12:50 2026",
+        "ja_JP": "\u706b  8/25 09:12:50 2026",
+    }
+
+    def test_the_same_instant_matches_in_every_locale_ps_uses(self):
         import immich_accelerator.__main__ as m
 
-        assert m._same_start_time(
-            "Sat Aug 22 23:07:37 2026", "Sat 22 Aug 23:07:37 2026"
-        )
+        for locale, form in self.LOCALE_FORMS.items():
+            assert m._same_start_time(self.C_FORM, form), (
+                f"{locale} form {form!r} read as a different process, so the "
+                f"upgrade deletes a healthy pidfile"
+            )
 
     def test_a_genuinely_different_start_is_still_a_mismatch(self):
-        """The whole point of the field is catching PID reuse. One second
-        apart is a different process."""
+        """The whole point of the field is catching PID reuse. Every one of
+        these differs from the reference in exactly one component."""
         import immich_accelerator.__main__ as m
 
-        assert not m._same_start_time(
-            "Sat Aug 22 23:07:37 2026", "Sat Aug 22 23:07:38 2026"
-        )
+        for other in (
+            "Tue Aug 25 09:12:51 2026",   # one second later
+            "Tue Aug 26 09:12:50 2026",   # next day
+            "Tue Aug 25 09:12:50 2025",   # last year
+            "Di 26 Aug 09:12:50 2026",    # another locale, different day
+        ):
+            assert not m._same_start_time(self.C_FORM, other), other
 
     def test_something_unparseable_is_treated_as_different(self):
         """Fail closed: a wrongly kept pidfile names a process that is not

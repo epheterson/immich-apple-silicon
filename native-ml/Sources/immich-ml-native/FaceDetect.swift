@@ -89,12 +89,29 @@ func detectFacesWithLandmarks(imageData: Data, width W: Int, height H: Int) -> [
     // uuid propagation through inputFaceObservations is undocumented, so if it
     // ever matches nothing, fall back to position and say so.
     let matched = detected.filter { byID[$0.uuid] != nil }.count
-    var byIndex = false
-    if matched == 0 && !landmarked.isEmpty {
+
+    // Position pairing only when the arrays line up exactly. The comment above
+    // forbids index pairing on a short array, and the first version of this
+    // fallback did it anyway: `obs` supplies the reported bounding box, so a
+    // short `landmarked` put one face's confidence on another face's box.
+    let byIndex = matched == 0 && landmarked.count == detected.count
+
+    if matched < detected.count {
+        // Every unmatched detection falls through to the rectangles
+        // observation, which has no landmarks, so embedFaces takes the padded
+        // crop instead of an ArcFace normCrop and those embeddings will not
+        // cluster with the rest of the library. Counts, boxes and scores all
+        // still look right, so this line is the only symptom there is.
+        //
+        // landmarked.isEmpty is included deliberately: if the landmarks
+        // perform fails, `try?` swallows it and results is nil, which is the
+        // most likely wholesale failure and the previous condition excluded
+        // exactly that case.
+        let how = byIndex ? "pairing by position" : "using unaligned crops"
         FileHandle.standardError.write(Data(
-            ("[native-ml] landmark observations carry no matching uuids; "
-             + "pairing by position. Face embeddings may be unaligned.\n").utf8))
-        byIndex = true
+            ("[native-ml] landmarks matched \(matched) of \(detected.count) "
+             + "detections; \(how). Face embeddings for the rest may not "
+             + "cluster with existing ones.\n").utf8))
     }
 
     var faces: [DetectedFace] = []

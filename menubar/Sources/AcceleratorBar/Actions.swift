@@ -107,7 +107,20 @@ enum Actions {
         }
         return "/opt/homebrew/bin/brew"
     }()
-    static let cli = "/opt/homebrew/opt/immich-accelerator/bin/immich-accelerator"
+    /// Both prefixes, for the same reason `brew` checks both. Fixing `brew`
+    /// alone changed nothing: every entry point here is gated on
+    /// `isBrewInstall`, which tests this path, so on an x86 install the new
+    /// `brew` value was never reached and the pane still said nothing while
+    /// the CLI said "Updates: blocked".
+    static let cli: String = {
+        for prefix in ["/opt/homebrew", "/usr/local"] {
+            let candidate = "\(prefix)/opt/immich-accelerator/bin/immich-accelerator"
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return "/opt/homebrew/opt/immich-accelerator/bin/immich-accelerator"
+    }()
     static let service = "epheterson/immich-accelerator/immich-accelerator"
     /// What `brew services list` prints in its Name column. brew accepts
     /// the tap path as an argument but never echoes it back.
@@ -132,32 +145,44 @@ enum Actions {
                 if !env.isEmpty {
                     // Overlay, not replacement: the child still needs PATH and
                     // the rest of the inherited environment to find its tools.
+                    // HOMEBREW_NO_ANALYTICS is added for brew callers because
+                    // its analytics send is a detached curl that inherits our
+                    // stdout and can outlive brew itself.
                     p.environment = ProcessInfo.processInfo.environment
                         .merging(env) { _, new in new }
                 }
-                let out = Pipe()
-                p.standardOutput = out
-                p.standardError = out
+
+                // Two signals, deliberately separate.
+                //
+                // `exited` is the process. `drained` is the pipe. They are not
+                // the same event: the pipe closes when the LAST holder of its
+                // write end lets go, which includes any grandchild that
+                // inherited our stdout. Timing out on the pipe meant a brew
+                // that succeeded in a second could be reported as a 20s
+                // timeout, and then killed, because a detached grandchild was
+                // still holding the fd.
+                let exited = DispatchSemaphore(value: 0)
+                let drained = DispatchSemaphore(value: 0)
+                p.terminationHandler = { _ in exited.signal() }
+
+                let buffer = NSMutableData()
+                let lock = NSLock()
+                let handle = out_handle(p)
+
                 do { try p.run() } catch {
                     cont.resume(returning: (-1, "\(error)")); return
                 }
 
-                // Read on another thread, not here. The first version of the
-                // timeout put the deadline loop after readDataToEndOfFile,
-                // which returns only at EOF, i.e. when the child closes stdout.
-                // A brew waiting on the Homebrew lock holds it open and writes
-                // nothing, so the read never returned and the deadline was
-                // never reached: the timeout could not fire in the one case it
-                // was written for. Reading off-thread also keeps the original
-                // reason this was drained before waiting, which is that a child
-                // filling the 64KB pipe buffer deadlocks against waitUntilExit.
-                let buffer = NSMutableData()
-                let lock = NSLock()
-                let reading = DispatchSemaphore(value: 0)
                 DispatchQueue.global().async {
-                    let data = out.fileHandleForReading.readDataToEndOfFile()
-                    lock.lock(); buffer.append(data); lock.unlock()
-                    reading.signal()
+                    // Incremental, so output survives a timeout. Reading only
+                    // at EOF meant the timeout message carried none of the
+                    // child's own explanation.
+                    while true {
+                        let chunk = handle.availableData
+                        if chunk.isEmpty { break }
+                        lock.lock(); buffer.append(chunk); lock.unlock()
+                    }
+                    drained.signal()
                 }
 
                 func text() -> String {
@@ -165,29 +190,49 @@ enum Actions {
                     return String(data: buffer as Data, encoding: .utf8) ?? ""
                 }
 
+                var timedOut = false
                 if let timeout {
-                    if reading.wait(timeout: .now() + timeout) == .timedOut {
-                        // SIGTERM, then SIGKILL if it is ignored: returning
-                        // while the child is still alive would leave brew
-                        // running unsupervised after the caller was told the
-                        // command finished.
-                        p.terminate()
-                        if reading.wait(timeout: .now() + 2) == .timedOut {
+                    if exited.wait(timeout: .now() + timeout) == .timedOut {
+                        timedOut = true
+                        // isRunning before each signal: once Process has reaped
+                        // the child, processIdentifier names a PID the kernel
+                        // is free to reassign, and we would be killing someone
+                        // else's.
+                        if p.isRunning { p.terminate() }
+                        if exited.wait(timeout: .now() + 2) == .timedOut,
+                           p.isRunning {
                             kill(p.processIdentifier, SIGKILL)
-                            _ = reading.wait(timeout: .now() + 2)
+                            _ = exited.wait(timeout: .now() + 2)
                         }
-                        p.waitUntilExit()
-                        cont.resume(returning: (
-                            -1, text() + "\ntimed out after \(Int(timeout))s"))
-                        return
                     }
                 } else {
-                    reading.wait()
+                    exited.wait()
                 }
+
+                // Close the read end so the reader thread cannot sit in
+                // availableData for ever on an fd a grandchild still holds.
+                // Without this each timeout leaked a global-queue thread, and
+                // brewRefusesTap runs on every Settings open.
+                _ = drained.wait(timeout: .now() + 1)
+                try? handle.close()
+                _ = drained.wait(timeout: .now() + 1)
+
                 p.waitUntilExit()
-                cont.resume(returning: (p.terminationStatus, text()))
+                cont.resume(returning: (
+                    timedOut ? -1 : p.terminationStatus,
+                    timedOut
+                        ? text() + "\ntimed out after \(Int(timeout ?? 0))s"
+                        : text()))
             }
         }
+    }
+
+    /// The pipe both streams are wired to, returned as its read handle.
+    private static func out_handle(_ p: Process) -> FileHandle {
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        return pipe.fileHandleForReading
     }
 
     /// What happened when a setting tried to take effect.
@@ -248,7 +293,8 @@ enum Actions {
         // conditional and this one is a routine user action.
         let (_, out) = await run(
             brew, ["outdated", "--formula", listedService],
-            env: ["HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1"],
+            env: ["HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1",
+                  "HOMEBREW_NO_ANALYTICS": "1"],
             timeout: 20)
         // On the line that names us. brew emits refusals for other untrusted
         // taps too, and matching anywhere in the output meant someone else's
@@ -266,7 +312,8 @@ enum Actions {
     static func trustTap() async -> (ok: Bool, output: String) {
         let (code, out) = await run(
             brew, ["trust", tap],
-            env: ["HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1"],
+            env: ["HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1",
+                  "HOMEBREW_NO_ANALYTICS": "1"],
             timeout: 20)
         return (code == 0, out)
     }
