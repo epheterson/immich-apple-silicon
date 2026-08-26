@@ -3467,3 +3467,98 @@ class TestUninstallAsksBeforeItDeletes:
         m.cmd_uninstall(None)
         assert "launchctl" in calls["run"], "plist removed without unloading it first"
         assert not plist.exists(), "plist unloaded but left on disk"
+
+
+class TestInstallingSoftwareNeedsConsent:
+    """`_ensure_homebrew` fetches a remote script and pipes it into a shell,
+    and `_brew_install` installs packages. Neither had a test.
+
+    The property that matters is not that they work, it is that they do not
+    run without someone saying yes. An unattended `setup` that reaches the
+    Homebrew installer is remote code execution the user never approved.
+    """
+
+    @staticmethod
+    def _no_brew(monkeypatch):
+        monkeypatch.setattr(m.os.path, "isfile", lambda p: False)
+
+    @staticmethod
+    def _spy(monkeypatch):
+        ran = []
+
+        def fake_run(cmd, *a, **k):
+            ran.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(m.subprocess, "run", fake_run)
+        return ran
+
+    def test_existing_homebrew_is_used_without_prompting(self, monkeypatch):
+        monkeypatch.setattr(m.os.path, "isfile", lambda p: p == "/usr/local/bin/brew")
+        ran = self._spy(monkeypatch)
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda _p: pytest.fail("prompted when brew was already present"),
+        )
+        assert m._ensure_homebrew() == "/usr/local/bin/brew"
+        assert ran == []
+
+    def test_declining_does_not_install_homebrew(self, monkeypatch):
+        self._no_brew(monkeypatch)
+        ran = self._spy(monkeypatch)
+        monkeypatch.setattr("builtins.input", lambda _p: "n")
+        assert m._ensure_homebrew() is None
+        assert ran == [], "declined, but it ran the installer anyway"
+
+    def test_no_terminal_does_not_fetch_and_run_the_installer(self, monkeypatch):
+        """The one that matters most. With no tty there is nobody to consent,
+        so an unattended run must not fetch and execute a remote script."""
+        self._no_brew(monkeypatch)
+        ran = self._spy(monkeypatch)
+
+        def no_tty(_p):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", no_tty)
+        assert m._ensure_homebrew() is None
+        assert ran == [], "no terminal, but it fetched and ran the installer"
+        flat = " ".join(" ".join(map(str, c)) for c in ran)
+        assert "install.sh" not in flat
+
+    def test_consenting_runs_the_installer(self, monkeypatch):
+        self._no_brew(monkeypatch)
+        ran = self._spy(monkeypatch)
+        monkeypatch.setattr("builtins.input", lambda _p: "y")
+        m._ensure_homebrew()
+        flat = " ".join(" ".join(map(str, c)) for c in ran)
+        assert "install.sh" in flat, "consented, but nothing was installed"
+
+    def test_brew_install_declines_without_consent(self, monkeypatch):
+        monkeypatch.setattr(m, "_ensure_homebrew", lambda: "/usr/local/bin/brew")
+        ran = self._spy(monkeypatch)
+        for answer in ("n", "no"):
+            ran.clear()
+            monkeypatch.setattr("builtins.input", lambda _p, a=answer: a)
+            assert m._brew_install("vips") is False
+            assert ran == [], f"declined with {answer!r} but installed anyway"
+
+    def test_brew_install_never_runs_with_no_terminal(self, monkeypatch):
+        monkeypatch.setattr(m, "_ensure_homebrew", lambda: "/usr/local/bin/brew")
+        ran = self._spy(monkeypatch)
+
+        def no_tty(_p):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", no_tty)
+        assert m._brew_install("vips") is False
+        assert ran == []
+
+    def test_brew_install_does_nothing_when_there_is_no_brew(self, monkeypatch):
+        monkeypatch.setattr(m, "_ensure_homebrew", lambda: None)
+        ran = self._spy(monkeypatch)
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda _p: pytest.fail("prompted with no brew available"),
+        )
+        assert m._brew_install("vips") is False
+        assert ran == []
