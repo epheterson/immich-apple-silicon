@@ -46,7 +46,7 @@ import sys
 import time
 import urllib.request
 
-from _predict import predict
+from _predict import predict as _post
 from concurrent.futures import ThreadPoolExecutor
 
 # Same minimal valid baseline JPEG as ml-preflight.py, so this gate has no
@@ -120,7 +120,7 @@ def predict_raw(
     The wire format itself lives in _predict.py, shared with ml-preflight.py
     and ml-parity.py so the three gates cannot drift apart on what they send.
     """
-    return predict(base, entries, image=image, text=text, timeout=timeout)
+    return _post(base, entries, image=image, text=text, timeout=timeout)
 
 
 def predict(

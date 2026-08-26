@@ -981,3 +981,43 @@ def test_the_app_and_the_cli_agree_on_reading_a_pidfile_start_time():
         "back to comparing byte for byte, which deletes healthy pidfiles "
         "written before 1.16 by any locale that is not C"
     )
+
+
+def test_no_script_imports_a_name_it_also_defines():
+    """A shared helper must not shadow a script's own function of the same name.
+
+    scripts/native-ml-preflight.py already had its own `predict(base, name,
+    kind, ...)`. Importing `predict` from _predict silently replaced it, and
+    every call then failed with a TypeError about a missing argument. The unit
+    suite could not catch it, because nothing here exercises that call path,
+    so it surfaced only when the real Apple Silicon gate ran the service.
+
+    This is the cheap version of that check: a name imported from a sibling
+    module must not also be defined in the file importing it.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parent.parent
+    offenders = []
+    for path in sorted((root / "scripts").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        defined = {
+            n.name
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for node in tree.body:
+            if not isinstance(node, ast.ImportFrom) or node.level == 0:
+                if not (isinstance(node, ast.ImportFrom) and node.module == "_predict"):
+                    continue
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                if bound in defined:
+                    offenders.append(
+                        f"{path.name} imports '{bound}' from "
+                        f"{node.module} and also defines it"
+                    )
+    assert not offenders, (
+        "a shared import shadows a local function of the same name:\n  "
+        + "\n  ".join(offenders)
+    )
