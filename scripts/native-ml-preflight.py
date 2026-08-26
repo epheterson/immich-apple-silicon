@@ -45,6 +45,8 @@ import subprocess
 import sys
 import time
 import urllib.request
+
+from _predict import predict
 from concurrent.futures import ThreadPoolExecutor
 
 # Same minimal valid baseline JPEG as ml-preflight.py, so this gate has no
@@ -113,40 +115,12 @@ def predict_raw(
     base: str, entries: dict, image: bytes | None, text: str | None, timeout: int = 60
 ) -> dict:
     """One real /predict call for an arbitrary entries dict, matching Immich's
-    own multipart wire format (see Server.swift/Predict.swift)."""
-    boundary = "----native-ml-preflight"
-    parts = [
-        f"--{boundary}\r\n".encode(),
-        b'Content-Disposition: form-data; name="entries"\r\n\r\n',
-        json.dumps(entries).encode() + b"\r\n",
-    ]
-    if image is not None:
-        parts += [
-            f"--{boundary}\r\n".encode(),
-            b'Content-Disposition: form-data; name="image"; filename="t.jpg"\r\n'
-            b"Content-Type: image/jpeg\r\n\r\n",
-            image,
-            b"\r\n",
-        ]
-    if text is not None:
-        parts += [
-            f"--{boundary}\r\n".encode(),
-            b'Content-Disposition: form-data; name="text"\r\n\r\n',
-            text.encode() + b"\r\n",
-        ]
-    parts.append(f"--{boundary}--\r\n".encode())
-    body = b"".join(parts)
+    own multipart wire format (see Server.swift/Predict.swift).
 
-    req = urllib.request.Request(
-        f"{base}/predict",
-        data=body,
-        headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    The wire format itself lives in _predict.py, shared with ml-preflight.py
+    and ml-parity.py so the three gates cannot drift apart on what they send.
+    """
+    return predict(base, entries, image=image, text=text, timeout=timeout)
 
 
 def predict(

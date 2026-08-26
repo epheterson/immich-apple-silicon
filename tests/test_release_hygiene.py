@@ -15,6 +15,7 @@ import os
 import inspect
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -495,8 +496,14 @@ def _parity():
     import importlib.util
     from pathlib import Path
 
-    path = Path(__file__).parent.parent / "scripts" / "ml-parity.py"
-    spec = importlib.util.spec_from_file_location("ml_parity", path)
+    scripts = Path(__file__).parent.parent / "scripts"
+    # Running `python3 scripts/ml-parity.py` puts scripts/ on sys.path, which
+    # is how it reaches its sibling _predict module. Loading it by file path
+    # here does not, so do it explicitly rather than have the test fail on an
+    # import that works fine in real use.
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    spec = importlib.util.spec_from_file_location("ml_parity", scripts / "ml-parity.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -648,8 +655,12 @@ def _preflight():
     import importlib.util
     from pathlib import Path
 
-    path = Path(__file__).parent.parent / "scripts" / "ml-preflight.py"
-    spec = importlib.util.spec_from_file_location("ml_preflight", path)
+    scripts = Path(__file__).parent.parent / "scripts"
+    if str(scripts) not in sys.path:  # see the note in _parity()
+        sys.path.insert(0, str(scripts))
+    spec = importlib.util.spec_from_file_location(
+        "ml_preflight", scripts / "ml-preflight.py"
+    )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod

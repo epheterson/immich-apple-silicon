@@ -46,6 +46,8 @@ import subprocess
 import sys
 import time
 import urllib.request
+
+from _predict import predict
 from concurrent.futures import ThreadPoolExecutor
 
 # A minimal valid baseline JPEG, embedded so the gate has no PIL/numpy dependency
@@ -248,30 +250,7 @@ def predict_task(base: str, image: bytes, task: str = "clip",
         if face_image is None:
             raise RuntimeError("faces task reached without a resolved image")
         image = face_image
-    boundary = "----iac-ml-preflight"
-    body = b"".join(
-        [
-            f"--{boundary}\r\n".encode(),
-            b'Content-Disposition: form-data; name="entries"\r\n\r\n',
-            json.dumps(TASKS[task]).encode() + b"\r\n",
-            f"--{boundary}\r\n".encode(),
-            b'Content-Disposition: form-data; name="image"; filename="t.jpg"\r\n'
-            b"Content-Type: image/jpeg\r\n\r\n",
-            image,
-            b"\r\n",
-            f"--{boundary}--\r\n".encode(),
-        ]
-    )
-    req = urllib.request.Request(
-        f"{base}/predict",
-        data=body,
-        headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=120) as r:
-        result = json.loads(r.read())
+    result = predict(base, TASKS[task], image=image, timeout=120)
     return check_response(task, result)
 
 
