@@ -4090,24 +4090,6 @@ class TestAskingTheUser:
         with patch("builtins.input", lambda _p: " nas.local "):
             assert m._ask("host? ", "localhost") == "nas.local"
 
-    def test_confirm_takes_its_default_when_nobody_can_answer(self):
-        import immich_accelerator.__main__ as m
-
-        def no_tty(_prompt):
-            raise EOFError
-
-        with patch("builtins.input", no_tty):
-            assert m._confirm("proceed?") is True
-            assert m._confirm("destroy everything?", default=False) is False
-
-    def test_confirm_reads_yes_and_no(self):
-        import immich_accelerator.__main__ as m
-
-        for said, expected in (("y", True), ("Y", True), ("yes", True),
-                               ("n", False), ("no", False), ("nope", False)):
-            with patch("builtins.input", lambda _p, s=said: s):
-                assert m._confirm("go?") is expected, said
-
     def test_setup_remote_no_longer_dies_on_a_closed_stdin(self):
         """The bug this replaces. `setup --url ...` from a script reached a
         bare input() inside _setup_remote's own prompt helper and exited with
@@ -4153,3 +4135,56 @@ class TestAskingTheUser:
                 if not guarded_nearby:
                     offenders.append(f"{fn} (line {node.lineno}): {src_line.strip()[:60]}")
         assert not offenders, "unguarded input():\n  " + "\n  ".join(offenders)
+
+
+class TestNobodyAtTheKeyboardIsNotConsent:
+    """Setup asks before installing Homebrew, reconfiguring Docker or deleting
+    an install. Ten of those twelve prompts deliberately treat "no terminal"
+    differently from "pressed Enter": Enter takes the default, while a run
+    with nobody watching declines, and one raises outright.
+
+    That distinction is easy to mistake for inconsistency and collapse into a
+    single _confirm(default=True) helper. Doing so would make an unattended
+    `setup` silently agree to install software on the machine. This pins the
+    property so the tidying is not attempted twice.
+    """
+
+    def test_no_consent_prompt_treats_eof_as_yes(self):
+        import ast
+        import re
+
+        import immich_accelerator.__main__ as m
+
+        src = Path(m.__file__).read_text()
+        lines = src.splitlines()
+        tree = ast.parse(src)
+        owner = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for line in range(fn.lineno, (fn.end_lineno or fn.lineno) + 1):
+                    owner.setdefault(line, fn.name)
+
+        offenders = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "input"):
+                continue
+            if owner.get(node.lineno) == "_ask":
+                continue
+            block = "\n".join(lines[node.lineno - 4 : node.lineno + 18])
+            if "[Y/n]" not in block and "[y/N]" not in block:
+                continue  # a value prompt, not a consent prompt
+            handler = re.search(r"except EOFError:\s*\n\s*(.+)", block)
+            assert handler, (
+                f"{owner.get(node.lineno)} asks for consent without handling EOF; "
+                f"an unattended run will crash"
+            )
+            action = handler.group(1).strip()
+            said_yes = 'answer = "y"' in action or "answer = 'y'" in action
+            if said_yes:
+                offenders.append(f"{owner.get(node.lineno)} (line {node.lineno})")
+
+        assert not offenders, (
+            "these prompts treat an absent user as agreement, so an unattended "
+            "setup would proceed with something nobody approved: " + ", ".join(offenders)
+        )

@@ -118,14 +118,7 @@ def _installed_version() -> str:
 DEFAULT_TIMEOUT = 30
 
 
-def _output(
-    cmd: list[str],
-    *,
-    timeout: float = DEFAULT_TIMEOUT,
-    input: str | None = None,
-    env: dict[str, str] | None = None,
-    cwd: str | Path | None = None,
-) -> str | None:
+def _output(cmd: list[str], *, timeout: float = DEFAULT_TIMEOUT) -> str | None:
     """Run *cmd* and return its stdout, or None if it did not succeed.
 
     This replaces a shape repeated dozens of times here: run with
@@ -146,15 +139,7 @@ def _output(
     would silently discard the output they did produce.
     """
     try:
-        r = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            input=input,
-            env=env,
-            cwd=cwd,
-        )
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         log.debug("timed out after %ss: %s", timeout, " ".join(map(str, cmd)))
         return None
@@ -173,12 +158,7 @@ def _output(
 
 
 def _ok(
-    cmd: list[str],
-    *,
-    timeout: float = DEFAULT_TIMEOUT,
-    input: str | None = None,
-    env: dict[str, str] | None = None,
-    cwd: str | Path | None = None,
+    cmd: list[str], *, timeout: float = DEFAULT_TIMEOUT, input: str | None = None
 ) -> bool:
     """Run *cmd* for its effect and say whether it worked.
 
@@ -192,13 +172,7 @@ def _ok(
     """
     try:
         r = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            input=input,
-            env=env,
-            cwd=cwd,
+            cmd, capture_output=True, text=True, timeout=timeout, input=input
         )
     except subprocess.TimeoutExpired:
         log.debug("timed out after %ss: %s", timeout, " ".join(map(str, cmd)))
@@ -235,18 +209,6 @@ def _ask(prompt: str, default: str = "") -> str:
         return input(prompt).strip() or default
     except EOFError:
         return default
-
-
-def _confirm(question: str, *, default: bool = True) -> bool:
-    """Ask a yes/no question. A non-interactive run takes *default*.
-
-    The prompt shows which way Enter goes, the same convention the rest of
-    setup already used by hand.
-    """
-    answer = _ask(f"{question}{' [Y/n] ' if default else ' [y/N] '}").lower()
-    if not answer:
-        return default
-    return answer in ("y", "yes")
 
 
 def _preload_node_shim(env: dict[str, str], shim: str) -> None:
@@ -4264,7 +4226,7 @@ def _fresh_install(docker: str) -> bool:
     return True
 
 
-def _setup_local(args):
+def _setup_local(_args):
     """Setup from local Docker (original behavior, with fresh install support)."""
     log.info("Detecting Immich instance...")
 
@@ -4606,7 +4568,7 @@ def _setup_manual(_args):
     log.info("  python -m immich_accelerator start")
 
 
-def _setup_ml_only(args) -> None:
+def _setup_ml_only(_args) -> None:
     """Set up this Mac as an ML-only network compute node: just the ML engine
     (native Swift by default, Python venv fallback), reachable at this Mac's
     IP on ml_port. No Docker, no Postgres, no Redis, no worker, no library
