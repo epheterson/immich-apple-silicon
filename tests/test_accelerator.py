@@ -4063,3 +4063,93 @@ class TestNodeShimPreload:
             name for name in on_disk if f'_preload_node_shim(worker_env, "{name}")' in src
         }
         assert on_disk == wired, f"present but never preloaded: {sorted(on_disk - wired)}"
+
+
+class TestAskingTheUser:
+    """Setup asks sixteen questions across a dozen functions and every one has
+    to cope with there being no terminal: piped stdin, CI, ssh without a tty.
+    Fifteen sites handled that by hand and the sixteenth did not, so this is
+    the behaviour rather than the copies that gets pinned.
+    """
+
+    def test_ask_falls_back_to_the_default_with_no_terminal(self):
+        import immich_accelerator.__main__ as m
+
+        def no_tty(_prompt):
+            raise EOFError("EOF when reading a line")
+
+        with patch("builtins.input", no_tty):
+            assert m._ask("host? ", "localhost") == "localhost"
+            assert m._ask("nothing? ") == ""
+
+    def test_ask_returns_the_default_for_a_bare_enter(self):
+        import immich_accelerator.__main__ as m
+
+        with patch("builtins.input", lambda _p: "   "):
+            assert m._ask("host? ", "localhost") == "localhost"
+        with patch("builtins.input", lambda _p: " nas.local "):
+            assert m._ask("host? ", "localhost") == "nas.local"
+
+    def test_confirm_takes_its_default_when_nobody_can_answer(self):
+        import immich_accelerator.__main__ as m
+
+        def no_tty(_prompt):
+            raise EOFError
+
+        with patch("builtins.input", no_tty):
+            assert m._confirm("proceed?") is True
+            assert m._confirm("destroy everything?", default=False) is False
+
+    def test_confirm_reads_yes_and_no(self):
+        import immich_accelerator.__main__ as m
+
+        for said, expected in (("y", True), ("Y", True), ("yes", True),
+                               ("n", False), ("no", False), ("nope", False)):
+            with patch("builtins.input", lambda _p, s=said: s):
+                assert m._confirm("go?") is expected, said
+
+    def test_setup_remote_no_longer_dies_on_a_closed_stdin(self):
+        """The bug this replaces. `setup --url ...` from a script reached a
+        bare input() inside _setup_remote's own prompt helper and exited with
+        an EOFError traceback instead of taking the default it had printed."""
+        import immich_accelerator.__main__ as m
+
+        src = Path(m.__file__).read_text()
+        start = src.index("def _setup_remote(")
+        body = src[start : src.index("\ndef ", start + 1)]
+        nested = body[body.index("def prompt(") :]
+        nested = nested[: nested.index("\n\n")]
+        assert "_ask(" in nested and "input(" not in nested, (
+            "_setup_remote's prompt helper calls input() directly again, so a "
+            "non-interactive run crashes instead of taking the printed default"
+        )
+
+    def test_no_prompt_anywhere_calls_input_unguarded(self):
+        """The drift check. Any new bare input() outside _ask reintroduces
+        exactly the crash that was invisible for as long as it shipped."""
+        import ast
+        import immich_accelerator.__main__ as m
+
+        tree = ast.parse(Path(m.__file__).read_text())
+        owner = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for line in range(fn.lineno, (fn.end_lineno or fn.lineno) + 1):
+                    owner.setdefault(line, fn.name)
+
+        offenders = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "input"):
+                fn = owner.get(node.lineno, "<module>")
+                if fn == "_ask":
+                    continue
+                src_line = Path(m.__file__).read_text().splitlines()[node.lineno - 1]
+                guarded_nearby = "EOFError" in "\n".join(
+                    Path(m.__file__).read_text().splitlines()[
+                        node.lineno - 1 : node.lineno + 12
+                    ]
+                )
+                if not guarded_nearby:
+                    offenders.append(f"{fn} (line {node.lineno}): {src_line.strip()[:60]}")
+        assert not offenders, "unguarded input():\n  " + "\n  ".join(offenders)

@@ -216,6 +216,39 @@ def _ok(
     return r.returncode == 0
 
 
+def _ask(prompt: str, default: str = "") -> str:
+    """Read one answer from the user, or *default* when there is nobody to ask.
+
+    Setup asks sixteen questions across a dozen functions, and every one of
+    them has to cope with there being no terminal: piped stdin, a CI job, ssh
+    without a tty. Fifteen sites wrapped input() in the same try/except; the
+    sixteenth was a local helper inside _setup_remote that did not, so
+    `setup --url ...` on a non-interactive stdin died with an EOFError
+    traceback at the first Postgres prompt rather than taking the default it
+    had just printed on screen.
+
+    That is the whole argument for having this in one place: the handling was
+    not complicated, it was just copied, and the one copy that got missed was
+    invisible until someone ran setup from a script.
+    """
+    try:
+        return input(prompt).strip() or default
+    except EOFError:
+        return default
+
+
+def _confirm(question: str, *, default: bool = True) -> bool:
+    """Ask a yes/no question. A non-interactive run takes *default*.
+
+    The prompt shows which way Enter goes, the same convention the rest of
+    setup already used by hand.
+    """
+    answer = _ask(f"{question}{' [Y/n] ' if default else ' [y/N] '}").lower()
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
 def _preload_node_shim(env: dict[str, str], shim: str) -> None:
     """Append ``hooks/<shim>`` to NODE_OPTIONS as a --require preload.
 
@@ -4359,8 +4392,7 @@ def _setup_remote(args):
 
     def prompt(label: str, default: str = "") -> str:
         suffix = f" [{default}]" if default else ""
-        val = input(f"  {label}{suffix}: ").strip()
-        return val or default
+        return _ask(f"  {label}{suffix}: ", default)
 
     db_hostname = prompt("Postgres host", "localhost")
     db_port = prompt("Postgres port", "5432")
