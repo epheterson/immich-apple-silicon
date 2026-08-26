@@ -29,6 +29,8 @@ import time
 import uuid
 from pathlib import Path
 
+from .common import COMPONENTS, DEFAULT_TIMEOUT, component_enabled, run_ok, run_output
+
 
 def _read_version() -> str:
     """Read version from VERSION file (single source of truth)."""
@@ -111,71 +113,10 @@ def _installed_version() -> str:
         return __version__
 
 
-# Nothing here should be able to hang forever waiting on another program. Every
-# call through the helpers below gets a timeout, and this is the default for the
-# ones that do not name their own: long enough for a local tool to answer under
-# load, short enough that a wedged one is noticed rather than waited on.
-DEFAULT_TIMEOUT = 30
-
-
-def _output(
-    cmd: list[str], *, timeout: float = DEFAULT_TIMEOUT, input: str | None = None
-) -> str | None:
-    """Run *cmd* and return its stdout, or None if it did not succeed.
-
-    This replaces a shape repeated dozens of times here: run with
-    capture_output and text, catch OSError and TimeoutExpired, check
-    returncode, then use stdout. It is not a wrapper around subprocess.run
-    with the same surface, which would be indirection rather than
-    simplification; it replaces the *whole pattern*, error handling included.
-
-    None rather than "" on failure, deliberately. An empty string is exactly
-    what a command that succeeded and printed nothing returns, so collapsing
-    the two makes "we could not ask" indistinguishable from "the answer is
-    nothing". Several bugs shipped by this project have had precisely that
-    shape. A caller that genuinely does not care can write ``or ""``.
-
-    Only for commands where a non-zero exit means failure. Tools whose exit
-    code is an *answer* rather than an error (lsof, pgrep and grep all exit 1
-    for "found nothing") must keep calling subprocess.run directly, or this
-    would silently discard the output they did produce.
-    """
-    try:
-        r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, input=input
-        )
-    except subprocess.TimeoutExpired:
-        log.debug("timed out after %ss: %s", timeout, " ".join(map(str, cmd)))
-        return None
-    except OSError as e:
-        log.debug("could not run %s: %s", " ".join(map(str, cmd)), e)
-        return None
-    if r.returncode != 0:
-        log.debug(
-            "exit %s from %s: %s",
-            r.returncode,
-            " ".join(map(str, cmd)),
-            (r.stderr or "").strip()[:200],
-        )
-        return None
-    return r.stdout
-
-
-def _ok(
-    cmd: list[str], *, timeout: float = DEFAULT_TIMEOUT, input: str | None = None
-) -> bool:
-    """Run *cmd* for its effect and say whether it worked.
-
-    For the calls that capture output purely to keep a command quiet and then
-    look only at the exit status, or at nothing at all. Output is still
-    captured, for the same reason those calls captured it, and a failure
-    leaves its stderr in the debug log via _output rather than vanishing.
-
-    Deliberately a thin shim over _output rather than its own copy of the
-    same try/except: the two were byte-identical apart from the return value,
-    which is the duplication this release exists to remove.
-    """
-    return _output(cmd, timeout=timeout, input=input) is not None
+# The CLI's names for the shared helpers. Same objects, so there is one
+# implementation rather than two that agree by convention.
+_output = run_output
+_ok = run_ok
 
 
 def _ask(prompt: str, default: str = "") -> str:
@@ -2973,7 +2914,6 @@ def _dashboard_port() -> int:
 # is a real process boundary — which is exactly where this stops. Video,
 # thumbnails and RAW decode all happen inside the single microservices worker,
 # so "video but not thumbnails" is Immich's job scheduler, not ours.
-COMPONENTS = ("worker", "ml", "dashboard")
 
 # How to say each one in a sentence. str.capitalize() turns "ml" into "Ml".
 COMPONENT_LABELS = {
@@ -2984,25 +2924,17 @@ COMPONENT_LABELS = {
 
 
 def _component_enabled(name: str, config: dict | None = None) -> bool:
-    """Whether a component should be running. Defaults True.
+    """Whether a component should be running, loading config when not given.
 
-    Absent means enabled, because every config written before these keys existed
-    has none of them, and an upgrade must not silently turn anything off.
-
-    An explicit component key beats the legacy "ml_only" preset. That order
-    matters: without it, a user who ran `setup --ml-only` once could never turn
-    the worker back on without hand-editing config.json.
+    The rule itself lives in common.component_enabled, because the dashboard
+    needs the same answer and cannot import it from here.
     """
     if config is None:
         try:
             config = load_config()
         except (RuntimeError, ValueError, OSError):
             return True
-    if name in config:
-        return bool(config[name])
-    if config.get("ml_only"):  # preset: worker off, everything else on
-        return name != "worker"
-    return True
+    return component_enabled(name, config)
 
 
 def _dashboard_enabled() -> bool:

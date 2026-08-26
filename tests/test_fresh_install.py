@@ -173,21 +173,33 @@ class TestDashboardDependenciesAreAvailable:
             "socket",
             "sys",
         }
-        for node in tree.body:  # top-level only
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    root = alias.name.split(".")[0]
-                    assert root in stdlib_prefixes, (
-                        f"Top-level import '{alias.name}' in dashboard.py "
-                        f"pulls in a third-party dep — move it inside the "
-                        f"function that needs it."
+        def top_level_imports(tree_):
+            for node in tree_.body:
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        yield alias.name.split(".")[0], alias.name, 0
+                elif isinstance(node, ast.ImportFrom):
+                    yield (node.module or "").split(".")[0], node.module, node.level
+
+        for root, full, level in top_level_imports(tree):
+            if level:
+                # A sibling module of our own package. Allowed, but only if it
+                # is itself stdlib-only at import time, or the guarantee just
+                # moves one file across and stops meaning anything.
+                sib = REPO_ROOT / "immich_accelerator" / f"{root}.py"
+                assert sib.exists(), f"relative import of a missing module: {root}"
+                for r2, full2, lvl2 in top_level_imports(ast.parse(sib.read_text())):
+                    assert lvl2 == 0 and r2 in stdlib_prefixes, (
+                        f"dashboard.py imports .{root}, which imports "
+                        f"'{full2}' at module level. That reaches a "
+                        f"third-party dep by one more hop, so importing "
+                        f"dashboard.py can still crash."
                     )
-            elif isinstance(node, ast.ImportFrom):
-                root = (node.module or "").split(".")[0]
-                assert root in stdlib_prefixes, (
-                    f"Top-level 'from {node.module} import ...' in "
-                    f"dashboard.py pulls in a third-party dep."
-                )
+                continue
+            assert root in stdlib_prefixes, (
+                f"Top-level import '{full}' in dashboard.py pulls in a "
+                f"third-party dep. Move it inside the function that needs it."
+            )
 
 
 # --- ghcr.io rate-limit retry -------------------------------------------
