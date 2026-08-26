@@ -3975,6 +3975,20 @@ class TestRunHelpers:
         assert m._ok(["/nonexistent/binary"]) is False
         assert m._ok(["/bin/sleep", "5"], timeout=0.2) is False
 
+    def test_input_actually_reaches_the_command(self):
+        """The gap this closes: dropping the input= payload passed every other
+        test here. It is not cosmetic. `_ok(["sudo", "tee", SYNTHETIC_CONF],
+        input=entry)` is how the /build link is written, so silently sending
+        nothing makes tee truncate that file to empty and report success. The
+        suite stayed green through exactly that mutation.
+        """
+        import immich_accelerator.__main__ as m
+
+        assert m._output(["/bin/cat"], input="payload") == "payload"
+        # and through _ok, which is the shape the sudo-tee call sites use
+        assert m._ok(["/bin/sh", "-c", 'test "$(cat)" = "payload"'], input="payload")
+        assert not m._ok(["/bin/sh", "-c", 'test "$(cat)" = "payload"'], input="wrong")
+
     def test_neither_helper_can_run_without_a_timeout(self):
         """The property that matters: nothing this tool spawns can hang the
         tool forever. Asserted on the call actually handed to subprocess.run,
@@ -4002,25 +4016,13 @@ class TestRunHelpers:
 
 
 class TestNodeShimPreload:
-    """Four shims are preloaded into the worker via NODE_OPTIONS, and the
-    quoting was copy-pasted four times. The v1.4.2 bug was exactly this
-    quoting getting it wrong, so it is pinned in the one place it now lives.
+    """Four shims are preloaded into the worker via NODE_OPTIONS.
+
+    The quoting rule and its empirical Node tokenizer table live in
+    _preload_node_shim's docstring; the v1.4.2 regression it caused is
+    guarded by test_cmd_start_node_options_string_is_well_formed in
+    test_fresh_install.py. These cover the wiring around it.
     """
-
-    def test_a_path_with_spaces_survives(self, tmp_path, monkeypatch):
-        """The whole reason for double quotes. Single quotes put literal
-        quote characters in the filename, and unquoted splits on the space."""
-        import immich_accelerator.__main__ as m
-
-        hooks = tmp_path / "has space" / "hooks"
-        hooks.mkdir(parents=True)
-        (hooks / "pg_dump_shim.js").write_text("//")
-        monkeypatch.setattr(m, "__file__", str(tmp_path / "has space" / "x.py"))
-
-        env: dict[str, str] = {}
-        m._preload_node_shim(env, "pg_dump_shim.js")
-        assert env["NODE_OPTIONS"] == f'--require "{hooks / "pg_dump_shim.js"}"'
-        assert "'" not in env["NODE_OPTIONS"]
 
     def test_each_shim_appends_rather_than_replacing(self, tmp_path, monkeypatch):
         """Four of these run in a row. If one overwrote instead of appending,

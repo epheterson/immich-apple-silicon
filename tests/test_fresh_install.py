@@ -1477,8 +1477,10 @@ const fake = () => {
     def test_shim_is_wired_into_worker_node_options(self):
         """cmd_start must add the shim to the worker's NODE_OPTIONS."""
         src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()
-        assert "heic_decode_shim.js" in src
-        assert 'require "{heic_shim}"' in src or "--require" in src
+        # Not a grep for "--require": that string lives inside
+        # _preload_node_shim itself, so the old `or` clause was true no matter
+        # what and the assertion checked nothing at all.
+        assert '_preload_node_shim(worker_env, "heic_decode_shim.js")' in src
 
     def test_shim_syntax_valid(self):
         import shutil

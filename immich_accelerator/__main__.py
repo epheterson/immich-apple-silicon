@@ -118,7 +118,9 @@ def _installed_version() -> str:
 DEFAULT_TIMEOUT = 30
 
 
-def _output(cmd: list[str], *, timeout: float = DEFAULT_TIMEOUT) -> str | None:
+def _output(
+    cmd: list[str], *, timeout: float = DEFAULT_TIMEOUT, input: str | None = None
+) -> str | None:
     """Run *cmd* and return its stdout, or None if it did not succeed.
 
     This replaces a shape repeated dozens of times here: run with
@@ -139,7 +141,9 @@ def _output(cmd: list[str], *, timeout: float = DEFAULT_TIMEOUT) -> str | None:
     would silently discard the output they did produce.
     """
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, input=input
+        )
     except subprocess.TimeoutExpired:
         log.debug("timed out after %ss: %s", timeout, " ".join(map(str, cmd)))
         return None
@@ -162,32 +166,16 @@ def _ok(
 ) -> bool:
     """Run *cmd* for its effect and say whether it worked.
 
-    For the calls that pass capture_output purely to keep a command quiet and
-    then look only at the exit status, or at nothing at all. Output is still
-    captured, for the same reason those calls captured it, but a failure now
-    leaves its stderr in the debug log instead of being discarded outright.
+    For the calls that capture output purely to keep a command quiet and then
+    look only at the exit status, or at nothing at all. Output is still
+    captured, for the same reason those calls captured it, and a failure
+    leaves its stderr in the debug log via _output rather than vanishing.
 
-    Takes *input* because writing a file as root here means piping into
-    ``sudo tee``, and that is an effect whose output nobody wants.
+    Deliberately a thin shim over _output rather than its own copy of the
+    same try/except: the two were byte-identical apart from the return value,
+    which is the duplication this release exists to remove.
     """
-    try:
-        r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, input=input
-        )
-    except subprocess.TimeoutExpired:
-        log.debug("timed out after %ss: %s", timeout, " ".join(map(str, cmd)))
-        return False
-    except OSError as e:
-        log.debug("could not run %s: %s", " ".join(map(str, cmd)), e)
-        return False
-    if r.returncode != 0:
-        log.debug(
-            "exit %s from %s: %s",
-            r.returncode,
-            " ".join(map(str, cmd)),
-            (r.stderr or "").strip()[:200],
-        )
-    return r.returncode == 0
+    return _output(cmd, timeout=timeout, input=input) is not None
 
 
 def _ask(prompt: str, default: str = "") -> str:
@@ -241,7 +229,7 @@ def _preload_node_shim(env: dict[str, str], shim: str) -> None:
         return
     existing = env.get("NODE_OPTIONS", "").strip()
     arg = f'--require "{path}"'
-    env["NODE_OPTIONS"] = f"{existing} {arg}".strip() if existing else arg
+    env["NODE_OPTIONS"] = f"{existing} {arg}".strip()
 
 
 # Service logs are opened in append mode and the worker can spew stack traces
@@ -395,24 +383,21 @@ def _ensure_build_link():
                 content = ""
             if _has_build_entry(content):
                 entry = _synthetic_build_entry(build_data)
-                try:
-                    # Write new synthetic.d file first — only remove legacy if this succeeds
-                    # install -d pins mode 755 (see note in main create path)
-                    if not _ok(
-                        ["sudo", "install", "-d", "-m", "755", "/etc/synthetic.d"]
-                    ):
-                        raise OSError("mkdir failed")
-                    if not _ok(["sudo", "tee", str(SYNTHETIC_CONF)], input=entry):
-                        raise OSError("tee failed")
-                    # New file written — now safe to clean legacy
+                # Write the new file first, and only clean up the legacy one
+                # if that worked. Non-fatal either way: the link still works
+                # from the legacy location. No try/except, because _ok never
+                # raises, so the handler here could only ever have caught the
+                # two OSErrors this block threw at itself.
+                # install -d pins mode 755 (see note in main create path)
+                if _ok(
+                    ["sudo", "install", "-d", "-m", "755", "/etc/synthetic.d"]
+                ) and _ok(["sudo", "tee", str(SYNTHETIC_CONF)], input=entry):
                     new_content = _strip_build_entry(content)
                     if new_content.strip():
                         _ok(["sudo", "tee", str(legacy)], input=new_content)
                     else:
                         _ok(["sudo", "rm", str(legacy)], timeout=10)
                     log.info("Migrated /build link to /etc/synthetic.d/")
-                except OSError:
-                    pass  # Non-fatal, link still works from legacy location
         return True
 
     if Path("/build").exists():
@@ -1718,7 +1703,6 @@ def download_immich_server(version: str) -> Path:
                     log.info("    Extracting server...")
                     # Extract all server members at once — pnpm symlinks need
                     # their targets to exist, so per-member extract breaks.
-                    import tempfile
 
                     with tempfile.TemporaryDirectory() as tmpdir:
                         try:
@@ -1929,13 +1913,12 @@ _WORKER_CMD_RE = re.compile(
 )
 
 
-def _scan_worker_pids(exclude: set[int] | None = None) -> list[int]:
+def _scan_worker_pids() -> list[int]:
     """Return PIDs of live Immich worker processes found via ``ps``.
 
     Immich 2.7+ sets ``process.title='immich'``, so the recorded PID's
     parent may exit while child 'immich' processes keep running.
 
-    *exclude* is an optional set of PIDs to skip (e.g. tracked PIDs).
     The current process is always excluded.
     """
     try:
@@ -1949,8 +1932,6 @@ def _scan_worker_pids(exclude: set[int] | None = None) -> list[int]:
         return []
 
     skip = {os.getpid()}
-    if exclude:
-        skip |= exclude
 
     pids: list[int] = []
     for line in result.stdout.splitlines():
@@ -4646,7 +4627,6 @@ def _find_python() -> str | None:
             ["python3", "--version"], capture_output=True, text=True, timeout=5
         )
         version = r.stdout.strip() + r.stderr.strip()  # some builds print to stderr
-        import re
 
         m = re.search(r"3\.(\d+)", version)
         if m and int(m.group(1)) >= 11:
@@ -7863,21 +7843,20 @@ def cmd_ml_test(_args):
             "2Q=="
         )
 
-    def predict(entries: dict, include_image: bool = True) -> bytes:
-        """POST /predict multipart with entries JSON and optional image."""
+    def predict(entries: dict) -> bytes:
+        """POST /predict multipart with entries JSON and the test image."""
         boundary = "----iac-ml-test"
         lines = []
         lines.append(f"--{boundary}\r\n".encode())
         lines.append(b'Content-Disposition: form-data; name="entries"\r\n\r\n')
         lines.append(json.dumps(entries).encode() + b"\r\n")
-        if include_image:
-            lines.append(f"--{boundary}\r\n".encode())
-            lines.append(
-                b'Content-Disposition: form-data; name="image"; '
-                b'filename="t.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'
-            )
-            lines.append(_tiny_jpeg())
-            lines.append(b"\r\n")
+        lines.append(f"--{boundary}\r\n".encode())
+        lines.append(
+            b'Content-Disposition: form-data; name="image"; '
+            b'filename="t.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'
+        )
+        lines.append(_tiny_jpeg())
+        lines.append(b"\r\n")
         lines.append(f"--{boundary}--\r\n".encode())
         body = b"".join(lines)
 
