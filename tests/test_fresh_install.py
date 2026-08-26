@@ -3332,3 +3332,138 @@ class TestUntrustedTapIsReported:
         assert "brew trust epheterson/immich-accelerator" in out, (
             f"the user must be given the exact command: {out}"
         )
+
+
+class TestUninstallAsksBeforeItDeletes:
+    """`uninstall` removes services, launchd config and the whole data
+    directory. It had no test at all, which is the wrong place in this
+    codebase to have none: every failure here is destructive and silent.
+
+    These pin the properties where a regression costs a user their data
+    rather than merely annoying them.
+    """
+
+    @staticmethod
+    def _harness(monkeypatch, answer):
+        """Neuter everything destructive and record what would have run."""
+        calls = {"stop": 0, "rmtree": [], "run": [], "unlink": 0, "build_link": 0}
+        monkeypatch.setattr(m, "cmd_stop", lambda *a: calls.__setitem__("stop", calls["stop"] + 1))
+        monkeypatch.setattr(m, "_remove_build_link",
+                            lambda *a: calls.__setitem__("build_link", calls["build_link"] + 1))
+
+        def fake_rmtree(path, *, what):
+            calls["rmtree"].append(what)
+            return True
+
+        monkeypatch.setattr(m, "_rmtree_or_explain", fake_rmtree)
+
+        def fake_run(cmd, *a, **k):
+            calls["run"].append(cmd[0] if cmd else "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(m.subprocess, "run", fake_run)
+        if answer is EOFError:
+            monkeypatch.setattr("builtins.input", lambda _p: (_ for _ in ()).throw(EOFError))
+        else:
+            monkeypatch.setattr("builtins.input", lambda _p: answer)
+        return calls
+
+    @staticmethod
+    def _fake_home(monkeypatch, tmp_path):
+        """Point Path.home() at a temp tree.
+
+        Not optional: cmd_uninstall unlinks ~/Library/LaunchAgents/
+        com.immich.accelerator.plist, and an earlier version of this test
+        reached the real one. It survived only because that file happened not
+        to exist on this machine.
+        """
+        home = tmp_path / "home"
+        (home / "Library" / "LaunchAgents").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(m.Path, "home", staticmethod(lambda: home))
+        return home
+
+    def test_answering_no_deletes_nothing(self, tmp_data_dir, monkeypatch):
+        calls = self._harness(monkeypatch, "n")
+        m.cmd_uninstall(None)
+        assert calls["rmtree"] == [], "declined, but it deleted something anyway"
+        assert calls["stop"] == 0, "declined, but it stopped the services"
+        assert calls["build_link"] == 0
+
+    def test_bare_enter_deletes_nothing(self, tmp_data_dir, monkeypatch):
+        """The prompt shows [y/N], so Enter must decline. If the default ever
+        flips, a user hitting Return loses their install."""
+        calls = self._harness(monkeypatch, "")
+        m.cmd_uninstall(None)
+        assert calls["rmtree"] == []
+        assert calls["stop"] == 0
+
+    def test_no_terminal_deletes_nothing(self, tmp_data_dir, monkeypatch):
+        """Piped stdin, CI, ssh with no tty. Nobody is there to consent, so
+        this must not proceed on their behalf."""
+        calls = self._harness(monkeypatch, EOFError)
+        m.cmd_uninstall(None)
+        assert calls["rmtree"] == []
+        assert calls["stop"] == 0
+
+    def test_yes_removes_data_and_stops_services(self, tmp_data_dir, monkeypatch):
+        calls = self._harness(monkeypatch, "y")
+        m.cmd_uninstall(None)
+        assert calls["stop"] == 1, "consented, but the services were left running"
+        assert "accelerator data" in calls["rmtree"]
+        assert calls["build_link"] == 1, "the /build link was left behind"
+
+    def test_a_brew_install_never_deletes_the_cellar_venv(
+        self, tmp_data_dir, tmp_path, monkeypatch
+    ):
+        """Homebrew owns that venv. Deleting it breaks the running python and
+        leaves the formula unusable until `brew reinstall`, so the guard is
+        load-bearing rather than tidiness.
+
+        Built on a real temp tree rather than by faking Path.exists, so the
+        venv genuinely exists and the assertion means something.
+        """
+        calls = self._harness(monkeypatch, "y")
+        self._fake_home(monkeypatch, tmp_path)
+        cellar = tmp_path / "Cellar" / "immich-accelerator" / "9.9.9" / "libexec"
+        pkg = cellar / "immich_accelerator"
+        pkg.mkdir(parents=True)
+        (cellar / "ml" / "venv").mkdir(parents=True)
+        monkeypatch.setattr(m, "__file__", str(pkg / "__main__.py"))
+
+        m.cmd_uninstall(None)
+        assert "ML venv" not in calls["rmtree"], (
+            "deleted Homebrew's own ML venv, which breaks the installed formula"
+        )
+        assert "accelerator data" in calls["rmtree"], (
+            "the brew guard also skipped the data directory it should remove"
+        )
+
+    def test_a_git_clone_does_delete_its_own_venv(
+        self, tmp_data_dir, tmp_path, monkeypatch
+    ):
+        """The other half: without the Cellar marker the venv is ours to
+        remove, so the guard above must be about brew and not about venvs."""
+        calls = self._harness(monkeypatch, "y")
+        self._fake_home(monkeypatch, tmp_path)
+        repo = tmp_path / "checkout"
+        pkg = repo / "immich_accelerator"
+        pkg.mkdir(parents=True)
+        (repo / "ml" / "venv").mkdir(parents=True)
+        monkeypatch.setattr(m, "__file__", str(pkg / "__main__.py"))
+
+        m.cmd_uninstall(None)
+        assert "ML venv" in calls["rmtree"]
+
+    def test_the_launchd_plist_is_unloaded_before_it_is_removed(
+        self, tmp_data_dir, tmp_path, monkeypatch
+    ):
+        """Unlinking a still-loaded plist leaves launchd supervising a job
+        whose definition is gone."""
+        calls = self._harness(monkeypatch, "y")
+        home = self._fake_home(monkeypatch, tmp_path)
+        plist = home / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
+        plist.write_text("<plist/>")
+
+        m.cmd_uninstall(None)
+        assert "launchctl" in calls["run"], "plist removed without unloading it first"
+        assert not plist.exists(), "plist unloaded but left on disk"
