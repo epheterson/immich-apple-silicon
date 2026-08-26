@@ -574,7 +574,7 @@ class TestRegressionGuards:
             "Cannot find module" in result.stderr or "MODULE_NOT_FOUND" in result.stderr
         ), f"expected module-not-found error, got: {result.stderr[:300]}"
 
-    def test_cmd_start_node_options_string_is_well_formed(self):
+    def test_cmd_start_node_options_string_is_well_formed(self, tmp_path, monkeypatch):
         """Static check that cmd_start wraps the shim path in DOUBLE
         quotes for NODE_OPTIONS. Double is the only form Node's
         NODE_OPTIONS tokenizer honors universally. v1.4.2 shipped
@@ -582,23 +582,27 @@ class TestRegressionGuards:
         filename). A v1.4.3 pre-fix attempted backslash escaping
         (also broken — Node doesn't honor shell escapes either).
         Verified empirically against Node 25.2."""
-        src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()
-        # Must wrap the shim path in double quotes.
-        assert "f'--require \"{shim_path}\"'" in src, (
-            "cmd_start must wrap the shim path in double quotes for "
-            "NODE_OPTIONS. See issue #24 and the empirical findings "
-            "in TestRegressionGuards."
-        )
-        # Must not regress to single-quoting the require arg.
-        assert "f\"--require '{shim_path}'\"" not in src, (
-            "NODE_OPTIONS single-quoted the shim path — Node doesn't "
-            "honor shell quoting (v1.4.2 regression, #24)"
-        )
-        # Must not regress to backslash-escaping whitespace.
-        assert 'str(shim_path).replace(" ", r"\\ ")' not in src, (
-            "NODE_OPTIONS backslash-escaped whitespace — Node doesn't "
-            "honor shell escapes in NODE_OPTIONS either"
-        )
+        # Asserted on the string the code actually produces, not on the
+        # source text. This guard used to grep for a particular variable
+        # name and broke the moment the four copied blocks were collapsed
+        # into one helper, even though the behaviour was identical. What
+        # matters is the quoting, so check that.
+        hooks = tmp_path / "with space" / "hooks"
+        hooks.mkdir(parents=True)
+        (hooks / "pg_dump_shim.js").write_text("//")
+        monkeypatch.setattr(m, "__file__", str(tmp_path / "with space" / "x.py"))
+
+        env: dict[str, str] = {}
+        m._preload_node_shim(env, "pg_dump_shim.js")
+        produced = env["NODE_OPTIONS"]
+
+        shim = hooks / "pg_dump_shim.js"
+        assert produced == f'--require "{shim}"', produced
+        # Single quotes became literal characters in the filename (v1.4.2).
+        assert f"--require '{shim}'" != produced
+        assert "'" not in produced
+        # Backslash escaping is not honoured by NODE_OPTIONS either.
+        assert "\\ " not in produced
 
 
 class TestPgDumpShim:

@@ -3999,3 +3999,67 @@ class TestRunHelpers:
         import immich_accelerator.__main__ as m
 
         assert m._output(["/bin/sh", "-c", "echo oops >&2; echo fine"]) == "fine\n"
+
+
+class TestNodeShimPreload:
+    """Four shims are preloaded into the worker via NODE_OPTIONS, and the
+    quoting was copy-pasted four times. The v1.4.2 bug was exactly this
+    quoting getting it wrong, so it is pinned in the one place it now lives.
+    """
+
+    def test_a_path_with_spaces_survives(self, tmp_path, monkeypatch):
+        """The whole reason for double quotes. Single quotes put literal
+        quote characters in the filename, and unquoted splits on the space."""
+        import immich_accelerator.__main__ as m
+
+        hooks = tmp_path / "has space" / "hooks"
+        hooks.mkdir(parents=True)
+        (hooks / "pg_dump_shim.js").write_text("//")
+        monkeypatch.setattr(m, "__file__", str(tmp_path / "has space" / "x.py"))
+
+        env: dict[str, str] = {}
+        m._preload_node_shim(env, "pg_dump_shim.js")
+        assert env["NODE_OPTIONS"] == f'--require "{hooks / "pg_dump_shim.js"}"'
+        assert "'" not in env["NODE_OPTIONS"]
+
+    def test_each_shim_appends_rather_than_replacing(self, tmp_path, monkeypatch):
+        """Four of these run in a row. If one overwrote instead of appending,
+        only the last shim would load and the other three would silently do
+        nothing at all."""
+        import immich_accelerator.__main__ as m
+
+        hooks = tmp_path / "hooks"
+        hooks.mkdir()
+        for name in ("a.js", "b.js"):
+            (hooks / name).write_text("//")
+        monkeypatch.setattr(m, "__file__", str(tmp_path / "x.py"))
+
+        env = {"NODE_OPTIONS": "--max-old-space-size=4096"}
+        m._preload_node_shim(env, "a.js")
+        m._preload_node_shim(env, "b.js")
+        assert env["NODE_OPTIONS"].count("--require") == 2
+        assert env["NODE_OPTIONS"].startswith("--max-old-space-size=4096 ")
+
+    def test_a_missing_shim_is_skipped_not_fatal(self, tmp_path, monkeypatch):
+        """A partial install should start a worker without the extra
+        behaviour rather than refuse to start."""
+        import immich_accelerator.__main__ as m
+
+        (tmp_path / "hooks").mkdir()
+        monkeypatch.setattr(m, "__file__", str(tmp_path / "x.py"))
+        env: dict[str, str] = {}
+        m._preload_node_shim(env, "not_installed.js")
+        assert env == {}
+
+    def test_every_shim_on_disk_is_actually_preloaded(self):
+        """The drift this collapse exists to stop: a fifth shim added to the
+        hooks directory and never wired in reads as shipped but never loads."""
+        import immich_accelerator.__main__ as m
+
+        hooks = Path(m.__file__).parent / "hooks"
+        on_disk = {p.name for p in hooks.glob("*_shim.js")}
+        src = Path(m.__file__).read_text()
+        wired = {
+            name for name in on_disk if f'_preload_node_shim(worker_env, "{name}")' in src
+        }
+        assert on_disk == wired, f"present but never preloaded: {sorted(on_disk - wired)}"
