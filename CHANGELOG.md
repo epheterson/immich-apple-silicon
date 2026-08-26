@@ -1,9 +1,20 @@
 # Changelog
 
+## 1.16.1 - 2026-08-26
+
+### Fixed
+- **`compare` could hang forever on a video ffmpeg cannot decode.** The frame extraction ran with no timeout, so a file it could not parse left the command sitting there with no output and no way to tell whether it was still working. Bounded at 120 seconds, which is far longer than extracting one frame ever takes.
+- **Setup could hang while checking the Node version, and said nothing useful when it failed.** `node --version` ran unbounded and unguarded, so a wedged node stalled the whole install, and a node that failed printed `Node.js:` followed by nothing at all. Bounded at 10 seconds, and a failure now reports that it could not be read.
+- **`setup --url ...` crashed when run from a script.** With stdin not a terminal, the first Postgres prompt raised `EOFError` and setup exited with a Python traceback instead of taking the default it had just printed on screen. Every other prompt in setup already handled this; one did not. Non-interactive setup works now.
+
+### Changed
+- **The install path has tests.** Uninstall, and the two functions that install software on your machine, had no test coverage at all. They now have eighteen, covering the cases where a mistake would be both destructive and silent: that declining or running with no terminal never deletes your data and never installs anything, that a Homebrew install never removes Homebrew's own ML environment, and that launchd is unloaded before its configuration is deleted.
+
 ## 1.16.0 - 2026-08-25
 
 ### Added
 - **A Library pane in Settings**, and five panes in place of three: General, Services, Transcoding, Library, Diagnostics. Library shows where your photos are, how that directory is mounted, and whether it is reachable right now.
+- **Reconnect SMB shares at launch**, in Settings under Library. Remembers the SMB shares mounted when you turn it on, and reconnects any that have gone missing the next time the app starts. Automounts like Time Machine's are deliberately left alone, and turning it off forgets the list rather than remounting something you unmounted on purpose.
 - **`scripts/ml-parity.py`.** Sends the same images to Immich's own container and to whichever engines you name, then reports cosine similarity for search, box overlap for faces, and the text each one read. Every machine learning figure in these notes comes from it rather than from an assertion.
 
 ### Fixed
@@ -28,7 +39,6 @@
 - **On an x86 Homebrew, the menu bar app and the CLI disagreed about the install.** The app resolved Homebrew's location three separate times by two different rules. Two looked for the prefix holding the accelerator and one took the first `brew` binary that exists, so on a machine with both prefixes an accelerator under `/usr/local` was managed with the Apple Silicon brew, which has never heard of it. The version row came back blank, onboarding offered to install something already installed, and the CLI printed "Updates: blocked" while Settings showed nothing. There is now one answer that all three derive from, and it is decided by where the accelerator actually is.
 - **The Swift mirror of the encoding settings was only half checked.** The test stopped at the default-off set, so which switches default off and the words the wrapper reads as on and off were pinned by nothing; emptying the set left the suite green while the pane would have shown hardware audio on by default. By [@RxChi1d](https://github.com/RxChi1d) ([#165](https://github.com/epheterson/immich-apple-silicon/pull/165)).
 
-### Changed
 - **The Software position now names what it does not cover.** It is described as byte-for-byte identical to Docker, and the QuickLook fallback is not gated on any hardware switch, so a file ffmpeg cannot decode gets a thumbnail ffmpeg did not produce. Said in all four places the claim appears. Raised by [@RxChi1d](https://github.com/RxChi1d) ([#166](https://github.com/epheterson/immich-apple-silicon/issues/166)).
 
 ## 1.15.0 - 2026-08-22

@@ -6,14 +6,16 @@
 - Squash merge to main. One clean commit per release.
 - Version bump + CHANGELOG entry required for every push to main. Enforced by the `version-bump` CI job and `tests/test_release_hygiene.py`, not just convention: `auto-tag` publishes the CHANGELOG section verbatim as the release notes, so a missing bump ships silently and a missing heading makes the notes run on into every previous release.
 - Contributor PRs from forks are exempt from the bump. They merge unversioned and our own release PR carries the version and the changelog entry that credits them.
-- Tag releases as `vX.Y.Z` matching the VERSION file.
-- **After every tag push**: run the `Update Homebrew Formula` workflow with the tag (`gh workflow run update-homebrew.yml -f tag=vX.Y.Z`). It builds the native ML bundle and the menu-bar app, attaches them to the release, renders the formula and the cask, and pushes both to epheterson/homebrew-immich-accelerator. Do not hand-edit the tap. Verify on the Mac Mini afterwards. Never skip this.
+- **The release is fully automated. Once Eric merges, do nothing but watch.** Merging to main *is* releasing. The `auto-tag` job in `ci.yml` reads VERSION, creates and pushes `vX.Y.Z`, publishes that version's CHANGELOG section as the release notes, and triggers `update-homebrew.yml` itself. That workflow builds the native ML bundle and the menu-bar app, attaches them to the release, renders the formula and the cask, and pushes both to epheterson/homebrew-immich-accelerator.
+- **Never create or push a tag by hand, and never trigger the Homebrew workflow by hand.** `auto-tag` skips when the tag already exists, and both its release step and its Homebrew trigger are gated on having created the tag. So a manual tag turns the entire release into a silent no-op while the job still reports success: no release, no notes, no assets, nothing red to tell you. This happened with v1.16.0. Recovering means deleting the tag (`git push origin :refs/tags/vX.Y.Z`, `git tag -d vX.Y.Z`) and re-running the `auto-tag` job so it takes the created path.
+- Watch `gh run list --workflow=ci.yml --branch=main`, then the update-homebrew run. Do not hand-edit the tap. Verify on the Mac Mini once the tap has moved.
+- Read the workflow before doing anything the pipeline may already own. The instruction above used to read "after every tag push, run the Update Homebrew workflow", which describes what happens after **auto-tag** pushes a tag, and was misread as an instruction to tag.
 
 ## Code style
 
 - Python: type hints, f-strings, pathlib for paths.
 - Keep it simple. No abstractions for one-time operations.
-- The ffmpeg wrapper is bash — keep it minimal, no unnecessary forks.
+- The ffmpeg wrapper is bash. Keep it minimal, no unnecessary forks.
 
 ## Testing
 
