@@ -261,30 +261,26 @@ if [[ "$IS_SINGLE_FRAME" == true && "$DECODE_REJECTED" == true && -n "$INPUT" \
         QL_RESULT=$(find "$QL_DIR" -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \) -print -quit)
         if [[ -n "$QL_RESULT" ]]; then
             # vips, not sips: sips cannot write webp, which this install uses.
+            # `vips thumbnail in out WIDTH [--height H]` takes the width as a
+            # required positional and fits the image inside WIDTH x H, so which
+            # side binds is chosen by making the other one unreachable.
             if [[ "$SCALE_H" =~ ^[0-9]+$ ]]; then
-                RESIZE=("--height" "$SCALE_H")
+                # Immich asked for a height; the width was -2, "whatever keeps
+                # the aspect ratio". A width no thumbnail will ever reach lets
+                # the height bind and the source's own shape pick the width.
+                # Measured: a 1920x1080 source at --height 250 gives 444x250,
+                # a 1080x1920 source gives 141x250.
+                RESIZE=(999999 --height "$SCALE_H")
             else
-                RESIZE=("--width" "${SCALE_W:-$QL_SIZE}")
+                RESIZE=("${SCALE_W:-$QL_SIZE}")
             fi
-            # KNOWN DEFECT, deliberately left as it is for now.
-            #
-            # ":1:1" passes the number without its flag, so vips reads it as
-            # the positional width: a preview requested at height 1440 comes
-            # back 1440 wide rather than 1440 tall. That is wrong.
-            #
-            # It is not fixed here because the obvious fixes are worse.
-            # `vips thumbnail` requires a positional width, so passing
-            # "${RESIZE[@]}" alone exits "too few arguments" and the fallback
-            # produces nothing. Passing a large width with --height did not
-            # bound the result either: measured on a 1920x1080 source,
-            # `10000 --height 400` returned 10000x5625. Getting this right
-            # means computing the width from the QuickLook output's own aspect
-            # ratio, which needs its dimensions read back and deserves its own
-            # change with its own tests rather than a guess in a release.
-            #
-            # Only reached when ffmpeg cannot decode the stream at all, and it
-            # still produces a usable thumbnail, just at the wrong dimension.
-            if "$VIPS_BIN" thumbnail "$QL_RESULT" "$OUTPUT" "${RESIZE[@]:1:1}" >/dev/null 2>&1 \
+            # The whole array. An earlier version sliced it to ":1:1", which
+            # passed the number without its flag, so vips read a requested
+            # height as the positional width and a 1440-tall preview came back
+            # 1440 wide. Immich records that as a success, so the wrong size is
+            # permanent until the asset is reprocessed. Noted alongside
+            # #166, which is about what the position claims, not this.
+            if "$VIPS_BIN" thumbnail "$QL_RESULT" "$OUTPUT" "${RESIZE[@]}" >/dev/null 2>&1 \
                || "$VIPS_BIN" copy "$QL_RESULT" "$OUTPUT" >/dev/null 2>&1; then
                 echo "[immich-accelerator] ffmpeg couldn't decode $INPUT for a thumbnail; QuickLook/AVFoundation produced one instead" >&2
                 exit 0

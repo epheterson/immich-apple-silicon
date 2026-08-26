@@ -140,7 +140,36 @@ struct ProcessProbe: Sendable {
 enum Paths {
     static let dataDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".immich-accelerator")
-    static let optDir = URL(fileURLWithPath: "/opt/homebrew/opt/immich-accelerator")
+    /// The Homebrew prefix this install lives under. The single answer that
+    /// Actions.brew, Actions.cli and optDir are all derived from.
+    ///
+    /// There were three of these, and they did not agree. Two picked the first
+    /// prefix containing the accelerator; `brew` picked the first brew binary
+    /// that exists. On a machine with both, an accelerator under /usr/local
+    /// was managed with the ARM brew, which has never heard of it, so every
+    /// upgrade and every `brew services` call went to the wrong Homebrew.
+    ///
+    /// The accelerator's own location decides. Only when it is not installed
+    /// yet does the question become which brew is present, since that is the
+    /// one that will install it.
+    ///
+    /// Computed, not stored: installing from this app is a supported flow, and
+    /// a `static let` captured "not installed" at first read and kept it until
+    /// relaunch, leaving the UI on the not-installed screen after a successful
+    /// install. Two `stat` calls per access.
+    static var brewPrefix: String {
+        for prefix in ["/opt/homebrew", "/usr/local"]
+        where FileManager.default.isExecutableFile(
+            atPath: "\(prefix)/opt/immich-accelerator/bin/immich-accelerator") {
+            return prefix
+        }
+        for prefix in ["/opt/homebrew", "/usr/local"]
+        where FileManager.default.isExecutableFile(atPath: "\(prefix)/bin/brew") {
+            return prefix
+        }
+        return "/opt/homebrew"
+    }
+    static var optDir: URL { URL(fileURLWithPath: "\(brewPrefix)/opt/immich-accelerator") }
     static let configFile = dataDir.appendingPathComponent("config.json")
 
     // Is the accelerator CLI installed (via Homebrew)?
@@ -481,9 +510,36 @@ final class StatusModel: ObservableObject {
         let storedStart = lines.count > 1 ? lines[1].trimmingCharacters(in: .whitespaces) : ""
         if !storedStart.isEmpty {
             let actualStart = psField(pid, "lstart=")
-            if !actualStart.isEmpty && actualStart != storedStart { return nil }
+            if !actualStart.isEmpty && !sameStart(actualStart, storedStart) { return nil }
         }
         return pid
+    }
+
+    /// Do these two `ps` start times describe the same process?
+    ///
+    /// The CLI's `_same_start_time`, in Swift, and it has to stay that way:
+    /// the two read the same pidfiles, so a rule that holds on one side and
+    /// not the other means the app and `status` disagree about whether the
+    /// service is running.
+    ///
+    /// Pinning LC_ALL=C above fixes what *we* read. It does nothing for what
+    /// is already stored, which for any pidfile written before 1.16 is
+    /// whatever the writer's locale produced, and comparing those byte for
+    /// byte turns an intermittent mismatch into a guaranteed one. So: equal is
+    /// the same process; parseable as the C form and different is genuinely a
+    /// different process; anything else was written before the pin, by a
+    /// locale we are not going to parse, and is accepted. The CLI restamps
+    /// such a file in the C form on its next read, and `watch` reads
+    /// constantly, so the tolerance is short-lived in practice.
+    nonisolated static func sameStart(_ actual: String, _ stored: String) -> Bool {
+        if actual == stored { return true }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        // ps pads a single-digit day with a second space ("Sat Aug  2").
+        let collapsed = stored.split(separator: " ", omittingEmptySubsequences: true)
+            .joined(separator: " ")
+        return fmt.date(from: collapsed) == nil
     }
 
     nonisolated static func command(of pid: Int32) -> String { psField(pid, "command=") }
@@ -494,6 +550,14 @@ final class StatusModel: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
         p.arguments = ["-p", "\(pid)", "-o", field]
+        // LC_ALL=C, because ps formats lstart through the caller's locale and
+        // this is compared byte for byte against a pidfile the CLI now writes
+        // under C. Without it, an app launched with a LANG set reads
+        // "Tue 25 Aug" against a stored "Tue Aug 25" and reports a running
+        // worker as stopped. Same defect as #169, in the sibling
+        // implementation.
+        p.environment = ProcessInfo.processInfo.environment
+            .merging(["LC_ALL": "C"]) { _, new in new }
         let out = Pipe()
         p.standardOutput = out
         try? p.run()

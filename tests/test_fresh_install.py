@@ -2382,8 +2382,7 @@ class TestFfmpegWrapperQuickLookFallback:
     _VIPS_RECORD = 'printf "%s\\n" "$@" > "$VIPS_ARGS_FILE"\ncp "$2" "$3"\n'
 
     def test_the_quicklook_fallback_asks_vips_for_a_size(self, tmp_path):
-        """Not which size, which is a known defect tracked separately: that it
-        passes one at all. With none, vips exits 'too few arguments', the
+        """With no size argument vips exits 'too few arguments', the
         `|| vips copy` branch writes the QuickLook output through at whatever
         size QuickLook produced, and the wrapper still exits 0, so Immich
         records the asset as thumbnailed and never retries.
@@ -2417,6 +2416,72 @@ class TestFfmpegWrapperQuickLookFallback:
             f"and the copy fallback would write an unresized image: {received}"
         )
 
+
+    def _vips_argv_for(self, tmp_path, scale):
+        """Drive the fallback and return the exact argv vips received."""
+        ffmpeg = tmp_path / "ffmpeg"
+        self._bash_stub(ffmpeg, self._DECODE_REJECTED_STDERR + "exit 69\n")
+        qlmanage = tmp_path / "qlmanage"
+        self._bash_stub(qlmanage, self._QLMANAGE_SUCCEEDS)
+        vips = tmp_path / "vips_stub.sh"
+        seen = tmp_path / "vips_args"
+        self._bash_stub(vips, f'printf "%s\\n" "$@" > {seen}\ncp "$2" "$3"\n')
+        wrapper = self._prepare_wrapper(tmp_path, ffmpeg)
+        # 60s, not 10: the wrapper forks bash, mktemp, qlmanage and vips, and
+        # this failed once on a machine running four ML engines and a Swift
+        # build at the same time. The fallback has its own 30s cap on
+        # qlmanage, so a real hang still fails rather than hanging here.
+        proc = subprocess.run(
+            ["/bin/bash", str(wrapper),
+             *self._thumbnail_args(tmp_path / "in.mp4", tmp_path / "out.jpg",
+                                   scale=scale)],
+            env={"PATH": f"{tmp_path}:/usr/bin:/bin",
+                 "IMMICH_ACCELERATOR_VIPS": str(vips)},
+            capture_output=True, text=True, timeout=60,
+        )
+        assert seen.is_file(), (
+            f"vips was never called, so the fallback did not reach it. "
+            f"wrapper rc={proc.returncode} stderr={proc.stderr[-300:]!r}"
+        )
+        return seen.read_text().split()
+
+    def test_a_requested_height_reaches_vips_as_a_height(self, tmp_path):
+        """Immich's `scale=-2:H` means "H tall, whatever width keeps the shape".
+
+        The argument list was previously sliced to one element, which dropped
+        the --height flag and left the bare number, which vips reads as the
+        positional width. A 1440-tall preview came back 1440 wide, and Immich
+        records that as a success, so the wrong size is permanent until the
+        asset is reprocessed.
+
+        `vips thumbnail` fits the image inside WIDTH x HEIGHT, so the height
+        only binds if the width cannot: hence the sentinel width, asserted
+        here so it cannot quietly become a real one.
+        """
+        received = self._vips_argv_for(tmp_path, "-2:1440")
+        assert received[0] == "thumbnail", received
+        assert "--height" in received, (
+            f"a requested height must reach vips as --height, not as the "
+            f"positional width: {received}"
+        )
+        assert received[received.index("--height") + 1] == "1440", received
+        width = received[3]
+        assert width.isdigit() and int(width) >= 100000, (
+            f"the positional width must be unreachable so the height binds, "
+            f"got {width}: {received}"
+        )
+
+    def test_a_requested_width_reaches_vips_as_the_width(self, tmp_path):
+        """The other half of `scale`: `W:-2` means "W wide". vips takes the
+        width positionally, so this one needs no flag and must not carry a
+        height that would fight it.
+        """
+        received = self._vips_argv_for(tmp_path, "640:-2")
+        assert received[3] == "640", received
+        assert "--height" not in received, (
+            f"a width-only request must not also constrain the height: "
+            f"{received}"
+        )
 
     def test_successful_ffmpeg_call_passes_through_unchanged(self, tmp_path):
         ffmpeg = tmp_path / "ffmpeg"
@@ -3147,3 +3212,117 @@ class TestJobRetryShim:
         # past where run1 left off instead of restarting at the same value.
         assert "DELAY:4000" in run1.stdout, run1.stdout
         assert "DELAY:4000" in run2.stdout, run2.stdout
+
+
+class TestUntrustedTapIsReported:
+    """Homebrew refuses to load a formula from an untrusted tap, and that
+    refusal looks exactly like "nothing to upgrade" to anything reading only
+    the exit status. The install then sits on an old version forever with no
+    signal: `brew upgrade` does nothing, `brew outdated` reports nothing, and
+    the menu bar app's only update path is `brew outdated`.
+
+    Verified against a real Homebrew by removing the tap from trust.json on the
+    release Mac: `brew outdated --formula immich-accelerator` prints "Refusing
+    to load formula ... from untrusted tap".
+    """
+
+    REFUSAL = (
+        "Error: Refusing to load formula epheterson/immich-accelerator/"
+        "immich-accelerator from untrusted tap epheterson/immich-accelerator.\n"
+        "Run `brew trust epheterson/immich-accelerator` to trust it.\n"
+    )
+
+    def _brew_stub(self, tmp_path, stdout="", stderr="", code=0):
+        brew = tmp_path / "brew"
+        brew.write_text(
+            "#!/bin/bash\n"
+            f"cat <<'OUT'\n{stdout}OUT\n"
+            f"cat >&2 <<'ERR'\n{stderr}ERR\n"
+            f"exit {code}\n"
+        )
+        brew.chmod(0o755)
+        return brew
+
+    def test_a_refusal_is_recognised(self, tmp_path, monkeypatch):
+        brew = self._brew_stub(tmp_path, stderr=self.REFUSAL, code=1)
+        monkeypatch.setattr(m, "_brew_path", lambda: str(brew))
+        assert m.brew_refuses_our_tap() is True
+
+    def test_an_ordinary_up_to_date_answer_is_not_a_refusal(
+        self, tmp_path, monkeypatch
+    ):
+        """The case that must not false-positive: brew prints nothing at all
+        when the formula is current, which is the common state."""
+        brew = self._brew_stub(tmp_path)
+        monkeypatch.setattr(m, "_brew_path", lambda: str(brew))
+        assert m.brew_refuses_our_tap() is False
+
+    def test_an_available_upgrade_is_not_a_refusal(self, tmp_path, monkeypatch):
+        brew = self._brew_stub(tmp_path, stdout="immich-accelerator\n")
+        monkeypatch.setattr(m, "_brew_path", lambda: str(brew))
+        assert m.brew_refuses_our_tap() is False
+
+    def test_no_brew_is_not_a_refusal(self, monkeypatch):
+        """A source install has no brew and nothing to say about trust."""
+        monkeypatch.setattr(m, "_brew_path", lambda: None)
+        assert m.brew_refuses_our_tap() is False
+
+    def test_the_brew_asked_is_the_one_that_installed_us(self, tmp_path, fake_mac):
+        """An x86 brew under Rosetta is a real configuration, and a Mac
+        migrated from Intel carries both prefixes at once.
+
+        Taking the first brew that merely *exists* is not enough, and was the
+        original defect: on a dual-prefix Mac it asks the Apple Silicon brew
+        about a formula only the x86 brew ever installed. That answers "No
+        available formula" rather than the refusal, so no line matches, the
+        warning never fires, and the user it was written for sits on an old
+        version with nothing on screen to explain why.
+        """
+        with fake_mac(tmp_path, brew_in=("arm", "x86"), accelerator_in="x86") as (
+            arm,
+            x86,
+        ):
+            assert m._brew_path() == f"{x86}/bin/brew"
+            assert m._brew_path() != f"{arm}/bin/brew"
+
+    def test_the_check_does_not_let_brew_auto_update(self, tmp_path, monkeypatch):
+        """`brew outdated` git-fetches every tap once a day, measured at 68
+        seconds. `status` is a question, not a maintenance task, and the run
+        that paid that cost was also the one that timed out reporting nothing.
+
+        The stub refuses to answer unless the environment says not to
+        auto-update, so this asserts on the child's environment rather than
+        on ours.
+        """
+        brew = tmp_path / "brew"
+        brew.write_text(
+            "#!/bin/bash\n"
+            'if [ "$HOMEBREW_NO_AUTO_UPDATE" != "1" ]; then\n'
+            '  echo "would auto-update" >&2; exit 3\n'
+            "fi\n"
+            "cat >&2 <<'ERR'\n" + self.REFUSAL + "ERR\n"
+            "exit 1\n"
+        )
+        brew.chmod(0o755)
+        monkeypatch.setattr(m, "_brew_path", lambda: str(brew))
+        assert m.brew_refuses_our_tap() is True, (
+            "the refusal was missed, so the child ran without "
+            "HOMEBREW_NO_AUTO_UPDATE and the stub declined to answer"
+        )
+
+    def test_status_tells_the_user_and_names_the_command(
+        self, tmp_data_dir, tmp_path, monkeypatch, caplog
+    ):
+        """Through cmd_status, not the helper: a detector nothing calls is
+        worth nothing, and the whole defect is that the user is never told."""
+        brew = self._brew_stub(tmp_path, stderr=self.REFUSAL, code=1)
+        monkeypatch.setattr(m, "_brew_path", lambda: str(brew))
+        m.save_config({"version": "1.16.0"})
+        monkeypatch.setattr(m, "read_pid", lambda name: 4242)
+        with caplog.at_level("WARNING"):
+            m.cmd_status(None)
+        out = caplog.text
+        assert "blocked" in out, out
+        assert "brew trust epheterson/immich-accelerator" in out, (
+            f"the user must be given the exact command: {out}"
+        )

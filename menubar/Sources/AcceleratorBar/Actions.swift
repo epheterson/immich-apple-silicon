@@ -95,20 +95,85 @@ enum MountSharesAtLogin {
 
 // Daily actions, shelling out to the same commands a user would run.
 enum Actions {
-    static let brew = "/opt/homebrew/bin/brew"
-    static let cli = "/opt/homebrew/opt/immich-accelerator/bin/immich-accelerator"
+    /// Both derived from Paths.brewPrefix, which is what decides which
+    /// Homebrew this install belongs to. These used to resolve themselves,
+    /// with two different rules between them; see brewPrefix for what that
+    /// cost on a machine with both prefixes.
+    static var brew: String { "\(Paths.brewPrefix)/bin/brew" }
+    static var cli: String {
+        "\(Paths.brewPrefix)/opt/immich-accelerator/bin/immich-accelerator"
+    }
     static let service = "epheterson/immich-accelerator/immich-accelerator"
     /// What `brew services list` prints in its Name column. brew accepts
     /// the tap path as an argument but never echoes it back.
     static let listedService = "immich-accelerator"
+    /// The tap, as `brew trust` wants it named.
+    static let tap = "epheterson/immich-accelerator"
+
+    /// The environment for brew calls that only read local state.
+    ///
+    /// No auto-update, because `brew outdated` git-fetches every tap once a
+    /// day before answering and this runs when a window opens. No analytics,
+    /// because that send is a detached curl which inherits our stdout and
+    /// keeps the pipe open after brew itself has exited, so `run` waits on a
+    /// process nobody is waiting for. No env hints, because they are noise in
+    /// a parsed output.
+    ///
+    /// One constant rather than a literal at each call site: it was set on two
+    /// of eight brew invocations when written out by hand.
+    ///
+    /// NOT for the two calls that ask whether a new version exists. A tap is a
+    /// local git clone, and nothing but that fetch refreshes it, so suppressing
+    /// it there made `brew outdated` permanently answer "nothing to do":
+    /// Sparkle would update this app and the CLI core would never follow.
+    /// Those use `brewEnvAllowingFetch`.
+    static let brewEnv = [
+        "HOMEBREW_NO_AUTO_UPDATE": "1",
+        "HOMEBREW_NO_ANALYTICS": "1",
+        "HOMEBREW_NO_ENV_HINTS": "1",
+    ]
+
+    /// For `outdated` and `upgrade`, which have to see the tap's new commits.
+    /// Analytics and hints are still off: those only add output and a detached
+    /// curl that holds our pipe open.
+    static let brewEnvAllowingFetch = [
+        "HOMEBREW_NO_ANALYTICS": "1",
+        "HOMEBREW_NO_ENV_HINTS": "1",
+    ]
 
     @discardableResult
-    static func run(_ tool: String, _ args: [String]) async -> (Int32, String) {
+    /// Run a tool and return its exit status and combined output.
+    ///
+    /// No timeout, deliberately. One was added in this release and removed
+    /// again after three rounds of review found it broken three different
+    /// ways: first it could not fire at all, because the deadline came after a
+    /// read that only returns at EOF; then it fired on pipe EOF rather than
+    /// process exit, so a command that succeeded in a second was reported as a
+    /// timeout and killed; then the fix for that waited twice on a semaphore
+    /// signalled once, adding a full second to every call in the app, and
+    /// closed a file handle another thread was reading, which raises an
+    /// Objective-C exception Swift cannot catch.
+    ///
+    /// It was there for a brew blocked on the Homebrew lock. The waiting is
+    /// now the caller's problem rather than this function's: the Trust button
+    /// says "Trusting...", says "Still working..." after ten seconds, and
+    /// settles on the real answer whenever it arrives (see startTrust in
+    /// SettingsView). Nothing is cancelled, so brew is never signalled halfway
+    /// through writing trust.json, and a command that succeeds slowly is
+    /// reported as the success it was.
+    static func run(_ tool: String, _ args: [String],
+                    env: [String: String] = [:]) async -> (Int32, String) {
         await withCheckedContinuation { cont in
             DispatchQueue.global().async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: tool)
                 p.arguments = args
+                if !env.isEmpty {
+                    // Overlay, not replacement: the child still needs PATH and
+                    // the rest of the inherited environment to find its tools.
+                    p.environment = ProcessInfo.processInfo.environment
+                        .merging(env) { _, new in new }
+                }
                 let out = Pipe()
                 p.standardOutput = out
                 p.standardError = out
@@ -119,7 +184,8 @@ enum Actions {
                 // pipe buffer (ml-test output does) would otherwise deadlock
                 // against our waitUntilExit.
                 let text = String(
-                    data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    data: out.fileHandleForReading.readDataToEndOfFile(),
+                    encoding: .utf8) ?? ""
                 p.waitUntilExit()
                 cont.resume(returning: (p.terminationStatus, text))
             }
@@ -162,6 +228,49 @@ enum Actions {
     /// stopped service, so changing a setting would start the accelerator and
     /// set it processing. Applying a setting must never be the thing that
     /// starts work.
+    /// Whether Homebrew is refusing to load our formula because the tap is
+    /// untrusted.
+    ///
+    /// This is not the same as "no update available", and telling them apart
+    /// is the whole point: `brew outdated` prints nothing in both cases, so
+    /// coreOutdated() returns nil either way and the app offered nothing while
+    /// the Mac sat on an old version indefinitely. Measured on the release Mac
+    /// by removing the tap from trust.json: brew prints "Refusing to load
+    /// formula ... from untrusted tap" and `brew info --json` returns no
+    /// formula at all.
+    ///
+    /// The words are the same two the CLI matches, pinned by a test.
+    static func brewRefusesTap() async -> Bool {
+        guard isBrewInstall else { return false }
+        // HOMEBREW_NO_AUTO_UPDATE, because `brew outdated` git-fetches every
+        // tap once a day before answering, measured at 68 seconds. This runs
+        // whenever the Settings window opens, so without it opening Settings
+        // can stall on a network fetch nobody asked for. App.swift already
+        // guards coreOutdated() for the same cost, but that path is
+        // conditional and this one is a routine user action.
+        let (_, out) = await run(
+            brew, ["outdated", "--formula", listedService],
+            env: brewEnv)
+        // On the line that names us. brew emits refusals for other untrusted
+        // taps too, and matching anywhere in the output meant someone else's
+        // tap put "Updates are blocked" on our pane, with a button that
+        // succeeds and changes nothing.
+        return out.lowercased().split(separator: "\n").contains { line in
+            line.contains(listedService)
+                && (line.contains("untrusted tap")
+                    || line.contains("refusing to load formula"))
+        }
+    }
+
+    /// Trust the tap, which is what the button offers to do. Only ever from an
+    /// explicit click: it changes the user's Homebrew configuration.
+    static func trustTap() async -> (ok: Bool, output: String) {
+        let (code, out) = await run(
+            brew, ["trust", tap],
+            env: brewEnv)
+        return (code == 0, out)
+    }
+
     /// Whether `brew services list` says our service is started.
     ///
     /// Split out and reachable from the command line (`AcceleratorBar
@@ -198,7 +307,7 @@ enum Actions {
 
     @discardableResult
     static func applyToRunningService() async -> ApplyResult {
-        let (_, list) = await run(brew, ["services", "list"])
+        let (_, list) = await run(brew, ["services", "list"], env: brewEnv)
         if brewHasItStarted(list) {
             await restartService()
             return .applied
@@ -254,9 +363,9 @@ enum Actions {
         return cleaned.isEmpty ? "No output." : cleaned
     }
 
-    static func startService() async { await run(brew, ["services", "start", service]) }
-    static func stopService() async { await run(brew, ["services", "stop", service]) }
-    static func restartService() async { await run(brew, ["services", "restart", service]) }
+    static func startService() async { await run(brew, ["services", "start", service], env: brewEnv) }
+    static func stopService() async { await run(brew, ["services", "stop", service], env: brewEnv) }
+    static func restartService() async { await run(brew, ["services", "restart", service], env: brewEnv) }
 
     // Runs the CLI's real ML test and condenses the result to one line.
     static func mlTest() async -> String {
@@ -355,11 +464,29 @@ enum Actions {
     // `brew outdated --verbose` prints "immich-accelerator (1.7.1) < 1.7.2" and
     // stays silent for an up-to-date OR pinned formula, so nil correctly means
     // "do not run an upgrade".
+    //
+    // The exit code is deliberately not consulted. `brew outdated` with a named
+    // formula is an assertion, not a report: Homebrew sets a failure status when
+    // the formula it was asked about IS outdated (cmd/outdated.rb, `Homebrew.
+    // failed = args.named.present? && outdated.present?`). Measured on this
+    // machine: `brew outdated --formula --verbose git` prints
+    // "git (2.46.0) < 2.55.0" and exits 1. Guarding on `code == 0` therefore
+    // threw the answer away in precisely the case that matters, and an app
+    // updated by Sparkle went on running the old CLI core forever.
     static func coreOutdated() async -> String? {
-        let (code, out) = await run(
-            brew, ["outdated", "--formula", "--verbose", "immich-accelerator"])
-        guard code == 0, let r = out.range(of: "< ") else { return nil }
-        let v = out[r.upperBound...]
+        let (_, out) = await run(
+            brew, ["outdated", "--formula", "--verbose", "immich-accelerator"],
+            env: brewEnvAllowingFetch)
+        // Anchored to the line naming the formula. run() merges stderr into
+        // this string, so a bare search for "< " can lift a version out of a
+        // message about something else entirely.
+        guard
+            let line = out.split(separator: "\n").first(where: {
+                $0.contains("immich-accelerator") && $0.contains("< ")
+            }),
+            let r = line.range(of: "< ")
+        else { return nil }
+        let v = line[r.upperBound...]
             .prefix { !$0.isWhitespace }
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return v.isEmpty ? nil : v
@@ -370,7 +497,7 @@ enum Actions {
     // the standard launchd install.
     @discardableResult
     static func upgradeCore() async -> Bool {
-        let (code, _) = await run(brew, ["upgrade", "immich-accelerator"])
+        let (code, _) = await run(brew, ["upgrade", "immich-accelerator"], env: brewEnvAllowingFetch)
         return code == 0
     }
 

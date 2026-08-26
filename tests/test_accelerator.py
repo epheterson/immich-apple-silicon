@@ -22,6 +22,7 @@ from immich_accelerator.__main__ import (
     write_pid,
     read_pid,
     kill_pid,
+    _get_process_start_time,
     detect_immich,
     _docker_is_running,
     _find_running_docker,
@@ -329,11 +330,14 @@ class TestPidManagement:
     def test_read_pid_detects_pid_reuse(self, tmp_data_dir):
         current_pid = os.getpid()
         pid_file = tmp_data_dir["pid_dir"] / "worker.pid"
-        pid_file.write_text(f"{current_pid}\nOLD START TIME")
+        # Real `ps -o lstart=` output, not a sentinel. "OLD START TIME" is a
+        # string no ps emits and no comparison can read, so this test passed
+        # under any rule, including one that never rejected anything at all.
+        pid_file.write_text(f"{current_pid}\nSat Aug 22 23:07:37 2026")
 
         with patch(
             "immich_accelerator.__main__._get_process_start_time",
-            return_value="DIFFERENT START TIME",
+            return_value="Sat Aug 22 23:09:14 2026",
         ):
             result = read_pid("worker")
             assert result is None
@@ -350,6 +354,38 @@ class TestPidManagement:
         ):
             result = read_pid("worker")
             assert result == current_pid
+
+    def test_start_time_is_locale_independent(self):
+        """ps formats lstart through the caller's locale, so an unpinned
+        locale makes the same live process read back differently depending
+        on who asked: "Sat Aug 22 23:07:37 2026" under C/en_US but "Sat 22
+        Aug 23:07:37 2026" under en_AU/en_GB. launchd (brew services)
+        passes no LANG while a Terminal inherits the user's region, so the
+        writer and the reader of a pidfile disagreed, read_pid called it a
+        reused PID, and deleted the pidfile of a healthy service."""
+        baseline = _get_process_start_time(os.getpid())
+        assert baseline, "ps gave no start time for our own pid"
+
+        for lang in ("en_AU.UTF-8", "en_GB.UTF-8", "en_US.UTF-8", "C"):
+            with patch.dict(os.environ, {"LANG": lang, "LC_TIME": lang}):
+                assert _get_process_start_time(os.getpid()) == baseline, (
+                    f"start time changed under LANG={lang} — the ps call "
+                    "is not pinned to a fixed locale"
+                )
+
+    def test_pidfile_survives_a_reader_in_a_different_locale(self, tmp_data_dir):
+        """End-to-end guard for the deletion: write the pidfile as one
+        process would, then read it back as a differently-localed process
+        (launchd vs Terminal). The pid must still resolve and the file must
+        still be there."""
+        current_pid = os.getpid()
+        with patch.dict(os.environ, {"LANG": "C", "LC_TIME": "C"}):
+            write_pid("worker", current_pid)
+
+        pid_file = tmp_data_dir["pid_dir"] / "worker.pid"
+        with patch.dict(os.environ, {"LANG": "en_AU.UTF-8", "LC_TIME": "en_AU.UTF-8"}):
+            assert read_pid("worker") == current_pid
+        assert pid_file.exists(), "a differently-localed reader deleted the pidfile"
 
     def test_kill_pid_returns_false_when_not_running(self, tmp_data_dir):
         assert kill_pid("worker") is False
@@ -1916,21 +1952,89 @@ class TestEnsureMediaReady:
             os.chmod(media, 0o755)
 
 
+class TestWhereOurOwnInstallLives:
+    """One rule for which Homebrew prefix holds this install.
+
+    /usr/local is a real configuration here: an x86 brew under Rosetta, and
+    Macs migrated from Intel end up carrying both prefixes. Everything that
+    locates our own files derives from the same answer, so one half of a
+    feature cannot end up reading the other half's tree.
+    """
+
+    def test_the_prefix_holding_the_accelerator_beats_the_first_brew(
+        self, tmp_path, fake_mac
+    ):
+        """The defect this replaces: picking the first brew that *exists* asked
+        the Apple Silicon brew about a formula only the x86 brew had installed.
+        It answers "No available formula", which reads as "nothing is wrong"."""
+        import immich_accelerator.__main__ as m
+
+        with fake_mac(tmp_path, brew_in=("arm", "x86"), accelerator_in="x86") as (
+            arm,
+            x86,
+        ):
+            assert m._brew_prefix() == x86
+            assert m._brew_path() == f"{x86}/bin/brew"
+            assert not str(m._opt_dir()).startswith(arm)
+
+    def test_falls_back_to_the_prefix_that_has_a_brew_at_all(self, tmp_path, fake_mac):
+        import immich_accelerator.__main__ as m
+
+        with fake_mac(tmp_path, brew_in=("x86",)) as (_arm, x86):
+            assert m._brew_prefix() == x86
+
+    def test_every_lookup_for_our_own_files_agrees_on_one_prefix(
+        self, tmp_path, fake_mac
+    ):
+        """The invariant, stated as a test: one answer, not three resolvers
+        with two rules between them."""
+        import immich_accelerator.__main__ as m
+
+        with fake_mac(tmp_path, brew_in=("arm", "x86"), accelerator_in="x86") as (
+            arm,
+            x86,
+        ):
+            opt = m._opt_dir()
+            assert str(opt).startswith(x86)
+
+            (opt / "libexec").mkdir(parents=True)
+            (opt / "libexec/VERSION").write_text("9.9.9\n")
+            assert m._installed_version() == "9.9.9"
+
+            native = opt / "libexec/native-ml"
+            native.mkdir()
+            (native / "immich-ml-native").write_text("")
+            assert m._native_bundle_dir({}) == native
+
+            ml = opt / "libexec/ml"
+            (ml / "src").mkdir(parents=True)
+            (ml / "src/main.py").write_text("")
+            (ml / "venv/bin").mkdir(parents=True)
+            (ml / "venv/bin/python3").write_text("")
+            assert m._find_ml_dir() == ml
+
+            # Nothing resolved into the other prefix.
+            for found in (opt, native, ml):
+                assert arm not in str(found)
+
+
 class TestInstalledVersion:
     """Detect a `brew upgrade` while watch runs old code, so it can relaunch
     into the new code and reload the worker (otherwise a detached worker keeps
     running stale code after an upgrade)."""
 
     def test_reads_opt_symlink_version(self, tmp_path):
-        vf = tmp_path / "VERSION"
-        vf.write_text("9.9.9\n")
-        with patch("immich_accelerator.__main__._OPT_VERSION_FILE", vf):
+        (tmp_path / "libexec").mkdir()
+        (tmp_path / "libexec/VERSION").write_text("9.9.9\n")
+        with patch("immich_accelerator.__main__._opt_dir", return_value=tmp_path):
             assert _installed_version() == "9.9.9"
 
     def test_falls_back_to_running_version_when_absent(self, tmp_path):
         from immich_accelerator.__main__ import __version__ as running
 
-        with patch("immich_accelerator.__main__._OPT_VERSION_FILE", tmp_path / "nope"):
+        with patch(
+            "immich_accelerator.__main__._opt_dir", return_value=tmp_path / "nope"
+        ):
             assert _installed_version() == running
 
 
@@ -2107,7 +2211,8 @@ class TestStopAllFast:
             "immich_accelerator.__main__.read_pid",
             side_effect=lambda n: {"ml": 222}.get(n),
         ), patch("os.getsid", return_value=900), patch(
-            "os.getpgid", return_value=222  # a shell job: group leader is not the session leader
+            "os.getpgid",
+            return_value=222,  # a shell job: group leader is not the session leader
         ), patch(
             "os.killpg", side_effect=lambda pgid, sig: by_group.append(pgid)
         ), patch(
@@ -3559,3 +3664,273 @@ class TestWorkerConfigGate:
         guarded = set(re.findall(r'config\.get\("([a-z_]+)"', src))
         missing = reads - guarded - set(m._WORKER_CONFIG_KEYS)
         assert not missing, f"cmd_start dereferences ungated keys: {sorted(missing)}"
+
+
+class TestSwitchingMlOffSaysImmichStillPointsHere:
+    """Setup points Immich's IMMICH_MACHINE_LEARNING_URL at this Mac and never
+    edits anyone's docker-compose.yml, by design: "nothing inside Docker is
+    modified" is the promise on the front of the README.
+
+    So switching our ML off cannot put that URL back, and if it says nothing
+    the toggle looks like it worked while every search, face and OCR job fails
+    against a service that stopped listening. The reason then lives only in
+    Immich's logs, which is the last place anyone looks.
+    """
+
+    def test_turning_ml_off_warns_and_names_the_setting(
+        self, tmp_data_dir, monkeypatch, caplog
+    ):
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"ml": True})
+        monkeypatch.setattr(m, "reconcile_ml", lambda *a, **k: None)
+        monkeypatch.setattr(m, "read_pid", lambda name: None)
+        monkeypatch.setattr(m, "_restart_worker", lambda *a, **k: True)
+
+        with caplog.at_level("WARNING"):
+            m._set_component("ml", False)
+
+        out = caplog.text
+        assert "IMMICH_MACHINE_LEARNING_URL" in out, out
+        assert "immich-machine-learning" in out, "say what to point it back to"
+
+    def test_a_split_setup_with_another_engine_is_not_warned(
+        self, tmp_data_dir, monkeypatch, caplog
+    ):
+        """ml_url is the engine the worker falls back to, so on a two-Mac
+        split it names the other Mac and nothing is wrong. Warning here told
+        a working setup its search was about to break, and pointed it at a
+        container that would have broken it."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"ml": True, "ml_url": "http://macmini2:3003"})
+        monkeypatch.setattr(m, "reconcile_ml", lambda *a, **k: None)
+        monkeypatch.setattr(m, "read_pid", lambda name: None)
+        monkeypatch.setattr(m, "_restart_worker", lambda *a, **k: True)
+
+        with caplog.at_level("WARNING"):
+            m._set_component("ml", False)
+        assert (
+            "immich-machine-learning" not in caplog.text
+        ), "told a working split setup to point at a container it does not use"
+
+    def test_turning_ml_on_does_not_warn(self, tmp_data_dir, monkeypatch, caplog):
+        """The warning is about a URL pointing at nothing. Turning it on makes
+        that URL correct, so saying it there would be noise."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"ml": False, "ml_url": "http://host.internal:3003"})
+        monkeypatch.setattr(m, "reconcile_ml", lambda *a, **k: None)
+        monkeypatch.setattr(m, "read_pid", lambda name: 4242)
+        monkeypatch.setattr(m, "_restart_worker", lambda *a, **k: True)
+
+        with caplog.at_level("WARNING"):
+            m._set_component("ml", True)
+        assert "IMMICH_MACHINE_LEARNING_URL" not in caplog.text
+
+    def test_it_still_warns_when_no_url_was_recorded(
+        self, tmp_data_dir, monkeypatch, caplog
+    ):
+        """A split install set up before ml_url was recorded still has Immich
+        pointed here. Saying nothing because we cannot quote the value is the
+        wrong way round."""
+        import immich_accelerator.__main__ as m
+
+        m.save_config({"ml": True})
+        monkeypatch.setattr(m, "reconcile_ml", lambda *a, **k: None)
+        monkeypatch.setattr(m, "read_pid", lambda name: None)
+        monkeypatch.setattr(m, "_restart_worker", lambda *a, **k: True)
+
+        with caplog.at_level("WARNING"):
+            m._set_component("ml", False)
+        assert "no other engine is set" in caplog.text
+
+    def test_nothing_writes_to_a_compose_file(self, tmp_data_dir, monkeypatch):
+        """The guard on the promise: this path must not open, let alone edit,
+        anyone's docker-compose.yml."""
+        import immich_accelerator.__main__ as m
+
+        opened = []
+        real_open = open
+
+        def watched_open(path, *a, **kw):
+            if "compose" in str(path):
+                opened.append(str(path))
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", watched_open)
+        monkeypatch.setattr(m, "reconcile_ml", lambda *a, **k: None)
+        monkeypatch.setattr(m, "read_pid", lambda name: None)
+        monkeypatch.setattr(m, "_restart_worker", lambda *a, **k: True)
+        m.save_config({"ml": True, "ml_url": "http://host.internal:3003"})
+
+        m._set_component("ml", False)
+        assert not opened, f"touched a compose file: {opened}"
+
+
+class TestUpgradingDoesNotFireTheLocaleBugItFixes:
+    """Pinning ps to LC_ALL=C changes the string every pidfile already holds.
+
+    A pidfile written by the previous version from a terminal under en_AU says
+    "Sat 22 Aug 23:07:37 2026"; the reader now gets "Sat Aug 22 23:07:37 2026".
+    Compared as strings that is a mismatch, so read_pid deletes the pidfile of
+    a healthy service -- and ml and dashboard have no _adopt_live_worker to
+    recover with. The fix would have fired the bug once, for exactly the users
+    it helps.
+    """
+
+    # Real `ps -o lstart=` output for one process, captured under each locale.
+    # The first version of this parsed with strptime, whose %a and %b resolve
+    # against LC_TIME, so it fixed en_AU while leaving German, French, Spanish
+    # and Japanese users still losing a healthy pidfile on upgrade.
+    C_FORM = "Tue Aug 25 09:12:50 2026"
+    LOCALE_FORMS = {
+        "en_AU": "Tue 25 Aug 09:12:50 2026",
+        "de_DE": "Di 25 Aug 09:12:50 2026",
+        "fr_FR": "Mar 25 ao\u00fb 09:12:50 2026",
+        "es_ES": "mar 25 ago 09:12:50 2026",
+        "ja_JP": "\u706b  8/25 09:12:50 2026",
+    }
+
+    def test_the_same_instant_matches_in_every_locale_ps_uses(self):
+        import immich_accelerator.__main__ as m
+
+        for locale, form in self.LOCALE_FORMS.items():
+            assert m._same_start_time(self.C_FORM, form), (
+                f"{locale} form {form!r} read as a different process, so the "
+                f"upgrade deletes a healthy pidfile"
+            )
+
+    def test_a_genuinely_different_start_is_still_a_mismatch(self):
+        """The whole point of the field is catching PID reuse. Every one of
+        these is in our own format and differs in exactly one component, which
+        is every pidfile written from 1.16 onward."""
+        import immich_accelerator.__main__ as m
+
+        for other in (
+            "Tue Aug 25 09:12:51 2026",   # one second later
+            "Tue Aug 26 09:12:50 2026",   # next day
+            "Tue Aug 25 09:12:50 2025",   # last year
+            # The month, which an earlier version never compared at all: it
+            # returned the clock, day and year only, so a process a month old
+            # read as the same one and would have been signalled.
+            "Tue Jun 25 09:12:50 2026",
+        ):
+            assert not m._same_start_time(self.C_FORM, other), other
+
+    def test_the_cost_a_pre_pin_pidfile_whose_pid_was_reused(self):
+        """What the design gives up, written down rather than left implicit.
+
+        These are pre-pin forms that are also genuinely different processes.
+        They cannot be told from a pre-pin form of the *same* process without
+        reading the locale that wrote them, and every attempt to do that
+        misread some other locale in the far more damaging direction: Finnish
+        "Mar" is marraskuu, November, which a month table reads as March, and
+        se_NO's ps prints no month word for a table to look up at all. Those
+        mistakes stop a healthy service for every user of the locale, on
+        upgrade, every time.
+
+        This one needs a pidfile written before 1.16, that pid reused by a
+        live process, and the read to land in the single window before
+        read_pid restamps the file. It is also exactly what 1.15.0 and every
+        release before it did for these users.
+        """
+        import immich_accelerator.__main__ as m
+
+        for other in (
+            "Di 26 Aug 09:12:50 2026",      # de_DE, next day
+            "Di 25 Jun 09:12:50 2026",      # de_DE, three months back
+            "\u706b  6/25 09:12:50 2026",    # ja_JP writes the month numerically
+        ):
+            assert m._same_start_time(self.C_FORM, other), other
+
+    def test_a_form_we_cannot_read_is_accepted_exactly_once(self, tmp_data_dir):
+        """Anything not in our own format was written before ps was pinned, by
+        a locale we cannot parse. Rejecting it stops a healthy service, so it
+        is accepted, and read_pid restamps the file so the next read is strict.
+        Without the restamp the pidfile keeps its unreadable string until the
+        service next restarts, and every read in between is fail-open.
+        """
+        import immich_accelerator.__main__ as m
+
+        assert m._same_start_time("Sat Aug 22 23:07:37 2026", "garbage")
+
+        pid_file = tmp_data_dir["pid_dir"] / "ml.pid"
+        pid_file.write_text(f"{os.getpid()}\nSat 22 Aug 23:07:37 2026")
+        with patch(
+            "immich_accelerator.__main__._get_process_start_time",
+            return_value="Sat Aug 22 23:07:37 2026",
+        ):
+            assert m.read_pid("ml") == os.getpid()
+        assert pid_file.read_text().endswith("Sat Aug 22 23:07:37 2026")
+
+        # Same file, same pid, now a genuinely different process. The
+        # restamped form is comparable, so this one is caught.
+        with patch(
+            "immich_accelerator.__main__._get_process_start_time",
+            return_value="Sat Aug 22 23:09:14 2026",
+        ):
+            assert m.read_pid("ml") is None
+
+    def test_a_restamp_is_never_visible_as_an_empty_file(self, tmp_data_dir):
+        """The restamp rewrites a file that `watch`, `status` and the menu bar
+        app (every 3s) are all reading concurrently.
+
+        ``write_text`` opens with O_TRUNC and then writes, so an in-place
+        rewrite is zero bytes on disk for a moment. A reader landing in that
+        window parses ``int("")``, raises, and unlinks the pidfile of a
+        healthy service: reported stopped, ``stop`` becomes a no-op that
+        orphans it, and the next ``start`` collides on the port. That is the
+        failure the start-time check exists to prevent, reintroduced by the
+        fix for it as a race. os.replace closes the window.
+        """
+        import threading
+
+        import immich_accelerator.__main__ as m
+
+        pid_file = tmp_data_dir["pid_dir"] / "ml.pid"
+        pid_file.write_text("4242\nSat Aug 22 23:07:37 2026")
+
+        bad = []
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    if not pid_file.read_text().strip():
+                        bad.append("empty")
+                except OSError:
+                    bad.append("absent")
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        try:
+            for i in range(4000):
+                m._write_pid_file(pid_file, 4242, f"Sat Aug 22 23:07:{i % 60:02d} 2026")
+        finally:
+            stop.set()
+            t.join(timeout=5)
+
+        assert not bad, f"a concurrent reader saw {len(bad)} unusable pidfiles"
+
+    def test_a_pidfile_from_the_previous_version_survives(
+        self, tmp_data_dir, monkeypatch
+    ):
+        """Through read_pid, not the helper: the helper being right is worth
+        nothing if the caller still unlinks the file."""
+        import immich_accelerator.__main__ as m
+
+        m.PID_DIR.mkdir(parents=True, exist_ok=True)
+        pid_file = m.PID_DIR / "ml.pid"
+        # Written by 1.15.0 under en_AU, day before month.
+        pid_file.write_text("4242\nSat 22 Aug 23:07:37 2026")
+        monkeypatch.setattr(m.os, "kill", lambda *a: None)
+        monkeypatch.setattr(
+            m, "_get_process_start_time", lambda pid: "Sat Aug 22 23:07:37 2026"
+        )
+
+        assert m.read_pid("ml") == 4242
+        assert pid_file.exists(), (
+            "deleted the pidfile of a healthy service on upgrade, which is the "
+            "bug the locale fix exists to prevent"
+        )

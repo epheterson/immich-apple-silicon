@@ -24,7 +24,7 @@ struct SettingsView: View {
     /// thing that makes a sidebar read as macOS settings rather than as a
     /// generic list, and System Settings gives every pane one.
     private enum Pane: String, Hashable, CaseIterable, Identifiable {
-        case general, processing, diagnostics
+        case general, services, transcoding, library, diagnostics
 
         // Identity is the case itself, so List's selection binding is a Pane?
         // rather than the String? an id-of-String would demand. Getting this
@@ -35,21 +35,27 @@ struct SettingsView: View {
         var title: String {
             switch self {
             case .general: return "General"
-            case .processing: return "Processing"
+            case .services: return "Services"
+            case .transcoding: return "Transcoding"
+            case .library: return "Library"
             case .diagnostics: return "Diagnostics"
             }
         }
         var symbol: String {
             switch self {
             case .general: return "gearshape.fill"
-            case .processing: return "cpu.fill"
+            case .services: return "square.stack.3d.up.fill"
+            case .transcoding: return "film.fill"
+            case .library: return "photo.on.rectangle.angled"
             case .diagnostics: return "stethoscope"
             }
         }
         var tint: Color {
             switch self {
             case .general: return .gray
-            case .processing: return .indigo
+            case .services: return .indigo
+            case .transcoding: return .purple
+            case .library: return .orange
             case .diagnostics: return .teal
             }
         }
@@ -90,6 +96,12 @@ struct SettingsView: View {
     @State private var comparing = false
     @State private var compareResult: String?
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
+    // Homebrew refusing to load the formula, which reads identically to
+    // "you are up to date" everywhere else in the app.
+    @State private var updatesBlocked = false
+    @State private var trusting = false
+    // Ten seconds in, the label says more. Never changes the outcome.
+    @State private var trustSlow = false
     @State private var mountSharesAtLogin = MountSharesAtLogin.isEnabled
 
     var body: some View {
@@ -136,9 +148,65 @@ struct SettingsView: View {
     @ViewBuilder
     private var detail: some View {
         switch pane {
-        case .processing: processingTab
+        case .services: servicesTab
+        case .transcoding: transcodingTab
+        case .library: libraryTab
         case .diagnostics: diagnosticsTab
         default: generalTab
+        }
+    }
+
+    /// The button's own text, which is the whole waiting story.
+    ///
+    /// There is no deadline on the subprocess. `brew` takes a lock and can sit
+    /// behind another brew for a long time, and every attempt to cancel it from
+    /// here went wrong in a different way: a deadline that could not fire, one
+    /// that fired on the wrong event and killed a command that had succeeded,
+    /// and one that signalled a PID the kernel had already reassigned. Killing
+    /// brew halfway through writing trust.json is worse than waiting for it.
+    ///
+    /// So nothing is cancelled. The button says what is happening, says more
+    /// after ten seconds, and settles on the real answer whenever it arrives.
+    private var trustLabel: String {
+        if !trusting { return "Trust the Tap" }
+        return trustSlow ? "Still working…" : "Trusting…"
+    }
+
+    private func startTrust() {
+        trusting = true
+        trustSlow = false
+
+        // Not a timeout: a label change. It never affects the result.
+        let slow = Task {
+            try? await Task.sleep(for: .seconds(10))
+            if !Task.isCancelled { trustSlow = true }
+        }
+
+        Task {
+            // A refused write looks identical to a successful one that did not
+            // take, so re-read the state rather than believing the exit code,
+            // and show brew's own text when it disagrees.
+            let result = await Actions.trustTap()
+            updatesBlocked = await Actions.brewRefusesTap()
+            slow.cancel()
+            trusting = false
+            trustSlow = false
+            if !result.ok || updatesBlocked {
+                record((ok: false,
+                        message: result.output.isEmpty
+                            ? "brew trust did not take effect."
+                            : result.output))
+            } else {
+                // Clear the banner a previous failed attempt left behind.
+                // Without this, a first Trust that fails (brew held the lock,
+                // say) leaves red text that the retry never removes: the
+                // "Updates are blocked" block disappears, so the action
+                // plainly worked, while the error beside it still says it
+                // did not. These sections are shared by General, Services
+                // and Transcoding, so the stale message follows the user
+                // onto all three.
+                record((ok: true, message: ""))
+            }
         }
     }
 
@@ -159,8 +227,9 @@ struct SettingsView: View {
         hardwareDecodeOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_DECODE", config)
         hardwareVideoOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_VIDEO", config)
         hardwareAudioOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_AUDIO", config)
-        hardwareVideoOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_VIDEO", config)
-        hardwareDecodeOn = StatusModel.encodingSwitchOn("IMMICH_ACCEL_HW_DECODE", config)
+        // Off the main thread: this shells out to brew, which on a cold cache
+        // takes seconds, and the window must not wait on it to draw.
+        Task { updatesBlocked = await Actions.brewRefusesTap() }
     }
 
     // MARK: - General
@@ -181,17 +250,6 @@ struct SettingsView: View {
                 Toggle("Launch menu bar at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in LaunchAtLogin.set(on) }
 
-                VStack(alignment: .leading, spacing: Metrics.xs) {
-                    Toggle("Mount NAS shares at login", isOn: $mountSharesAtLogin)
-                        .onChange(of: mountSharesAtLogin) { _, on in
-                            Task { await MountSharesAtLogin.set(on) }
-                        }
-                    // Turning this on remembers whatever SMB shares (e.g. a
-                    // NAS backing a split deployment) are mounted right now;
-                    // it doesn't ask which ones separately.
-                    Text("Remembers the SMB shares mounted right now and reconnects any that are missing on launch.")
-                        .font(.rowDetail).foregroundStyle(.secondary)
-                }
             } header: {
                 Text("Startup")
             } footer: {
@@ -199,7 +257,7 @@ struct SettingsView: View {
                 // about the menu bar icon, not about whether photos get
                 // processed. The background service is brew's, and it runs
                 // whether or not anyone is logged in.
-                Text("The accelerator itself runs as a background service and is unaffected by this.")
+                Text("The accelerator runs as a background service, separately.")
                     .font(.rowDetail).foregroundStyle(.secondary)
             }
 
@@ -214,8 +272,38 @@ struct SettingsView: View {
                 if let drifted = driftedCoreVersion {
                     LabeledContent("Background service", value: drifted)
                 }
+                if updatesBlocked {
+                    VStack(alignment: .leading, spacing: Metrics.xs) {
+                        Label("Updates are blocked", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        // What is happening and what it costs, before the fix.
+                        // "Untrusted tap" alone reads like a warning about us.
+                        Text("Homebrew will not load the formula until the tap is "
+                             + "trusted, so upgrades do nothing and say nothing.")
+                            .font(.rowDetail).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: Metrics.md) {
+                            Button(trustLabel) { startTrust() }
+                                .disabled(trusting)
+                            // Shown as well as offered: this changes the
+                            // user's Homebrew configuration, so anyone who
+                            // would rather run it themselves can read it and
+                            // copy it.
+                            Text("brew trust \(Actions.tap)")
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
                 Button("Check for Updates…") { UpdaterModel.shared.checkForUpdates() }
             }
+
+            // The Trust button writes here, and without this its failure went
+            // to a channel only Services and Transcoding render: the user
+            // clicked, nothing happened, and brew's reason appeared later
+            // under Hardware Transcoding with no context.
+            messageSections
 
             Section {
                 LabeledContent("Files") {
@@ -234,19 +322,16 @@ struct SettingsView: View {
         return model.snap.immichVersion.isEmpty ? url : "v\(model.snap.immichVersion) · \(url)"
     }
 
-    // MARK: - Processing
+    // MARK: - Services
 
-    /// Everything this Mac does to a photo or video, on one screen.
+    /// What runs on this Mac, and which engine does the machine learning.
     ///
-    /// Section order and gating follow docs/plans/2026-08-22-processing-pane-spec.md.
-    /// A control that writes switches only the worker uses is hidden when no
-    /// worker runs, because it would be a control over nothing.
-    private var processingTab: some View {
+    /// Split from Transcoding because they answer different questions: this
+    /// one is "is it on", that one is "how does it encode". They were one
+    /// screen and it ran long enough that the controls at the bottom were
+    /// below the fold on an unmodified window.
+    private var servicesTab: some View {
         Form {
-            if workerOn {
-                positionSection
-            }
-
             Section("Services") {
                 componentToggle("worker", $workerOn, "Worker",
                                 "Thumbnails, video, metadata")
@@ -256,7 +341,27 @@ struct SettingsView: View {
                                 dashboardStatus)
             }
 
+            if mlOn {
+                engineSection
+            }
+
+            messageSections
+        }
+        .formStyle(.grouped)
+    }
+
+    // MARK: - Transcoding
+
+    /// How this Mac encodes video, and the tool for deciding.
+    ///
+    /// Every control here writes switches only the worker reads, so with no
+    /// worker there is nothing to configure and the pane says so rather than
+    /// showing controls over nothing.
+    private var transcodingTab: some View {
+        Form {
             if workerOn {
+                positionSection
+
                 Section("Hardware Transcoding") {
                     encodingToggle("hardware-decode", $hardwareDecodeOn,
                                    "Decoding", "Video, thumbnails and previews")
@@ -265,41 +370,113 @@ struct SettingsView: View {
                     encodingToggle("hardware-audio", $hardwareAudioOn,
                                    "Audio Encoding", "AAC on AudioToolbox")
                 }
-            }
 
-            if mlOn {
-                engineSection
-            }
-
-            if workerOn {
                 compareSection
+            } else {
+                Section {
+                    Text("The worker is off. Turn it on in Services.")
+                        .font(.rowDetail).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
-            // Failures in red, then saved-but-not-live in secondary text. Two
-            // channels on purpose: showing "saved, takes effect later" in red
-            // beside real errors teaches people to ignore both.
-            if let message = encodingError ?? componentError {
-                Section {
-                    Label(message, systemImage: "exclamationmark.triangle.fill")
-                        .font(.rowDetail)
-                        .foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            if let notice, encodingError == nil, componentError == nil {
-                Section {
-                    Label(notice, systemImage: "info.circle")
-                        .font(.rowDetail)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
+            messageSections
         }
         .formStyle(.grouped)
     }
 
-    /// Software / Custom / Hardware, with both named ends described where they
-    /// sit on the control, so the choice can be made before making it.
+    /// Failures in red, then saved-but-not-live in secondary text.
+    ///
+    /// Two channels on purpose: showing "saved, takes effect later" in red
+    /// beside real errors teaches people to ignore both. Shared by every pane
+    /// that can write, so a message cannot appear on one and not the other.
+    @ViewBuilder
+    private var messageSections: some View {
+        if let message = encodingError ?? componentError {
+            Section {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.rowDetail)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        // Only when nothing is wrong. The two channels are mutually exclusive
+        // by design (see above), and factoring these sections out of the panes
+        // dropped the guard that enforced it: a success notice from one pane
+        // then sat beside an unrelated red failure on another.
+        if let note = notice, encodingError == nil, componentError == nil {
+            Section {
+                Label(note, systemImage: "info.circle")
+                    .font(.rowDetail)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // MARK: - Library
+
+    /// Where the photos are, how they are reached, and whether that is working.
+    ///
+    /// This exists because the mount story was split across a caption in
+    /// General and nothing at all: the SMB toggle there is launch-only and
+    /// covers every share on the Mac, while the library is watched and
+    /// remounted continuously by the accelerator and may not even be SMB. On
+    /// the release Mac it is NFS, so that toggle never touched it.
+    private var libraryTab: some View {
+        // Split into two sections rather than one Form body: as a single
+        // expression the type-checker gave up on it.
+        Form {
+            librarySection
+            otherSharesSection
+        }
+        .formStyle(.grouped)
+    }
+
+    private var librarySection: some View {
+        // header:/footer: closures, not Section("title"){} footer:{}: that
+        // overload does not exist and the compiler's complaint about it is a
+        // type-check timeout rather than a missing-initializer error.
+        Section {
+            LabeledContent("Location", value: libraryPath)
+            if let recipe = libraryMount {
+                LabeledContent("Mounted", value: recipe)
+            }
+            libraryStateRow
+        } header: {
+            Text("Library")
+        } footer: {
+            Text("Checked every 30 seconds. If it drops, the worker pauses "
+                 + "and the mount is retried until it comes back.")
+                .font(.rowDetail).foregroundStyle(.secondary)
+        }
+    }
+
+    private var libraryStateRow: some View {
+        let state = libraryState
+        return LabeledContent("State") {
+            HStack(spacing: Metrics.md) {
+                Text(state.label)
+                StatusDot(state: state.dot)
+            }
+        }
+    }
+
+    private var otherSharesSection: some View {
+        Section {
+            Toggle("Reconnect SMB shares at launch", isOn: $mountSharesAtLogin)
+                .onChange(of: mountSharesAtLogin) { _, on in
+                    Task { await MountSharesAtLogin.set(on) }
+                }
+        } header: {
+            Text("Other Shares")
+        } footer: {
+            Text("Remembers the SMB shares mounted now, and reconnects any "
+                 + "that are missing when this app launches.")
+                .font(.rowDetail).foregroundStyle(.secondary)
+        }
+    }
+
     private var positionSection: some View {
         Section {
             HStack {
@@ -340,7 +517,7 @@ struct SettingsView: View {
                 }
             }
 
-            Text("This covers transcoding. Machine learning is chosen separately below.")
+            Text("Transcoding only. The machine learning engine is under Services.")
                 .font(.rowDetail).foregroundStyle(.secondary)
         }
     }
@@ -407,10 +584,10 @@ struct SettingsView: View {
     /// The two named positions and the derived middle, in control order.
     static let positions: [(name: String, title: String, detail: String)] = [
         ("software", "Software",
-         "The encoders and decoders Immich's own container uses. Video and thumbnails come out byte for byte what Docker produces. Uses the most CPU."),
+         "Immich's own encoders. Byte for byte what Docker produces, except thumbnails for files ffmpeg cannot decode, which come from QuickLook. Most CPU."),
         ("custom", "Custom", "Some on, some off. Set below."),
         ("hardware", "Hardware",
-         "VideoToolbox for decoding, video and audio. Much less CPU, so the Mac keeps up with everything else it is doing. Video is visually identical to Docker's; audio and 10-bit thumbnails differ byte for byte."),
+         "VideoToolbox for decoding, video and audio. Much less CPU. Video looks identical to Docker's; audio and 10-bit thumbnails differ byte for byte."),
     ]
 
     /// The positions to show, in control order. The control and the
@@ -465,6 +642,19 @@ struct SettingsView: View {
     }
 
     /// Route one result into the two channels the spec defines.
+
+    /// A spinner that occupies its space whether or not it is spinning.
+    ///
+    /// Inserting one shifts every row below it, which lands at the exact
+    /// moment someone is reaching for the next control. A settings window
+    /// must not move under the pointer.
+    private func spinnerSlot(_ active: Bool) -> some View {
+        ProgressView()
+            .controlSize(.small)
+            .opacity(active ? 1 : 0)
+            .frame(width: 16, height: 16)
+    }
+
     private func record(_ result: (ok: Bool, message: String)) {
         encodingError = result.ok ? nil : result.message
         notice = result.ok && !result.message.isEmpty ? result.message : nil
@@ -508,9 +698,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: Metrics.xs) {
                 HStack(spacing: Metrics.md) {
                     Text(title)
-                    if applyingSwitch == name {
-                        ProgressView().controlSize(.small)
-                    }
+                    spinnerSlot(applyingSwitch == name)
                 }
                 Text(caption).font(.rowDetail).foregroundStyle(.secondary)
             }
@@ -568,16 +756,17 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: Metrics.xs) {
                 HStack(spacing: Metrics.md) {
                     Text(title)
-                    // Turning the worker on runs a full start (extract, verify
-                    // sharp, preflight) and can take minutes. A row that just
-                    // went dead with no explanation reads as a hang.
-                    if applyingComponent == name {
-                        ProgressView().controlSize(.small)
-                        Text(binding.wrappedValue ? "Starting…" : "Stopping…")
-                            .font(.rowDetail).foregroundStyle(.secondary)
-                    }
+                    spinnerSlot(applyingComponent == name)
                 }
-                Text(caption).font(.rowDetail).foregroundStyle(.secondary)
+                // Turning the worker on runs a full start (extract, verify
+                // sharp, preflight) and can take minutes, so a row that just
+                // went dead with no explanation reads as a hang. The progress
+                // word replaces the caption rather than joining it: the line
+                // is already there, so swapping its text moves nothing.
+                Text(applyingComponent == name
+                     ? (binding.wrappedValue ? "Starting…" : "Stopping…")
+                     : caption)
+                    .font(.rowDetail).foregroundStyle(.secondary)
             }
         }
         .toggleStyle(.switch)
@@ -665,6 +854,110 @@ struct SettingsView: View {
     // MARK: - helpers
 
     private var apiKey: String { config["api_key"] as? String ?? "" }
+
+    // MARK: - Library facts
+
+    private var libraryPath: String {
+        (config["upload_mount"] as? String) ?? "not configured"
+    }
+
+    /// "nfs from 10.0.0.14:/volume1/ELP NAS", when the accelerator has
+    /// recorded how the mount is put together. It records it while the mount
+    /// is up, because it cannot be read back once the mount is gone.
+    private var libraryMount: String? {
+        guard let recipe = config["mount_recipe"] as? [String: Any],
+              let fstype = recipe["fstype"] as? String,
+              let spec = recipe["spec"] as? String
+        else { return nil }
+        return "\(fstype) from \(spec)"
+    }
+
+    /// Reachable, or not, and whether that has already stopped the worker.
+    ///
+    /// Never stats the library path. On a hard NFS or SMB mount whose server
+    /// has gone away, stat does not time out, it blocks forever, and this runs
+    /// during body evaluation on the main thread: the app would beachball for
+    /// exactly the person who opened this pane to find out why their photos
+    /// stopped. The Python side learned this the same way, which is why the
+    /// watch loop reads the mount table rather than the mount (see
+    /// mount_recipe_for's comment about taking the whole watcher down with the
+    /// NAS).
+    ///
+    /// Two sources that cannot block, both local: paused.json, which the watch
+    /// loop writes at the moment it stops the worker and which knows why, and
+    /// the mount table.
+    private var libraryState: (label: String, dot: ServiceState) {
+        guard libraryPath != "not configured" else {
+            return ("Not configured", .stopped)
+        }
+        if pausedReason == "library-unreachable" {
+            return ("Missing, worker paused", .degraded)
+        }
+        guard let mounted = libraryIsMounted else {
+            // No recorded mount: a local disk, or never seen healthy. Either
+            // way there is no absence to report.
+            return ("Reachable", .running)
+        }
+        return mounted ? ("Reachable", .running) : ("Missing", .degraded)
+    }
+
+    /// Is `point` the mount that would provide `root`: the path itself, or an
+    /// ancestor of it? Mirrors _mount_covers in the CLI.
+    private func mountCovers(_ point: String, _ root: String) -> Bool {
+        guard !point.isEmpty, !root.isEmpty else { return false }
+        let p = URL(fileURLWithPath: point).standardizedFileURL.path
+        let r = URL(fileURLWithPath: root).standardizedFileURL.path
+        if p == r { return true }
+        // Component-wise, so /nas does not "cover" /nastyname.
+        return r.hasPrefix(p.hasSuffix("/") ? p : p + "/")
+    }
+
+    /// Whether the recorded mount point is in the mount table, or nil when no
+    /// mount was ever recorded.
+    ///
+    /// getmntinfo, not a URL resource query and certainly not stat: the kernel
+    /// hands back its own table without touching any filesystem, so a mount
+    /// whose server has gone away answers instantly instead of blocking. A
+    /// resource query on the mount point would have wedged in exactly the case
+    /// this pane exists to report.
+    private var libraryIsMounted: Bool? {
+        guard let recipe = config["mount_recipe"] as? [String: Any],
+              let point = recipe["mountpoint"] as? String, !point.isEmpty,
+              // Only while it still covers the configured library, which is
+              // what library_mount checks on the Python side and this did not.
+              // The recipe is written once and never cleared, so a library
+              // moved from a NAS to a local disk keeps naming the old share:
+              // this pane then reported Missing, with a footer promising the
+              // worker would be paused, while the accelerator correctly did
+              // nothing at all.
+              mountCovers(point, libraryPath)
+        else { return nil }
+
+        var buffer: UnsafeMutablePointer<statfs>?
+        let count = getmntinfo(&buffer, MNT_NOWAIT)
+        guard count > 0, let mounts = buffer else { return false }
+        for i in 0..<Int(count) {
+            var entry = mounts[i].f_mntonname
+            let path = withUnsafePointer(to: &entry) {
+                $0.withMemoryRebound(to: CChar.self,
+                                     capacity: Int(MAXPATHLEN)) {
+                    String(cString: $0)
+                }
+            }
+            if path == point { return true }
+        }
+        return false
+    }
+
+    /// Why the watch loop paused the worker, if it has.
+    private var pausedReason: String? {
+        let file = Paths.dataDir.appendingPathComponent("paused.json")
+        guard let data = try? Data(contentsOf: file),
+              let obj = try? JSONSerialization.jsonObject(with: data)
+                  as? [String: Any]
+        else { return nil }
+        return obj["reason"] as? String
+    }
 
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"

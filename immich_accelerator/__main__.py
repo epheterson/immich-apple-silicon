@@ -10,9 +10,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import contextlib
 import ctypes
 import fcntl
+import functools
 import json
 import logging
 import os
@@ -59,14 +61,52 @@ WORKER_VERSION_FILE = PID_DIR / "worker.version"
 # swaps the Cellar. Reading VERSION through Homebrew's version-independent opt
 # symlink lets it notice it's now stale and relaunch into the new code. Absent
 # on non-Homebrew (git) installs, where __version__ is authoritative.
-_OPT_VERSION_FILE = Path("/opt/homebrew/opt/immich-accelerator/libexec/VERSION")
+
+# The two prefixes Homebrew installs under: /opt/homebrew on Apple Silicon and
+# /usr/local on x86, which is a real configuration here (an x86 brew under
+# Rosetta, and Macs migrated from Intel that end up carrying both).
+_BREW_PREFIXES = ("/opt/homebrew", "/usr/local")
+
+
+@functools.cache
+def _brew_prefix() -> str:
+    """The prefix this install belongs to.
+
+    "Which prefix exists" is a different question with a different answer, and
+    on a Mac carrying both it names the one Homebrew would prefer rather than
+    the one we were installed into. Everything that locates our own files has
+    to agree on this or the halves of a feature end up reading different
+    trees, so decide it once, and decide it by where this very file is, which
+    is the one answer that cannot be wrong.
+
+    Cached so that all callers get the same answer even if an upgrade moves
+    things underneath a running process.
+    """
+    here = str(Path(__file__).resolve())
+    for prefix in _BREW_PREFIXES:
+        if here.startswith(f"{prefix}/"):
+            return prefix
+    # Not running from under a prefix at all: a git checkout, or a venv. Fall
+    # back to wherever an accelerator is installed, then to wherever brew is.
+    for prefix in _BREW_PREFIXES:
+        if (Path(prefix) / "opt/immich-accelerator/bin/immich-accelerator").exists():
+            return prefix
+    for prefix in _BREW_PREFIXES:
+        if (Path(prefix) / "bin/brew").is_file():
+            return prefix
+    return _BREW_PREFIXES[0]
+
+
+def _opt_dir() -> Path:
+    """Our Homebrew opt dir. Version-independent, so it survives an upgrade."""
+    return Path(_brew_prefix()) / "opt/immich-accelerator"
 
 
 def _installed_version() -> str:
     """The version currently installed on disk (via the stable opt symlink),
     which can differ from __version__ when watch is running post-upgrade."""
     try:
-        return _OPT_VERSION_FILE.read_text().strip()
+        return (_opt_dir() / "libexec/VERSION").read_text().strip()
     except OSError:
         return __version__
 
@@ -1743,13 +1783,26 @@ def load_config() -> dict:
 
 
 def _get_process_start_time(pid: int) -> str | None:
-    """Get process start time via ps. Used to detect PID reuse."""
+    """Get process start time via ps. Used to detect PID reuse.
+
+    LC_ALL=C is required, not cosmetic: ps formats lstart through the
+    caller's locale, so the same process reads back as "Sat Aug 22
+    23:07:37 2026" under C/en_US but "Sat 22 Aug 23:07:37 2026" under
+    en_AU/en_GB. Our writer and reader are frequently different processes
+    with different locales — launchd (brew services) passes no LANG at
+    all, while a Terminal session inherits the user's region — so an
+    unpinned locale makes read_pid see a start-time mismatch, conclude
+    the PID was reused, and delete a pidfile whose service is healthy.
+    Downstream that reports a running service as stopped, makes stop a
+    no-op that orphans it, and makes start try to spawn a duplicate.
+    """
     try:
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "lstart="],
             capture_output=True,
             text=True,
             timeout=5,
+            env={**os.environ, "LC_ALL": "C"},
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
@@ -1758,10 +1811,35 @@ def _get_process_start_time(pid: int) -> str | None:
     return None
 
 
+def _write_pid_file(pid_file: Path, pid: int, start_time: str) -> None:
+    """Replace a pidfile in one step.
+
+    ``write_text`` opens with O_TRUNC and then writes, so between those two
+    syscalls the file is zero bytes on disk. That window is not theoretical
+    here: ``watch``, ``status`` and the menu bar app (every 3s) all read these
+    files concurrently, and a reader landing inside it parses ``int("")``,
+    raises, and deletes the pidfile of a perfectly healthy service. The
+    service is then reported stopped, ``stop`` becomes a no-op that orphans
+    it, and the next ``start`` collides on the port. Write a sibling and
+    rename: ``os.replace`` is atomic within a directory, so a reader sees
+    either the old contents or the new ones and never nothing.
+
+    The temp name carries our PID so two processes restamping at once cannot
+    tread on each other's partial file.
+    """
+    tmp = pid_file.with_name(f"{pid_file.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(f"{pid}\n{start_time}")
+        os.replace(tmp, pid_file)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def write_pid(name: str, pid: int) -> None:
     PID_DIR.mkdir(parents=True, exist_ok=True)
     start_time = _get_process_start_time(pid) or ""
-    (PID_DIR / f"{name}.pid").write_text(f"{pid}\n{start_time}")
+    _write_pid_file(PID_DIR / f"{name}.pid", pid, start_time)
 
 
 _WORKER_CMD_RE = re.compile(
@@ -1824,6 +1902,52 @@ def _adopt_live_worker() -> int | None:
     return pid
 
 
+def _same_start_time(current: str, stored: str) -> bool:
+    """Do these two `ps` start times describe the same process?
+
+    `current` is always the C form now that ps is pinned to LC_ALL=C:
+
+        Tue Aug 25 09:12:50 2026
+
+    `stored` is that too, unless the pidfile predates the pin, in which case it
+    holds whatever the writer's locale produced. Across the 83 UTF-8 locales on
+    this machine that includes day-first ordering, non-English month names, a
+    month written as "8/25", dot-separated clocks, trailing dots on the day and
+    year, and at least one locale with no month word at all.
+
+    So this does not try to parse them. Every attempt to did the same thing:
+    fixed the locales it was tested against and broke others, most sharply by
+    reading Finnish "Mar" (marraskuu, November) as March and by rejecting
+    locales whose format lacked a field it expected. Both directions land on
+    the same failure, which is that read_pid deletes the pidfile of a healthy
+    service and ml and dashboard have no adopt-live path to recover with.
+
+    Instead it asks one question it can answer exactly: is `stored` in our own
+    format? We know that format, because we write it.
+
+      - Equal strings: the same process.
+      - `stored` parses as the C form and differs: genuinely a different
+        process, so the pidfile is stale. This is every pidfile written from
+        1.16 onward.
+      - `stored` is not the C form: written before the pin, by a locale we
+        cannot read. Accept it and move on, and restamp the file in the C
+        form so the next read is a strict one.
+
+    The last case is the only give: a PID reused between that old write and
+    this read is adopted. It is the behaviour every release before 1.16 had for
+    these users anyway, the restamp in read_pid closes it after a single
+    read, and it is a far smaller risk than stopping a healthy service on
+    upgrade.
+    """
+    if current == stored:
+        return True
+    try:
+        datetime.datetime.strptime(" ".join(stored.split()), "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return True  # not our format: pre-pin, unreadable, accept once
+    return False  # our format and different: a different process
+
+
 def read_pid(name: str) -> int | None:
     pid_file = PID_DIR / f"{name}.pid"
     if not pid_file.exists():
@@ -1837,12 +1961,21 @@ def read_pid(name: str) -> int | None:
         # Verify start time matches to detect PID reuse
         if len(lines) > 1 and lines[1]:
             current_start = _get_process_start_time(pid)
-            if current_start and current_start != lines[1]:
+            if current_start and not _same_start_time(current_start, lines[1]):
                 log.debug("PID %d reused (start time mismatch), cleaning up", pid)
                 pid_file.unlink(missing_ok=True)
                 if name == "worker":
                     return _adopt_live_worker()
                 return None
+            if current_start and current_start != lines[1]:
+                # Accepted on the strength of being unreadable rather than of
+                # matching: a pidfile written before ps was pinned to LC_ALL=C.
+                # Restamp it in the form we can actually compare, so the next
+                # read is a strict one. Without this the file keeps its old
+                # string until the service restarts, and every read in between
+                # is another one that cannot detect PID reuse.
+                with contextlib.suppress(OSError):
+                    _write_pid_file(pid_file, pid, current_start)
         return pid
     except (ValueError, OSError):
         pid_file.unlink(missing_ok=True)
@@ -2211,6 +2344,9 @@ _REMOUNTABLE_FS = {"smbfs", "nfs", "afpfs"}
 # should not be probed every 30s, and an SMB server should never be hit with a
 # tight retry loop; repeated failed auth is how accounts get locked.
 _REMOUNT_BACKOFF = (0, 60, 300, 900)
+# Watch cycles between advisory reads of the library. The loop runs every 30s,
+# so ten cycles is five minutes.
+MEDIA_IO_EVERY = 10
 
 
 def mount_recipe_for(root: str) -> dict | None:
@@ -4461,7 +4597,7 @@ def _native_bundle_dir(config: dict) -> Path | None:
     candidates = []
     if config.get("native_ml_dir"):
         candidates.append(Path(config["native_ml_dir"]))
-    candidates.append(Path("/opt/homebrew/opt/immich-accelerator/libexec/native-ml"))
+    candidates.append(_opt_dir() / "libexec/native-ml")
     candidates.append(Path.home() / ".immich-accelerator" / "native-ml")
     return next((b for b in candidates if (b / "immich-ml-native").exists()), None)
 
@@ -5054,7 +5190,7 @@ def _find_ml_dir() -> Path | None:
 
     Candidate priority:
     1. Homebrew's stable opt symlink — survives ``brew upgrade`` because
-       Homebrew maintains ``/opt/homebrew/opt/immich-accelerator`` as a
+       Homebrew maintains ``<prefix>/opt/immich-accelerator`` as a
        symlink to the current Cellar version. The versioned Cellar path
        itself (e.g., ``.../Cellar/immich-accelerator/1.4.4/libexec/ml``)
        is ephemeral: ``brew upgrade`` deletes it, and ``config.json``
@@ -5065,7 +5201,7 @@ def _find_ml_dir() -> Path | None:
     3. Home-directory fallback for legacy standalone ml clones.
     """
     candidates = [
-        Path("/opt/homebrew/opt/immich-accelerator/libexec/ml"),
+        _opt_dir() / "libexec/ml",
         Path(__file__).parent.parent / "ml",
         Path.home() / "immich-ml-metal",
     ]
@@ -5882,6 +6018,67 @@ def cmd_stop(_args):
         log.info("Nothing running")
 
 
+# Homebrew refuses to load a formula from a tap the user has not trusted, and
+# that refusal is indistinguishable from "nothing to upgrade" to anything that
+# only reads the exit status. `brew upgrade` then does nothing, `brew outdated`
+# reports nothing, and the menu bar app offers nothing, so an install sits on
+# an old version indefinitely with no signal anywhere. Measured on the release
+# Mac by removing the tap from trust.json: `brew outdated --formula
+# immich-accelerator` prints "Refusing to load formula ... from untrusted tap"
+# and `brew info --json` returns no formula at all.
+_TAP = "epheterson/immich-accelerator"
+
+
+def _brew_path() -> str | None:
+    """The brew that manages *this* install.
+
+    Not the first brew that exists: on a Mac carrying both prefixes that is
+    the wrong one half the time, and asking the Apple Silicon brew about a
+    formula the x86 brew installed gets "No available formula" rather than
+    the refusal we are looking for. A warning that cannot fire for the users
+    who need it is indistinguishable from not having written it.
+    """
+    candidate = Path(_brew_prefix()) / "bin/brew"
+    if candidate.is_file():
+        return str(candidate)
+    return shutil.which("brew")
+
+
+def brew_refuses_our_tap() -> bool:
+    """True when Homebrew will not load our formula because the tap is
+    untrusted. False for any other reason, including brew not being installed:
+    a non-brew install has nothing to say here."""
+    brew = _brew_path()
+    if not brew:
+        return False
+    try:
+        out = subprocess.run(
+            [brew, "outdated", "--formula", "immich-accelerator"],
+            capture_output=True, text=True, timeout=10,
+            # `brew outdated` is on Homebrew's auto-update path: once a day it
+            # git-fetches every tap first. Measured at 68 seconds. `status` is
+            # a question, not a maintenance task, and the run that paid that
+            # cost was also the one that timed out and reported nothing.
+            env={**os.environ,
+                 "HOMEBREW_NO_AUTO_UPDATE": "1",
+                 "HOMEBREW_NO_ENV_HINTS": "1"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    # On the line that names us: brew refuses for other untrusted taps too, and
+    # matching anywhere in the output made someone else's tap print our fix.
+    return any(
+        "immich-accelerator" in line
+        and ("untrusted tap" in line or "refusing to load formula" in line)
+        # Joined with a newline, not concatenated: stdout's last line often has
+        # no trailing newline, and gluing it to stderr's first makes a line
+        # that can carry our formula name from one stream and the refusal from
+        # the other, which is the cross-tap false positive this anchoring is
+        # for.
+        for line in "\n".join((out.stdout, out.stderr)).lower().splitlines()
+    )
+
+
 def cmd_status(_args):
     worker_pid = read_pid("worker")
     ml_pid = read_pid("ml")
@@ -5917,6 +6114,13 @@ def cmd_status(_args):
         log.info("Version:    %s", config.get("version", "?"))
         if config.get("ffmpeg_path"):
             log.info("FFmpeg:     %s (VideoToolbox)", config["ffmpeg_path"])
+
+    if brew_refuses_our_tap():
+        log.warning("Updates:    blocked. Homebrew will not load the formula "
+                    "until the tap is trusted,")
+        log.warning("            so `brew upgrade` silently leaves you on this "
+                    "version. Run once:")
+        log.warning("              brew trust %s", _TAP)
 
 
 def cmd_logs(args):
@@ -6253,6 +6457,7 @@ def _watch_worker(config: dict) -> str | None:
     media_paused = False
     remount_state: dict = {}  # {attempts, last, blocked} for the remount backoff
     media_down_since: float | None = None  # first failed probe of a run
+    media_io_countdown = 0  # cycles until the next advisory read of the mount
     backend_down_since: float | None = None  # first cycle Postgres/Redis went quiet
     backend_paused = False
     # This loop's state starts clean, so any marker from a previous run is
@@ -6460,7 +6665,18 @@ def _watch_worker(config: dict) -> str | None:
                                 )
                             worker_handled = True
 
-                healthy, detail = media_io_healthy(config)
+                # This one reads a marker file on the mount, so unlike the
+                # mount-table check above it is real I/O against the NAS. It is
+                # advisory and never stops the worker, so it does not need to
+                # run on every 30s cycle: once every ten of them is five
+                # minutes, which is often enough for something nobody acts on
+                # automatically. Skipped entirely when no worker is running,
+                # because then nothing is reading the library anyway.
+                media_io_countdown -= 1
+                healthy, detail = True, ""
+                if read_pid("worker") and media_io_countdown <= 0:
+                    media_io_countdown = MEDIA_IO_EVERY
+                    healthy, detail = media_io_healthy(config)
                 if not healthy and detail and detail not in shown_media_warnings:
                     shown_media_warnings.add(detail)
                     log.warning(
@@ -6669,6 +6885,34 @@ def _restart_worker(reason: str) -> bool:
     return True
 
 
+def _warn_immich_still_points_here(config: dict) -> None:
+    """Say that nothing else is configured to do machine learning.
+
+    Only when there is genuinely nowhere else to go. `ml_url` is the engine
+    the worker falls back to when ours is off (see the branch in the worker's
+    environment setup), so on a two-Mac split it names the other Mac and
+    everything is fine. Warning unconditionally told those users their search
+    was about to break and pointed them at immich-machine-learning:3003, which
+    would have broken the working configuration they had.
+
+    Not a fix, a warning: setup does not edit anyone's docker-compose.yml and
+    this must not either. "Nothing inside Docker is modified" is the promise on
+    the front of the README, and quietly rewriting a URL in a file we say we
+    never touch is worse than the problem.
+    """
+    if config.get("ml_url"):
+        return  # somewhere else is configured; the worker will use it
+    log.warning("Machine learning is off here and no other engine is set.")
+    log.warning(
+        "  Immich's own IMMICH_MACHINE_LEARNING_URL governs now. If it still "
+        "points at this Mac, search, faces and text will fail."
+    )
+    log.warning(
+        "  Point it back at your own container (usually "
+        "http://immich-machine-learning:3003) and restart the Immich stack."
+    )
+
+
 def _set_component(name: str, on: bool) -> bool:
     """Record that a component should be on or off, and converge toward it.
 
@@ -6713,6 +6957,8 @@ def _set_component(name: str, on: bool) -> bool:
         # worker keeps talking to an engine we just killed, failing every CLIP,
         # face and OCR job, or ignoring one we just started.
         ok = _restart_worker("to pick up the new ML setting") and ok
+        if not on:
+            _warn_immich_still_points_here(config)
     elif name == "worker":
         if not on:
             if read_pid("worker"):
@@ -6985,14 +7231,14 @@ PRESET_SUMMARY = {
 # and is not part of this. A label that overclaims is worse than a plain one.
 PRESET_DETAIL = {
     "software": (
-        "The encoders and decoders Immich's own container uses. Video and "
-        "thumbnails come out byte for byte what Docker produces. Uses the most "
-        "CPU."
+        "Immich's own encoders. Byte for byte what Docker produces, except "
+        "thumbnails for files ffmpeg cannot decode, which come from "
+        "QuickLook. Most CPU."
     ),
     "hardware": (
-        "VideoToolbox for decoding, video and audio. Much less CPU, so the Mac "
-        "keeps up with everything else it is doing. Video is visually identical "
-        "to Docker's; audio and 10-bit thumbnails differ byte for byte."
+        "VideoToolbox for decoding, video and audio. Much less CPU. Video "
+        "looks identical to Docker's; audio and 10-bit thumbnails differ "
+        "byte for byte."
     ),
     "custom": "Some on, some off. Set below.",
 }

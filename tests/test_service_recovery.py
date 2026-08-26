@@ -1827,3 +1827,39 @@ class TestEncodeCompare:
             m.subprocess, "run", return_value=MagicMock(stdout="", stderr="")
         ):
             assert m._ssim_against("/bin/ffmpeg", "/a.mp4", "/b.mp4") is None
+
+
+class TestTheMountIsOnlyCheckedWhenItMatters:
+    """`media_io_healthy` reads a marker file on the mount, so unlike the
+    mount-table check beside it this is real I/O against the server. It is
+    advisory and never stops the worker, and it was running on every 30s cycle.
+
+    The worker-disabled case needs no test here: _watch_worker returns _SWITCH
+    before any of this when the worker is off, handing over to the worker-free
+    loop, so an ML-only Mac never reaches the mount code at all. A test for it
+    passed with the check present and absent, which is worth nothing.
+    """
+
+    CFG = {
+        "worker": True,
+        "ml": True,
+        "upload_mount": "/nas/photos",
+        "media_id": "abc123",
+    }
+
+    def test_a_worker_mac_still_watches_its_library(self, tmp_data_dir):
+        """The other half: this must not have turned the protection off."""
+        mocks = drive_watch(self.CFG, [True, True], pids={"worker": 4242})
+        assert mocks["is_mounted"].call_count > 0, (
+            "a Mac with a worker must still notice its library going away"
+        )
+
+    def test_the_advisory_read_is_not_done_every_cycle(self, tmp_data_dir):
+        """It is advisory and never acts, so twice a minute against a NAS is
+        cost for nothing. Ten cycles is five minutes."""
+        cycles = 6
+        mocks = drive_watch(self.CFG, [True] * cycles, pids={"worker": 4242})
+        assert mocks["media_io_healthy"].call_count <= 1, (
+            f"read the mount {mocks['media_io_healthy'].call_count} times in "
+            f"{cycles} cycles; it should be once per {m.MEDIA_IO_EVERY}"
+        )
