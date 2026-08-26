@@ -3934,3 +3934,68 @@ class TestUpgradingDoesNotFireTheLocaleBugItFixes:
             "deleted the pidfile of a healthy service on upgrade, which is the "
             "bug the locale fix exists to prevent"
         )
+
+
+class TestRunHelpers:
+    """`_output` and `_ok` replace a shape repeated dozens of times: run,
+    catch OSError and TimeoutExpired, check returncode, use stdout. They are
+    load-bearing for most external commands this tool runs, so the contract
+    is pinned here rather than trusted.
+    """
+
+    def test_output_returns_stdout_when_the_command_succeeds(self):
+        import immich_accelerator.__main__ as m
+
+        assert m._output(["/bin/echo", "hello"]) == "hello\n"
+
+    def test_output_tells_no_output_apart_from_no_answer(self):
+        """The reason it returns None rather than "".
+
+        A command that succeeds and prints nothing returns "", which is a real
+        answer. A command that could not run has no answer at all. Collapsing
+        the two is how "we could not ask" starts reading as "the answer is
+        nothing", which is the shape of several bugs this project has shipped.
+        """
+        import immich_accelerator.__main__ as m
+
+        assert m._output(["/usr/bin/true"]) == ""
+        assert m._output(["/usr/bin/false"]) is None
+        assert m._output(["/nonexistent/binary"]) is None
+
+    def test_output_is_none_when_the_command_times_out(self):
+        import immich_accelerator.__main__ as m
+
+        assert m._output(["/bin/sleep", "5"], timeout=0.2) is None
+
+    def test_ok_reports_whether_it_worked(self):
+        import immich_accelerator.__main__ as m
+
+        assert m._ok(["/usr/bin/true"]) is True
+        assert m._ok(["/usr/bin/false"]) is False
+        assert m._ok(["/nonexistent/binary"]) is False
+        assert m._ok(["/bin/sleep", "5"], timeout=0.2) is False
+
+    def test_neither_helper_can_run_without_a_timeout(self):
+        """The property that matters: nothing this tool spawns can hang the
+        tool forever. Asserted on the call actually handed to subprocess.run,
+        so a default that stops being passed through is caught."""
+        import immich_accelerator.__main__ as m
+
+        seen = []
+
+        def fake_run(*a, **kw):
+            seen.append(kw.get("timeout"))
+            return subprocess.CompletedProcess(a[0], 0, "", "")
+
+        with patch.object(m.subprocess, "run", fake_run):
+            m._output(["x"])
+            m._ok(["x"])
+            m._output(["x"], timeout=7)
+        assert seen == [m.DEFAULT_TIMEOUT, m.DEFAULT_TIMEOUT, 7], seen
+        assert all(t is not None for t in seen)
+
+    def test_output_does_not_swallow_a_command_that_prints_to_stderr_and_wins(self):
+        """Noise on stderr is not failure. Only the exit status decides."""
+        import immich_accelerator.__main__ as m
+
+        assert m._output(["/bin/sh", "-c", "echo oops >&2; echo fine"]) == "fine\n"
