@@ -3,12 +3,12 @@
 ## 1.16.1 - 2026-08-26
 
 ### Fixed
-- **`compare` could hang forever on a video ffmpeg cannot decode.** The frame extraction ran with no timeout, so a file it could not parse left the command sitting there with no output and no way to tell whether it was still working. Bounded at 120 seconds, which is far longer than extracting one frame ever takes.
-- **Setup could hang while checking the Node version, and said nothing useful when it failed.** `node --version` ran unbounded and unguarded, so a wedged node stalled the whole install, and a node that failed printed `Node.js:` followed by nothing at all. Bounded at 10 seconds, and a failure now reports that it could not be read.
-- **`setup --url ...` crashed when run from a script.** With stdin not a terminal, the first Postgres prompt raised `EOFError` and setup exited with a Python traceback instead of taking the default it had just printed on screen. Every other prompt in setup already handled this; one did not. Non-interactive setup works now.
+- **`compare` could hang forever on a video ffmpeg cannot decode.** Frame extraction ran with no timeout. Now bounded at 120 seconds.
+- **Setup could hang while checking the Node version.** `node --version` ran unbounded and unguarded, and a node that failed printed `Node.js:` followed by nothing. Now bounded at 10 seconds, and a failure says so.
+- **`setup --url ...` crashed when run from a script.** With stdin not a terminal the first Postgres prompt raised `EOFError` and setup exited with a traceback instead of taking the default it had printed. Non-interactive setup works now.
 
 ### Changed
-- **The install path has tests.** Uninstall, and the two functions that install software on your machine, had no test coverage at all. They now have fourteen, covering the cases where a mistake would be both destructive and silent: that declining or running with no terminal never deletes your data and never installs anything, that a Homebrew install never removes Homebrew's own ML environment, and that launchd is unloaded before its configuration is deleted.
+- **The install path has tests.** Uninstall and the two functions that install software had no coverage. Fourteen tests now cover the cases where a mistake is destructive and silent: declining or running with no terminal never deletes your data and never installs anything, a Homebrew install never removes Homebrew's own ML environment, and launchd is unloaded before its configuration is deleted.
 
 ## 1.16.0 - 2026-08-25
 
