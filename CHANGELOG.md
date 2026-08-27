@@ -8,7 +8,7 @@
 - **`setup --url ...` crashed when run from a script.** With stdin not a terminal, the first Postgres prompt raised `EOFError` and setup exited with a Python traceback instead of taking the default it had just printed on screen. Every other prompt in setup already handled this; one did not. Non-interactive setup works now.
 
 ### Changed
-- **The install path has tests.** Uninstall, and the two functions that install software on your machine, had no test coverage at all. They now have eighteen, covering the cases where a mistake would be both destructive and silent: that declining or running with no terminal never deletes your data and never installs anything, that a Homebrew install never removes Homebrew's own ML environment, and that launchd is unloaded before its configuration is deleted.
+- **The install path has tests.** Uninstall, and the two functions that install software on your machine, had no test coverage at all. They now have fourteen, covering the cases where a mistake would be both destructive and silent: that declining or running with no terminal never deletes your data and never installs anything, that a Homebrew install never removes Homebrew's own ML environment, and that launchd is unloaded before its configuration is deleted.
 
 ## 1.16.0 - 2026-08-25
 

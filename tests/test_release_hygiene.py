@@ -1001,15 +1001,21 @@ def test_no_script_imports_a_name_it_also_defines():
     offenders = []
     for path in sorted((root / "scripts").glob("*.py")):
         tree = ast.parse(path.read_text())
+        # Top-level defs only: a nested `def predict` inside another function
+        # shadows nothing at module scope and is not a collision.
         defined = {
             n.name
-            for n in ast.walk(tree)
+            for n in tree.body
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
         for node in tree.body:
-            if not isinstance(node, ast.ImportFrom) or node.level == 0:
-                if not (isinstance(node, ast.ImportFrom) and node.module == "_predict"):
-                    continue
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            # Any sibling module in scripts/, not just _predict: the next
+            # shared helper added here must be covered by this too.
+            sibling = root / "scripts" / f"{(node.module or '').split('.')[0]}.py"
+            if not (node.level or sibling.exists()):
+                continue
             for alias in node.names:
                 bound = alias.asname or alias.name
                 if bound in defined:

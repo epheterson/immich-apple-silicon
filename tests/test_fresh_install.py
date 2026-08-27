@@ -3358,7 +3358,7 @@ class TestUninstallAsksBeforeItDeletes:
     @staticmethod
     def _harness(monkeypatch, answer):
         """Neuter everything destructive and record what would have run."""
-        calls = {"stop": 0, "rmtree": [], "run": [], "unlink": 0, "build_link": 0}
+        calls = {"stop": 0, "rmtree": [], "run": [], "order": [], "build_link": 0}
         monkeypatch.setattr(m, "cmd_stop", lambda *a: calls.__setitem__("stop", calls["stop"] + 1))
         monkeypatch.setattr(m, "_remove_build_link",
                             lambda *a: calls.__setitem__("build_link", calls["build_link"] + 1))
@@ -3369,8 +3369,16 @@ class TestUninstallAsksBeforeItDeletes:
 
         monkeypatch.setattr(m, "_rmtree_or_explain", fake_rmtree)
 
+        plist = (
+            Path.home() / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
+        )
+
         def fake_run(cmd, *a, **k):
+            # Record whether the plist still existed at the moment each
+            # command ran, so "unloaded before deleted" is actually checked
+            # rather than just asserted in the test's name.
             calls["run"].append(cmd[0] if cmd else "")
+            calls["order"].append((cmd[0] if cmd else "", plist.exists()))
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         monkeypatch.setattr(m.subprocess, "run", fake_run)
@@ -3379,6 +3387,19 @@ class TestUninstallAsksBeforeItDeletes:
         else:
             monkeypatch.setattr("builtins.input", lambda _p: answer)
         return calls
+
+    @pytest.fixture(autouse=True)
+    def _always_fake_home(self, monkeypatch, tmp_path):
+        """Autouse, not opt-in.
+
+        cmd_uninstall unlinks ~/Library/LaunchAgents/com.immich.accelerator
+        .plist, and plist.unlink() is real even when subprocess.run is faked.
+        One test in this class forgot to redirect HOME and would have deleted
+        a contributor's own launchd registration, silently, on any clone that
+        had run setup. Three tests remembered; the fourth did not, which is
+        exactly why this is not left to remembering.
+        """
+        self._fake_home(monkeypatch, tmp_path)
 
     @staticmethod
     def _fake_home(monkeypatch, tmp_path):
@@ -3477,7 +3498,12 @@ class TestUninstallAsksBeforeItDeletes:
         plist.write_text("<plist/>")
 
         m.cmd_uninstall(None)
-        assert "launchctl" in calls["run"], "plist removed without unloading it first"
+        assert "launchctl" in calls["run"], "the plist was never unloaded"
+        unload = [existed for cmd, existed in calls["order"] if cmd == "launchctl"]
+        assert unload and all(unload), (
+            "launchctl ran after the plist was already deleted, which leaves "
+            "launchd supervising a job whose definition is gone"
+        )
         assert not plist.exists(), "plist unloaded but left on disk"
 
 
@@ -3534,8 +3560,6 @@ class TestInstallingSoftwareNeedsConsent:
         monkeypatch.setattr("builtins.input", no_tty)
         assert m._ensure_homebrew() is None
         assert ran == [], "no terminal, but it fetched and ran the installer"
-        flat = " ".join(" ".join(map(str, c)) for c in ran)
-        assert "install.sh" not in flat
 
     def test_consenting_runs_the_installer(self, monkeypatch):
         self._no_brew(monkeypatch)

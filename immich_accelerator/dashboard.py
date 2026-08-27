@@ -20,9 +20,9 @@ import json
 import logging
 import os
 import subprocess
+import time
 
 from .common import component_enabled, run_output
-import time
 from pathlib import Path
 
 log = logging.getLogger("dashboard")

@@ -53,8 +53,6 @@ import pathlib
 import statistics
 import sys
 import time
-import urllib.request
-
 from _predict import predict as _post
 
 # The model names Immich itself asks for, taken from a real worker's requests.
