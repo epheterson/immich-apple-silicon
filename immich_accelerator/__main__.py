@@ -118,6 +118,11 @@ def _installed_version() -> str:
 _output = run_output
 _ok = run_ok
 
+# The native engine's executable. Both the "is native installed" check and the
+# "is native what is actually running" check compare against this name, and they
+# have to agree, so it is spelled once.
+NATIVE_EXE = "immich-ml-native"
+
 
 def _ask(prompt: str, default: str = "") -> str:
     """Read one answer from the user, or *default* when there is nobody to ask.
@@ -1985,6 +1990,23 @@ def read_pid(name: str) -> int | None:
         if name == "worker":
             return _adopt_live_worker()
         return None
+
+
+def _ml_engine_running(pid: int | None) -> str | None:
+    """Which ML engine *pid* actually is, read from the process table.
+
+    Deliberately not config["ml_engine"], which records the preference and
+    stays "native" while the venv is the thing running, and deliberately
+    not a value written down at start time, which is stale from the moment
+    a fallback swaps the engine underneath it. The process table cannot
+    disagree with itself.
+    """
+    if not pid:
+        return None
+    comm = _output(["ps", "-p", str(pid), "-o", "comm="], timeout=5)
+    if not comm:
+        return None
+    return "native" if comm.strip().endswith(NATIVE_EXE) else "Python venv"
 
 
 def _kill_all_worker_processes():
@@ -4588,7 +4610,7 @@ def _native_bundle_dir(config: dict) -> Path | None:
         candidates.append(Path(config["native_ml_dir"]))
     candidates.append(_opt_dir() / "libexec/native-ml")
     candidates.append(Path.home() / ".immich-accelerator" / "native-ml")
-    return next((b for b in candidates if (b / "immich-ml-native").exists()), None)
+    return next((b for b in candidates if (b / NATIVE_EXE).exists()), None)
 
 
 def _native_clip_dir(config: dict) -> Path:
@@ -6058,7 +6080,31 @@ def cmd_status(_args):
         return f"running (PID {pid})" if pid else "stopped"
 
     log.info("Worker:     %s", state("worker", worker_pid))
-    log.info("ML service: %s", state("ml", ml_pid))
+
+    # Name the engine, because "running" was true of both and the difference
+    # is the whole point of the native one. A fallback is otherwise invisible:
+    # the warning scrolls past once at start, and every status after it says
+    # "running" while the slow engine serves every request.
+    running_engine = (
+        _ml_engine_running(ml_pid) if _component_enabled("ml", config) else None
+    )
+    log.info(
+        "ML service: %s%s",
+        state("ml", ml_pid),
+        f", {running_engine} engine" if running_engine else "",
+    )
+    # `config and` is load-bearing: with no config file there is no configured
+    # preference, so there is nothing for the running engine to contradict.
+    if (
+        running_engine == "Python venv"
+        and config
+        and config.get("ml_engine", "native") != "python"
+    ):
+        log.warning(
+            "            This is the fallback engine, not the native one "
+            "you configured."
+        )
+        log.warning("            `immich-accelerator restart` retries native.")
 
     if config:
         log.info("Version:    %s", config.get("version", "?"))

@@ -947,6 +947,72 @@ class TestCmdStatus:
             cmd_status(None)  # Should not raise
 
 
+class TestStatusNamesTheEngineThatIsActuallyRunning:
+    """`status` used to say "ML service: running" for either engine.
+
+    A user whose native engine lost a bind race is served by the slow venv
+    from then on. The one warning scrolls past at start time, so the only
+    standing report of the fact is this line, and it did not carry it.
+    """
+
+    def _status(self, caplog, comm, config_engine="native", has_config=True):
+        import logging
+
+        from immich_accelerator.__main__ import cmd_status
+
+        cfg = {"version": "1.0", "ml_engine": config_engine} if has_config else {}
+        with patch(
+            "immich_accelerator.__main__.read_pid",
+            side_effect=lambda n: 1234 if n == "worker" else 5678,
+        ), patch("immich_accelerator.__main__.load_config", return_value=cfg), patch(
+            # cmd_status only calls load_config when the file is there, so
+            # without this the patch above never runs and config is {}.
+            "immich_accelerator.__main__.CONFIG_FILE"
+        ), patch(
+            "immich_accelerator.__main__._output", return_value=comm
+        ), patch(
+            "immich_accelerator.__main__.brew_refuses_our_tap", return_value=False
+        ), caplog.at_level(
+            logging.INFO, logger="accelerator"
+        ):
+            cmd_status(None)
+        return "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_native_is_named(self, tmp_data_dir, caplog):
+        text = self._status(
+            caplog, "/opt/homebrew/opt/x/libexec/native-ml/immich-ml-native"
+        )
+        assert "native engine" in text
+        assert "fallback engine" not in text
+
+    def test_the_fallback_says_so_every_time_status_runs(self, tmp_data_dir, caplog):
+        text = self._status(caplog, "/opt/homebrew/opt/x/libexec/ml/venv/bin/python3")
+        assert "Python venv engine" in text
+        # The point of the whole change: not just named, but flagged as wrong.
+        assert "fallback engine, not the native one" in text
+
+    def test_no_complaint_when_the_venv_is_what_was_asked_for(
+        self, tmp_data_dir, caplog
+    ):
+        """Choosing the Python engine deliberately is not a degraded state."""
+        text = self._status(caplog, "/usr/bin/python3", config_engine="python")
+        assert "Python venv engine" in text
+        assert "fallback engine, not the native one" not in text
+
+    def test_an_unconfigured_box_is_not_told_it_chose_native(
+        self, tmp_data_dir, caplog
+    ):
+        """With no config there is no preference to have been departed from."""
+        text = self._status(caplog, "/usr/bin/python3", has_config=False)
+        assert "fallback engine, not the native one" not in text
+
+    def test_a_dead_ps_does_not_invent_an_engine(self, tmp_data_dir, caplog):
+        """ps can fail. Better to say nothing than to name the wrong engine."""
+        text = self._status(caplog, None)
+        assert "ML service:" in text
+        assert "engine" not in text
+
+
 # ---------------------------------------------------------------------------
 # start_service
 # ---------------------------------------------------------------------------
@@ -4064,7 +4130,9 @@ class TestNodeShimPreload:
         wired = {
             name for name in on_disk if f'_preload_node_shim(worker_env, "{name}")' in src
         }
-        assert on_disk == wired, f"present but never preloaded: {sorted(on_disk - wired)}"
+        assert (
+            on_disk == wired
+        ), f"present but never preloaded: {sorted(on_disk - wired)}"
 
 
 class TestAskingTheUser:
