@@ -29,6 +29,8 @@ import time
 import uuid
 from pathlib import Path
 
+from .common import COMPONENTS, DEFAULT_TIMEOUT, component_enabled, run_ok, run_output
+
 
 def _read_version() -> str:
     """Read version from VERSION file (single source of truth)."""
@@ -109,6 +111,71 @@ def _installed_version() -> str:
         return (_opt_dir() / "libexec/VERSION").read_text().strip()
     except OSError:
         return __version__
+
+
+# The CLI's names for the shared helpers. Same objects, so there is one
+# implementation rather than two that agree by convention.
+_output = run_output
+_ok = run_ok
+
+# The native engine's executable. Both the "is native installed" check and the
+# "is native what is actually running" check compare against this name, and they
+# have to agree, so it is spelled once.
+NATIVE_EXE = "immich-ml-native"
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    """Read one answer from the user, or *default* when there is nobody to ask.
+
+    Setup asks sixteen questions across a dozen functions, and every one of
+    them has to cope with there being no terminal: piped stdin, a CI job, ssh
+    without a tty. Fifteen sites wrapped input() in the same try/except; the
+    sixteenth was a local helper inside _setup_remote that did not, so
+    `setup --url ...` on a non-interactive stdin died with an EOFError
+    traceback at the first Postgres prompt rather than taking the default it
+    had just printed on screen.
+
+    That is the whole argument for having this in one place: the handling was
+    not complicated, it was just copied, and the one copy that got missed was
+    invisible until someone ran setup from a script.
+    """
+    try:
+        return input(prompt).strip() or default
+    except EOFError:
+        return default
+
+
+def _preload_node_shim(env: dict[str, str], shim: str) -> None:
+    """Append ``hooks/<shim>`` to NODE_OPTIONS as a --require preload.
+
+    Every shim here exists for the same reason: Immich hardcodes something
+    that is wrong on macOS or in a split deployment, and patching its source
+    would break the "we run Immich unmodified" invariant. A --require preload
+    monkey-patches the module at load time instead, leaving the JS on disk
+    untouched.
+
+    The quoting is the part worth having in one place rather than four.
+    NODE_OPTIONS parsing, empirically verified against Node 25.2 and
+    unchanged back to 16:
+
+      unquoted    — splits on whitespace, so any path with a space fails
+      single '..' — the literal quotes land in the filename (the v1.4.2 bug)
+      double  ".." — works for every path, with or without spaces
+
+    So the path is wrapped in double quotes unconditionally. Homebrew Cellar
+    paths have no spaces in practice, but this is the portable correct form,
+    and getting it wrong once already shipped.
+
+    Missing shim files are skipped rather than raising: a partial install
+    should start a worker without the extra behaviour, not refuse to start.
+    """
+    path = Path(__file__).parent / "hooks" / shim
+    if not path.exists():
+        log.debug("shim not installed, skipping: %s", shim)
+        return
+    existing = env.get("NODE_OPTIONS", "").strip()
+    arg = f'--require "{path}"'
+    env["NODE_OPTIONS"] = f"{existing} {arg}".strip()
 
 
 # Service logs are opened in append mode and the worker can spew stack traces
@@ -262,44 +329,21 @@ def _ensure_build_link():
                 content = ""
             if _has_build_entry(content):
                 entry = _synthetic_build_entry(build_data)
-                try:
-                    # Write new synthetic.d file first — only remove legacy if this succeeds
-                    r1 = subprocess.run(
-                        # install -d pins mode 755 (see note in main create path)
-                        ["sudo", "install", "-d", "-m", "755", "/etc/synthetic.d"],
-                        capture_output=True,
-                        timeout=30,
-                    )
-                    if r1.returncode != 0:
-                        raise OSError("mkdir failed")
-                    r2 = subprocess.run(
-                        ["sudo", "tee", str(SYNTHETIC_CONF)],
-                        input=entry,
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
-                    if r2.returncode != 0:
-                        raise OSError("tee failed")
-                    # New file written — now safe to clean legacy
+                # Write the new file first, and only clean up the legacy one
+                # if that worked. Non-fatal either way: the link still works
+                # from the legacy location. No try/except, because _ok never
+                # raises, so the handler here could only ever have caught the
+                # two OSErrors this block threw at itself.
+                # install -d pins mode 755 (see note in main create path)
+                if _ok(
+                    ["sudo", "install", "-d", "-m", "755", "/etc/synthetic.d"]
+                ) and _ok(["sudo", "tee", str(SYNTHETIC_CONF)], input=entry):
                     new_content = _strip_build_entry(content)
                     if new_content.strip():
-                        subprocess.run(
-                            ["sudo", "tee", str(legacy)],
-                            input=new_content,
-                            capture_output=True,
-                            text=True,
-                            timeout=30,
-                        )
+                        _ok(["sudo", "tee", str(legacy)], input=new_content)
                     else:
-                        subprocess.run(
-                            ["sudo", "rm", str(legacy)],
-                            capture_output=True,
-                            timeout=10,
-                        )
+                        _ok(["sudo", "rm", str(legacy)], timeout=10)
                     log.info("Migrated /build link to /etc/synthetic.d/")
-                except (OSError, subprocess.SubprocessError):
-                    pass  # Non-fatal, link still works from legacy location
         return True
 
     if Path("/build").exists():
@@ -368,19 +412,16 @@ def _ensure_build_link():
     base = existing.rstrip("\n") + "\n" if existing.strip() else ""
     entry = base + _synthetic_build_entry(build_data)
     try:
-        result = subprocess.run(
-            # install -d, not mkdir -p: pin mode 755 so a tight root umask
-            # (e.g. 027 → 750) can't leave /etc/synthetic.d unsearchable by
-            # the non-root user. A 750 dir makes a later non-root exists()
-            # check on its contents raise PermissionError. install -d also
-            # normalises an existing dir's mode, self-healing prior installs.
-            ["sudo", "install", "-d", "-m", "755", "/etc/synthetic.d"],
-            capture_output=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
+        # install -d, not mkdir -p: pin mode 755 so a tight root umask
+        # (e.g. 027 → 750) can't leave /etc/synthetic.d unsearchable by
+        # the non-root user. A 750 dir makes a later non-root exists()
+        # check on its contents raise PermissionError. install -d also
+        # normalises an existing dir's mode, self-healing prior installs.
+        if not _ok(["sudo", "install", "-d", "-m", "755", "/etc/synthetic.d"]):
             log.warning("Failed to create /etc/synthetic.d/")
             return False
+        # Not _ok: this one's stderr is shown to the user on failure, and the
+        # helper keeps stderr for the debug log only.
         result = subprocess.run(
             ["sudo", "tee", str(SYNTHETIC_CONF)],
             input=entry,
@@ -398,13 +439,7 @@ def _ensure_build_link():
     # Try to activate without reboot
     apfs_util = "/System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util"
     if Path(apfs_util).exists():
-        result = subprocess.run(
-            ["sudo", apfs_util, "-t"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0 and _build_link_ok():
+        if _ok(["sudo", apfs_util, "-t"], timeout=10) and _build_link_ok():
             log.info("/build link created successfully")
             return True
 
@@ -423,27 +458,14 @@ def _remove_build_link():
     if conf_content:
         log.info("Removing /build link (requires sudo)...")
         remainder = _strip_build_entry(conf_content)
-        try:
-            if remainder.strip():
-                result = subprocess.run(
-                    ["sudo", "tee", str(SYNTHETIC_CONF)],
-                    input=remainder,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-            else:
-                result = subprocess.run(
-                    ["sudo", "rm", str(SYNTHETIC_CONF)],
-                    capture_output=True,
-                    timeout=10,
-                )
-            if result.returncode == 0:
-                removed = True
-            else:
-                log.warning("  Could not update %s", SYNTHETIC_CONF)
-        except subprocess.SubprocessError as e:
-            log.warning("  Could not update %s: %s", SYNTHETIC_CONF, e)
+        if remainder.strip():
+            wrote = _ok(["sudo", "tee", str(SYNTHETIC_CONF)], input=remainder)
+        else:
+            wrote = _ok(["sudo", "rm", str(SYNTHETIC_CONF)], timeout=10)
+        if wrote:
+            removed = True
+        else:
+            log.warning("  Could not update %s", SYNTHETIC_CONF)
 
     # Also clean legacy entry from /etc/synthetic.conf (pre-v1.3.3)
     legacy_conf = LEGACY_SYNTHETIC_CONF
@@ -465,21 +487,11 @@ def _remove_build_link():
                         "Removing /build link from synthetic.conf (requires sudo)..."
                     )
                 if new_content.strip():
-                    subprocess.run(
-                        ["sudo", "tee", str(legacy_conf)],
-                        input=new_content,
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
+                    _ok(["sudo", "tee", str(legacy_conf)], input=new_content)
                 else:
-                    subprocess.run(
-                        ["sudo", "rm", str(legacy_conf)],
-                        capture_output=True,
-                        timeout=10,
-                    )
+                    _ok(["sudo", "rm", str(legacy_conf)], timeout=10)
                 removed = True
-        except (OSError, subprocess.SubprocessError) as e:
+        except OSError as e:
             log.warning("  Could not clean synthetic.conf: %s", e)
 
     if removed:
@@ -1637,7 +1649,6 @@ def download_immich_server(version: str) -> Path:
                     log.info("    Extracting server...")
                     # Extract all server members at once — pnpm symlinks need
                     # their targets to exist, so per-member extract breaks.
-                    import tempfile
 
                     with tempfile.TemporaryDirectory() as tmpdir:
                         try:
@@ -1848,13 +1859,12 @@ _WORKER_CMD_RE = re.compile(
 )
 
 
-def _scan_worker_pids(exclude: set[int] | None = None) -> list[int]:
+def _scan_worker_pids() -> list[int]:
     """Return PIDs of live Immich worker processes found via ``ps``.
 
     Immich 2.7+ sets ``process.title='immich'``, so the recorded PID's
     parent may exit while child 'immich' processes keep running.
 
-    *exclude* is an optional set of PIDs to skip (e.g. tracked PIDs).
     The current process is always excluded.
     """
     try:
@@ -1868,8 +1878,6 @@ def _scan_worker_pids(exclude: set[int] | None = None) -> list[int]:
         return []
 
     skip = {os.getpid()}
-    if exclude:
-        skip |= exclude
 
     pids: list[int] = []
     for line in result.stdout.splitlines():
@@ -1982,6 +1990,23 @@ def read_pid(name: str) -> int | None:
         if name == "worker":
             return _adopt_live_worker()
         return None
+
+
+def _ml_engine_running(pid: int | None) -> str | None:
+    """Which ML engine *pid* actually is, read from the process table.
+
+    Deliberately not config["ml_engine"], which records the preference and
+    stays "native" while the venv is the thing running, and deliberately
+    not a value written down at start time, which is stale from the moment
+    a fallback swaps the engine underneath it. The process table cannot
+    disagree with itself.
+    """
+    if not pid:
+        return None
+    comm = _output(["ps", "-p", str(pid), "-o", "comm="], timeout=5)
+    if not comm:
+        return None
+    return "native" if comm.strip().endswith(NATIVE_EXE) else "Python venv"
 
 
 def _kill_all_worker_processes():
@@ -2911,7 +2936,6 @@ def _dashboard_port() -> int:
 # is a real process boundary — which is exactly where this stops. Video,
 # thumbnails and RAW decode all happen inside the single microservices worker,
 # so "video but not thumbnails" is Immich's job scheduler, not ours.
-COMPONENTS = ("worker", "ml", "dashboard")
 
 # How to say each one in a sentence. str.capitalize() turns "ml" into "Ml".
 COMPONENT_LABELS = {
@@ -2922,25 +2946,17 @@ COMPONENT_LABELS = {
 
 
 def _component_enabled(name: str, config: dict | None = None) -> bool:
-    """Whether a component should be running. Defaults True.
+    """Whether a component should be running, loading config when not given.
 
-    Absent means enabled, because every config written before these keys existed
-    has none of them, and an upgrade must not silently turn anything off.
-
-    An explicit component key beats the legacy "ml_only" preset. That order
-    matters: without it, a user who ran `setup --ml-only` once could never turn
-    the worker back on without hand-editing config.json.
+    The rule itself lives in common.component_enabled, because the dashboard
+    needs the same answer and cannot import it from here.
     """
     if config is None:
         try:
             config = load_config()
         except (RuntimeError, ValueError, OSError):
             return True
-    if name in config:
-        return bool(config[name])
-    if config.get("ml_only"):  # preset: worker off, everything else on
-        return name != "worker"
-    return True
+    return component_enabled(name, config)
 
 
 def _dashboard_enabled() -> bool:
@@ -3195,12 +3211,9 @@ def _ensure_vips() -> None:
 def _check_local_tools() -> tuple[str, str | None, Path | None]:
     """Check for Node.js, ffmpeg, libvips, and ML service. Returns (node, ffmpeg_path, ml_dir)."""
     node = find_node()
-    log.info(
-        "Node.js: %s",
-        subprocess.run(
-            [node, "--version"], capture_output=True, text=True
-        ).stdout.strip(),
-    )
+    # Was unbounded and unguarded: a wedged node hung setup, and a node that
+    # failed printed "Node.js:" followed by nothing at all.
+    log.info("Node.js: %s", (_output([node, "--version"], timeout=10) or "?").strip())
 
     _ensure_vips()
 
@@ -4148,7 +4161,7 @@ def _fresh_install(docker: str) -> bool:
     return True
 
 
-def _setup_local(args):
+def _setup_local(_args):
     """Setup from local Docker (original behavior, with fresh install support)."""
     log.info("Detecting Immich instance...")
 
@@ -4276,8 +4289,7 @@ def _setup_remote(args):
 
     def prompt(label: str, default: str = "") -> str:
         suffix = f" [{default}]" if default else ""
-        val = input(f"  {label}{suffix}: ").strip()
-        return val or default
+        return _ask(f"  {label}{suffix}: ", default)
 
     db_hostname = prompt("Postgres host", "localhost")
     db_port = prompt("Postgres port", "5432")
@@ -4491,7 +4503,7 @@ def _setup_manual(_args):
     log.info("  python -m immich_accelerator start")
 
 
-def _setup_ml_only(args) -> None:
+def _setup_ml_only(_args) -> None:
     """Set up this Mac as an ML-only network compute node: just the ML engine
     (native Swift by default, Python venv fallback), reachable at this Mac's
     IP on ml_port. No Docker, no Postgres, no Redis, no worker, no library
@@ -4569,7 +4581,6 @@ def _find_python() -> str | None:
             ["python3", "--version"], capture_output=True, text=True, timeout=5
         )
         version = r.stdout.strip() + r.stderr.strip()  # some builds print to stderr
-        import re
 
         m = re.search(r"3\.(\d+)", version)
         if m and int(m.group(1)) >= 11:
@@ -4599,7 +4610,7 @@ def _native_bundle_dir(config: dict) -> Path | None:
         candidates.append(Path(config["native_ml_dir"]))
     candidates.append(_opt_dir() / "libexec/native-ml")
     candidates.append(Path.home() / ".immich-accelerator" / "native-ml")
-    return next((b for b in candidates if (b / "immich-ml-native").exists()), None)
+    return next((b for b in candidates if (b / NATIVE_EXE).exists()), None)
 
 
 def _native_clip_dir(config: dict) -> Path:
@@ -4641,7 +4652,7 @@ def _native_ml_spec(config: dict, env: dict):
     env["ML_CLIP_DIR"] = str(clip_dir)
     env["ML_ARCFACE"] = str(arcface)
     ml_port = int(config.get("ml_port", 3003))
-    return [str(bundle / "immich-ml-native"), "serve", str(ml_port)], str(bundle), env
+    return [str(bundle / NATIVE_EXE), "serve", str(ml_port)], str(bundle), env
 
 
 def _maybe_fetch_native_models(config: dict) -> None:
@@ -4900,7 +4911,7 @@ def _start_ml_service(config: dict):
 
 # Our two ML engines, as they appear in `ps`. Anything else listening on the
 # port belongs to somebody else (usually Docker's immich-machine-learning).
-_ML_CMD_RE = re.compile(r"immich-ml-native\s+serve|python[^\s]*\s+-m\s+src\.main")
+_ML_CMD_RE = re.compile(rf"{NATIVE_EXE}\s+serve|python[^\s]*\s+-m\s+src\.main")
 
 
 def _our_ml_process(port: int) -> int | None:
@@ -4928,7 +4939,7 @@ def _our_ml_process(port: int) -> int | None:
     # port. The preflight gate runs one on another port on this same Mac, and
     # Docker's own ML container is a real holder of 3003, so the combination
     # adopted the wrong process and would later have signalled it.
-    native = re.compile(rf"immich-ml-native\s+serve\s+{int(port)}(\s|$)")
+    native = re.compile(rf"{NATIVE_EXE}\s+serve\s+{int(port)}(\s|$)")
     venv = re.compile(r"python[^\s]*\s+-m\s+src\.main")
     for line in out.splitlines():
         pid, _, cmd = line.strip().partition(" ")
@@ -5735,32 +5746,11 @@ def _cmd_start(args):
     if config.get("upload_mount"):
         worker_env["IMMICH_MEDIA_LOCATION"] = config["upload_mount"]
 
-    # pg_dump shim (issue #24): Immich hardcodes the Linux postgres
-    # client path `/usr/lib/postgresql/<ver>/bin/pg_dump` in its
-    # DatabaseBackupService. On macOS that path doesn't exist and
-    # there's no env-var escape hatch in the upstream code. Instead
-    # of patching Immich's source (which would break our "unmodified"
-    # invariant), we preload a tiny Node module via `--require` that
-    # monkey-patches child_process.spawn to rewrite that path to the
-    # Homebrew libpq bin dir at call time. Immich's JS on disk is
-    # never touched.
-    # NODE_OPTIONS parsing reference (empirically verified with
-    # Node 25.2, which matches the behavior back to 16+):
-    #   unquoted    — splits on whitespace (fails for spaces)
-    #   single '..' — FAILS, literals land in the filename (v1.4.2 bug)
-    #   backslash \ — FAILS, Node does not honor shell-style escapes
-    #   double  ".." — WORKS for all paths, with or without spaces
-    #
-    # So we wrap the shim path in double quotes unconditionally.
-    # Brew Cellar paths are space-free in practice but double quotes
-    # are still the portable correct form.
-    shim_path = Path(__file__).parent / "hooks" / "pg_dump_shim.js"
-    if shim_path.exists():
-        existing = worker_env.get("NODE_OPTIONS", "").strip()
-        require_arg = f'--require "{shim_path}"'
-        worker_env["NODE_OPTIONS"] = (
-            f"{existing} {require_arg}".strip() if existing else require_arg
-        )
+    # pg_dump shim (issue #24): Immich hardcodes the Linux postgres client path
+    # `/usr/lib/postgresql/<ver>/bin/pg_dump` in its DatabaseBackupService. On
+    # macOS that path does not exist and upstream offers no env-var escape
+    # hatch, so the shim rewrites it to the Homebrew libpq bin dir at call time.
+    _preload_node_shim(worker_env, "pg_dump_shim.js")
 
     # HEIC + camera-RAW decode shim (issues #62, #99): Sharp's prebuilt libvips
     # ships without an HEVC decoder (AVIF-only) and without a dcraw/libraw
@@ -5768,13 +5758,7 @@ def _cmd_start(args):
     # never get thumbnails. This preload wraps the `sharp` module to route those
     # file paths through Homebrew libvips (to a lossless TIFF) before Sharp.
     # Same --require interposition; Immich's source on disk is untouched.
-    heic_shim = Path(__file__).parent / "hooks" / "heic_decode_shim.js"
-    if heic_shim.exists():
-        existing = worker_env.get("NODE_OPTIONS", "").strip()
-        require_arg = f'--require "{heic_shim}"'
-        worker_env["NODE_OPTIONS"] = (
-            f"{existing} {require_arg}".strip() if existing else require_arg
-        )
+    _preload_node_shim(worker_env, "heic_decode_shim.js")
 
     # pg keepalive shim (issue #74): in a split deployment a stateful firewall
     # between the worker and a remote Postgres can silently reap an idle
@@ -5782,13 +5766,7 @@ def _cmd_start(args):
     # never recovers. Immich doesn't expose a keepalive env var, so we wrap the
     # `pg` module to set keepAlive on every connection. Same --require
     # interposition; Immich's source is untouched. No-op for same-host setups.
-    pg_keepalive_shim = Path(__file__).parent / "hooks" / "pg_keepalive_shim.js"
-    if pg_keepalive_shim.exists():
-        existing = worker_env.get("NODE_OPTIONS", "").strip()
-        require_arg = f'--require "{pg_keepalive_shim}"'
-        worker_env["NODE_OPTIONS"] = (
-            f"{existing} {require_arg}".strip() if existing else require_arg
-        )
+    _preload_node_shim(worker_env, "pg_keepalive_shim.js")
 
     # job retry shim: Immich hardcodes `attempts: 1` (no retry) for every
     # BullMQ queue. In a split deployment a transient connection drop to a
@@ -5796,13 +5774,7 @@ def _cmd_start(args):
     # instead of retrying. We wrap `bullmq`'s Queue constructor to raise the
     # attempt count with exponential backoff. Same --require interposition;
     # Immich's source is untouched.
-    job_retry_shim = Path(__file__).parent / "hooks" / "job_retry_shim.js"
-    if job_retry_shim.exists():
-        existing = worker_env.get("NODE_OPTIONS", "").strip()
-        require_arg = f'--require "{job_retry_shim}"'
-        worker_env["NODE_OPTIONS"] = (
-            f"{existing} {require_arg}".strip() if existing else require_arg
-        )
+    _preload_node_shim(worker_env, "job_retry_shim.js")
 
     # /build link points to our build-data dir (set up during setup).
     # Required for Immich 2.7+ plugin WASM paths stored in the shared DB.
@@ -6108,7 +6080,31 @@ def cmd_status(_args):
         return f"running (PID {pid})" if pid else "stopped"
 
     log.info("Worker:     %s", state("worker", worker_pid))
-    log.info("ML service: %s", state("ml", ml_pid))
+
+    # Name the engine, because "running" was true of both and the difference
+    # is the whole point of the native one. A fallback is otherwise invisible:
+    # the warning scrolls past once at start, and every status after it says
+    # "running" while the slow engine serves every request.
+    running_engine = (
+        _ml_engine_running(ml_pid) if _component_enabled("ml", config) else None
+    )
+    log.info(
+        "ML service: %s%s",
+        state("ml", ml_pid),
+        f", {running_engine} engine" if running_engine else "",
+    )
+    # `config and` is load-bearing: with no config file there is no configured
+    # preference, so there is nothing for the running engine to contradict.
+    if (
+        running_engine == "Python venv"
+        and config
+        and config.get("ml_engine", "native") != "python"
+    ):
+        log.warning(
+            "            This is the fallback engine, not the native one "
+            "you configured."
+        )
+        log.warning("            `immich-accelerator restart` retries native.")
 
     if config:
         log.info("Version:    %s", config.get("version", "?"))
@@ -7412,12 +7408,28 @@ def _extract_frame(ffmpeg: str, video: str, dest: str, at: float) -> bool:
     comparison is about, which is the fastest way to make a visual comparison
     lie.
     """
-    r = subprocess.run(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-         "-ss", f"{at:.2f}", "-i", video, "-frames:v", "1", dest],
-        capture_output=True, text=True,
+    # Bounded: this had no timeout, and ffmpeg given a file it cannot make
+    # sense of can sit there indefinitely, which hung `compare` with no output
+    # and no way to tell whether it was working. 120s is far longer than one
+    # frame ever takes and still finishes.
+    ok = _ok(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{at:.2f}",
+            "-i",
+            video,
+            "-frames:v",
+            "1",
+            dest,
+        ],
+        timeout=120,
     )
-    return r.returncode == 0 and Path(dest).is_file()
+    return ok and Path(dest).is_file()
 
 
 def _comparison_page(rows: list[dict], out_dir: Path, source: str) -> Path:
@@ -7505,8 +7517,10 @@ def cmd_compare(args):
         log.error("No ffmpeg found. Run setup, or pass one on PATH.")
         return
 
-    out_dir = Path(args.output).expanduser() if args.output else (
-        Path(tempfile.mkdtemp(prefix="immich-compare-"))
+    out_dir = (
+        Path(args.output).expanduser()
+        if args.output
+        else (Path(tempfile.mkdtemp(prefix="immich-compare-")))
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -7807,21 +7821,20 @@ def cmd_ml_test(_args):
             "2Q=="
         )
 
-    def predict(entries: dict, include_image: bool = True) -> bytes:
-        """POST /predict multipart with entries JSON and optional image."""
+    def predict(entries: dict) -> bytes:
+        """POST /predict multipart with entries JSON and the test image."""
         boundary = "----iac-ml-test"
         lines = []
         lines.append(f"--{boundary}\r\n".encode())
         lines.append(b'Content-Disposition: form-data; name="entries"\r\n\r\n')
         lines.append(json.dumps(entries).encode() + b"\r\n")
-        if include_image:
-            lines.append(f"--{boundary}\r\n".encode())
-            lines.append(
-                b'Content-Disposition: form-data; name="image"; '
-                b'filename="t.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'
-            )
-            lines.append(_tiny_jpeg())
-            lines.append(b"\r\n")
+        lines.append(f"--{boundary}\r\n".encode())
+        lines.append(
+            b'Content-Disposition: form-data; name="image"; '
+            b'filename="t.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'
+        )
+        lines.append(_tiny_jpeg())
+        lines.append(b"\r\n")
         lines.append(f"--{boundary}--\r\n".encode())
         body = b"".join(lines)
 

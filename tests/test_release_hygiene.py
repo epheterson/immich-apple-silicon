@@ -15,6 +15,7 @@ import os
 import inspect
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -495,8 +496,14 @@ def _parity():
     import importlib.util
     from pathlib import Path
 
-    path = Path(__file__).parent.parent / "scripts" / "ml-parity.py"
-    spec = importlib.util.spec_from_file_location("ml_parity", path)
+    scripts = Path(__file__).parent.parent / "scripts"
+    # Running `python3 scripts/ml-parity.py` puts scripts/ on sys.path, which
+    # is how it reaches its sibling _predict module. Loading it by file path
+    # here does not, so do it explicitly rather than have the test fail on an
+    # import that works fine in real use.
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    spec = importlib.util.spec_from_file_location("ml_parity", scripts / "ml-parity.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -648,8 +655,12 @@ def _preflight():
     import importlib.util
     from pathlib import Path
 
-    path = Path(__file__).parent.parent / "scripts" / "ml-preflight.py"
-    spec = importlib.util.spec_from_file_location("ml_preflight", path)
+    scripts = Path(__file__).parent.parent / "scripts"
+    if str(scripts) not in sys.path:  # see the note in _parity()
+        sys.path.insert(0, str(scripts))
+    spec = importlib.util.spec_from_file_location(
+        "ml_preflight", scripts / "ml-preflight.py"
+    )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -969,4 +980,50 @@ def test_the_app_and_the_cli_agree_on_reading_a_pidfile_start_time():
     assert "actualStart != storedStart" not in body, (
         "back to comparing byte for byte, which deletes healthy pidfiles "
         "written before 1.16 by any locale that is not C"
+    )
+
+
+def test_no_script_imports_a_name_it_also_defines():
+    """A shared helper must not shadow a script's own function of the same name.
+
+    scripts/native-ml-preflight.py already had its own `predict(base, name,
+    kind, ...)`. Importing `predict` from _predict silently replaced it, and
+    every call then failed with a TypeError about a missing argument. The unit
+    suite could not catch it, because nothing here exercises that call path,
+    so it surfaced only when the real Apple Silicon gate ran the service.
+
+    This is the cheap version of that check: a name imported from a sibling
+    module must not also be defined in the file importing it.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parent.parent
+    offenders = []
+    for path in sorted((root / "scripts").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        # Top-level defs only: a nested `def predict` inside another function
+        # shadows nothing at module scope and is not a collision.
+        defined = {
+            n.name
+            for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for node in tree.body:
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            # Any sibling module in scripts/, not just _predict: the next
+            # shared helper added here must be covered by this too.
+            sibling = root / "scripts" / f"{(node.module or '').split('.')[0]}.py"
+            if not (node.level or sibling.exists()):
+                continue
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                if bound in defined:
+                    offenders.append(
+                        f"{path.name} imports '{bound}' from "
+                        f"{node.module} and also defines it"
+                    )
+    assert not offenders, (
+        "a shared import shadows a local function of the same name:\n  "
+        + "\n  ".join(offenders)
     )

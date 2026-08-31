@@ -129,7 +129,7 @@ immich-accelerator update             # check and update to match Immich version
 1. **Native deps may not build on macOS.** Sharp uses libvips which does build on macOS (Homebrew). But other Immich deps might assume Linux.
 2. **File paths.** Docker containers see different paths than the host. The native worker needs to see the same files at the same paths, or Immich needs path translation. This was the problem our current project solves with UPLOAD_DIR/PHOTOS_DIR.
 3. **Breaking changes.** When Immich updates, new deps or new worker behavior could break our setup. Auto-update mitigates but doesn't eliminate this.
-4. **Support burden.** If users file bugs on Immich from bare-metal setups, the maintainers won't be happy. We need clear messaging that bare-metal issues come to us.
+4. **Support burden.** Bare-metal issues are ours, not upstream Immich's. Messaging has to make that routing obvious so reports land in the right tracker.
 
 ## Phased approach
 

@@ -21,6 +21,8 @@ import logging
 import os
 import subprocess
 import time
+
+from .common import component_enabled, run_output
 from pathlib import Path
 
 log = logging.getLogger("dashboard")
@@ -38,16 +40,12 @@ _static_hw: dict | None = None
 def _component_on(config: dict, name: str) -> bool:
     """Whether a component ("worker", "ml", "dashboard") is switched on.
 
-    Deliberately a small duplicate of __main__._component_enabled rather than an
-    import: the dashboard is spawned as `python -m immich_accelerator dashboard`,
-    so __main__ is the running module, and importing it from here would load a
-    second copy of it with its own state. Keep the two in sync.
+    The rule lives in common.component_enabled, which the CLI uses too. This
+    used to be a hand-written duplicate with a note saying "keep the two in
+    sync" and nothing enforcing it, because importing __main__ from here would
+    load a second copy of it. A plain module has no such problem.
     """
-    if name in config:
-        return bool(config[name])
-    if config.get("ml_only"):  # legacy preset: worker off, everything else on
-        return name != "worker"
-    return True
+    return component_enabled(name, config)
 
 
 def _worker_enabled(config: dict) -> bool:
@@ -78,14 +76,13 @@ def _get_accelerator_version() -> str:
 
 
 def _run(cmd: list[str], timeout: int = 5, env: dict | None = None) -> str:
-    """Run a command and return stdout, or empty string on failure."""
-    try:
-        r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, env=env
-        )
-        return r.stdout.strip() if r.returncode == 0 else ""
-    except (subprocess.SubprocessError, OSError):
-        return ""
+    """Run a command and return stdout, or empty string on failure.
+
+    The empty string is load-bearing here rather than sloppy: _query_db uses a
+    falsy result to mean "that route failed, try the next one". Callers that
+    need to tell "no answer" from "no rows" should use run_output directly.
+    """
+    return (run_output(cmd, timeout=timeout, env=env) or "").strip()
 
 
 _db_error_logged = False

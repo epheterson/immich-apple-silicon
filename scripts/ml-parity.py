@@ -53,7 +53,7 @@ import pathlib
 import statistics
 import sys
 import time
-import urllib.request
+from _predict import predict as _post
 
 # The model names Immich itself asks for, taken from a real worker's requests.
 # Every engine is asked for the same ones: comparing two engines running
@@ -80,32 +80,14 @@ TASKS = {
 
 
 def predict(base: str, task: str, image: bytes, timeout: int) -> tuple[dict, float]:
-    """One /predict call, multipart, the same shape the worker sends."""
-    boundary = "----iac-ml-parity"
-    body = b"".join(
-        [
-            f"--{boundary}\r\n".encode(),
-            b'Content-Disposition: form-data; name="entries"\r\n\r\n',
-            json.dumps(TASKS[task]).encode() + b"\r\n",
-            f"--{boundary}\r\n".encode(),
-            b'Content-Disposition: form-data; name="image"; filename="i.jpg"\r\n'
-            b"Content-Type: image/jpeg\r\n\r\n",
-            image,
-            b"\r\n",
-            f"--{boundary}--\r\n".encode(),
-        ]
-    )
-    req = urllib.request.Request(
-        f"{base}/predict",
-        data=body,
-        headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Accept": "application/json",
-        },
-    )
+    """One /predict call, multipart, the same shape the worker sends.
+
+    Wraps the shared builder in _predict.py to time the round trip, which is
+    the one thing this script needs and the gates do not.
+    """
     started = time.time()
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read()), time.time() - started
+    result = _post(base, TASKS[task], image=image, timeout=timeout, filename="i.jpg")
+    return result, time.time() - started
 
 
 def embedding(result: dict) -> list[float]:

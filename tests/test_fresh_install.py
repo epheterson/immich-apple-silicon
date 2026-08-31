@@ -173,21 +173,33 @@ class TestDashboardDependenciesAreAvailable:
             "socket",
             "sys",
         }
-        for node in tree.body:  # top-level only
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    root = alias.name.split(".")[0]
-                    assert root in stdlib_prefixes, (
-                        f"Top-level import '{alias.name}' in dashboard.py "
-                        f"pulls in a third-party dep — move it inside the "
-                        f"function that needs it."
+        def top_level_imports(tree_):
+            for node in tree_.body:
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        yield alias.name.split(".")[0], alias.name, 0
+                elif isinstance(node, ast.ImportFrom):
+                    yield (node.module or "").split(".")[0], node.module, node.level
+
+        for root, full, level in top_level_imports(tree):
+            if level:
+                # A sibling module of our own package. Allowed, but only if it
+                # is itself stdlib-only at import time, or the guarantee just
+                # moves one file across and stops meaning anything.
+                sib = REPO_ROOT / "immich_accelerator" / f"{root}.py"
+                assert sib.exists(), f"relative import of a missing module: {root}"
+                for r2, full2, lvl2 in top_level_imports(ast.parse(sib.read_text())):
+                    assert lvl2 == 0 and r2 in stdlib_prefixes, (
+                        f"dashboard.py imports .{root}, which imports "
+                        f"'{full2}' at module level. That reaches a "
+                        f"third-party dep by one more hop, so importing "
+                        f"dashboard.py can still crash."
                     )
-            elif isinstance(node, ast.ImportFrom):
-                root = (node.module or "").split(".")[0]
-                assert root in stdlib_prefixes, (
-                    f"Top-level 'from {node.module} import ...' in "
-                    f"dashboard.py pulls in a third-party dep."
-                )
+                continue
+            assert root in stdlib_prefixes, (
+                f"Top-level import '{full}' in dashboard.py pulls in a "
+                f"third-party dep. Move it inside the function that needs it."
+            )
 
 
 # --- ghcr.io rate-limit retry -------------------------------------------
@@ -574,7 +586,7 @@ class TestRegressionGuards:
             "Cannot find module" in result.stderr or "MODULE_NOT_FOUND" in result.stderr
         ), f"expected module-not-found error, got: {result.stderr[:300]}"
 
-    def test_cmd_start_node_options_string_is_well_formed(self):
+    def test_cmd_start_node_options_string_is_well_formed(self, tmp_path, monkeypatch):
         """Static check that cmd_start wraps the shim path in DOUBLE
         quotes for NODE_OPTIONS. Double is the only form Node's
         NODE_OPTIONS tokenizer honors universally. v1.4.2 shipped
@@ -582,23 +594,27 @@ class TestRegressionGuards:
         filename). A v1.4.3 pre-fix attempted backslash escaping
         (also broken — Node doesn't honor shell escapes either).
         Verified empirically against Node 25.2."""
-        src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()
-        # Must wrap the shim path in double quotes.
-        assert "f'--require \"{shim_path}\"'" in src, (
-            "cmd_start must wrap the shim path in double quotes for "
-            "NODE_OPTIONS. See issue #24 and the empirical findings "
-            "in TestRegressionGuards."
-        )
-        # Must not regress to single-quoting the require arg.
-        assert "f\"--require '{shim_path}'\"" not in src, (
-            "NODE_OPTIONS single-quoted the shim path — Node doesn't "
-            "honor shell quoting (v1.4.2 regression, #24)"
-        )
-        # Must not regress to backslash-escaping whitespace.
-        assert 'str(shim_path).replace(" ", r"\\ ")' not in src, (
-            "NODE_OPTIONS backslash-escaped whitespace — Node doesn't "
-            "honor shell escapes in NODE_OPTIONS either"
-        )
+        # Asserted on the string the code actually produces, not on the
+        # source text. This guard used to grep for a particular variable
+        # name and broke the moment the four copied blocks were collapsed
+        # into one helper, even though the behaviour was identical. What
+        # matters is the quoting, so check that.
+        hooks = tmp_path / "with space" / "hooks"
+        hooks.mkdir(parents=True)
+        (hooks / "pg_dump_shim.js").write_text("//")
+        monkeypatch.setattr(m, "__file__", str(tmp_path / "with space" / "x.py"))
+
+        env: dict[str, str] = {}
+        m._preload_node_shim(env, "pg_dump_shim.js")
+        produced = env["NODE_OPTIONS"]
+
+        shim = hooks / "pg_dump_shim.js"
+        assert produced == f'--require "{shim}"', produced
+        # Single quotes became literal characters in the filename (v1.4.2).
+        assert f"--require '{shim}'" != produced
+        assert "'" not in produced
+        # Backslash escaping is not honoured by NODE_OPTIONS either.
+        assert "\\ " not in produced
 
 
 class TestPgDumpShim:
@@ -1473,8 +1489,10 @@ const fake = () => {
     def test_shim_is_wired_into_worker_node_options(self):
         """cmd_start must add the shim to the worker's NODE_OPTIONS."""
         src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()
-        assert "heic_decode_shim.js" in src
-        assert 'require "{heic_shim}"' in src or "--require" in src
+        # Not a grep for "--require": that string lives inside
+        # _preload_node_shim itself, so the old `or` clause was true no matter
+        # what and the assertion checked nothing at all.
+        assert '_preload_node_shim(worker_env, "heic_decode_shim.js")' in src
 
     def test_shim_syntax_valid(self):
         import shutil
@@ -3326,3 +3344,257 @@ class TestUntrustedTapIsReported:
         assert "brew trust epheterson/immich-accelerator" in out, (
             f"the user must be given the exact command: {out}"
         )
+
+
+class TestUninstallAsksBeforeItDeletes:
+    """`uninstall` removes services, launchd config and the whole data
+    directory. It had no test at all, which is the wrong place in this
+    codebase to have none: every failure here is destructive and silent.
+
+    These pin the properties where a regression costs a user their data
+    rather than merely annoying them.
+    """
+
+    @staticmethod
+    def _harness(monkeypatch, answer):
+        """Neuter everything destructive and record what would have run."""
+        calls = {"stop": 0, "rmtree": [], "run": [], "order": [], "build_link": 0}
+        monkeypatch.setattr(m, "cmd_stop", lambda *a: calls.__setitem__("stop", calls["stop"] + 1))
+        monkeypatch.setattr(m, "_remove_build_link",
+                            lambda *a: calls.__setitem__("build_link", calls["build_link"] + 1))
+
+        def fake_rmtree(path, *, what):
+            calls["rmtree"].append(what)
+            return True
+
+        monkeypatch.setattr(m, "_rmtree_or_explain", fake_rmtree)
+
+        plist = (
+            Path.home() / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
+        )
+
+        def fake_run(cmd, *a, **k):
+            # Record whether the plist still existed at the moment each
+            # command ran, so "unloaded before deleted" is actually checked
+            # rather than just asserted in the test's name.
+            calls["run"].append(cmd[0] if cmd else "")
+            calls["order"].append((cmd[0] if cmd else "", plist.exists()))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(m.subprocess, "run", fake_run)
+        if answer is EOFError:
+            monkeypatch.setattr("builtins.input", lambda _p: (_ for _ in ()).throw(EOFError))
+        else:
+            monkeypatch.setattr("builtins.input", lambda _p: answer)
+        return calls
+
+    @pytest.fixture(autouse=True)
+    def _always_fake_home(self, monkeypatch, tmp_path):
+        """Autouse, not opt-in.
+
+        cmd_uninstall unlinks ~/Library/LaunchAgents/com.immich.accelerator
+        .plist, and plist.unlink() is real even when subprocess.run is faked.
+        One test in this class forgot to redirect HOME and would have deleted
+        a contributor's own launchd registration, silently, on any clone that
+        had run setup. Three tests remembered; the fourth did not, which is
+        exactly why this is not left to remembering.
+        """
+        self._fake_home(monkeypatch, tmp_path)
+
+    @staticmethod
+    def _fake_home(monkeypatch, tmp_path):
+        """Point Path.home() at a temp tree.
+
+        Not optional: cmd_uninstall unlinks ~/Library/LaunchAgents/
+        com.immich.accelerator.plist, and an earlier version of this test
+        reached the real one. It survived only because that file happened not
+        to exist on this machine.
+        """
+        home = tmp_path / "home"
+        (home / "Library" / "LaunchAgents").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(m.Path, "home", staticmethod(lambda: home))
+        return home
+
+    def test_answering_no_deletes_nothing(self, tmp_data_dir, monkeypatch):
+        calls = self._harness(monkeypatch, "n")
+        m.cmd_uninstall(None)
+        assert calls["rmtree"] == [], "declined, but it deleted something anyway"
+        assert calls["stop"] == 0, "declined, but it stopped the services"
+        assert calls["build_link"] == 0
+
+    def test_bare_enter_deletes_nothing(self, tmp_data_dir, monkeypatch):
+        """The prompt shows [y/N], so Enter must decline. If the default ever
+        flips, a user hitting Return loses their install."""
+        calls = self._harness(monkeypatch, "")
+        m.cmd_uninstall(None)
+        assert calls["rmtree"] == []
+        assert calls["stop"] == 0
+
+    def test_no_terminal_deletes_nothing(self, tmp_data_dir, monkeypatch):
+        """Piped stdin, CI, ssh with no tty. Nobody is there to consent, so
+        this must not proceed on their behalf."""
+        calls = self._harness(monkeypatch, EOFError)
+        m.cmd_uninstall(None)
+        assert calls["rmtree"] == []
+        assert calls["stop"] == 0
+
+    def test_yes_removes_data_and_stops_services(self, tmp_data_dir, monkeypatch):
+        calls = self._harness(monkeypatch, "y")
+        m.cmd_uninstall(None)
+        assert calls["stop"] == 1, "consented, but the services were left running"
+        assert "accelerator data" in calls["rmtree"]
+        assert calls["build_link"] == 1, "the /build link was left behind"
+
+    def test_a_brew_install_never_deletes_the_cellar_venv(
+        self, tmp_data_dir, tmp_path, monkeypatch
+    ):
+        """Homebrew owns that venv. Deleting it breaks the running python and
+        leaves the formula unusable until `brew reinstall`, so the guard is
+        load-bearing rather than tidiness.
+
+        Built on a real temp tree rather than by faking Path.exists, so the
+        venv genuinely exists and the assertion means something.
+        """
+        calls = self._harness(monkeypatch, "y")
+        self._fake_home(monkeypatch, tmp_path)
+        cellar = tmp_path / "Cellar" / "immich-accelerator" / "9.9.9" / "libexec"
+        pkg = cellar / "immich_accelerator"
+        pkg.mkdir(parents=True)
+        (cellar / "ml" / "venv").mkdir(parents=True)
+        monkeypatch.setattr(m, "__file__", str(pkg / "__main__.py"))
+
+        m.cmd_uninstall(None)
+        assert "ML venv" not in calls["rmtree"], (
+            "deleted Homebrew's own ML venv, which breaks the installed formula"
+        )
+        assert "accelerator data" in calls["rmtree"], (
+            "the brew guard also skipped the data directory it should remove"
+        )
+
+    def test_a_git_clone_does_delete_its_own_venv(
+        self, tmp_data_dir, tmp_path, monkeypatch
+    ):
+        """The other half: without the Cellar marker the venv is ours to
+        remove, so the guard above must be about brew and not about venvs."""
+        calls = self._harness(monkeypatch, "y")
+        self._fake_home(monkeypatch, tmp_path)
+        repo = tmp_path / "checkout"
+        pkg = repo / "immich_accelerator"
+        pkg.mkdir(parents=True)
+        (repo / "ml" / "venv").mkdir(parents=True)
+        monkeypatch.setattr(m, "__file__", str(pkg / "__main__.py"))
+
+        m.cmd_uninstall(None)
+        assert "ML venv" in calls["rmtree"]
+
+    def test_the_launchd_plist_is_unloaded_before_it_is_removed(
+        self, tmp_data_dir, tmp_path, monkeypatch
+    ):
+        """Unlinking a still-loaded plist leaves launchd supervising a job
+        whose definition is gone."""
+        calls = self._harness(monkeypatch, "y")
+        home = self._fake_home(monkeypatch, tmp_path)
+        plist = home / "Library" / "LaunchAgents" / "com.immich.accelerator.plist"
+        plist.write_text("<plist/>")
+
+        m.cmd_uninstall(None)
+        assert "launchctl" in calls["run"], "the plist was never unloaded"
+        unload = [existed for cmd, existed in calls["order"] if cmd == "launchctl"]
+        assert unload and all(unload), (
+            "launchctl ran after the plist was already deleted, which leaves "
+            "launchd supervising a job whose definition is gone"
+        )
+        assert not plist.exists(), "plist unloaded but left on disk"
+
+
+class TestInstallingSoftwareNeedsConsent:
+    """`_ensure_homebrew` fetches a remote script and pipes it into a shell,
+    and `_brew_install` installs packages. Neither had a test.
+
+    The property that matters is not that they work, it is that they do not
+    run without someone saying yes. An unattended `setup` that reaches the
+    Homebrew installer is remote code execution the user never approved.
+    """
+
+    @staticmethod
+    def _no_brew(monkeypatch):
+        monkeypatch.setattr(m.os.path, "isfile", lambda p: False)
+
+    @staticmethod
+    def _spy(monkeypatch):
+        ran = []
+
+        def fake_run(cmd, *a, **k):
+            ran.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(m.subprocess, "run", fake_run)
+        return ran
+
+    def test_existing_homebrew_is_used_without_prompting(self, monkeypatch):
+        monkeypatch.setattr(m.os.path, "isfile", lambda p: p == "/usr/local/bin/brew")
+        ran = self._spy(monkeypatch)
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda _p: pytest.fail("prompted when brew was already present"),
+        )
+        assert m._ensure_homebrew() == "/usr/local/bin/brew"
+        assert ran == []
+
+    def test_declining_does_not_install_homebrew(self, monkeypatch):
+        self._no_brew(monkeypatch)
+        ran = self._spy(monkeypatch)
+        monkeypatch.setattr("builtins.input", lambda _p: "n")
+        assert m._ensure_homebrew() is None
+        assert ran == [], "declined, but it ran the installer anyway"
+
+    def test_no_terminal_does_not_fetch_and_run_the_installer(self, monkeypatch):
+        """The one that matters most. With no tty there is nobody to consent,
+        so an unattended run must not fetch and execute a remote script."""
+        self._no_brew(monkeypatch)
+        ran = self._spy(monkeypatch)
+
+        def no_tty(_p):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", no_tty)
+        assert m._ensure_homebrew() is None
+        assert ran == [], "no terminal, but it fetched and ran the installer"
+
+    def test_consenting_runs_the_installer(self, monkeypatch):
+        self._no_brew(monkeypatch)
+        ran = self._spy(monkeypatch)
+        monkeypatch.setattr("builtins.input", lambda _p: "y")
+        m._ensure_homebrew()
+        flat = " ".join(" ".join(map(str, c)) for c in ran)
+        assert "install.sh" in flat, "consented, but nothing was installed"
+
+    def test_brew_install_declines_without_consent(self, monkeypatch):
+        monkeypatch.setattr(m, "_ensure_homebrew", lambda: "/usr/local/bin/brew")
+        ran = self._spy(monkeypatch)
+        for answer in ("n", "no"):
+            ran.clear()
+            monkeypatch.setattr("builtins.input", lambda _p, a=answer: a)
+            assert m._brew_install("vips") is False
+            assert ran == [], f"declined with {answer!r} but installed anyway"
+
+    def test_brew_install_never_runs_with_no_terminal(self, monkeypatch):
+        monkeypatch.setattr(m, "_ensure_homebrew", lambda: "/usr/local/bin/brew")
+        ran = self._spy(monkeypatch)
+
+        def no_tty(_p):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", no_tty)
+        assert m._brew_install("vips") is False
+        assert ran == []
+
+    def test_brew_install_does_nothing_when_there_is_no_brew(self, monkeypatch):
+        monkeypatch.setattr(m, "_ensure_homebrew", lambda: None)
+        ran = self._spy(monkeypatch)
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda _p: pytest.fail("prompted with no brew available"),
+        )
+        assert m._brew_install("vips") is False
+        assert ran == []

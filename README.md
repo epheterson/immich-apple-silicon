@@ -19,7 +19,7 @@ Docker handles the lightweight parts (API server, Postgres, Redis). The accelera
 
 ### Same machine
 
-Docker and the accelerator on one Mac — the default, and what [Quick start](#quick-start) below sets up.
+Docker and the accelerator on one Mac. This is the default, and what [Quick start](#quick-start) below sets up.
 
 ```
 Docker (lightweight)                Native macOS (compute)
@@ -55,7 +55,7 @@ Host A: Docker (NAS, etc.)          Host B: Mac (compute)
                                     +-------------------------------+
 ```
 
-**Extra requirement:** both hosts must see your library at the same absolute path via a shared filesystem (not pictured) — the worker reads and writes photos directly, no HTTP transport. That requirement comes from the **worker**, not from ML.
+**Extra requirement:** both hosts must see your library at the same absolute path via a shared filesystem (not pictured), because the worker reads and writes photos directly, no HTTP transport. That requirement comes from the **worker**, not from ML.
 
 ### ML-only: dedicate a spare Mac to ML compute
 
@@ -77,7 +77,7 @@ Docker, anywhere (unmodified)       Spare Mac (ML compute only)
                                     +---------------------------------+
 ```
 
-**No extra requirement.** The ML service never touches your library on disk — only the image bytes and text sent to it — so there's no shared filesystem to align. If your actual goal is "give my Immich instance more ML horsepower," this is almost always the mode you want, not the split above.
+**No extra requirement.** The ML service never touches your library on disk, only the image bytes and text sent to it, so there's no shared filesystem to align. If your actual goal is "give my Immich instance more ML horsepower," this is almost always the mode you want, not the split above.
 
 ## Requirements
 
@@ -105,7 +105,7 @@ For existing Immich installs, setup detects the running containers and configure
 
 For NAS + Mac setups, see [Split: worker + ML on a remote host](#split-worker--ml-on-a-remote-host) above. For `IMMICH_MEDIA_LOCATION` details and moving thumbnails/transcodes to faster storage, see [docs/usage.md#configuration-details](docs/usage.md#configuration-details).
 
-Run the accelerator as a background service rather than a bare `start` — see [docs/usage.md#running-as-a-service-recommended](docs/usage.md#running-as-a-service-recommended) for auto-restart, auto-update, and log rotation.
+Run the accelerator as a background service rather than a bare `start`. See [docs/usage.md#running-as-a-service-recommended](docs/usage.md#running-as-a-service-recommended) for auto-restart, auto-update, and log rotation.
 
 ## Documentation
 
@@ -117,7 +117,7 @@ Everything past the quick start lives in [`docs/`](docs/):
 | [docs/deployment.md](docs/deployment.md)               | Split deployment (worker + ML remote) and ML-only network nodes, in full detail                                                                         |
 | [docs/ml-engine.md](docs/ml-engine.md)                 | Native Swift vs. Python ML engine, model zoo, switching engines                                                                                         |
 | [docs/known-differences.md](docs/known-differences.md) | Where native output can differ from Docker, and why it usually doesn't matter                                                                           |
-| [docs/troubleshooting.md](docs/troubleshooting.md)     | Symptom → cause → fix for common setup and runtime issues                                                                                               |
+| [docs/troubleshooting.md](docs/troubleshooting.md)     | Symptom, cause and fix for common setup and runtime issues                                                                                               |
 | [docs/security.md](docs/security.md)                   | Safety guarantees and every network-facing surface                                                                                                      |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                     | Testing requirements and PR guidelines                                                                                                                  |
 
@@ -152,11 +152,11 @@ immich-apple-silicon/
 | Native ML service              | Native Swift engine (Python venv fallback)                                       | Stop the accelerator                                            | None |
 | `/build` symlink (Immich 2.7+) | `/etc/synthetic.d/immich-accelerator` (requires sudo once during setup)          | `immich-accelerator uninstall` removes it; reboot to deactivate | Low  |
 
-**Why `/build`?** Immich 2.7+ stores absolute plugin paths like `/build/corePlugin/dist/plugin.wasm` in its database. Both Docker and native workers need `/build` to resolve. macOS SIP prevents creating root-level directories, so we use Apple's [synthetic link](<https://man.cx/synthetic.conf(5)>) mechanism to map `/build` → `~/.immich-accelerator/build-data`. Setup prompts for sudo once; a reboot may be required to activate.
+**Why `/build`?** Immich 2.7+ stores absolute plugin paths like `/build/corePlugin/dist/plugin.wasm` in its database. Both Docker and native workers need `/build` to resolve. macOS SIP prevents creating root-level directories, so we use Apple's [synthetic link](<https://man.cx/synthetic.conf(5)>) mechanism to map `/build` to `~/.immich-accelerator/build-data`. Setup prompts for sudo once; a reboot may be required to activate.
 
 **To fully revert:** Stop the accelerator, remove the env vars and port mappings from docker-compose, `docker compose up -d`. Immich is back to stock.
 
-The native worker runs Immich's own code with the same UPSERT-safe writes, and the extracted server always matches the Docker image version exactly — see [docs/security.md](docs/security.md) for the full safety and network-surface rundown.
+The native worker runs Immich's own code with the same UPSERT-safe writes, and the extracted server always matches the Docker image version exactly. See [docs/security.md](docs/security.md) for the full safety and network-surface rundown.
 
 ## On agentic engineering
 

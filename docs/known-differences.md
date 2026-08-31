@@ -1,6 +1,6 @@
 # Known differences from Docker
 
-The native worker runs Immich's unmodified code. The ffmpeg and image processing toolchain match Docker. The only differences are in the ML service, which uses Apple-native frameworks instead of ONNX Runtime.
+The native worker runs Immich's unmodified code, against the same jellyfin-ffmpeg binary and the same libvips Docker uses. Most of the differences are in the ML service, which uses Apple-native frameworks instead of ONNX Runtime. The rest are the three places where hardware acceleration changes the bytes: VideoToolbox video encoding, 10-bit hardware decode, and AudioToolbox audio. All of them are in the table below.
 
 | Area | Docker | Native (Accelerator) | Impact |
 |------|--------|---------------------|--------|
@@ -26,5 +26,5 @@ An install that existed before this setting is left exactly as it was.
 - **HEIC photos**: Thumbnails generate correctly. The default iPhone format (HEVC-coded HEIC, often tiled) is decoded by the Homebrew `vips` (libvips + libde265, a formula dependency) since Sharp's bundled libheif is AVIF-only. This works with no logged-in GUI session (a headless Mac Mini), and output matches Docker. Apple ImageIO (`sips`) remains a fallback but needs a GUI session, so it isn't relied on.
 - **Camera RAW photos** (Canon CR2/CR3, Nikon NEF, Sony ARW, Adobe DNG, and other RAW formats): Thumbnails generate correctly. Sharp's bundled libvips on macOS can't decode these (no old-style-JPEG support, no dcraw/libraw), so they're pre-decoded by the Homebrew `vips` (fuller libtiff/libjpeg plus libraw), the same libvips Docker uses. Works headless.
 - **CLIP search**: Search results are equivalent but not identical. A search that returns 20 results in Docker will return ~18-20 of the same results natively, possibly in slightly different order.
-- **Face grouping**: Faces are detected and grouped correctly. The grouping boundaries may differ slightly (e.g., a borderline face might be grouped differently).
+- **Face grouping**: On the 24-image test set, Vision finds 23 of the 48 faces Immich's own detector finds, and none smaller than 20px. The faces it does find cluster normally and existing clusters stay valid, but a small or side-on face that Docker would have caught may never appear at all.
 - **OCR**: Text extraction is at least as good as Docker for English/Latin text.

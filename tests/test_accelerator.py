@@ -947,6 +947,72 @@ class TestCmdStatus:
             cmd_status(None)  # Should not raise
 
 
+class TestStatusNamesTheEngineThatIsActuallyRunning:
+    """`status` used to say "ML service: running" for either engine.
+
+    A user whose native engine lost a bind race is served by the slow venv
+    from then on. The one warning scrolls past at start time, so the only
+    standing report of the fact is this line, and it did not carry it.
+    """
+
+    def _status(self, caplog, comm, config_engine="native", has_config=True):
+        import logging
+
+        from immich_accelerator.__main__ import cmd_status
+
+        cfg = {"version": "1.0", "ml_engine": config_engine} if has_config else {}
+        with patch(
+            "immich_accelerator.__main__.read_pid",
+            side_effect=lambda n: 1234 if n == "worker" else 5678,
+        ), patch("immich_accelerator.__main__.load_config", return_value=cfg), patch(
+            # cmd_status only calls load_config when the file is there, so
+            # without this the patch above never runs and config is {}.
+            "immich_accelerator.__main__.CONFIG_FILE"
+        ), patch(
+            "immich_accelerator.__main__._output", return_value=comm
+        ), patch(
+            "immich_accelerator.__main__.brew_refuses_our_tap", return_value=False
+        ), caplog.at_level(
+            logging.INFO, logger="accelerator"
+        ):
+            cmd_status(None)
+        return "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_native_is_named(self, tmp_data_dir, caplog):
+        text = self._status(
+            caplog, "/opt/homebrew/opt/x/libexec/native-ml/immich-ml-native"
+        )
+        assert "native engine" in text
+        assert "fallback engine" not in text
+
+    def test_the_fallback_says_so_every_time_status_runs(self, tmp_data_dir, caplog):
+        text = self._status(caplog, "/opt/homebrew/opt/x/libexec/ml/venv/bin/python3")
+        assert "Python venv engine" in text
+        # The point of the whole change: not just named, but flagged as wrong.
+        assert "fallback engine, not the native one" in text
+
+    def test_no_complaint_when_the_venv_is_what_was_asked_for(
+        self, tmp_data_dir, caplog
+    ):
+        """Choosing the Python engine deliberately is not a degraded state."""
+        text = self._status(caplog, "/usr/bin/python3", config_engine="python")
+        assert "Python venv engine" in text
+        assert "fallback engine, not the native one" not in text
+
+    def test_an_unconfigured_box_is_not_told_it_chose_native(
+        self, tmp_data_dir, caplog
+    ):
+        """With no config there is no preference to have been departed from."""
+        text = self._status(caplog, "/usr/bin/python3", has_config=False)
+        assert "fallback engine, not the native one" not in text
+
+    def test_a_dead_ps_does_not_invent_an_engine(self, tmp_data_dir, caplog):
+        """ps can fail. Better to say nothing than to name the wrong engine."""
+        text = self._status(caplog, None)
+        assert "ML service:" in text
+        assert "engine" not in text
+
+
 # ---------------------------------------------------------------------------
 # start_service
 # ---------------------------------------------------------------------------
@@ -3933,4 +3999,262 @@ class TestUpgradingDoesNotFireTheLocaleBugItFixes:
         assert pid_file.exists(), (
             "deleted the pidfile of a healthy service on upgrade, which is the "
             "bug the locale fix exists to prevent"
+        )
+
+
+class TestRunHelpers:
+    """`_output` and `_ok` replace a shape repeated dozens of times: run,
+    catch OSError and TimeoutExpired, check returncode, use stdout. They are
+    load-bearing for most external commands this tool runs, so the contract
+    is pinned here rather than trusted.
+    """
+
+    def test_output_returns_stdout_when_the_command_succeeds(self):
+        import immich_accelerator.__main__ as m
+
+        assert m._output(["/bin/echo", "hello"]) == "hello\n"
+
+    def test_output_tells_no_output_apart_from_no_answer(self):
+        """The reason it returns None rather than "".
+
+        A command that succeeds and prints nothing returns "", which is a real
+        answer. A command that could not run has no answer at all. Collapsing
+        the two is how "we could not ask" starts reading as "the answer is
+        nothing", which is the shape of several bugs this project has shipped.
+        """
+        import immich_accelerator.__main__ as m
+
+        assert m._output(["/usr/bin/true"]) == ""
+        assert m._output(["/usr/bin/false"]) is None
+        assert m._output(["/nonexistent/binary"]) is None
+
+    def test_output_is_none_when_the_command_times_out(self):
+        import immich_accelerator.__main__ as m
+
+        assert m._output(["/bin/sleep", "5"], timeout=0.2) is None
+
+    def test_ok_reports_whether_it_worked(self):
+        import immich_accelerator.__main__ as m
+
+        assert m._ok(["/usr/bin/true"]) is True
+        assert m._ok(["/usr/bin/false"]) is False
+        assert m._ok(["/nonexistent/binary"]) is False
+        assert m._ok(["/bin/sleep", "5"], timeout=0.2) is False
+
+    def test_input_actually_reaches_the_command(self):
+        """The gap this closes: dropping the input= payload passed every other
+        test here. It is not cosmetic. `_ok(["sudo", "tee", SYNTHETIC_CONF],
+        input=entry)` is how the /build link is written, so silently sending
+        nothing makes tee truncate that file to empty and report success. The
+        suite stayed green through exactly that mutation.
+        """
+        import immich_accelerator.__main__ as m
+
+        assert m._output(["/bin/cat"], input="payload") == "payload"
+        # and through _ok, which is the shape the sudo-tee call sites use
+        assert m._ok(["/bin/sh", "-c", 'test "$(cat)" = "payload"'], input="payload")
+        assert not m._ok(["/bin/sh", "-c", 'test "$(cat)" = "payload"'], input="wrong")
+
+    def test_neither_helper_can_run_without_a_timeout(self):
+        """The property that matters: nothing this tool spawns can hang the
+        tool forever. Asserted on the call actually handed to subprocess.run,
+        so a default that stops being passed through is caught."""
+        import immich_accelerator.__main__ as m
+
+        seen = []
+
+        def fake_run(*a, **kw):
+            seen.append(kw.get("timeout"))
+            return subprocess.CompletedProcess(a[0], 0, "", "")
+
+        with patch.object(m.subprocess, "run", fake_run):
+            m._output(["x"])
+            m._ok(["x"])
+            m._output(["x"], timeout=7)
+        assert seen == [m.DEFAULT_TIMEOUT, m.DEFAULT_TIMEOUT, 7], seen
+        assert all(t is not None for t in seen)
+
+    def test_output_does_not_swallow_a_command_that_prints_to_stderr_and_wins(self):
+        """Noise on stderr is not failure. Only the exit status decides."""
+        import immich_accelerator.__main__ as m
+
+        assert m._output(["/bin/sh", "-c", "echo oops >&2; echo fine"]) == "fine\n"
+
+
+class TestNodeShimPreload:
+    """Four shims are preloaded into the worker via NODE_OPTIONS.
+
+    The quoting rule and its empirical Node tokenizer table live in
+    _preload_node_shim's docstring; the v1.4.2 regression it caused is
+    guarded by test_cmd_start_node_options_string_is_well_formed in
+    test_fresh_install.py. These cover the wiring around it.
+    """
+
+    def test_each_shim_appends_rather_than_replacing(self, tmp_path, monkeypatch):
+        """Four of these run in a row. If one overwrote instead of appending,
+        only the last shim would load and the other three would silently do
+        nothing at all."""
+        import immich_accelerator.__main__ as m
+
+        hooks = tmp_path / "hooks"
+        hooks.mkdir()
+        for name in ("a.js", "b.js"):
+            (hooks / name).write_text("//")
+        monkeypatch.setattr(m, "__file__", str(tmp_path / "x.py"))
+
+        env = {"NODE_OPTIONS": "--max-old-space-size=4096"}
+        m._preload_node_shim(env, "a.js")
+        m._preload_node_shim(env, "b.js")
+        assert env["NODE_OPTIONS"].count("--require") == 2
+        assert env["NODE_OPTIONS"].startswith("--max-old-space-size=4096 ")
+
+    def test_a_missing_shim_is_skipped_not_fatal(self, tmp_path, monkeypatch):
+        """A partial install should start a worker without the extra
+        behaviour rather than refuse to start."""
+        import immich_accelerator.__main__ as m
+
+        (tmp_path / "hooks").mkdir()
+        monkeypatch.setattr(m, "__file__", str(tmp_path / "x.py"))
+        env: dict[str, str] = {}
+        m._preload_node_shim(env, "not_installed.js")
+        assert env == {}
+
+    def test_every_shim_on_disk_is_actually_preloaded(self):
+        """The drift this collapse exists to stop: a fifth shim added to the
+        hooks directory and never wired in reads as shipped but never loads."""
+        import immich_accelerator.__main__ as m
+
+        hooks = Path(m.__file__).parent / "hooks"
+        on_disk = {p.name for p in hooks.glob("*_shim.js")}
+        src = Path(m.__file__).read_text()
+        wired = {
+            name for name in on_disk if f'_preload_node_shim(worker_env, "{name}")' in src
+        }
+        assert (
+            on_disk == wired
+        ), f"present but never preloaded: {sorted(on_disk - wired)}"
+
+
+class TestAskingTheUser:
+    """Setup asks sixteen questions across a dozen functions and every one has
+    to cope with there being no terminal: piped stdin, CI, ssh without a tty.
+    Fifteen sites handled that by hand and the sixteenth did not, so this is
+    the behaviour rather than the copies that gets pinned.
+    """
+
+    def test_ask_falls_back_to_the_default_with_no_terminal(self):
+        import immich_accelerator.__main__ as m
+
+        def no_tty(_prompt):
+            raise EOFError("EOF when reading a line")
+
+        with patch("builtins.input", no_tty):
+            assert m._ask("host? ", "localhost") == "localhost"
+            assert m._ask("nothing? ") == ""
+
+    def test_ask_returns_the_default_for_a_bare_enter(self):
+        import immich_accelerator.__main__ as m
+
+        with patch("builtins.input", lambda _p: "   "):
+            assert m._ask("host? ", "localhost") == "localhost"
+        with patch("builtins.input", lambda _p: " nas.local "):
+            assert m._ask("host? ", "localhost") == "nas.local"
+
+    def test_setup_remote_no_longer_dies_on_a_closed_stdin(self):
+        """The bug this replaces. `setup --url ...` from a script reached a
+        bare input() inside _setup_remote's own prompt helper and exited with
+        an EOFError traceback instead of taking the default it had printed."""
+        import immich_accelerator.__main__ as m
+
+        src = Path(m.__file__).read_text()
+        start = src.index("def _setup_remote(")
+        body = src[start : src.index("\ndef ", start + 1)]
+        nested = body[body.index("def prompt(") :]
+        nested = nested[: nested.index("\n\n")]
+        assert "_ask(" in nested and "input(" not in nested, (
+            "_setup_remote's prompt helper calls input() directly again, so a "
+            "non-interactive run crashes instead of taking the printed default"
+        )
+
+    def test_no_prompt_anywhere_calls_input_unguarded(self):
+        """The drift check. Any new bare input() outside _ask reintroduces
+        exactly the crash that was invisible for as long as it shipped."""
+        import ast
+        import immich_accelerator.__main__ as m
+
+        tree = ast.parse(Path(m.__file__).read_text())
+        owner = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for line in range(fn.lineno, (fn.end_lineno or fn.lineno) + 1):
+                    owner.setdefault(line, fn.name)
+
+        offenders = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "input"):
+                fn = owner.get(node.lineno, "<module>")
+                if fn == "_ask":
+                    continue
+                src_line = Path(m.__file__).read_text().splitlines()[node.lineno - 1]
+                guarded_nearby = "EOFError" in "\n".join(
+                    Path(m.__file__).read_text().splitlines()[
+                        node.lineno - 1 : node.lineno + 12
+                    ]
+                )
+                if not guarded_nearby:
+                    offenders.append(f"{fn} (line {node.lineno}): {src_line.strip()[:60]}")
+        assert not offenders, "unguarded input():\n  " + "\n  ".join(offenders)
+
+
+class TestNobodyAtTheKeyboardIsNotConsent:
+    """Setup asks before installing Homebrew, reconfiguring Docker or deleting
+    an install. Ten of those twelve prompts deliberately treat "no terminal"
+    differently from "pressed Enter": Enter takes the default, while a run
+    with nobody watching declines, and one raises outright.
+
+    That distinction is easy to mistake for inconsistency and collapse into a
+    single _confirm(default=True) helper. Doing so would make an unattended
+    `setup` silently agree to install software on the machine. This pins the
+    property so the tidying is not attempted twice.
+    """
+
+    def test_no_consent_prompt_treats_eof_as_yes(self):
+        import ast
+        import re
+
+        import immich_accelerator.__main__ as m
+
+        src = Path(m.__file__).read_text()
+        lines = src.splitlines()
+        tree = ast.parse(src)
+        owner = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for line in range(fn.lineno, (fn.end_lineno or fn.lineno) + 1):
+                    owner.setdefault(line, fn.name)
+
+        offenders = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "input"):
+                continue
+            if owner.get(node.lineno) == "_ask":
+                continue
+            block = "\n".join(lines[node.lineno - 4 : node.lineno + 18])
+            if "[Y/n]" not in block and "[y/N]" not in block:
+                continue  # a value prompt, not a consent prompt
+            handler = re.search(r"except EOFError:\s*\n\s*(.+)", block)
+            assert handler, (
+                f"{owner.get(node.lineno)} asks for consent without handling EOF; "
+                f"an unattended run will crash"
+            )
+            action = handler.group(1).strip()
+            said_yes = 'answer = "y"' in action or "answer = 'y'" in action
+            if said_yes:
+                offenders.append(f"{owner.get(node.lineno)} (line {node.lineno})")
+
+        assert not offenders, (
+            "these prompts treat an absent user as agreement, so an unattended "
+            "setup would proceed with something nobody approved: " + ", ".join(offenders)
         )
