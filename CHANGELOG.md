@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.0 - 2026-08-31
+
+### Changed
+- **Smart search is faster on the SigLIP models.** The engine that serves SigLIP and SigLIP2 ran one image per forward pass, so a bulk smart-search job paid the per-call dispatch cost on every photo. Images arriving at the same time are now gathered into a single pass, which is where the speed-up comes from: the contributor measured 3 to 4 times the throughput on a bulk job. Models that run on the MLX path, including the default, are unaffected because they were never on this path. By [@yppy](https://github.com/yppy) ([immich-ml-metal#7](https://github.com/epheterson/immich-ml-metal/pull/7)).
+
 ## 1.16.1 - 2026-08-26
 
 ### Fixed
