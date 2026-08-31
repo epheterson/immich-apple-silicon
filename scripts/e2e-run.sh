@@ -90,13 +90,13 @@ fi
 #   scripts/e2e-run.sh             # fast, ~90s, can repeat
 #   scripts/e2e-stack.sh down     # when you're done
 #
-# If the stack isn't up, refuse to run. We will NOT fall back to
-# prod Immich — that's the whole point of this refactor.
+# If the stack isn't up, refuse to run. Falling back to a real Immich
+# would write test assets into a live library, so there is no fallback.
 if ! curl -sf http://127.0.0.1:22283/api/server/ping >/dev/null 2>&1; then
     log "Isolated e2e stack not reachable at 127.0.0.1:22283."
     log "Bring it up first with: scripts/e2e-stack.sh up"
-    log "(Refusing to fall back to prod Immich — that caused the "
-    log " /tmp/e2e-upload DB pollution incident on 2026-04-15.)"
+    log "(There is deliberately no fallback to a real Immich: these tests"
+    log " upload assets, and a live library is not a test fixture.)"
     exit 1
 fi
 if [ ! -s /tmp/immich-e2e-stack/api-key ]; then

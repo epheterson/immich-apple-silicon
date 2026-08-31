@@ -2,10 +2,11 @@
 
 ## Why this exists
 
-Two production bugs (#17, #18) shipped in v1.4.0 because every pre-release
-check was run on the maintainer's machine, which had globally-installed
-Python packages and leftover state that masked both regressions. The
-reporter hit both within 14 minutes of first trying a fresh install.
+A development machine is not a clean machine. Globally-installed Python
+packages and state left behind by earlier runs both satisfy install-time
+checks that a fresh Mac would fail, which is how #17 and #18 reached
+v1.4.0: they were unreproducible anywhere except a machine that had never
+run the accelerator before.
 
 The unit tests in `tests/test_fresh_install.py` close the specific holes,
 and the `fresh-install-macos` CI job runs them on clean GitHub runners.

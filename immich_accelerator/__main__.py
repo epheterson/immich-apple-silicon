@@ -4652,7 +4652,7 @@ def _native_ml_spec(config: dict, env: dict):
     env["ML_CLIP_DIR"] = str(clip_dir)
     env["ML_ARCFACE"] = str(arcface)
     ml_port = int(config.get("ml_port", 3003))
-    return [str(bundle / "immich-ml-native"), "serve", str(ml_port)], str(bundle), env
+    return [str(bundle / NATIVE_EXE), "serve", str(ml_port)], str(bundle), env
 
 
 def _maybe_fetch_native_models(config: dict) -> None:
@@ -4911,7 +4911,7 @@ def _start_ml_service(config: dict):
 
 # Our two ML engines, as they appear in `ps`. Anything else listening on the
 # port belongs to somebody else (usually Docker's immich-machine-learning).
-_ML_CMD_RE = re.compile(r"immich-ml-native\s+serve|python[^\s]*\s+-m\s+src\.main")
+_ML_CMD_RE = re.compile(rf"{NATIVE_EXE}\s+serve|python[^\s]*\s+-m\s+src\.main")
 
 
 def _our_ml_process(port: int) -> int | None:
@@ -4939,7 +4939,7 @@ def _our_ml_process(port: int) -> int | None:
     # port. The preflight gate runs one on another port on this same Mac, and
     # Docker's own ML container is a real holder of 3003, so the combination
     # adopted the wrong process and would later have signalled it.
-    native = re.compile(rf"immich-ml-native\s+serve\s+{int(port)}(\s|$)")
+    native = re.compile(rf"{NATIVE_EXE}\s+serve\s+{int(port)}(\s|$)")
     venv = re.compile(r"python[^\s]*\s+-m\s+src\.main")
     for line in out.splitlines():
         pid, _, cmd = line.strip().partition(" ")
