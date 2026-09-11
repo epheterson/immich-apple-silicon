@@ -1380,6 +1380,36 @@ class TestADeadMountCannotWedgeTheWatcher:
         assert self._recipe_counting_forks(self.LOCAL_LIB, table, calls) is None
         assert calls == []
 
+    def test_a_dead_mount_is_retried_rather_than_remembered_as_hopeless(self):
+        """The regression the cache could have introduced, and the one that
+        matters most here.
+
+        A mount whose server has gone away hangs the resolver, which times out
+        and returns None. That mount is still listed in the table the whole
+        time, so the table never changes. Caching the failure would answer
+        "cannot resolve" for the rest of the process: the watcher would stop
+        looking, and would never remount the share when the server came back,
+        at exactly the moment noticing is its entire job.
+        """
+        m._RESOLVED_FOR_TABLE = None
+        table = self._mounts("nas:/vol on /nas (nfs)")
+        attempts = []
+
+        def resolver(path, timeout=5):
+            attempts.append(path)
+            # Dead for the first two cycles, then the server comes back.
+            return None if len(attempts) <= 2 else "/nas/immich"
+
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(stdout=table, returncode=0)
+        ), patch.object(m, "_resolve_offthread", side_effect=resolver):
+            assert m.mount_recipe_for("/link/to/immich") is None
+            assert m.mount_recipe_for("/link/to/immich") is None
+            r = m.mount_recipe_for("/link/to/immich")
+
+        assert len(attempts) == 3, "a failed resolve must be retried, not cached"
+        assert r and r["mountpoint"] == "/nas", "recovery must be noticed"
+
     def test_caching_did_not_break_finding_a_real_mount(self):
         """A path that does resolve onto a network mount still matches, and the
         cached answer keeps matching on later cycles."""
