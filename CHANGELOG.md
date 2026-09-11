@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.1 - 2026-09-11
+
+### Fixed
+- **The watcher started a throwaway process every 30 seconds on most Macs.** Working out which mount holds your library sometimes needs the path resolved, and that has to happen in a child process because resolving a path on a mount whose server has gone away never returns. A check existed to skip that work when no network mount could plausibly be the answer, but it asked whether the Mac had any network mount at all rather than whether one could cover your library. Anything that mounts a share in the background satisfies it forever: OrbStack keeps one permanently, as does a Time Machine destination or any connected NAS. A library on a local disk therefore paid for a resolution that was thrown away, about 119 times an hour, indefinitely. The answer is now remembered until the set of mounts changes, which is the only thing that can change it. Measured on an M4 with an OrbStack mount present: ten cycles, ten processes before, one after. Reported by [@beachmeat](https://github.com/beachmeat) ([#176](https://github.com/epheterson/immich-apple-silicon/issues/176)).
+
 ## 1.17.0 - 2026-08-31
 
 ### Changed

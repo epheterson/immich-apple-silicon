@@ -2417,8 +2417,36 @@ def mount_recipe_for(root: str) -> dict | None:
         for line in out.splitlines()
     ):
         return None
-    resolved = _resolve_offthread(root)
+    resolved = _resolve_for_mount_table(root, out)
     return _best_mount_for(resolved, out) if resolved and resolved != root else None
+
+
+# One entry, keyed on the mount table the answer was computed against.
+#
+# The guard above only skips the fork when the table holds no remountable mount
+# at all. One unrelated mount defeats it forever: an OrbStack install has a
+# permanent NFS mount at ~/OrbStack, so a library on a local disk matched no
+# mount, satisfied the guard anyway, and forked a resolver every 30s cycle for
+# an answer that was then discarded. Measured by the reporter at 119 spawns an
+# hour, indefinitely (#176).
+#
+# Keyed on the table rather than time because the table is exactly what can
+# change the answer: a path resolves onto a network mount only once that mount
+# exists. So this re-resolves promptly when it could matter and never otherwise.
+_RESOLVED_FOR_TABLE: tuple[tuple[str, str], str | None] | None = None
+
+
+def _resolve_for_mount_table(root: str, out: str) -> str | None:
+    """_resolve_offthread(root), reused while the mount table is unchanged."""
+    global _RESOLVED_FOR_TABLE
+    key = (root, out)
+    if _RESOLVED_FOR_TABLE is not None and _RESOLVED_FOR_TABLE[0] == key:
+        return _RESOLVED_FOR_TABLE[1]
+    resolved = _resolve_offthread(root)
+    # None is cached too: "this path resolves to nothing useful" is an answer,
+    # and re-forking to learn it again every cycle is the reported bug.
+    _RESOLVED_FOR_TABLE = (key, resolved)
+    return resolved
 
 
 def _resolve_offthread(path: str, timeout: int = 5) -> str | None:

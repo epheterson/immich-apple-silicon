@@ -1321,6 +1321,79 @@ class TestADeadMountCannotWedgeTheWatcher:
         ):
             assert m._resolve_offthread("/nas/immich") is None
 
+    # --- #176: one unrelated network mount made this fork every cycle ---
+
+    @staticmethod
+    def _mounts(*lines):
+        return "".join(l + "\n" for l in lines)
+
+    def _recipe_counting_forks(self, root, table, calls):
+        """mount_recipe_for(root) against `table`, counting resolver forks."""
+        def fake_resolve(path, timeout=5):
+            calls.append(path)
+            return path  # resolves to itself: matches no mount, as in #176
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(stdout=table, returncode=0)
+        ), patch.object(m, "_resolve_offthread", side_effect=fake_resolve):
+            return m.mount_recipe_for(root)
+
+    ORBSTACK = "OrbStack:/OrbStack on /Users/x/OrbStack (nfs, nodev)"
+    LOCAL_LIB = "/Volumes/MacMini2TB/immich-data"
+
+    def test_an_unrelated_nfs_mount_does_not_fork_a_resolver_every_cycle(self):
+        """The reported bug. OrbStack's NFS mount satisfies the guard forever,
+        while nothing in the table ever covers a library on a local disk."""
+        m._RESOLVED_FOR_TABLE = None
+        table = self._mounts(self.ORBSTACK, "/dev/disk7s1 on /Volumes/MacMini2TB (apfs, local)")
+        calls = []
+        for _cycle in range(10):
+            assert self._recipe_counting_forks(self.LOCAL_LIB, table, calls) is None
+        assert len(calls) == 1, (
+            f"forked {len(calls)} resolvers across 10 cycles; the whole point "
+            f"is that the answer cannot change while the mount table has not"
+        )
+
+    def test_a_new_mount_is_noticed_immediately(self):
+        """The cache must not outlive the thing it is keyed on: plugging in the
+        NAS is exactly when the answer changes."""
+        m._RESOLVED_FOR_TABLE = None
+        calls = []
+        before = self._mounts(self.ORBSTACK)
+        self._recipe_counting_forks(self.LOCAL_LIB, before, calls)
+        after = self._mounts(self.ORBSTACK, "nas:/vol on /nas (nfs)")
+        self._recipe_counting_forks(self.LOCAL_LIB, after, calls)
+        assert len(calls) == 2, "a changed mount table must re-resolve"
+
+    def test_a_different_library_is_not_served_the_cached_answer(self):
+        m._RESOLVED_FOR_TABLE = None
+        calls = []
+        table = self._mounts(self.ORBSTACK)
+        self._recipe_counting_forks("/Volumes/A/lib", table, calls)
+        self._recipe_counting_forks("/Volumes/B/lib", table, calls)
+        assert calls == ["/Volumes/A/lib", "/Volumes/B/lib"]
+
+    def test_the_guard_still_skips_the_fork_with_no_network_mount_at_all(self):
+        """Most installs. They should not fork even once."""
+        m._RESOLVED_FOR_TABLE = None
+        calls = []
+        table = self._mounts("/dev/disk1s1 on / (apfs, local)")
+        assert self._recipe_counting_forks(self.LOCAL_LIB, table, calls) is None
+        assert calls == []
+
+    def test_caching_did_not_break_finding_a_real_mount(self):
+        """A path that does resolve onto a network mount still matches, and the
+        cached answer keeps matching on later cycles."""
+        m._RESOLVED_FOR_TABLE = None
+        table = self._mounts("nas:/vol on /nas (nfs)")
+        def fake_resolve(path, timeout=5):
+            return "/nas/immich"
+        with patch.object(
+            m.subprocess, "run", return_value=MagicMock(stdout=table, returncode=0)
+        ), patch.object(m, "_resolve_offthread", side_effect=fake_resolve):
+            for _ in range(3):
+                r = m.mount_recipe_for("/link/to/immich")
+                assert r and r["mountpoint"] == "/nas"
+
 
 class TestTheWorkerWaitsWhenItsDatabaseIsGone:
     """On a split install Postgres and Redis live on the same box as the
