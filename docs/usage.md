@@ -57,9 +57,11 @@ Either way the service uses `watch` mode with `KeepAlive`. Confirm everything is
 
 The accelerator handles Immich updates automatically:
 
-- **On every `start`:** checks the Docker container version, re-extracts if it changed
+- **On every `start`:** an all-in-one install checks the version of the container on this Mac and re-extracts if it changed. A split install does not check here; its version check is the watcher's, below.
 - **In `watch` mode:** checks every 5 minutes. If Watchtower or a manual `docker compose pull` updates Immich, the watchdog stops the worker, re-extracts the new server, and restarts. No manual intervention needed.
 - **Manual:** `immich-accelerator update` if you prefer to control the timing
+
+A [split install](deployment.md) takes the version from the Immich you configured with `setup --url`, never from a container on the Mac, and so needs an `api_key` in its config for any of this to run.
 
 To update the accelerator itself:
 

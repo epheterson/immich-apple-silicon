@@ -728,6 +728,25 @@ def is_valid_version(version: str) -> bool:
     return bool(re.match(r"^v?\d+\.\d+\.\d+", version))
 
 
+def _is_rollback(cached: str, running: str) -> bool:
+    """True when `running` is an older release than `cached`.
+
+    Only used to log a distinct line. The worker runs Immich's own code against
+    Immich's own database, so it has to match whatever the configured instance
+    runs in either direction; a rollback is followed, not refused. Versions that
+    do not parse are not reported as a rollback.
+    """
+
+    def parts(version: str) -> tuple[int, ...]:
+        try:
+            return tuple(int(p) for p in version.lstrip("v").split(".")[:3])
+        except ValueError:
+            return ()
+
+    old, new = parts(cached), parts(running)
+    return bool(old) and bool(new) and new < old
+
+
 # --- Docker detection ---
 
 
@@ -3689,6 +3708,7 @@ def _warn_on_path_mismatch(immich_url: str, api_key: str, upload_mount: str) -> 
 
 def _query_immich_api(base_url: str, api_key: str) -> dict:
     """Query Immich API for server info. Returns version and config."""
+    import http.client
     import urllib.request, urllib.error
 
     headers = {"x-api-key": api_key} if api_key else {}
@@ -3699,10 +3719,74 @@ def _query_immich_api(base_url: str, api_key: str) -> dict:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
             version = f"{data['major']}.{data['minor']}.{data['patch']}"
-    except (urllib.error.URLError, KeyError) as e:
+    # URLError only covers the connect; a read that times out raises
+    # TimeoutError and a truncated one IncompleteRead, and a proxy's HTML
+    # error page raises JSONDecodeError. Every caller catches RuntimeError
+    # only, and the watcher calls this every five minutes on a split install,
+    # so anything narrower takes the whole watch loop down with it.
+    except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
         raise RuntimeError(f"Could not reach Immich at {base_url}: {e}")
 
     return {"version": version, "url": base_url}
+
+
+def _authoritative_version(config: dict) -> str:
+    """The Immich version this install has to match, read from the right place.
+
+    immich_url is what marks an install as split (#139): the Immich it names is
+    authoritative, and a container on this Mac is a different server that must
+    not describe this one. Only a local install may read the version out of
+    Docker. Raises RuntimeError when the authoritative source cannot answer,
+    which every caller treats as "leave the version alone for now".
+    """
+    if config.get("immich_url"):
+        api_key = config.get("api_key")
+        if not api_key:
+            raise RuntimeError("immich_url is set but api_key is missing")
+        info = _query_immich_api(config["immich_url"], api_key)
+        return info["version"].lstrip("v")
+    return detect_immich(_find_running_docker())["version"].lstrip("v")
+
+
+def _server_build_for(version: str) -> Path:
+    """Build directory for `version`, from local Docker when it holds it.
+
+    Copying from a container is worth a ~0.5GB download, but extract_immich_server
+    names its output after the version passed in rather than the version inside
+    the container, so an unrelated Immich on this Mac silently produces
+    mislabelled files (3.1.0 server code sitting in server/3.2.2). Check the
+    container's own version first and fall back to the registry, which needs no
+    Docker at all.
+    """
+    import http.client
+
+    try:
+        docker = _find_running_docker()
+        immich = detect_immich(docker)
+        if immich["version"].lstrip("v") != version.lstrip("v"):
+            raise RuntimeError(
+                f"local Immich container is {immich['version']}, need {version}"
+            )
+        return extract_immich_server(docker, immich["container"], version)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        # Extraction fails in more ways than RuntimeError: it makes directories,
+        # clears stale ones and shells out, so a hung `docker cp` raises
+        # TimeoutExpired and a full disk OSError. Those used to escape the
+        # registry fallback as well as the caller.
+        log.info("Downloading server %s from ghcr.io (%s)", version, e)
+        try:
+            return download_immich_server(version)
+        except (
+            OSError,
+            ValueError,
+            subprocess.SubprocessError,
+            http.client.HTTPException,
+        ) as err:
+            # ghcr.io reaches urllib directly in there. Both callers stop the
+            # services before calling this and catch RuntimeError only, so a
+            # registry hiccup would otherwise take the watcher down with the
+            # worker off and the new version unsaved.
+            raise RuntimeError(f"Could not download server {version}: {err}") from err
 
 
 def _immich_clip_model(config: dict) -> str | None:
@@ -6167,38 +6251,51 @@ def cmd_logs(args):
 
 def cmd_update(_args):
     config = load_config()
-    docker = _find_running_docker()
-    immich = detect_immich(docker)
-
     current = config.get("version", "?")
-    running = immich["version"]
+    running = _authoritative_version(config)
 
     if not is_valid_version(running):
         raise RuntimeError(f"Could not detect Immich version (got '{running}')")
 
-    if current.lstrip("v") == running.lstrip("v"):
+    if current.lstrip("v") == running:
         log.info("Already up to date: %s", current)
         return
 
-    log.info("Update available: %s -> %s", current, running)
+    if _is_rollback(current, running):
+        log.warning("Immich rolled back: %s -> %s. Matching it.", current, running)
+    else:
+        log.info("Update available: %s -> %s", current, running)
+
+    # Connection details are refreshed from the local stack only on a local
+    # install. A split install got them from setup, and a container on this Mac
+    # is a different server whose credentials must not be copied in (#139).
+    # Read before anything is stopped: a daemon that goes away mid-update would
+    # otherwise raise past save_config, leaving the services down and the
+    # freshly extracted server unrecorded.
+    immich = None
+    if not config.get("immich_url"):
+        immich = detect_immich(_find_running_docker())
+
     log.info("Stopping services for update...")
     cmd_stop(None)
 
-    server_dir = extract_immich_server(docker, immich["container"], running)
+    server_dir = _server_build_for(running)
 
-    updates = {
-        "version": running,
-        "server_dir": str(server_dir),
-        "db_password": immich["db_password"],
-        "db_username": immich["db_username"],
-        "db_name": immich["db_name"],
-        "db_port": immich["db_port"],
-        "redis_port": immich["redis_port"],
-    }
-    # Only update upload_mount if Docker detection found one
-    # (avoid wiping a valid config with None)
-    if immich["upload_mount"]:
-        updates["upload_mount"] = immich["upload_mount"]
+    updates = {"version": running, "server_dir": str(server_dir)}
+    if immich:
+        updates.update(
+            {
+                "db_password": immich["db_password"],
+                "db_username": immich["db_username"],
+                "db_name": immich["db_name"],
+                "db_port": immich["db_port"],
+                "redis_port": immich["redis_port"],
+            }
+        )
+        # Only update upload_mount if Docker detection found one
+        # (avoid wiping a valid config with None)
+        if immich["upload_mount"]:
+            updates["upload_mount"] = immich["upload_mount"]
     config.update(updates)
     save_config(config)
 
@@ -6805,37 +6902,28 @@ def _watch_worker(config: dict) -> str | None:
                     cached = config.get("version", "").lstrip("v")
                     running = None
 
-                    # Try local Docker first, fall back to Immich API
+                    # A split install's version comes from the Immich it is
+                    # configured against, never from a container on this Mac.
                     try:
-                        docker = _find_running_docker()
-                        immich = detect_immich(docker)
-                        running = immich["version"].lstrip("v")
+                        running = _authoritative_version(config)
                     except RuntimeError:
-                        immich_url = config.get("immich_url")
-                        api_key = config.get("api_key")
-                        if immich_url and api_key:
-                            try:
-                                info = _query_immich_api(immich_url, api_key)
-                                running = info["version"].lstrip("v")
-                            except RuntimeError:
-                                pass
+                        pass
 
                     if running and is_valid_version(running) and running != cached:
-                        log.info(
-                            "Immich updated: %s -> %s. Restarting with new version...",
-                            cached,
-                            running,
-                        )
-                        cmd_stop(None)
-                        # Re-extract server — try Docker, fall back to ghcr.io download
-                        try:
-                            docker = _find_running_docker()
-                            immich = detect_immich(docker)
-                            server_dir = extract_immich_server(
-                                docker, immich["container"], running
+                        if _is_rollback(cached, running):
+                            log.warning(
+                                "Immich rolled back: %s -> %s. Restarting to match...",
+                                cached,
+                                running,
                             )
-                        except RuntimeError:
-                            server_dir = download_immich_server(running)
+                        else:
+                            log.info(
+                                "Immich updated: %s -> %s. Restarting with new version...",
+                                cached,
+                                running,
+                            )
+                        cmd_stop(None)
+                        server_dir = _server_build_for(running)
                         config["version"] = running
                         config["server_dir"] = str(server_dir)
                         save_config(config)

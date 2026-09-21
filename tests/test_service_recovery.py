@@ -1966,3 +1966,57 @@ class TestTheMountIsOnlyCheckedWhenItMatters:
             f"read the mount {mocks['media_io_healthy'].call_count} times in "
             f"{cycles} cycles; it should be once per {m.MEDIA_IO_EVERY}"
         )
+
+
+class TestTheWatchLoopAsksTheConfiguredImmich:
+    """The routing has to hold in the loop, not only in the helper it calls.
+
+    #139's rule lives in _authoritative_version, but the bug it prevents is in
+    _watch_worker: reading a version out of a container on this Mac and
+    rewriting the worker to match it. A test that only drives the helper stays
+    green while the loop reads Docker again, so these drive the loop and fail if
+    it touches Docker at all.
+    """
+
+    CFG = {
+        "immich_url": "http://immich.example:2283",
+        "api_key": "k",
+        "version": "3.1.0",
+        "worker": True,
+    }
+
+    def _no_docker(self):
+        return patch.object(
+            m, "_find_running_docker", side_effect=AssertionError("read local Docker")
+        ), patch.object(
+            m, "detect_immich", side_effect=AssertionError("read local Docker")
+        )
+
+    def test_the_loop_follows_the_api_and_never_reads_a_container(self, tmp_data_dir):
+        import pathlib
+
+        find, detect = self._no_docker()
+        with find, detect, patch.object(
+            m, "_authoritative_version", return_value="3.2.2"
+        ) as asked, patch.object(
+            m, "_server_build_for", return_value=pathlib.Path("/srv/3.2.2")
+        ) as built:
+            mocks = drive_watch(self.CFG, ready=[True] * 10, pids={"worker": 123})
+
+        assert asked.called, "the loop never asked the configured Immich"
+        assert built.call_args[0][0] == "3.2.2"
+        assert mocks["save_config"].call_args[0][0]["version"] == "3.2.2"
+
+    def test_a_version_the_loop_cannot_read_leaves_the_worker_alone(
+        self, tmp_data_dir
+    ):
+        # No api_key: _authoritative_version raises, and the cycle must do
+        # nothing rather than fall back to whatever Docker says.
+        cfg = {k: v for k, v in self.CFG.items() if k != "api_key"}
+        find, detect = self._no_docker()
+        with find, detect, patch.object(
+            m, "_server_build_for", side_effect=AssertionError("re-extracted")
+        ):
+            mocks = drive_watch(cfg, ready=[True] * 10, pids={"worker": 123})
+
+        assert not mocks["save_config"].called

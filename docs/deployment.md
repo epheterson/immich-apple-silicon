@@ -21,7 +21,7 @@ If you only want remote ML compute — not the worker — you don't need any of 
 
 The `immich_url` key in `~/.immich-accelerator/config.json`. `setup --url` is the only thing that writes it, and it means the Immich at that address is the one this install answers to.
 
-That matters if the Mac also runs Immich in Docker for something unrelated. The accelerator will still use a local image as a place to fetch server files from, but it does not read configuration out of the container: that container is not necessarily your server, and its database settings are not yours. Your version comes from the Immich you configured.
+That matters if the Mac also runs Immich in Docker for something unrelated. The accelerator will still use a local image as a place to fetch server files from when it holds the same version, but it does not read configuration out of the container: that container is not necessarily your server, and its database settings are not yours. Your version comes from the Immich you configured.
 
 On a local install there is no `immich_url`, the container on this Mac is the server, and its `IMMICH_WORKERS_INCLUDE` and `IMMICH_MEDIA_LOCATION` are checked before the worker starts.
 
