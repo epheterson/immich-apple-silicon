@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.2 - 2026-09-20
+
+### Fixed
+- **A split install could follow the wrong Immich and quietly break its worker.** When the accelerator runs against an Immich on another machine, a container left over on the Mac itself was still consulted first for the version to match. On a Mac that had been set up locally before moving to a split install, those old containers restarting was enough: a healthy worker was rewritten down to the older container's version, then crash-looped against the real Immich's database. Nothing reported it, because afterwards both the recorded and the detected version agreed with each other and neither was the one that mattered. The version now comes from the Immich the install is configured against and nothing else, `update` works on a Mac with no Docker at all, and server files copied from a local container are checked to be the version they claim. A rollback is followed rather than refused, and says so. Reported and fixed by [@RxChi1d](https://github.com/RxChi1d) ([#178](https://github.com/epheterson/immich-apple-silicon/pull/178)).
+
 ## 1.17.1 - 2026-09-11
 
 ### Fixed
