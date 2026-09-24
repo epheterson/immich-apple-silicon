@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.3 - 2026-09-24
+
+### Changed
+- **`scripts/ml-parity.py` tells you to start its reference container with `--rm`,** so stopping the comparison also removes it instead of leaving it exited on the machine. The model cache volume still persists on purpose, and the docstring now says how to remove that too.
+
 ## 1.17.2 - 2026-09-20
 
 ### Fixed
