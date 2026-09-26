@@ -162,15 +162,23 @@ final class SigLIPNative {
         return residual + hs
     }
 
-    // resize_mode=squash (every SigLIP/SigLIP2 model's preprocess_cfg.json):
-    // direct bicubic resize to targetSize x targetSize, no aspect-preserving
-    // crop. mean/std/targetSize come from the caller's own preprocess_cfg.json
-    // fetch (ZooCLIP.pre) rather than being hardcoded here — SigLIP's 0.5/0.5
-    // normalization is a stable convention across the family, but sourcing it
-    // from Immich's own per-model config (already fetched for the tokenizer
-    // and ONNX path) means this file carries no per-model preprocessing data
-    // beyond patch size, and can't silently drift from what Immich actually
-    // exported. See the so400m-patch14-378 case: its own HF config claims
+    // Short-side resize + center crop, matching immich_ml's resize_pil +
+    // crop_pil (models/transforms.py) — the transform the Immich ML container
+    // actually runs. Note the container never reads preprocess_cfg.json's
+    // resize_mode: every model, including the whole SigLIP/SigLIP2 family
+    // whose configs say "squash", goes through OpenClipVisualEncoder.transform,
+    // which resizes the short side and center-crops. Library indexes are built
+    // on that behavior, so matching the container (not the config) is what
+    // keeps embeddings compatible with an existing index. Verified against the
+    // immich-machine-learning v3.2.2 container: squash gives cosine ~0.94 on
+    // portrait images, this gives ~1.0. mean/std/targetSize still come from
+    // the caller's own preprocess_cfg.json fetch (ZooCLIP.pre) rather than
+    // being hardcoded here — SigLIP's 0.5/0.5 normalization is a stable
+    // convention across the family, but sourcing it from Immich's own
+    // per-model config (already fetched for the tokenizer and ONNX path)
+    // means this file carries no per-model preprocessing data beyond patch
+    // size, and can't silently drift from what Immich actually exported.
+    // See the so400m-patch14-378 case: its own HF config claims
     // image_size=384, which is misleading for a patch14 grid (384/14 isn't
     // integer) — Immich's preprocess_cfg.json is the ground truth for the
     // resize target, the HF vision config is not.
@@ -189,8 +197,21 @@ final class SigLIPNative {
         let patch = cfg.visionPatch
         let grid = targetSize / patch
         let (full, iw, ih) = rgbBuffer(cg)
-        let resized = (iw == targetSize && ih == targetSize)
-            ? full : Resize.bicubic(full, w: iw, h: ih, outW: targetSize, outH: targetSize)
+        // Exact immich_ml resize_pil: short side -> targetSize, long side
+        // int() truncated (same semantics as ZooCLIP's "shortest" case).
+        let newW: Int, newH: Int
+        if iw < ih {
+            newW = targetSize
+            newH = Int(Double(ih) / Double(iw) * Double(targetSize))
+        } else {
+            newW = Int(Double(iw) / Double(ih) * Double(targetSize))
+            newH = targetSize
+        }
+        let resized = (newW == iw && newH == ih)
+            ? full : Resize.bicubic(full, w: iw, h: ih, outW: newW, outH: newH)
+        // Exact immich_ml crop_pil: int() centers.
+        let left = Int(Double(newW) / 2 - Double(targetSize) / 2)
+        let upper = Int(Double(newH) / 2 - Double(targetSize) / 2)
         let dim = 3 * patch * patch
         var flat = [Float](repeating: 0, count: grid * grid * dim)
         resized.withUnsafeBufferPointer { src in
@@ -202,7 +223,7 @@ final class SigLIPNative {
                             let py = pi * patch + i
                             for j in 0 ..< patch {
                                 let px = pj * patch + j
-                                let srcBase = (py * targetSize + px) * 3
+                                let srcBase = ((upper + py) * newW + left + px) * 3
                                 let dstBase = p * dim + i * patch * 3 + j * 3
                                 for c in 0 ..< 3 {
                                     let v = Float(src[srcBase + c]) / 255.0
