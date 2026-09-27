@@ -230,12 +230,16 @@ final class ZooCLIP {
         // — the whole SigLIP/SigLIP2 family plus a few others). No shipped
         // model uses "longest", so it's not implemented — fail loudly rather
         // than silently mis-resize if that ever changes.
+        // NOTE: the immich_ml container never reads resize_mode at all — its
+        // single OpenClipVisualEncoder.transform always does resize_pil
+        // (short side) + crop_pil (center) for every model. Library indexes
+        // are built on that behavior, so both modes resize+crop here; honoring
+        // the config's "squash" instead would put new embeddings ~0.94 cosine
+        // off the existing index on portrait images (measured against the
+        // v3.2.2 container).
         let resized: [UInt8]
         switch pre.resizeMode {
-        case "squash":
-            // Resize(image_size): stretch straight to size x size, no crop.
-            resized = (w == size && h == size) ? rgb : Resize.bicubic(rgb, w: w, h: h, outW: size, outH: size)
-        case "shortest":
+        case "squash", "shortest":
             // Exact immich_ml resize_pil: short side -> size, long side int() truncated.
             let newW: Int, newH: Int
             if w < h {
