@@ -172,6 +172,16 @@ jobs:
       - name: Start Immich stack
         run: |
           cd /tmp/fresh-install-ci
+          # Docker Hub rate-limits pulls from shared CI runners, and a limited
+          # pull fails this job, which gates auto-tag, so one unlucky minute
+          # blocked a release. The limit clears in well under a second
+          # (retry-after is reported in microseconds), so retry the pull and let
+          # anything that is not a transient failure still fail at `up`.
+          for attempt in 1 2 3 4 5; do
+            docker compose pull && break
+            echo "pull failed (attempt $attempt), retrying"
+            sleep $((attempt * 10))
+          done
           docker compose up -d
           echo "Waiting for API..."
           for i in $(seq 1 90); do

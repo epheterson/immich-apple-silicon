@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.17.3 - 2026-09-27
+
+### Fixed
+- **Smart search on the SigLIP models embedded most photos differently from Immich.** Immich's own ML service resizes the short side and center-crops every image before embedding it, for every model. Both of our engines instead read the SigLIP and SigLIP2 model configs, which ask for the image to be stretched to a square, so a portrait or landscape photo was embedded as a distorted version of itself. A library indexed by Immich and then extended by the accelerator ended up with two halves that did not agree, and search ranked across them badly. Both engines now shape images exactly the way Immich does. Measured against Immich's ML container on real portrait photos, the native engine went from 0.949 average similarity (0.818 at worst) to 0.998, and the Python engine from 0.937 (0.810 at worst) to an exact match. If Immich's own ML service indexed your library, there is nothing to do. If the accelerator indexed it while set to a SigLIP model, re-run Smart Search for all assets from Administration > Jobs so older and newer photos match. The default model and other non-SigLIP models were never affected. Native engine fix by [@varialflip](https://github.com/varialflip) ([#181](https://github.com/epheterson/immich-apple-silicon/pull/181)).
+
+### Changed
+- **`scripts/ml-parity.py` tells you to start its reference container with `--rm`,** so stopping the comparison also removes it instead of leaving it exited on the machine. The model cache volume still persists on purpose, and the docstring now says how to remove that too.
+
 ## 1.17.2 - 2026-09-20
 
 ### Fixed
