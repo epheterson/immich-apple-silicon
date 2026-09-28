@@ -217,7 +217,11 @@ Audio is the one switch that is off for anyone upgrading. `aac_at` is faster and
 
 "Hardware" does not simply mean "faster". Immich asks ffmpeg for `preset ultrafast`, which is genuinely quick, so on an idle Mac the software encoder often finishes a single file sooner. What VideoToolbox buys is the rest of the machine. Measured on an M4 over 20 seconds of 1080p camera footage: software finished in 1.5 seconds but spent 12.5 seconds of CPU across about eight cores, while VideoToolbox took 2.8 seconds of wall clock and 5 seconds of CPU across about two. On a Mac also running Immich's other jobs and the machine learning engine, that is usually the trade you want.
 
-Quality is not the thing you give up, and on real footage it often goes the other way. `preset ultrafast` disables most of what x264 is good at, which shows up badly on grainy or high-motion video: on that same footage the software encode scored SSIM 0.967 against the original while the hardware encode scored 0.974 in half the file size. On synthetic test patterns the ranking reverses, which is exactly why these numbers are worth re-measuring on your own files rather than trusting a table here.
+Whether hardware also wins on quality depends on which software encode you compare it with. Against Immich's default, `preset ultrafast`, it wins outright, because `ultrafast` disables most of what x264 is good at. On a 23-second 1080p phone clip, VideoToolbox produced 7.6 MB at SSIM 0.957 where software produced 19.9 MB at 0.952, for about half the CPU. Against x264 at `veryfast` it no longer does: the same clip came out at 7.3 MB and SSIM 0.958 in software, slightly smaller and slightly better, for three times the CPU.
+
+[@RxChi1d](https://github.com/RxChi1d) measured this properly, 99 encodes across six real clips scored with MS-SSIM and LPIPS against a lossless reference, and found that at equal quality `veryfast` needs 2.1 to 4.8 times fewer bytes than VideoToolbox, at 7 to 13 times the CPU ([#162](https://github.com/epheterson/immich-apple-silicon/issues/162)). The data and scripts are attached there.
+
+So VideoToolbox trades storage for CPU. On a Mac that is also running Immich's other jobs and the machine learning engine, CPU is usually the scarce resource and that is the right trade. If storage matters more to you than CPU, Software with Immich set to `veryfast` makes smaller files for the same quality. Either way these numbers vary with the footage, which is what the comparison commands below are for.
 
 `preset ultrafast` is also the assumption both comparison commands make about your software side, because it is what Immich ships. If you have configured Immich for a different x264 preset, tell them so, or the comparison is against something you do not run:
 
@@ -225,7 +229,7 @@ Quality is not the thing you give up, and on real footage it often goes the othe
 immich-accelerator compare ~/Movies/clip.mov --preset veryfast
 ```
 
-That one matters more than it sounds. On the footage above, `ultrafast` produced 66.6 MB at SSIM 0.967 while `veryfast` produced 33.2 MB at 0.972: half the bytes at higher quality, from the same encoder. Which end of the comparison you are standing on changes the answer.
+That one matters more than it sounds. On the 20 seconds of camera footage measured above, `ultrafast` produced 66.6 MB at SSIM 0.967 while `veryfast` produced 33.2 MB at 0.972: half the bytes at higher quality, from the same encoder. Which end of the comparison you are standing on changes the answer.
 
 `compare` writes a page with a frame from each encode next to the measurements, since a table cannot tell you whether you would notice the difference. `encode-compare` prints the same measurements as text.
 
