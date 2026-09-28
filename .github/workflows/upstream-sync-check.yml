@@ -11,7 +11,7 @@ name: Upstream sync check
 #   3. Merge to fork main, bump the `ml` submodule, release.
 #
 # Standing patches we always carry forward (must survive every sync):
-#   - mlx>=0.22.0,<0.31.2  (0.31.1 is the last known-good; both 0.31.2 and 0.32.0
+#   - mlx>=0.22.0,<0.31.2  (0.31.1 is the last known-good; 0.31.2 through 0.32.2
 #     hard-crash CLIP inference, #38 / #103). Re-test any lift with the real-model
 #     gate scripts/ml-preflight.py, never a proxy/STUB_MODE test.
 
@@ -103,7 +103,7 @@ jobs:
           3. Merge to fork \`main\`, bump the \`ml\` submodule here, cut a release.
 
           Standing patches to carry forward every sync:
-          - \`mlx>=0.22.0,<0.31.2\` (#38, #103; CLIP threading crash, 0.31.2 and 0.32.0 both bad)
+          - \`mlx>=0.22.0,<0.31.2\` (#38, #103; CLIP threading crash, every release from 0.31.2 through 0.32.2 gate-tested bad)
 
           _Opened automatically by the weekly upstream-sync check; updates in place until synced._
           EOF
@@ -120,7 +120,7 @@ jobs:
           fi
 
   mlx-pin:
-    # Notify when an mlx newer than the latest KNOWN-BAD (0.32.0) ships, so we
+    # Notify when an mlx newer than the latest KNOWN-BAD (0.32.2) ships, so we
     # re-test before allowing it. Both 0.31.2 (gpu stream) and 0.32.0 (cpu stream)
     # hard-crash real CLIP inference in the worker thread pool with "There is no
     # Stream(...)" (#38, #103). The pin is `mlx>=0.22.0,<0.31.2` (0.31.1, the last
@@ -130,8 +130,8 @@ jobs:
     # v1.5.29 regression).
     runs-on: ubuntu-latest
     env:
-      LATEST_BAD: "0.32.0" # newest mlx known to crash; nag when something newer ships
-      MLX_TITLE: "mlx > 0.32.0 is available, re-test the CLIP pin (#38, #103)"
+      LATEST_BAD: "0.32.2" # newest mlx gate-tested and found to crash; nag only for something newer
+      MLX_TITLE: "mlx > 0.32.2 is available, re-test the CLIP pin (#38, #103)"
     steps:
       - name: Check PyPI for mlx newer than the latest known-bad
         id: mlx
