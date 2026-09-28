@@ -1499,6 +1499,19 @@ class TestTheWorkerWaitsWhenItsDatabaseIsGone:
         assert mocks["cmd_start"].called, "must come back without anyone helping"
         assert not m.read_paused(), "and the marker must be cleared"
 
+    def test_the_watcher_names_a_macos_refusal(self, tmp_data_dir):
+        """The helper being right proves nothing if the loop never asks it."""
+        with patch.object(m, "local_network_refused", return_value=True):
+            mocks = self._drive([["Postgres", "Redis"]] * 2, pids={"worker": 4242})
+        said = " ".join(str(c) for c in mocks["log"].warning.call_args_list)
+        assert "Local Network" in said
+
+    def test_the_watcher_does_not_blame_macos_for_a_real_outage(self, tmp_data_dir):
+        with patch.object(m, "local_network_refused", return_value=False):
+            mocks = self._drive([["Postgres", "Redis"]] * 2, pids={"worker": 4242})
+        said = " ".join(str(c) for c in mocks["log"].warning.call_args_list)
+        assert "Local Network" not in said
+
     def test_an_ml_only_node_is_never_judged(self, tmp_data_dir):
         """It has no database configured and does not want one."""
         assert m.backends_down({"ml_only": True}) == []
@@ -2020,3 +2033,73 @@ class TestTheWatchLoopAsksTheConfiguredImmich:
             mocks = drive_watch(cfg, ready=[True] * 10, pids={"worker": 123})
 
         assert not mocks["save_config"].called
+
+
+class TestAServiceRefusedByMacOSIsNamedAsSuch:
+    """macOS's Local Network privacy can refuse the accelerator's own processes
+    while the NAS is perfectly healthy, most visibly right after an upgrade,
+    since the permission follows the path the service runs from. It used to be
+    reported only as "Postgres and Redis not answering", which sends you to the
+    NAS. The fix is a switch in System Settings, so say that.
+    """
+
+    CFG = {"db_hostname": "10.0.0.14", "db_port": 15432,
+           "redis_hostname": "10.0.0.14", "redis_port": 16379}
+
+    def _refused(self, exc, elapsed):
+        clock = iter([100.0, 100.0 + elapsed])
+        with patch.object(m.socket, "create_connection", side_effect=exc), \
+                patch.object(m.time, "monotonic", side_effect=lambda: next(clock)):
+            return m.local_network_refused(self.CFG)
+
+    def test_an_instant_no_route_to_host_is_macos_refusing(self):
+        import errno
+        assert self._refused(OSError(errno.EHOSTUNREACH, "No route to host"), 0.0005)
+
+    def test_a_slow_no_route_to_host_is_not_counted(self):
+        """A router's unreachable reply can arrive late; only instant counts."""
+        import errno
+        assert not self._refused(OSError(errno.EHOSTUNREACH, "No route to host"), 3.0)
+
+    def test_a_dead_host_answering_from_the_arp_cache_is_not_mistaken_for_it(self):
+        """Measured on the release Mac against an unused LAN address: the first
+        connect times out, and every one after that fails in under a
+        millisecond from the ARP cache. That is fast enough to pass the timing
+        test, so it is the errno that has to tell it apart: EHOSTDOWN there,
+        EHOSTUNREACH from a macOS refusal."""
+        import errno
+        assert not self._refused(OSError(errno.EHOSTDOWN, "Host is down"), 0.0005)
+
+    def test_a_refused_port_is_not_mistaken_for_it(self):
+        import errno
+        assert not self._refused(OSError(errno.ECONNREFUSED, "refused"), 0.0005)
+
+    def test_a_timeout_is_not_mistaken_for_it(self):
+        assert not self._refused(socket.timeout("timed out"), 2.0)
+
+    def test_nothing_to_judge_without_a_database_host(self):
+        assert m.local_network_refused({}) is False
+
+    def _status(self, caplog, down_from_here):
+        import logging
+        with patch.object(m, "read_paused",
+                          return_value={"reason": "backend-unreachable", "detail": "Postgres, Redis"}), \
+                patch.object(m, "load_config", return_value=dict(self.CFG)), \
+                patch.object(m, "CONFIG_FILE"), \
+                patch.object(m, "backends_down", return_value=down_from_here), \
+                patch.object(m, "read_pid", return_value=None), \
+                patch.object(m, "brew_refuses_our_tap", return_value=False), \
+                caplog.at_level(logging.INFO, logger="accelerator"):
+            m.cmd_status(None)
+        return "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_status_names_macos_when_the_database_answers_from_the_terminal(self, caplog):
+        """A terminal is exempt and the service is not, so this proves it."""
+        text = self._status(caplog, down_from_here=[])
+        assert "Local Network" in text
+        assert "starts again on its own when they are back" not in text
+
+    def test_status_blames_the_database_when_it_is_really_down(self, caplog):
+        text = self._status(caplog, down_from_here=["Postgres", "Redis"])
+        assert "Local Network" not in text
+        assert "starts again on its own when they are back" in text

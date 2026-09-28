@@ -13,6 +13,7 @@ import argparse
 import datetime
 import contextlib
 import ctypes
+import errno
 import fcntl
 import functools
 import json
@@ -2722,6 +2723,37 @@ def backends_down(config: dict) -> list[str]:
         except (OSError, ValueError):
             down.append(label)
     return down
+
+
+# Well under the time an ARP lookup for an absent host takes to give up, and
+# far above the microseconds macOS takes to refuse.
+_INSTANT_REFUSAL = 0.05
+
+
+def local_network_refused(config: dict) -> bool:
+    """Does reaching Postgres fail the way macOS refuses an unapproved service?
+
+    macOS's Local Network privacy denies a process it has not approved by
+    failing connect() with EHOSTUNREACH before any packet is sent, so the error
+    arrives in well under a millisecond. A host that is really gone behaves
+    differently: the first connect times out, and later ones fail just as fast
+    from the ARP cache but with EHOSTDOWN (measured on the release Mac). The
+    errno and the timing together are the tell, and it matters because the fix
+    is a switch in System Settings, not anything on the NAS. An upgrade can
+    trigger it, since the permission follows the path the service runs from.
+    """
+    host = config.get("db_hostname")
+    if not host:
+        return False
+    start = time.monotonic()
+    try:
+        with socket.create_connection((host, int(config.get("db_port", 5432))), timeout=2):
+            return False
+    except (OSError, ValueError) as e:
+        return (
+            getattr(e, "errno", None) == errno.EHOSTUNREACH
+            and time.monotonic() - start < _INSTANT_REFUSAL
+        )
 
 
 def library_mount_gone(config: dict) -> tuple[bool, str]:
@@ -6180,7 +6212,21 @@ def cmd_status(_args):
     paused = read_paused()
     if paused and paused.get("reason") == "backend-unreachable":
         log.warning("Worker:     paused, %s not answering", paused.get("detail") or "?")
-        log.warning("            It starts again on its own when they are back.")
+        # A terminal is exempt from macOS's Local Network privacy and the
+        # service is not. So if they answer from here, the database is fine and
+        # it is the service that is being refused, usually after an upgrade.
+        if config and not backends_down(config):
+            log.warning(
+                "            They answer from here, so it is the service that "
+                "cannot reach them. If this"
+            )
+            log.warning(
+                "            persists, macOS is blocking its local network access: "
+                "System Settings >"
+            )
+            log.warning("            Privacy & Security > Local Network.")
+        else:
+            log.warning("            It starts again on its own when they are back.")
     elif paused and paused.get("reason") == "library-unreachable":
         log.warning(
             "Worker:     paused, library is not reachable at %s",
@@ -6700,6 +6746,14 @@ def _watch_worker(config: dict) -> str | None:
                         " and ".join(down),
                         int(MEDIA_UNREACHABLE_GRACE),
                     )
+                    if local_network_refused(config):
+                        log.warning(
+                            "  The connection was refused instantly, which is how "
+                            "macOS blocks a service it has not given Local Network "
+                            "access. If the database answers from Terminal, allow "
+                            "this service in System Settings > Privacy & Security > "
+                            "Local Network."
+                        )
                 if time.monotonic() - backend_down_since >= MEDIA_UNREACHABLE_GRACE:
                     if not backend_paused:
                         backend_paused = True
