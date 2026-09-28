@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.4 - 2026-09-27
+
+### Fixed
+- **When macOS blocks the accelerator from your network, it now says so.** On recent macOS a background service needs Local Network permission to reach other machines on your network, and an upgrade can ask for it again. Until someone clicks Allow, a split install cannot reach its database, and the only message was "Postgres and Redis not answering", which sends you to check the NAS. `status` now checks from the terminal you run it in, which macOS does not restrict: if the database answers there but not for the service, it says macOS is blocking the service and where to allow it. The watcher's log gives the same hint when it can tell from how the connection failed.
+
 ## 1.17.3 - 2026-09-27
 
 ### Fixed
