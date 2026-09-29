@@ -2039,6 +2039,28 @@ class TestTheWatchLoopAsksTheConfiguredImmich:
         assert mocks["cmd_stop"].called, "the old worker was not stopped in the first cycle"
         assert mocks["save_config"].call_args[0][0]["version"] == "3.2.4"
 
+    def test_a_failed_switch_backs_off_instead_of_retrying_every_cycle(
+        self, tmp_data_dir
+    ):
+        """A new server version whose build will not download (a registry rate
+        limit) used to be retried every five minutes. Checking every cycle must
+        not turn that into a 0.5 GB attempt, and a log line, every 30 seconds."""
+        with patch.object(m, "_authoritative_version", return_value="3.2.4"), patch.object(
+            m, "_server_build_for", side_effect=RuntimeError("ghcr.io 429")
+        ) as build:
+            mocks = drive_watch(self.CFG, ready=[True] * 5, pids={"worker": 123})
+        assert build.call_count == 1, f"retried the download {build.call_count} times in 5 cycles"
+        assert mocks["cmd_stop"].called, "the old worker must stay stopped meanwhile"
+        assert not mocks["save_config"].called, "a build that never arrived must not be recorded"
+
+    def test_the_every_cycle_check_uses_a_short_timeout(self, tmp_data_dir):
+        """The loop sleeps 30s after its work, so a hung server would stretch
+        every cycle by the whole request timeout."""
+        with patch.object(m, "_query_immich_api", return_value={"version": "3.1.0"}) as q:
+            drive_watch(self.CFG, ready=[True] * 2, pids={"worker": 123})
+        assert q.called
+        assert q.call_args.kwargs.get("timeout", 10) <= 5
+
     def test_a_split_install_asks_every_cycle(self, tmp_data_dir):
         with patch.object(m, "_authoritative_version", return_value="3.1.0") as asked:
             drive_watch(self.CFG, ready=[True] * 4, pids={"worker": 123})

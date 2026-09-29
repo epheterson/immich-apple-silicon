@@ -3,7 +3,7 @@
 ## 1.17.5 - 2026-09-28
 
 ### Fixed
-- **A split install follows a server upgrade within a cycle instead of five minutes.** The worker has to run the same Immich version as the server, and the watcher already switches it automatically when the server moves. But it only asked every five minutes, so after an unattended overnight upgrade the old worker kept running against a database the new server had just migrated. A split install now asks every cycle, one small request to its server. A local install keeps the slower timer, since its check shells out to Docker, and the accelerator's own update check stays at five minutes, within GitHub's limit for unauthenticated requests. The server only reports its new version once its migrations have finished, so the overlap can shrink to a single cycle but not to zero.
+- **A split install follows a server upgrade within a cycle instead of five minutes.** The worker has to run the same Immich version as the server, and the watcher already switches it automatically when the server moves. But it only asked every five minutes, so after an unattended overnight upgrade the old worker kept running against a database the new server had just migrated. A split install now asks every cycle, one small request to its server. A local install keeps the slower timer, since its check shells out to Docker, and the accelerator's own update check stays at five minutes, within GitHub's limit for unauthenticated requests. The server only reports its new version once its migrations have finished, so the overlap can shrink to a single cycle but not to zero. If the matching server build cannot be downloaded, the old worker stays stopped and the next attempt waits five minutes, as before.
 
 ## 1.17.4 - 2026-09-27
 
