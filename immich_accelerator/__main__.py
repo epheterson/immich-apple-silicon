@@ -6602,6 +6602,49 @@ def _attempt_remount(config: dict, state: dict) -> None:
     log.warning("  Remount failed: %s", reason)
 
 
+def _follow_server_version(config: dict) -> None:
+    """Restart the worker onto the version the authoritative Immich runs.
+
+    A worker has to run exactly the server's version: it executes Immich's own
+    code against Immich's own database. When the server moves, in either
+    direction, stop the worker first, fetch the matching server build, record
+    it, and start again. A server that cannot be asked right now (restarting,
+    mid-migration, unreachable) is left alone until the next cycle.
+    """
+    try:
+        cached = config.get("version", "").lstrip("v")
+        running = None
+
+        # A split install's version comes from the Immich it is configured
+        # against, never from a container on this Mac.
+        try:
+            running = _authoritative_version(config)
+        except RuntimeError:
+            pass
+
+        if running and is_valid_version(running) and running != cached:
+            if _is_rollback(cached, running):
+                log.warning(
+                    "Immich rolled back: %s -> %s. Restarting to match...",
+                    cached,
+                    running,
+                )
+            else:
+                log.info(
+                    "Immich updated: %s -> %s. Restarting with new version...",
+                    cached,
+                    running,
+                )
+            cmd_stop(None)
+            server_dir = _server_build_for(running)
+            config["version"] = running
+            config["server_dir"] = str(server_dir)
+            save_config(config)
+            cmd_start(argparse.Namespace(force=True))
+    except RuntimeError:
+        pass  # Mid-restart or network issue, try again next cycle
+
+
 def _watch_worker(config: dict) -> str | None:
     """cmd_watch's worker loop. Returns _SWITCH if the worker was disabled
     mid-flight, so cmd_watch can hand over to the worker-free loop."""
@@ -6953,47 +6996,27 @@ def _watch_worker(config: dict) -> str | None:
                 except RuntimeError:
                     log.error("  Worker restart failed, will retry in 30s")
 
-            # Every 5 min, check if Immich updated. Skip on a cycle where the
+            # Check whether Immich changed version. Skip on a cycle where the
             # fd watchdog just restarted the worker, so we don't tear it back
             # down (cmd_stop + re-extract) in the same tick; check_count stays
-            # >=10 so it runs next cycle instead.
+            # >=10 so the throttled checks run next cycle instead.
+            #
+            # A split install asks every cycle. Its server can be upgraded
+            # underneath it overnight (a floating image tag and Watchtower),
+            # and until this notices, the old worker keeps running against a
+            # database the new server has just migrated. Asking is one small
+            # request to the configured Immich. A local install's check shells
+            # out to Docker several times, so it stays on the slower timer.
             check_count += 1
-            if check_count >= 10 and not worker_handled:
+            due = check_count >= 10
+            if not worker_handled and (due or config.get("immich_url")):
+                _follow_server_version(config)
+            if due and not worker_handled:
                 check_count = 0
-                try:
-                    cached = config.get("version", "").lstrip("v")
-                    running = None
 
-                    # A split install's version comes from the Immich it is
-                    # configured against, never from a container on this Mac.
-                    try:
-                        running = _authoritative_version(config)
-                    except RuntimeError:
-                        pass
-
-                    if running and is_valid_version(running) and running != cached:
-                        if _is_rollback(cached, running):
-                            log.warning(
-                                "Immich rolled back: %s -> %s. Restarting to match...",
-                                cached,
-                                running,
-                            )
-                        else:
-                            log.info(
-                                "Immich updated: %s -> %s. Restarting with new version...",
-                                cached,
-                                running,
-                            )
-                        cmd_stop(None)
-                        server_dir = _server_build_for(running)
-                        config["version"] = running
-                        config["server_dir"] = str(server_dir)
-                        save_config(config)
-                        cmd_start(argparse.Namespace(force=True))
-                except RuntimeError:
-                    pass  # Mid-restart or network issue, try again next cycle
-
-                # Check for accelerator self-update (once per watch session)
+                # Check for accelerator self-update (once per watch session).
+                # Stays on the slow timer: GitHub allows 60 unauthenticated
+                # requests an hour, and every cycle would be 120.
                 if not self_update_notified:
                     try:
                         import urllib.request as _urlreq3
