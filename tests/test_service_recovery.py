@@ -2020,6 +2020,71 @@ class TestTheWatchLoopAsksTheConfiguredImmich:
         assert built.call_args[0][0] == "3.2.2"
         assert mocks["save_config"].call_args[0][0]["version"] == "3.2.2"
 
+    def test_a_split_install_notices_a_new_server_on_the_very_next_cycle(
+        self, tmp_data_dir
+    ):
+        """With a floating image tag the NAS can upgrade overnight. Waiting the
+        old five minutes left the previous worker running against a database
+        the new server had just migrated."""
+        import pathlib
+
+        find, detect = self._no_docker()
+        with find, detect, patch.object(
+            m, "_authoritative_version", return_value="3.2.4"
+        ), patch.object(
+            m, "_server_build_for", return_value=pathlib.Path("/srv/3.2.4")
+        ):
+            mocks = drive_watch(self.CFG, ready=[True], pids={"worker": 123})
+
+        assert mocks["cmd_stop"].called, "the old worker was not stopped in the first cycle"
+        assert mocks["save_config"].call_args[0][0]["version"] == "3.2.4"
+
+    def test_a_failed_switch_backs_off_instead_of_retrying_every_cycle(
+        self, tmp_data_dir
+    ):
+        """A new server version whose build will not download (a registry rate
+        limit) used to be retried every five minutes. Checking every cycle must
+        not turn that into a 0.5 GB attempt, and a log line, every 30 seconds."""
+        with patch.object(m, "_authoritative_version", return_value="3.2.4"), patch.object(
+            m, "_server_build_for", side_effect=RuntimeError("ghcr.io 429")
+        ) as build:
+            mocks = drive_watch(self.CFG, ready=[True] * 5, pids={"worker": 123})
+        assert build.call_count == 1, f"retried the download {build.call_count} times in 5 cycles"
+        assert mocks["cmd_stop"].called, "the old worker must stay stopped meanwhile"
+        assert not mocks["save_config"].called, "a build that never arrived must not be recorded"
+
+    def test_the_every_cycle_check_uses_a_short_timeout(self, tmp_data_dir):
+        """The loop sleeps 30s after its work, so a hung server would stretch
+        every cycle by the whole request timeout."""
+        with patch.object(m, "_query_immich_api", return_value={"version": "3.1.0"}) as q:
+            drive_watch(self.CFG, ready=[True] * 2, pids={"worker": 123})
+        assert q.called
+        assert q.call_args.kwargs.get("timeout", 10) <= 5
+
+    def test_a_split_install_asks_every_cycle(self, tmp_data_dir):
+        with patch.object(m, "_authoritative_version", return_value="3.1.0") as asked:
+            drive_watch(self.CFG, ready=[True] * 4, pids={"worker": 123})
+        assert asked.call_count == 4
+
+    def test_a_local_install_keeps_the_slow_timer(self, tmp_data_dir):
+        """Its check shells out to Docker several times; not every 30s."""
+        cfg = {"version": "3.1.0", "worker": True}
+        with patch.object(m, "_authoritative_version", return_value="3.1.0") as asked:
+            drive_watch(cfg, ready=[True] * 6, pids={"worker": 123})
+        assert asked.call_count == 0, "a local install asked before its ten cycles"
+
+    def test_the_github_update_check_stays_throttled_on_a_split_install(
+        self, tmp_data_dir
+    ):
+        """GitHub allows 60 unauthenticated requests an hour; every cycle is 120."""
+        import urllib.request
+
+        with patch.object(m, "_authoritative_version", return_value="3.1.0"), patch.object(
+            urllib.request, "urlopen", side_effect=AssertionError("asked GitHub")
+        ) as gh:
+            drive_watch(self.CFG, ready=[True] * 6, pids={"worker": 123})
+        assert gh.call_count == 0
+
     def test_a_version_the_loop_cannot_read_leaves_the_worker_alone(
         self, tmp_data_dir
     ):

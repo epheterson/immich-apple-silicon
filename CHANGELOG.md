@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.5 - 2026-09-28
+
+### Fixed
+- **A split install's worker follows a server upgrade within 30 seconds instead of five minutes**, so it no longer runs the old version against a freshly migrated database. If the new server build can't be downloaded, the worker stays stopped and retries after five minutes.
+
 ## 1.17.4 - 2026-09-27
 
 ### Fixed
