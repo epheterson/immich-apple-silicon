@@ -38,12 +38,15 @@ Exit 1 = the service crashed or misbehaved (do NOT ship this mlx).
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import pathlib
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -174,8 +177,18 @@ def face_jpeg(override: str | None = None) -> bytes:
 # new inference paths passed this gate while stock OCR returned a shape the
 # response schema rejects and the stock face detector reported zero faces for
 # every image: the gate was green and had executed neither.
+DEFAULT_CLIP = "ViT-B-32__openai"
+# The models that take the open_clip fallback. Others either take the MLX path
+# like the default or are converted into a permanent MLX cache on first use.
+OPENCLIP_MODELS = [
+    "ViT-B-16-SigLIP__webli",
+    "ViT-B-16-SigLIP2__webli",
+    "ViT-L-16-SigLIP2-256__webli",
+    "ViT-SO400M-16-SigLIP2-384__webli",
+]
+
 TASKS = {
-    "clip": {"clip": {"visual": {"modelName": "ViT-B-32__openai"}}},
+    "clip": {"clip": {"visual": {"modelName": DEFAULT_CLIP}}},
     # The nested shape the service actually reads (main.py: task_config
     # ["detection"]["options"]["minScore"], ["recognition"]["modelName"]). The
     # flat form parses fine and the thresholds inside it reach nothing, so the
@@ -287,10 +300,25 @@ def main() -> int:
         "Without it the image is fetched once and cached outside the repo.",
     )
     ap.add_argument("--port", type=int, default=3991)
+    ap.add_argument(
+        "--clip-model",
+        default=DEFAULT_CLIP,
+        choices=[DEFAULT_CLIP, *OPENCLIP_MODELS],
+        help="CLIP model to gate on. The default takes the MLX path; a SigLIP "
+        "model takes the open_clip fallback, which the default never exercises. "
+        "A SigLIP model is downloaded into a throwaway cache and deleted when "
+        "the gate ends.",
+    )
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--requests", type=int, default=24)
     ap.add_argument("--startup-timeout", type=int, default=180)
     args = ap.parse_args()
+    TASKS["clip"]["clip"]["visual"]["modelName"] = args.clip_model
+
+    # The default model is already in the service's own cache. Anything else
+    # goes through open_clip and the Hugging Face hub, and would otherwise stay
+    # in ~/.cache/huggingface after every run.
+    scratch = None
 
     base = f"http://127.0.0.1:{args.port}"
     env = {
@@ -300,7 +328,7 @@ def main() -> int:
         "ML_HOST": "127.0.0.1",
         "ML_MODELS_DIR": args.models_dir,
         "ML_CACHE_DIR": args.cache_dir,
-        "ML_CLIP_MODEL": "ViT-B-32__openai",
+        "ML_CLIP_MODEL": args.clip_model,
         "ML_FACE_MODEL": "buffalo_l",  # load face too: the #103 crash had both models in-process
         "ML_LOG_REQUESTS": "true",
     }
@@ -333,6 +361,21 @@ def main() -> int:
         f"[preflight] booting real ML service on {base} with STUB_MODE=false ...",
         flush=True,
     )
+    if args.clip_model != DEFAULT_CLIP:
+        # The scratch HF_HOME hides the saved login, so carry it over.
+        token = pathlib.Path(env.get("HF_HOME", pathlib.Path.home() / ".cache/huggingface")) / "token"
+        if "HF_TOKEN" not in env and token.is_file():
+            env["HF_TOKEN"] = token.read_text().strip()
+        scratch = tempfile.mkdtemp(prefix="ml-preflight-hf-")
+        atexit.register(shutil.rmtree, scratch, ignore_errors=True)
+        env["HF_HOME"] = scratch
+        # Either of these would override HF_HOME and put the download back in
+        # the permanent cache.
+        env.pop("HF_HUB_CACHE", None)
+        env.pop("HUGGINGFACE_HUB_CACHE", None)
+        # A dropped ssh session or a kill would otherwise skip the cleanup.
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            signal.signal(sig, lambda signum, _frame: sys.exit(128 + signum))
     proc = subprocess.Popen(
         [args.python, "-m", "src.main"],
         cwd=args.src,
@@ -403,6 +446,16 @@ def main() -> int:
             for e in errors[:3]:
                 print(f"[preflight]   {e}")
             return 1
+        if args.clip_model != DEFAULT_CLIP:
+            # clip.py falls back to ViT-B-32 if the requested model won't load,
+            # which would pass without exercising the path being gated.
+            err.flush()
+            err.seek(0)
+            log = err.read().decode(errors="replace")
+            arch = args.clip_model.split("__")[0]
+            if f"Loading open_clip model: {arch} /" not in log or "Falling back to ViT-B-32" in log:
+                print(f"[preflight] FAIL — the service did not load {args.clip_model} via open_clip")
+                return 1
         print(
             f"[preflight] PASS — {args.requests} real concurrent CLIP inferences "
             f"plus {len(futs) - args.requests} other task calls, service alive, "

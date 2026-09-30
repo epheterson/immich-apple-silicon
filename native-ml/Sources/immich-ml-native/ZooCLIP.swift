@@ -2,9 +2,20 @@ import CoreGraphics
 import Foundation
 import Tokenizers
 
-// Native ML cache root (models persist across upgrades).
-let NATIVE_CACHE_DIR = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent(".cache/immich-ml-native")
+// Native ML cache root (models persist across upgrades). It holds only models
+// fetched on demand (zoo/, mlx-siglip/); the default CLIP and ArcFace come from
+// ML_CLIP_DIR and ML_ARCFACE. IMMICH_ML_NATIVE_CACHE points it elsewhere, so a
+// test run (the release gate, a parity comparison) fills a throwaway directory
+// rather than the one the real service keeps. Those runs had left 76 GB of
+// models on the release Mac that the service itself never asked for.
+let NATIVE_CACHE_DIR: URL = {
+    if let path = ProcessInfo.processInfo.environment["IMMICH_ML_NATIVE_CACHE"], !path.isEmpty {
+        // launchd and plists don't expand ~, so do it here.
+        return URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
+    }
+    return FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".cache/immich-ml-native")
+}()
 
 // CLIP model zoo: runs Immich's own ONNX exports (huggingface.co/immich-app/*)
 // through onnxruntime, replicating immich_ml's exact preprocessing, so any model
@@ -104,7 +115,20 @@ final class ZooCLIP {
         // double the permanent cache, with Immich's jobs timing out against a
         // wait twice as long as it needed to be.
         let useNative = SigLIPRegistry.config(for: name) != nil && !forceONNX
-        try Self.ensureFiles(name: name, dir: dir, needsONNX: !useNative)
+        let existed = FileManager.default.fileExists(atPath: dir.path)
+        do {
+            try Self.ensureFiles(name: name, dir: dir, needsONNX: !useNative)
+        } catch {
+            // A name that is valid but not a real model 404s on its first file,
+            // which left an empty folder named after whatever was asked for,
+            // forever. Remove it, but only if this call created it and nothing
+            // arrived: a real model cut off partway keeps what it has, because
+            // the retry skips files already on disk.
+            if !existed && Self.holdsNoFiles(dir) {
+                try? FileManager.default.removeItem(at: dir)
+            }
+            throw error
+        }
 
         // Large models keep their weights in external data files beside
         // model.onnx (#116). Resolve those once per model; the marker keeps a
@@ -400,6 +424,17 @@ final class ZooCLIP {
     // every download the service can be waiting on, not just the ONNX ones.
     static func setProgress(_ p: FetchProgress?) {
         progressLock.lock(); _progress = p; progressLock.unlock()
+    }
+
+    static func holdsNoFiles(_ dir: URL) -> Bool {
+        guard let walk = FileManager.default.enumerator(
+            at: dir, includingPropertiesForKeys: [.isRegularFileKey]) else { return true }
+        for case let url as URL in walk {
+            if (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                return false
+            }
+        }
+        return true
     }
 
     // needsONNX: false fetches only the metadata the native mlx path uses

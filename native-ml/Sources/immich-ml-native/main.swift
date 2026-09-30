@@ -7,6 +7,22 @@ import MLX
 // it so every print() shows up in the log as soon as it happens.
 setvbuf(stdout, nil, _IOLBF, 0)
 
+// The benchmark and parity harnesses fetch whole sets of models the service
+// never asks for. Unless told where to put them, they get a scratch cache that
+// is removed on exit, so they can't fill the service's own.
+if ["zootest", "fullbench"].contains(where: CommandLine.arguments.contains),
+   ProcessInfo.processInfo.environment["IMMICH_ML_NATIVE_CACHE"] == nil {
+    let scratch = NSTemporaryDirectory() + "immich-ml-native-scratch-\(getpid())"
+    setenv("IMMICH_ML_NATIVE_CACHE", scratch, 1)
+    setenv("IMMICH_ML_NATIVE_SCRATCH", scratch, 1)
+    print("[native-ml] scratch model cache \(scratch), removed on exit")
+    atexit {
+        if let dir = getenv("IMMICH_ML_NATIVE_SCRATCH") {
+            try? FileManager.default.removeItem(atPath: String(cString: dir))
+        }
+    }
+}
+
 // Native Swift ML service prototype: CLIP (mlx-swift) + OCR + face-detect (Vision).
 // Proves the whole ML compute layer can be native — no Python, no venv, no torch.
 
