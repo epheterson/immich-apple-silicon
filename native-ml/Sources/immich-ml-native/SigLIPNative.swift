@@ -343,8 +343,23 @@ final class SigLIPNative {
         if ((try? dst.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) ?? 0 > 0 {
             return dst.path
         }
+        let existed = FileManager.default.fileExists(atPath: dir.path)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         sweepPartials(dir: dir, name: name)
+        do {
+            try fetchWeights(hfRepo: hfRepo, name: name, dst: dst)
+        } catch {
+            // Both fetch paths are all-or-nothing, so a failure leaves the
+            // folder empty. Remove it if this call made it, as ZooCLIP does.
+            if !existed && ZooCLIP.holdsNoFiles(dir) {
+                try? FileManager.default.removeItem(at: dir)
+            }
+            throw error
+        }
+        return dst.path
+    }
+
+    private static func fetchWeights(hfRepo: String, name: String, dst: URL) throws {
         let url = URL(string: "https://huggingface.co/\(hfRepo)/resolve/main/model.safetensors")!
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 60
@@ -364,13 +379,12 @@ final class SigLIPNative {
         if let total = contentLength(session: session, url: url), total > 0 {
             do {
                 try downloadRanged(session: session, url: url, dst: dst, total: total, name: name)
-                return dst.path
+                return
             } catch {
                 print("[native-ml] \(name): parallel fetch failed (\(error)), falling back to single connection")
             }
         }
         try downloadWhole(session: session, url: url, dst: dst, name: name)
-        return dst.path
     }
 
     // Delete leftover .tmp-<uuid> files from an interrupted fetch.

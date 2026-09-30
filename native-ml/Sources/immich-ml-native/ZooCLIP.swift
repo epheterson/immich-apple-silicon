@@ -10,7 +10,8 @@ import Tokenizers
 // models on the release Mac that the service itself never asked for.
 let NATIVE_CACHE_DIR: URL = {
     if let path = ProcessInfo.processInfo.environment["IMMICH_ML_NATIVE_CACHE"], !path.isEmpty {
-        return URL(fileURLWithPath: path, isDirectory: true)
+        // launchd and plists don't expand ~, so do it here.
+        return URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
     }
     return FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".cache/immich-ml-native")
@@ -425,10 +426,6 @@ final class ZooCLIP {
         progressLock.lock(); _progress = p; progressLock.unlock()
     }
 
-    // needsONNX: false fetches only the metadata the native mlx path uses
-    // (config, preprocess_cfg, tokenizer). The two model.onnx towers are the
-    // large half of this list and are dead weight for a model that will be
-    // served from its own safetensors checkpoint.
     static func holdsNoFiles(_ dir: URL) -> Bool {
         guard let walk = FileManager.default.enumerator(
             at: dir, includingPropertiesForKeys: [.isRegularFileKey]) else { return true }
@@ -440,6 +437,10 @@ final class ZooCLIP {
         return true
     }
 
+    // needsONNX: false fetches only the metadata the native mlx path uses
+    // (config, preprocess_cfg, tokenizer). The two model.onnx towers are the
+    // large half of this list and are dead weight for a model that will be
+    // served from its own safetensors checkpoint.
     static func ensureFiles(name: String, dir: URL, extra: [String] = [],
                             needsONNX: Bool = true) throws {
         let base = needsONNX ? files : files.filter { !$0.hasSuffix("model.onnx") }
