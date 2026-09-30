@@ -41,9 +41,11 @@ import argparse
 import json
 import os
 import pathlib
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -174,8 +176,10 @@ def face_jpeg(override: str | None = None) -> bytes:
 # new inference paths passed this gate while stock OCR returned a shape the
 # response schema rejects and the stock face detector reported zero faces for
 # every image: the gate was green and had executed neither.
+DEFAULT_CLIP = "ViT-B-32__openai"
+
 TASKS = {
-    "clip": {"clip": {"visual": {"modelName": "ViT-B-32__openai"}}},
+    "clip": {"clip": {"visual": {"modelName": DEFAULT_CLIP}}},
     # The nested shape the service actually reads (main.py: task_config
     # ["detection"]["options"]["minScore"], ["recognition"]["modelName"]). The
     # flat form parses fine and the thresholds inside it reach nothing, so the
@@ -287,10 +291,24 @@ def main() -> int:
         "Without it the image is fetched once and cached outside the repo.",
     )
     ap.add_argument("--port", type=int, default=3991)
+    ap.add_argument(
+        "--clip-model",
+        default=DEFAULT_CLIP,
+        help="CLIP model to gate on. The default takes the MLX path; a SigLIP "
+        "model such as ViT-B-16-SigLIP__webli takes the open_clip fallback, "
+        "which the default never exercises. A non-default model is downloaded "
+        "into a throwaway cache and deleted when the gate ends.",
+    )
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--requests", type=int, default=24)
     ap.add_argument("--startup-timeout", type=int, default=180)
     args = ap.parse_args()
+    TASKS["clip"]["clip"]["visual"]["modelName"] = args.clip_model
+
+    # The default model is already in the service's own cache. Anything else
+    # goes through open_clip and the Hugging Face hub, and would otherwise stay
+    # in ~/.cache/huggingface after every run.
+    scratch = None
 
     base = f"http://127.0.0.1:{args.port}"
     env = {
@@ -300,7 +318,7 @@ def main() -> int:
         "ML_HOST": "127.0.0.1",
         "ML_MODELS_DIR": args.models_dir,
         "ML_CACHE_DIR": args.cache_dir,
-        "ML_CLIP_MODEL": "ViT-B-32__openai",
+        "ML_CLIP_MODEL": args.clip_model,
         "ML_FACE_MODEL": "buffalo_l",  # load face too: the #103 crash had both models in-process
         "ML_LOG_REQUESTS": "true",
     }
@@ -333,6 +351,9 @@ def main() -> int:
         f"[preflight] booting real ML service on {base} with STUB_MODE=false ...",
         flush=True,
     )
+    if args.clip_model != DEFAULT_CLIP:
+        scratch = tempfile.mkdtemp(prefix="ml-preflight-hf-")
+        env["HF_HOME"] = scratch
     proc = subprocess.Popen(
         [args.python, "-m", "src.main"],
         cwd=args.src,
@@ -417,6 +438,8 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 proc.kill()
         err.close()
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 if __name__ == "__main__":

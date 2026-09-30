@@ -28,18 +28,20 @@ TYPICAL USE
 Start Immich's own ML container as the reference:
 
     docker run -d --rm --name ml-parity-stock -p 3013:3003 \\
-      -v ml-parity-cache:/cache \\
       ghcr.io/immich-app/immich-machine-learning:v3.0.2
 
---rm so stopping it also removes it. Without that the container outlives the
-comparison and sits exited until somebody notices it months later. The named
-cache volume is deliberate and does survive, because re-downloading the models
-for every run is the thing it exists to avoid; drop it with
-`docker volume rm ml-parity-cache` when you are done comparing for good.
-
-Stop the reference when finished:
+--rm, and no cache volume: the models it downloads live inside the container
+and go with it when you stop it. Stop the reference when finished:
 
     docker stop ml-parity-stock
+
+A native engine you start just for a comparison should likewise keep its
+downloads out of the cache the real service uses:
+
+    IMMICH_ML_NATIVE_CACHE=$(mktemp -d) immich-ml-native serve 3021
+
+Without that, every model a comparison asks for stays in
+~/.cache/immich-ml-native after the run.
 
 Then:
 

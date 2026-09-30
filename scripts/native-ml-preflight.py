@@ -38,11 +38,13 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -604,6 +606,12 @@ def main() -> int:
     env = {**os.environ, "ML_CLIP_DIR": args.clip_dir}
     if args.arcface:
         env["ML_ARCFACE"] = args.arcface
+    # Every model the gate asks for beyond the default is fetched into a
+    # throwaway cache and deleted at the end. Pointed at the service's own
+    # cache, a handful of gate runs had left tens of gigabytes of SigLIP
+    # models on the release Mac that the service itself never used.
+    cache = tempfile.mkdtemp(prefix="native-ml-preflight-cache-")
+    env["IMMICH_ML_NATIVE_CACHE"] = cache
 
     err = open(os.path.join("/tmp", f"native-ml-preflight-{args.port}.err"), "w+b")
     print(
@@ -810,6 +818,7 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 proc.kill()
         err.close()
+        shutil.rmtree(cache, ignore_errors=True)
 
 
 if __name__ == "__main__":
