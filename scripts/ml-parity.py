@@ -36,9 +36,10 @@ and go with it when you stop it. Stop the reference when finished:
     docker stop ml-parity-stock
 
 A native engine you start just for a comparison should likewise keep its
-downloads out of the cache the real service uses:
+downloads out of the cache the real service uses, and delete them when it
+stops:
 
-    IMMICH_ML_NATIVE_CACHE=$(mktemp -d) immich-ml-native serve 3021
+    d=$(mktemp -d); IMMICH_ML_NATIVE_CACHE=$d immich-ml-native serve 3021; rm -rf "$d"
 
 Without that, every model a comparison asks for stays in
 ~/.cache/immich-ml-native after the run.

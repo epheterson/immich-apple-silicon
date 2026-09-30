@@ -35,6 +35,7 @@ Exit 1 = the server crashed or misbehaved (do NOT ship this change).
 """
 
 import argparse
+import atexit
 import base64
 import json
 import os
@@ -611,7 +612,12 @@ def main() -> int:
     # cache, a handful of gate runs had left tens of gigabytes of SigLIP
     # models on the release Mac that the service itself never used.
     cache = tempfile.mkdtemp(prefix="native-ml-preflight-cache-")
+    atexit.register(shutil.rmtree, cache, ignore_errors=True)
     env["IMMICH_ML_NATIVE_CACHE"] = cache
+    # A dropped ssh session (SIGHUP) or a kill (SIGTERM) would otherwise exit
+    # without unwinding, leaving the service running and the cache on disk.
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, lambda signum, _frame: sys.exit(128 + signum))
 
     err = open(os.path.join("/tmp", f"native-ml-preflight-{args.port}.err"), "w+b")
     print(
@@ -818,7 +824,6 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 proc.kill()
         err.close()
-        shutil.rmtree(cache, ignore_errors=True)
 
 
 if __name__ == "__main__":
