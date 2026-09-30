@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.17.6 - 2026-09-29
+
+### Fixed
+- **Asking for a model that doesn't exist no longer leaves an empty folder behind.** A valid model name with no model behind it failed on its first download and left an empty folder in the native engine's cache for good. Now, if nothing arrived, the engine removes the folder it created. A real model that was cut off partway keeps its files, so a retry only fetches what is missing.
+
+### Changed
+- **The native engine's cache location can be changed** with `IMMICH_ML_NATIVE_CACHE`. The default is still `~/.cache/immich-ml-native`.
+- **Release gates and parity runs clean up the models they download.** `scripts/native-ml-preflight.py` downloads into a throwaway cache and removes it afterwards. It used to fill the service's own cache with every SigLIP model it tested, tens of GB on a machine that serves one model. `scripts/ml-preflight.py` takes `--clip-model`, and any non-default model goes into a throwaway Hugging Face cache. The `scripts/ml-parity.py` instructions no longer create a Docker volume that outlives the run.
+
 ## 1.17.5 - 2026-09-28
 
 ### Fixed
