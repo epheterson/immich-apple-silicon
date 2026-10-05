@@ -1,5 +1,6 @@
 #include "ort_shim.h"
 #include <onnxruntime_c_api.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,7 +31,10 @@ static int ort_intra_op_threads(void) {
     return (int)n;
 }
 
-void *ort_load(const char *model_path) {
+// coreml_cache: NULL keeps the session on the CPU. Otherwise the CoreML provider
+// is tried first, with the settings the Python engine used for ArcFace, and
+// onnxruntime runs whatever CoreML can't take on the CPU as before.
+static void *load(const char *model_path, const char *coreml_cache) {
     if (!g) g = OrtGetApiBase()->GetApi(ORT_API_VERSION);
     OrtHandle *h = calloc(1, sizeof(OrtHandle));
     if (!h) return NULL;
@@ -46,6 +50,22 @@ void *ort_load(const char *model_path) {
     // path for the same model).
     g->SetIntraOpNumThreads(h->opts, ort_intra_op_threads());
     g->SetSessionGraphOptimizationLevel(h->opts, ORT_ENABLE_ALL);
+    if (coreml_cache) {
+        // CoreML only takes static shapes. ArcFace declares its batch as the
+        // free dimension "None" and is always run one face at a time, so pin
+        // it to 1; left dynamic, CoreML takes nothing and it all stays on CPU.
+        OrtStatus *st = g->AddFreeDimensionOverrideByName(h->opts, "None", 1);
+        if (st) g->ReleaseStatus(st);
+        const char *keys[] = {"ModelFormat", "MLComputeUnits", "RequireStaticInputShapes",
+                              "ModelCacheDirectory"};
+        const char *vals[] = {"MLProgram", "CPUAndNeuralEngine", "1", coreml_cache};
+        st = g->SessionOptionsAppendExecutionProvider(h->opts, "CoreML", keys, vals, 4);
+        if (st) {
+            fprintf(stderr, "[native-ml] CoreML unavailable, staying on CPU: %s\n",
+                    g->GetErrorMessage(st));
+            g->ReleaseStatus(st);
+        }
+    }
     if (g->CreateSession(h->env, model_path, h->opts, &h->session)) goto fail;
     OrtAllocator *alloc;
     g->GetAllocatorWithDefaultOptions(&alloc);
@@ -55,6 +75,14 @@ void *ort_load(const char *model_path) {
 fail:
     ort_free(h);
     return NULL;
+}
+
+void *ort_load(const char *model_path) { return load(model_path, NULL); }
+
+const char *ort_version(void) { return OrtGetApiBase()->GetVersionString(); }
+
+void *ort_load_coreml(const char *model_path, const char *cache_dir) {
+    return load(model_path, cache_dir);
 }
 
 int ort_run(void *handle, const float *input, int64_t *shape, int ndim,

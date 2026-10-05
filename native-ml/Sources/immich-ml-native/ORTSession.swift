@@ -7,8 +7,17 @@ final class ORTSession {
     private let handle: UnsafeMutableRawPointer
     let outDim: Int
 
-    init?(modelPath: String, outDim: Int = 512) {
-        guard let h = ort_load(modelPath) else { return nil }
+    // coreMLCache: run through CoreML (see ort_load_coreml), keeping the
+    // compiled model there. nil stays on the CPU.
+    init?(modelPath: String, outDim: Int = 512, coreMLCache: URL? = nil) {
+        let loaded: UnsafeMutableRawPointer?
+        if let cache = coreMLCache {
+            try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+            loaded = ort_load_coreml(modelPath, cache.path)
+        } else {
+            loaded = ort_load(modelPath)
+        }
+        guard let h = loaded else { return nil }
         handle = h
         self.outDim = outDim
     }

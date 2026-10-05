@@ -9,6 +9,11 @@
 // count). Returns an opaque handle, or NULL on failure.
 void *ort_load(const char *model_path);
 
+// Same, with the CoreML provider ahead of the CPU (Neural Engine where CoreML
+// places it). For single-input models run at batch 1; the compiled model is
+// kept in `cache_dir`.
+void *ort_load_coreml(const char *model_path, const char *cache_dir);
+
 // Run a single float tensor through the model. `shape`/`ndim` describe the input
 // (e.g. [1,3,112,112]). Writes up to `max_out` floats to `output`. Returns the
 // number of output elements, or -1 on failure.
@@ -27,6 +32,9 @@ int ort_run_multi(void *handle, int n_inputs, const void **datas,
 // -1 unknown).
 int ort_input_count(void *handle);
 int ort_input_elem_type(void *handle, int i);
+
+// onnxruntime's version string, e.g. "1.27.1".
+const char *ort_version(void);
 
 void ort_free(void *handle);
 

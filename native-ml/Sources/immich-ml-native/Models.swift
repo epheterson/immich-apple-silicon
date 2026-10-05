@@ -1,4 +1,5 @@
 import Foundation
+import COnnxShim
 import MLX
 
 // Model registry. The default ViT-B-32 runs on the mlx fast path (bit-identical
@@ -84,9 +85,28 @@ final class Models {
         defer { localLock.unlock() }
         arcfaceLastUsed = .now
         if let s = arcfaceSession { return s }
-        let s = ORTSession(modelPath: arcfacePath)
+        // Through CoreML: on the CPU ArcFace cost about 16 W while faces ran,
+        // the heaviest thing the service did, where the Python engine had
+        // used CoreML all along.
+        let s = ORTSession(modelPath: arcfacePath, coreMLCache: Self.coreMLCache(for: arcfacePath))
         arcfaceSession = s
         return s
+    }
+
+    // The compiled CoreML model is about 330 MB and onnxruntime keys it by a
+    // hash, so a new onnxruntime or model would add a copy beside the old one
+    // every time. Name the folder after what it was compiled from and remove
+    // any other, so there is only ever one.
+    static func coreMLCache(for modelPath: String) -> URL {
+        let root = NATIVE_CACHE_DIR.appendingPathComponent("coreml")
+        let attrs = try? FileManager.default.attributesOfItem(atPath: modelPath)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        let mtime = Int((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+        let key = "ort\(String(cString: ort_version()))-\(size)-\(mtime)"
+        for old in (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [] where old != key {
+            try? FileManager.default.removeItem(at: root.appendingPathComponent(old))
+        }
+        return root.appendingPathComponent(key)
     }
 
     private func startIdleTimer() {
