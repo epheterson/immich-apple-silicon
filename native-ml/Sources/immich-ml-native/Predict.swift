@@ -90,6 +90,10 @@ func processPredict(entries: [String: Any], imageData: Data?, text: String?, mod
                 .filter { Double($0.score) >= VISION_FACE_FLOOR }
             let embs = embedFaces(srcRGB: rgb, w: W, h: H, faces: faces, model: ort)
             var out: [[String: Any]] = []
+            let dropped = embs.filter { $0 == nil }.count
+            if dropped > 0 {
+                print("[native-ml]   faces: \(dropped) of \(faces.count) could not be embedded and were left out")
+            }
             for (f, e) in zip(faces, embs) {
                 guard let e = e else { continue }
                 out.append([

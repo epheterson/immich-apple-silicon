@@ -7,18 +7,24 @@ final class ORTSession {
     private let handle: UnsafeMutableRawPointer
     let outDim: Int
 
+    // Whether CoreML is running this session; false on the CPU, including
+    // when CoreML was asked for and could not build it.
+    let usesCoreML: Bool
+
     // coreMLCache: run through CoreML (see ort_load_coreml), keeping the
     // compiled model there. nil stays on the CPU.
     init?(modelPath: String, outDim: Int = 512, coreMLCache: URL? = nil) {
         let loaded: UnsafeMutableRawPointer?
+        var coreml: Int32 = 0
         if let cache = coreMLCache {
             try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
-            loaded = ort_load_coreml(modelPath, cache.path)
+            loaded = ort_load_coreml(modelPath, cache.path, &coreml)
         } else {
             loaded = ort_load(modelPath)
         }
         guard let h = loaded else { return nil }
         handle = h
+        usesCoreML = coreml != 0
         self.outDim = outDim
     }
 

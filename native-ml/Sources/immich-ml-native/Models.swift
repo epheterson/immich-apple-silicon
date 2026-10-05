@@ -29,8 +29,12 @@ final class Models {
     private let localLock = NSLock()
     private var clipVisualModel: CLIPEncoder?
     private var clipTextModel: CLIPText?
-    private var arcfaceSession: ORTSession?
     private var clipLastUsed = ContinuousClock.now
+
+    // ArcFace has its own lock: its first load compiles the model for CoreML,
+    // and CLIP requests should not wait on that.
+    private let arcfaceLock = NSLock()
+    private var arcfaceSession: ORTSession?
     private var arcfaceLastUsed = ContinuousClock.now
 
     private var idleTimer: DispatchSourceTimer?
@@ -81,14 +85,25 @@ final class Models {
     }
 
     func arcface() -> ORTSession? {
-        localLock.lock()
-        defer { localLock.unlock() }
+        arcfaceLock.lock()
+        defer { arcfaceLock.unlock() }
         arcfaceLastUsed = .now
         if let s = arcfaceSession { return s }
         // Through CoreML: on the CPU ArcFace cost about 16 W while faces ran,
         // the heaviest thing the service did, where the Python engine had
         // used CoreML all along.
-        let s = ORTSession(modelPath: arcfacePath, coreMLCache: Self.coreMLCache(for: arcfacePath))
+        let cache = Self.coreMLCache(for: arcfacePath)
+        let s = ORTSession(modelPath: arcfacePath, coreMLCache: cache)
+        if let s, let cache {
+            if s.usesCoreML {
+                print("[native-ml] face recognition on CoreML")
+            } else {
+                // Whatever is cached there did not load. Clear it so the next
+                // load compiles afresh instead of failing on it forever.
+                try? FileManager.default.removeItem(at: cache)
+                print("[native-ml] face recognition on CPU (CoreML could not load it)")
+            }
+        }
         arcfaceSession = s
         return s
     }
@@ -97,11 +112,15 @@ final class Models {
     // hash, so a new onnxruntime or model would add a copy beside the old one
     // every time. Name the folder after what it was compiled from and remove
     // any other, so there is only ever one.
-    static func coreMLCache(for modelPath: String) -> URL {
+    // nil when the model file isn't there, so a missing model never clears a
+    // good compile.
+    static func coreMLCache(for modelPath: String) -> URL? {
         let root = NATIVE_CACHE_DIR.appendingPathComponent("coreml")
-        let attrs = try? FileManager.default.attributesOfItem(atPath: modelPath)
-        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-        let mtime = Int((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: modelPath),
+              let size = (attrs[.size] as? NSNumber)?.int64Value,
+              let modified = attrs[.modificationDate] as? Date
+        else { return nil }
+        let mtime = Int(modified.timeIntervalSince1970)
         let key = "ort\(String(cString: ort_version()))-\(size)-\(mtime)"
         for old in (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [] where old != key {
             try? FileManager.default.removeItem(at: root.appendingPathComponent(old))
@@ -147,11 +166,14 @@ final class Models {
             clipTextModel = nil
             released.append(Self.defaultClip)
         }
+        localLock.unlock()
+
+        arcfaceLock.lock()
         if arcfaceSession != nil, arcfaceLastUsed.duration(to: .now) >= cutoff {
             arcfaceSession = nil
             released.append("arcface")
         }
-        localLock.unlock()
+        arcfaceLock.unlock()
 
         guard !released.isEmpty else { return }
         // Releasing the arrays is not enough on its own: MLX keeps freed device

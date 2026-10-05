@@ -11,8 +11,9 @@ void *ort_load(const char *model_path);
 
 // Same, with the CoreML provider ahead of the CPU (Neural Engine where CoreML
 // places it). For single-input models run at batch 1; the compiled model is
-// kept in `cache_dir`.
-void *ort_load_coreml(const char *model_path, const char *cache_dir);
+// kept in `cache_dir`. If CoreML can't build the session it falls back to the
+// CPU; *used_coreml is 1 only when CoreML is in use.
+void *ort_load_coreml(const char *model_path, const char *cache_dir, int *used_coreml);
 
 // Run a single float tensor through the model. `shape`/`ndim` describe the input
 // (e.g. [1,3,112,112]). Writes up to `max_out` floats to `output`. Returns the
