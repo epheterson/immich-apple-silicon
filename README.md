@@ -9,7 +9,7 @@
 
 > **Beta.** In daily use on a Mac Mini M4 (24GB) against an Immich 3.0.x library. Stable, but back up your Immich database before your first run.
 
-Run Immich's compute natively on Apple Silicon. Thumbnails use the fast M-series CPU, video transcoding uses VideoToolbox hardware encoding, and ML runs on Metal GPU, Neural Engine, and CoreML.
+Run Immich's compute natively on Apple Silicon. Thumbnails use the fast M-series CPU, video transcoding uses VideoToolbox hardware encoding, and ML runs on the Metal GPU and the Neural Engine.
 
 Docker handles the lightweight parts (API server, Postgres, Redis). The accelerator runs Immich's own microservices worker and/or ML service natively on macOS, giving either access to hardware that Docker can't reach.
 
