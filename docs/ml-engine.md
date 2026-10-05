@@ -4,10 +4,13 @@ The ML service runs Immich's CLIP, face, and OCR inference natively on Apple Sil
 
 | Task | Hardware | Framework |
 |------|----------|-----------|
-| CLIP embeddings (image + text) | GPU (Metal) | mlx-swift |
+| CLIP embeddings, default model and the SigLIP family | GPU (Metal) | mlx-swift |
+| CLIP embeddings, other models from Immich's model list | CPU | onnxruntime |
 | Face detection + landmarks | Neural Engine | Apple Vision |
-| Face recognition | CPU | InsightFace ArcFace (onnxruntime) |
-| OCR | Neural Engine | Apple Vision |
+| Face recognition | Neural Engine | InsightFace ArcFace (onnxruntime with CoreML) |
+| OCR | Neural Engine and CPU | Apple Vision |
+
+Apple Vision picks its own hardware; the entries for it are what `powermetrics` shows on an M4. Until 1.17.7 the default CLIP model and face recognition both ran on the CPU ([#186](https://github.com/epheterson/immich-apple-silicon/issues/186)). Face recognition compiles its model for CoreML once, about 330 MB kept in `~/.cache/immich-ml-native/coreml`, replaced rather than added to when onnxruntime or the model changes.
 
 As of 1.6.0 this runs as a **native Swift engine**: a single binary with the models and libraries bundled, no Python. It replaces the ~1.5 GB Python venv (torch, mlx, onnxruntime, opencv, insightface) and the dependency-pin fragility that came with it. It uses the same weights and models as the Python service, so embeddings stay in the same space as an existing Immich search index and face clusters (no re-index, no re-cluster).
 

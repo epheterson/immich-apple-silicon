@@ -26,7 +26,11 @@ if ["zootest", "fullbench"].contains(where: CommandLine.arguments.contains),
 // Native Swift ML service prototype: CLIP (mlx-swift) + OCR + face-detect (Vision).
 // Proves the whole ML compute layer can be native — no Python, no venv, no torch.
 
-MLX.Device.setDefault(device: Device(.cpu))   // CPU backend; GPU also works with mlx.metallib present
+// The default CLIP runs on the GPU, like the SigLIP models. It had been left on
+// the CPU from the prototype: on an M4 the GPU embeds an image in 12 ms instead
+// of 23, with a third of the CPU time and identical embeddings (#186). Its
+// calls hold metalLock, the same as the SigLIP path that already ran on the GPU.
+MLX.Device.setDefault(device: Device(.gpu))
 
 // --- CLIP text parity harness: encode phrases, dump ids + embeddings for cosine check ---
 if CommandLine.arguments.contains("texttest") {

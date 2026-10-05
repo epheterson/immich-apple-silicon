@@ -1,5 +1,6 @@
 #include "ort_shim.h"
 #include <onnxruntime_c_api.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,23 +31,65 @@ static int ort_intra_op_threads(void) {
     return (int)n;
 }
 
-void *ort_load(const char *model_path) {
+// 0 = onnxruntime picks its own default (hardware_concurrency-based).
+// Was hardcoded to 1 since the engine's original ArcFace-only use case
+// (a small face-embedding model, where single-threaded is plenty), but
+// the v1.7.0 model zoo feature reuses this same session setup for CLIP
+// models up to ~400M params, where single-threaded CPU is a real
+// bottleneck (measured ~14x slower than the mlx default-model path on
+// the same machine, and slower than the Python venv fallback's MPS
+// path for the same model).
+static OrtSessionOptions *cpu_options(void) {
+    OrtSessionOptions *opts = NULL;
+    if (g->CreateSessionOptions(&opts)) return NULL;
+    g->SetIntraOpNumThreads(opts, ort_intra_op_threads());
+    g->SetSessionGraphOptimizationLevel(opts, ORT_ENABLE_ALL);
+    return opts;
+}
+
+// Logs and releases a failed status; true if there was one.
+static int failed(OrtStatus *st, const char *what) {
+    if (!st) return 0;
+    fprintf(stderr, "[native-ml] %s: %s\n", what, g->GetErrorMessage(st));
+    g->ReleaseStatus(st);
+    return 1;
+}
+
+// coreml_cache: NULL keeps the session on the CPU. Otherwise the CoreML provider
+// is tried first, with the settings the Python engine used for ArcFace, and
+// onnxruntime runs whatever CoreML can't take on the CPU. If CoreML can't build
+// the session at all, it is built again on the CPU alone, so a CoreML problem
+// costs speed, never the model. *used_coreml says which happened.
+static void *load(const char *model_path, const char *coreml_cache, int *used_coreml) {
     if (!g) g = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (used_coreml) *used_coreml = 0;
     OrtHandle *h = calloc(1, sizeof(OrtHandle));
     if (!h) return NULL;
-    if (g->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "immich-ml", &h->env)) goto fail;
-    g->CreateSessionOptions(&h->opts);
-    // 0 = onnxruntime picks its own default (hardware_concurrency-based).
-    // Was hardcoded to 1 since the engine's original ArcFace-only use case
-    // (a small face-embedding model, where single-threaded is plenty), but
-    // the v1.7.0 model zoo feature reuses this same session setup for CLIP
-    // models up to ~400M params, where single-threaded CPU is a real
-    // bottleneck (measured ~14x slower than the mlx default-model path on
-    // the same machine, and slower than the Python venv fallback's MPS
-    // path for the same model).
-    g->SetIntraOpNumThreads(h->opts, ort_intra_op_threads());
-    g->SetSessionGraphOptimizationLevel(h->opts, ORT_ENABLE_ALL);
-    if (g->CreateSession(h->env, model_path, h->opts, &h->session)) goto fail;
+    if (failed(g->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "immich-ml", &h->env), "onnxruntime env"))
+        goto fail;
+    if (!(h->opts = cpu_options())) goto fail;
+    int coreml = 0;
+    if (coreml_cache) {
+        // CoreML only takes static shapes. ArcFace declares its batch as the
+        // free dimension "None" and is always run one face at a time, so pin
+        // it to 1; left dynamic, CoreML takes nothing and it all stays on CPU.
+        failed(g->AddFreeDimensionOverrideByName(h->opts, "None", 1), "batch override");
+        const char *keys[] = {"ModelFormat", "MLComputeUnits", "RequireStaticInputShapes",
+                              "ModelCacheDirectory"};
+        const char *vals[] = {"MLProgram", "CPUAndNeuralEngine", "1", coreml_cache};
+        coreml = !failed(g->SessionOptionsAppendExecutionProvider(h->opts, "CoreML", keys, vals, 4),
+                         "CoreML unavailable, staying on CPU");
+    }
+    OrtStatus *st = g->CreateSession(h->env, model_path, h->opts, &h->session);
+    if (st && coreml) {
+        failed(st, "CoreML could not build the session, retrying on CPU");
+        g->ReleaseSessionOptions(h->opts);
+        if (!(h->opts = cpu_options())) goto fail;
+        coreml = 0;
+        st = g->CreateSession(h->env, model_path, h->opts, &h->session);
+    }
+    if (failed(st, "onnxruntime could not load the model")) goto fail;
+    if (used_coreml) *used_coreml = coreml;
     OrtAllocator *alloc;
     g->GetAllocatorWithDefaultOptions(&alloc);
     g->SessionGetInputName(h->session, 0, alloc, &h->in_name);
@@ -55,6 +98,14 @@ void *ort_load(const char *model_path) {
 fail:
     ort_free(h);
     return NULL;
+}
+
+void *ort_load(const char *model_path) { return load(model_path, NULL, NULL); }
+
+const char *ort_version(void) { return OrtGetApiBase()->GetVersionString(); }
+
+void *ort_load_coreml(const char *model_path, const char *cache_dir, int *used_coreml) {
+    return load(model_path, cache_dir, used_coreml);
 }
 
 int ort_run(void *handle, const float *input, int64_t *shape, int ndim,

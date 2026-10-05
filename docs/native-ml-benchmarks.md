@@ -12,6 +12,8 @@ Generated 2026-08-18 17:06 UTC · commit `48c9531` · median of 20 calls, 3 warm
 
 ## CLIP visual: native mlx-swift vs. onnxruntime
 
+The ViT-B-32 rows predate 1.17.7, when the default model ran on the CPU. On the GPU it embeds an image in about 12 ms end to end through `/predict` (#186).
+
 | Model | ONNX visual | Native visual | Speedup |
 |---|---:|---:|---:|
 | ViT-B-32 (default) | 30ms | 18ms | **1.6x** |

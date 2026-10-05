@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.17.7 - 2026-10-04
+
+### Fixed
+- **Smart Search's default model now runs on the GPU.** The native engine had left the default CLIP model on the CPU, although the documentation said GPU. On an M4 an image now embeds in 12 ms instead of 23, about twice as many per second under load, with a third of the CPU time, so thumbnails and other jobs get more of the CPU. The embeddings are identical, so nothing needs re-indexing. The SigLIP models already ran on the GPU. Reported by [@gnattu](https://github.com/gnattu) ([#186](https://github.com/epheterson/immich-apple-silicon/issues/186)).
+
+- **Face recognition runs on the Neural Engine through CoreML.** On the CPU it was the heaviest thing the ML service did, about 16 W while faces were processed. On an M4 a photo's faces are now embedded in 25 ms instead of 72, using a sixteenth of the CPU time, with the same embeddings, so existing face clusters are unaffected. The first face after an upgrade compiles the model for CoreML, about a second, and the compiled model (about 330 MB) is kept for later starts.
+
+### Changed
+- **The ML documentation now says what runs where, as measured.** Other models from Immich's model list run on the CPU through onnxruntime, and OCR uses the CPU as well as the Neural Engine.
+
 ## 1.17.6 - 2026-09-29
 
 ### Fixed

@@ -148,7 +148,7 @@ In the Immich admin UI (Administration → Jobs), tune the per-queue concurrency
 | Queue | Concurrency | Why |
 |-------|-------------|-----|
 | Thumbnail Generation | 4 | CPU-bound (Sharp/libvips with NEON SIMD) |
-| Smart Search | 2 | GPU-serialized (MLX Metal, no benefit higher) |
+| Smart Search | 2 | GPU-serialized (MLX Metal, no benefit higher) for the default and SigLIP models |
 | Face Detection | 3 | Neural Engine (Vision framework) |
 | OCR | 3 | Neural Engine (Vision framework) |
 | Metadata Extraction | 4 | I/O-bound (exiftool) |

@@ -240,9 +240,9 @@ final class SigLIPNative {
 
     // Scoped to the GPU device for just this call (Device.withDefaultDevice
     // sets a @TaskLocal, not the process-wide default) — every model in this
-    // family is dramatically slower on CPU (SO400M measured ~28x), but the
-    // rest of the service (default mlx CLIP path, Vision-framework OCR/face
-    // detection) must keep running on whatever the global default is.
+    // family is dramatically slower on CPU (SO400M measured ~28x). Since
+    // 1.17.7 the global default is the GPU too (main.swift), so this is now
+    // belt and braces rather than the only thing putting SigLIP there.
     // Device.gpu / its .defaultStream are pre-existing cached singletons
     // (see mlx-swift's Device.swift), so this allocates nothing — earlier
     // this used Stream.withNewDefaultStream(device:), which constructs a
