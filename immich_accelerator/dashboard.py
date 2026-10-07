@@ -476,17 +476,16 @@ def create_app(config: dict):
 
     # A plain cross-site form POST needs no preflight, so any web page the user
     # opens could otherwise press the dashboard's buttons. Browsers send Origin
-    # on every POST; the dashboard's own page sends its own host.
+    # on every POST; the dashboard's own page sends its own host. Behind a
+    # reverse proxy that rewrites Host, the original is in X-Forwarded-Host,
+    # which a cross-site form can't set.
     @app.middleware("http")
     async def same_origin_posts(request, call_next):
         from urllib.parse import urlsplit
 
         origin = request.headers.get("origin")
-        if (
-            request.method == "POST"
-            and origin
-            and urlsplit(origin).netloc != request.headers.get("host")
-        ):
+        hosts = {request.headers.get("host"), request.headers.get("x-forwarded-host")}
+        if request.method == "POST" and origin and urlsplit(origin).netloc not in hosts:
             return JSONResponse({"error": "cross-site request"}, status_code=403)
         return await call_next(request)
 
