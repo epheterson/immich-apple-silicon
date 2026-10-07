@@ -4,7 +4,7 @@
 
 ### Changed
 - **Release downloads can be verified.** The native ML bundle and the menu-bar app now carry GitHub build-provenance attestations, and the bundle ships with an SBOM of its Swift packages. Check one with `gh attestation verify <file> --repo epheterson/immich-apple-silicon`.
-- **The repository is watched for supply-chain problems.** Every GitHub Action is pinned to a commit, each workflow token has only the permissions its job needs, Dependabot proposes action and Swift package updates (never mlx-swift, which has to pass the real-model gate first), CodeQL scans the Python and Node code, and an OpenSSF Scorecard badge is in the README.
+- **The repository is watched for supply-chain problems.** Every GitHub Action is pinned to a commit, each workflow token has only the permissions its job needs, Dependabot opens a pull request only when a security advisory affects an action or Swift package (never mlx-swift, which has to pass the real-model gate first), CodeQL scans the Python and Node code, and an OpenSSF Scorecard badge is in the README.
 
 ### Fixed
 - **1.17.7's notes understated the first face after upgrading.** Compiling the face model for CoreML takes about ten seconds with the onnxruntime in the release bundle, not about a second. It happens once; later starts reuse the compiled model.

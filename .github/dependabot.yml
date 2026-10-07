@@ -1,6 +1,6 @@
-# Weekly version updates, grouped so a quiet week is one pull request per ecosystem.
-# Security updates are separate: they come as soon as an advisory lands, whatever the schedule
-# (Settings > Code security > Dependabot security updates).
+# Quiet by design: open-pull-requests-limit 0 turns off routine version pull requests, so
+# nothing arrives unless a security advisory hits a dependency. Those come as soon as the
+# advisory lands, whatever the schedule (Settings > Code security > Dependabot security updates).
 # There is no Python requirements file in the tree (the ML submodule carries its own pins).
 # docker/ is not tracked: its compose mirrors Immich's own, which is where its versions come from.
 version: 2
@@ -13,6 +13,7 @@ updates:
       interval: weekly
       day: monday
     labels: [dependencies]
+    open-pull-requests-limit: 0 # quiet: no routine version PRs, security updates still open
     groups:
       actions:
         patterns: ["*"]
@@ -29,6 +30,7 @@ updates:
       interval: weekly
       day: monday
     labels: [dependencies]
+    open-pull-requests-limit: 0 # quiet: no routine version PRs, security updates still open
     groups:
       swift-minor:
         update-types: [minor, patch]
