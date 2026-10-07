@@ -36,6 +36,6 @@ logic the panel renders without a GUI session:
 # worker=true
 # ml_up=true ml_healthy=true engine=NATIVE
 # dashboard=true
-# immich=3.0.2 url=http://10.0.0.14:2283
+# immich=3.0.2 url=http://192.0.2.10:2283
 # overall=Running
 ```

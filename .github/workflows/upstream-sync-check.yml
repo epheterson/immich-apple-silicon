@@ -22,7 +22,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 env:
   UPSTREAM: sebastianfredette/immich-ml-metal
@@ -31,9 +30,12 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # open or update the tracking issue
     steps:
       - name: Checkout (with submodules)
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           submodules: recursive
           fetch-depth: 0
@@ -129,6 +131,9 @@ jobs:
     # and STUB_MODE tests yet crash the real service (that is what shipped the
     # v1.5.29 regression).
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # open or update the tracking issue
     env:
       LATEST_BAD: "0.32.2" # newest mlx gate-tested and found to crash; nag only for something newer
       MLX_TITLE: "mlx > 0.32.2 is available, re-test the CLIP pin (#38, #103)"

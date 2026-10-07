@@ -1,0 +1,38 @@
+# Quiet by design: open-pull-requests-limit 0 turns off routine version pull requests, so
+# nothing arrives unless a security advisory hits a dependency. Those come as soon as the
+# advisory lands, whatever the schedule (Settings > Code security > Dependabot security updates).
+# There is no Python requirements file in the tree (the ML submodule carries its own pins).
+# docker/ is not tracked: its compose mirrors Immich's own, which is where its versions come from.
+version: 2
+
+updates:
+  # Every action is pinned to a commit; this keeps the pins and their version comments current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies]
+    open-pull-requests-limit: 0 # quiet: no routine version PRs, security updates still open
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # The native ML engine and the menu-bar app. mlx-swift is never proposed: every mlx version
+  # must pass scripts/ml-preflight.py and native-ml-preflight.py on real Apple Silicon first,
+  # and two releases that passed CI crashed the real service (#38, #103). Anything else here
+  # that touches native-ml needs the same gate before it merges.
+  - package-ecosystem: swift
+    directories:
+      - /native-ml
+      - /menubar
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies]
+    open-pull-requests-limit: 0 # quiet: no routine version PRs, security updates still open
+    groups:
+      swift-minor:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: mlx-swift

@@ -288,7 +288,7 @@ enum Actions {
     /// Name and status are compared as whole fields, and the column runs are
     /// several spaces wide. Measured on the release Mac:
     ///
-    ///     immich-accelerator started         elp  ~/Library/LaunchAgents/...
+    ///     immich-accelerator started         you  ~/Library/LaunchAgents/...
     ///     immich-accelerator none
     ///
     /// A stopped service reads `none`, and its row ends after the status, so

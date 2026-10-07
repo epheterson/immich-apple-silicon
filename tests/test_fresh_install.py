@@ -2072,10 +2072,10 @@ class TestEncodingSwitches:
     def test_it_keeps_the_rest_of_the_config(self, tmp_data_dir):
         """Writing a switch must not drop settings, which is how a config
         rewrite quietly destroys an install."""
-        m.save_config({"immich_url": "http://10.0.0.9:2283", "api_key": "abc"})
+        m.save_config({"immich_url": "http://192.0.2.20:2283", "api_key": "abc"})
         m.cmd_encoding(self._args("hardware-video", "off"))
         after = m.load_config()
-        assert after["immich_url"] == "http://10.0.0.9:2283"
+        assert after["immich_url"] == "http://192.0.2.20:2283"
         assert after["api_key"] == "abc"
 
     def test_it_keeps_other_env_entries(self, tmp_data_dir):
@@ -2225,7 +2225,7 @@ class TestEncodingSwitches:
         away. Only going through _finalize_config catches that.
         """
         m.save_config(m.apply_encoding_preset("software", {}))
-        rebuilt = {"immich_url": "http://10.0.0.9:2283"}
+        rebuilt = {"immich_url": "http://192.0.2.20:2283"}
         self._finalize(rebuilt, monkeypatch)
         assert m.encoding_preset() == "software", (
             "a chosen position must survive re-running setup"
