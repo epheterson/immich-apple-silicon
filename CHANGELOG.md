@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.17.9 - 2026-10-07
+
+### Fixed
+- **Tarball extraction always refuses unsafe paths.** Importing a server tarball, its build data, or the server layers from the registry kept an unfiltered fallback for Pythons older than 3.11.4. The accelerator always runs on Homebrew's Python 3.11, so the fallback is gone and every extraction uses Python's safe tar filters.
+- **The dashboard no longer shows raw Immich API errors.** It is served on your network, so an unrecognized failure now shows the error type, and the full message goes to the log.
+
 ## 1.17.8 - 2026-10-06
 
 ### Changed

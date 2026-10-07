@@ -4414,3 +4414,23 @@ class TestSplitInstallVersionRouting:
             ), patch.object(m, "download_immich_server", downloaded):
                 assert m._server_build_for("3.2.2") == Path("/srv/3.2.2")
             downloaded.assert_called_once_with("3.2.2")
+
+
+class TestImportServerTarball:
+    def test_refuses_path_traversal(self, tmp_path):
+        import io
+        import tarfile
+
+        import immich_accelerator.__main__ as acc
+
+        tarball = tmp_path / "server.tar.gz"
+        with tarfile.open(tarball, "w:gz") as tf:
+            data = b"pwned"
+            info = tarfile.TarInfo("../../escaped.txt")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        data_dir = tmp_path / "data"
+        with patch.object(acc, "DATA_DIR", data_dir):
+            with pytest.raises(tarfile.OutsideDestinationError):
+                acc._import_server(str(tarball), "v9.9.9")
+        assert not (tmp_path / "escaped.txt").exists()

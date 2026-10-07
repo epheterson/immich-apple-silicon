@@ -1671,10 +1671,7 @@ def download_immich_server(version: str) -> Path:
                     # their targets to exist, so per-member extract breaks.
 
                     with tempfile.TemporaryDirectory() as tmpdir:
-                        try:
-                            tf.extractall(tmpdir, filter="tar")
-                        except TypeError:
-                            tf.extractall(tmpdir)
+                        tf.extractall(tmpdir, filter="tar")
                         src = Path(tmpdir) / "usr" / "src" / "app" / "server"
                         if src.exists():
                             if staging.exists():
@@ -1689,12 +1686,9 @@ def download_immich_server(version: str) -> Path:
                             # Rewrite "build/" -> "build-data/" so files land
                             # directly in our IMMICH_BUILD_DATA directory
                             member.name = "build-data" + member.name[5:]
-                            try:
-                                tf.extract(
-                                    member, str(build_data.parent), filter="data"
-                                )
-                            except TypeError:
-                                tf.extract(member, str(build_data.parent))
+                            tf.extract(
+                                member, str(build_data.parent), filter="data"
+                            )
                     found_build = True
 
         except Exception as e:
@@ -3884,16 +3878,8 @@ def _import_server(source: str, version: str) -> Path:
             shutil.rmtree(staging)
         staging.mkdir(parents=True, exist_ok=True)
         with tarfile.open(str(source_path), "r:gz") as tf:
-            # Prevent path traversal from crafted tarballs
-            try:
-                tf.extractall(str(staging), filter="data")
-            except TypeError:
-                # Python < 3.11.4 doesn't support filter=
-                for member in tf.getmembers():
-                    resolved = (staging / member.name).resolve()
-                    if not str(resolved).startswith(str(staging.resolve())):
-                        raise RuntimeError(f"Unsafe path in tarball: {member.name}")
-                tf.extractall(str(staging))
+            # filter="data" refuses path traversal and links out of staging
+            tf.extractall(str(staging), filter="data")
         # The tarball may have a top-level 'server' directory or not
         candidates = [staging, staging / "server"]
         found = None
@@ -3928,10 +3914,7 @@ def _import_server(source: str, version: str) -> Path:
                     shutil.rmtree(build_data)
                 build_data.mkdir(parents=True, exist_ok=True)
                 with tarfile.open(str(build_tar), "r:gz") as bf:
-                    try:
-                        bf.extractall(str(build_data), filter="data")
-                    except TypeError:
-                        bf.extractall(str(build_data))
+                    bf.extractall(str(build_data), filter="data")
                 # Stamp so the offline-imported build-data isn't seen as stale
                 # by the cache gate later (which would force a re-download that
                 # defeats the whole point of the offline import path).

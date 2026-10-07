@@ -359,8 +359,9 @@ def get_status(config: dict) -> dict:
             elif "timed out" in err.lower():
                 jobs_api_error = "Immich API timed out (server under heavy load?)"
             else:
-                jobs_api_error = err[:200]
-            log.warning("jobs API unreachable: %s", jobs_api_error)
+                # The page is served on the LAN; the details stay in the log.
+                jobs_api_error = f"Immich API error ({type(e).__name__})"
+            log.warning("jobs API unreachable: %s", err)
     else:
         jobs_api_error = "no api_key configured"
 
