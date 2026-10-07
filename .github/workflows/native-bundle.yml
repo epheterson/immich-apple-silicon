@@ -10,13 +10,16 @@ on:
         description: version string for the tarball name
         default: "1.6.0"
 
+permissions:
+  contents: read
+
 jobs:
   build:
     # macos-15 ships Xcode 16 / Swift 6, so mlx-swift resolves to the pinned
     # 0.31.6 (Package.resolved). Older Swift silently falls back to 0.29.x.
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: onnxruntime
         run: brew install onnxruntime
@@ -43,7 +46,7 @@ jobs:
           cd native-ml && bash scripts/release_bundle.sh "$VERSION"
 
       - name: upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-bundle
           path: native-ml/immich-ml-native-*.tar.gz

@@ -6,6 +6,7 @@
 [![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-blue.svg)]()
 [![Homebrew](https://img.shields.io/badge/install-Homebrew-orange.svg)](https://github.com/epheterson/homebrew-immich-accelerator)
 [![Immich](https://img.shields.io/badge/Immich-2.7%2B-5b21b6.svg)](https://immich.app/)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/epheterson/immich-apple-silicon/badge)](https://scorecard.dev/viewer/?uri=github.com/epheterson/immich-apple-silicon)
 
 > **Beta.** In daily use on a Mac Mini M4 (24GB) against an Immich 3.0.x library. Stable, but back up your Immich database before your first run.
 

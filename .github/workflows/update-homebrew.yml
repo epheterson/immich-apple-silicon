@@ -7,6 +7,9 @@ on:
         description: 'Tag to release (e.g. v1.3.6)'
         required: true
 
+permissions:
+  contents: read
+
 jobs:
   build-native:
     # Build the native ML bundle + menu-bar app on macOS (Swift + Metal) and
@@ -17,13 +20,15 @@ jobs:
     # run failed 403 without it and was completed by hand).
     runs-on: macos-15
     permissions:
-      contents: write
+      contents: write # upload release assets
+      id-token: write # OIDC: sign the build-provenance attestations
+      attestations: write # store them
     outputs:
       sha256: ${{ steps.pkg.outputs.sha256 }}
       menubar_sha256: ${{ steps.menubar.outputs.sha256 }}
       menubar_notarized: ${{ steps.menubar.outputs.notarized }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ inputs.tag }}
       - name: onnxruntime
@@ -48,6 +53,31 @@ jobs:
           TARBALL="$(ls immich-ml-native-*.tar.gz)"
           echo "sha256=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           gh release upload "$TAG" "$TARBALL" --clobber
+      - name: SBOM for the native bundle (Swift packages as resolved)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: native-ml
+          format: spdx-json
+          output-file: immich-ml-native-sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest the native bundle (build provenance)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: native-ml/immich-ml-native-*.tar.gz
+      - name: Attach the SBOM and attest it
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cp immich-ml-native-sbom.spdx.json "immich-ml-native-${TAG#v}-sbom.spdx.json"
+          gh release upload "$TAG" "immich-ml-native-${TAG#v}-sbom.spdx.json" --clobber
+      - name: Attest the SBOM against the bundle
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
+        with:
+          subject-path: native-ml/immich-ml-native-*.tar.gz
+          sbom-path: immich-ml-native-sbom.spdx.json
       # Import the Developer ID cert into a throwaway keychain so the menu-bar
       # build can Developer-ID sign (required before notarization). Skipped when
       # the secret is absent -- the build then falls back to ad-hoc signing and
@@ -154,6 +184,11 @@ jobs:
           else
             echo "SPARKLE_PRIVATE_KEY absent -- skipping appcast (in-app updates disabled until secrets are set)"
           fi
+      - name: Attest the menu-bar app (build provenance)
+        if: steps.menubar.outputs.sha256 != ''
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: menubar/immich-accelerator-menubar-*.zip
 
   # Guard against #111: prove the released native bundle actually runs on a clean
   # Mac with NONE of the ML Homebrew formulae (onnx / onnxruntime / abseil /
@@ -164,6 +199,8 @@ jobs:
   verify-native-clean:
     needs: build-native
     runs-on: macos-15
+    permissions:
+      contents: read
     env:
       TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
@@ -202,6 +239,8 @@ jobs:
   update-tap:
     needs: [build-native, verify-native-clean]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # the tap is pushed with TAP_TOKEN, not this token
     env:
       TAG: ${{ inputs.tag }}
     steps:
@@ -225,13 +264,13 @@ jobs:
           echo "sha256=$ML_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Checkout accelerator (for the formula renderer)
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ inputs.tag }}
           path: acc
 
       - name: Checkout tap repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: ${{ github.repository_owner }}/homebrew-immich-accelerator
           token: ${{ secrets.TAP_TOKEN }}
