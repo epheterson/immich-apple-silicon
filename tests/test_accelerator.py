@@ -4434,3 +4434,65 @@ class TestImportServerTarball:
             with pytest.raises(tarfile.OutsideDestinationError):
                 acc._import_server(str(tarball), "v9.9.9")
         assert not (tmp_path / "escaped.txt").exists()
+
+
+class TestDownloadIntegrity:
+    def test_blob_digest_mismatch_is_refused(self):
+        import hashlib
+
+        import immich_accelerator.__main__ as acc
+
+        data = b"layer bytes"
+        good = "sha256:" + hashlib.sha256(data).hexdigest()
+        acc._check_blob_digest(data, good)
+        with pytest.raises(RuntimeError, match="digest"):
+            acc._check_blob_digest(data + b"!", good)
+        with pytest.raises(RuntimeError, match="digest"):
+            acc._check_blob_digest(data, "md5:abc")
+
+    def _release(self, name, digest):
+        body = json.dumps({"assets": [{"name": name, "digest": digest}]}).encode()
+        resp = MagicMock()
+        resp.read.return_value = body
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: False
+        return resp
+
+    def test_jf_ffmpeg_digest_from_github_release(self):
+        import immich_accelerator.__main__ as acc
+
+        name = "jellyfin-ffmpeg_7.1.4-3_portable_macarm64-gpl.tar.xz"
+        with patch(
+            "urllib.request.urlopen", return_value=self._release(name, "sha256:ab12")
+        ) as op:
+            assert acc._jf_ffmpeg_github_digest(name) == "ab12"
+        assert op.call_args[0][0].endswith("/releases/tags/v7.1.4-3")
+
+    def test_jf_ffmpeg_digest_unknown_when_unavailable(self):
+        import immich_accelerator.__main__ as acc
+
+        name = "jellyfin-ffmpeg_7.1.4-3_portable_macarm64-gpl.tar.xz"
+        with patch("urllib.request.urlopen", side_effect=OSError("offline")):
+            assert acc._jf_ffmpeg_github_digest(name) is None
+        with patch(
+            "urllib.request.urlopen", return_value=self._release("other.tar.xz", "sha256:ab")
+        ):
+            assert acc._jf_ffmpeg_github_digest(name) is None
+        assert acc._jf_ffmpeg_github_digest("not-a-jellyfin-name.tar.xz") is None
+
+    def test_jf_ffmpeg_mismatch_refuses_install(self, tmp_path):
+        import immich_accelerator.__main__ as acc
+
+        def fake_retrieve(url, dst):
+            Path(dst).write_bytes(b"tampered")
+
+        with patch.object(acc, "DATA_DIR", tmp_path), patch.object(
+            acc, "_find_jf_ffmpeg_url",
+            return_value="https://x/jellyfin-ffmpeg_7.1.4-3_portable_macarm64-gpl.tar.xz",
+        ), patch("urllib.request.urlretrieve", side_effect=fake_retrieve), patch.object(
+            acc, "_jf_ffmpeg_github_digest", return_value="00" * 32
+        ), patch("subprocess.run") as run:
+            with pytest.raises(RuntimeError, match="checksum"):
+                acc._ensure_jellyfin_ffmpeg()
+        run.assert_not_called()
+        assert not (tmp_path / "jellyfin-ffmpeg" / "jellyfin-ffmpeg.tar.xz").exists()

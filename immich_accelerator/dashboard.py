@@ -474,6 +474,22 @@ def create_app(config: dict):
 
     app = FastAPI(title="Immich Accelerator Dashboard")
 
+    # A plain cross-site form POST needs no preflight, so any web page the user
+    # opens could otherwise press the dashboard's buttons. Browsers send Origin
+    # on every POST; the dashboard's own page sends its own host.
+    @app.middleware("http")
+    async def same_origin_posts(request, call_next):
+        from urllib.parse import urlsplit
+
+        origin = request.headers.get("origin")
+        if (
+            request.method == "POST"
+            and origin
+            and urlsplit(origin).netloc != request.headers.get("host")
+        ):
+            return JSONResponse({"error": "cross-site request"}, status_code=403)
+        return await call_next(request)
+
     # The captured config is the fallback; every request re-reads the file, so a
     # component toggle or an added api_key takes effect without a restart.
     # Both handlers do it: a reload in only one of them is the same bug with a
