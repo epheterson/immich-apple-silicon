@@ -34,9 +34,25 @@ func detectFaces(_ cg: CGImage) -> [FaceBox] {
 
 func loadCGImage(_ path: String) -> CGImage? {
     guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
-    return CGImageSourceCreateImageAtIndex(src, 0, nil)
+    return decodeBounded(src)
 }
 func loadCGImage(data: Data) -> CGImage? {
     guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+    return decodeBounded(src)
+}
+
+// A few KB of PNG can declare a canvas that decodes to many GB. Refuse it
+// from the header, before decoding, at the size where Pillow (what Immich's
+// own ML container decodes with) raises DecompressionBombError.
+private let maxDecodedPixels = 2 * 89_478_485
+
+private func decodeBounded(_ src: CGImageSource) -> CGImage? {
+    if let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+       let w = props[kCGImagePropertyPixelWidth] as? Int,
+       let h = props[kCGImagePropertyPixelHeight] as? Int,
+       w.multipliedReportingOverflow(by: h).overflow || w * h > maxDecodedPixels {
+        print("[native-ml] refusing a \(w)x\(h) image: too many pixels to decode")
+        return nil
+    }
     return CGImageSourceCreateImageAtIndex(src, 0, nil)
 }
