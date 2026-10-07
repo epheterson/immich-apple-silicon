@@ -28,8 +28,8 @@ REAL_PORT_IN_USE = m.port_in_use
 
 MOUNT_OUTPUT = """/dev/disk2s4s1 on / (apfs, sealed, local, read-only, journaled)
 devfs on /dev (devfs, local, nobrowse)
-//eric@nas/photos on /Volumes/photos (smbfs, nodev, nosuid)
-//eric@nas/Time%20Machine on /Volumes/Time Machine (smbfs, nobrowse)
+//user@nas/photos on /Volumes/photos (smbfs, nodev, nosuid)
+//user@nas/Time%20Machine on /Volumes/Time Machine (smbfs, nobrowse)
 nas:/volume1/media on /nas (nfs, nodev)
 /dev/disk1s2 on /Volumes/Fast Storage (hfs, local, journaled)
 """
@@ -110,7 +110,7 @@ class TestMountRecipe:
             r = m.mount_recipe_for("/Volumes/photos/library")
         assert r == {
             "fstype": "smbfs",
-            "spec": "//eric@nas/photos",
+            "spec": "//user@nas/photos",
             "mountpoint": "/Volumes/photos",
         }
 
@@ -129,7 +129,7 @@ class TestMountRecipe:
         with _mount():
             r = m.mount_recipe_for("/Volumes/Time Machine/x")
         assert r["mountpoint"] == "/Volumes/Time Machine"
-        assert r["spec"] == "//eric@nas/Time%20Machine"
+        assert r["spec"] == "//user@nas/Time%20Machine"
 
     def test_local_disks_are_never_recorded(self):
         """Remounting an APFS volume is not our business, and pretending we
@@ -139,7 +139,7 @@ class TestMountRecipe:
             assert m.mount_recipe_for("/var/lib/photos") is None
 
     def test_the_longest_matching_mount_wins(self):
-        nested = MOUNT_OUTPUT + "//eric@nas/inner on /nas/inner (smbfs, nodev)\n"
+        nested = MOUNT_OUTPUT + "//user@nas/inner on /nas/inner (smbfs, nodev)\n"
         with _mount(nested):
             assert m.mount_recipe_for("/nas/inner/photos")["mountpoint"] == "/nas/inner"
 
@@ -162,7 +162,7 @@ class TestMountRecipe:
 
 
 class TestRemount:
-    RECIPE = {"fstype": "smbfs", "spec": "//eric@nas/photos", "mountpoint": "/nas"}
+    RECIPE = {"fstype": "smbfs", "spec": "//user@nas/photos", "mountpoint": "/nas"}
 
     def _run(self, returncode=0, stderr=""):
         return patch.object(
@@ -227,7 +227,7 @@ class TestRemountBackoff:
     CFG = {
         "mount_recipe": {
             "fstype": "smbfs",
-            "spec": "//eric@nas/photos",
+            "spec": "//user@nas/photos",
             "mountpoint": "/nas",
         }
     }
@@ -728,7 +728,7 @@ class TestOnlyTheLibrarysOwnMountMaySpeakForIt:
         can never overwrite the old recipe. Judging it would pause the worker
         for a mount the library no longer uses, with no way back."""
         cfg = {
-            "upload_mount": "/Users/elp/Pictures/immich",
+            "upload_mount": "/Users/you/Pictures/immich",
             "media_id": "x",
             "mount_recipe": {"fstype": "nfs", "spec": "n:/v", "mountpoint": "/nas"},
         }
@@ -1305,7 +1305,7 @@ class TestADeadMountCannotWedgeTheWatcher:
     def test_a_plain_match_needs_no_resolving_at_all(self):
         """The common case, and the one that matters when the mount is dead:
         /nas/immich under a mount at /nas matches without touching the disk."""
-        out = "10.0.0.14:/volume1/ELP NAS on /nas (nfs)\n"
+        out = "192.0.2.10:/volume1/Photo Library on /nas (nfs)\n"
         with patch.object(m.subprocess, "run") as run:
             run.side_effect = lambda argv, **kw: (
                 MagicMock(stdout=out, returncode=0)
@@ -1439,8 +1439,8 @@ class TestTheWorkerWaitsWhenItsDatabaseIsGone:
     CFG = {
         "worker": True,
         "ml": False,
-        "db_hostname": "10.0.0.14", "db_port": 15432,
-        "redis_hostname": "10.0.0.14", "redis_port": 16379,
+        "db_hostname": "192.0.2.10", "db_port": 15432,
+        "redis_hostname": "192.0.2.10", "redis_port": 16379,
     }
 
     def _drive(self, down_seq, pids=None, cycles=None):
@@ -1578,8 +1578,8 @@ class TestTwoPauseReasonsShareOneMarker:
         "upload_mount": "/nas/immich",
         "media_id": "abc",
         "mount_recipe": {"fstype": "nfs", "spec": "n:/v", "mountpoint": "/nas"},
-        "db_hostname": "10.0.0.14", "db_port": 15432,
-        "redis_hostname": "10.0.0.14", "redis_port": 16379,
+        "db_hostname": "192.0.2.10", "db_port": 15432,
+        "redis_hostname": "192.0.2.10", "redis_port": 16379,
     }
 
     def _drive(self, gone_seq, down_seq, pids=None):
@@ -1659,7 +1659,7 @@ class TestTwoPauseReasonsShareOneMarker:
             raise AssertionError("must not spawn a resolver for a local library")
 
         with patch.object(m.subprocess, "run", side_effect=run):
-            assert m.mount_recipe_for("/Users/elp/Pictures/immich") is None
+            assert m.mount_recipe_for("/Users/you/Pictures/immich") is None
 
 
 class TestASplitInstallDoesNotReadAStrangersContainer:
@@ -1673,7 +1673,7 @@ class TestASplitInstallDoesNotReadAStrangersContainer:
     stranger's database credentials and version into this config and saved them.
     """
 
-    SPLIT = {"immich_url": "http://10.0.0.14:2283", "upload_mount": "/nas/immich"}
+    SPLIT = {"immich_url": "http://192.0.2.10:2283", "upload_mount": "/nas/immich"}
     LOCAL = {"upload_mount": "/data/immich"}
     STRANGER = {
         "workers_include": "microservices",   # would fail the local check
@@ -2108,8 +2108,8 @@ class TestAServiceRefusedByMacOSIsNamedAsSuch:
     NAS. The fix is a switch in System Settings, so say that.
     """
 
-    CFG = {"db_hostname": "10.0.0.14", "db_port": 15432,
-           "redis_hostname": "10.0.0.14", "redis_port": 16379}
+    CFG = {"db_hostname": "192.0.2.10", "db_port": 15432,
+           "redis_hostname": "192.0.2.10", "redis_port": 16379}
 
     def _refused(self, exc, elapsed):
         clock = iter([100.0, 100.0 + elapsed])

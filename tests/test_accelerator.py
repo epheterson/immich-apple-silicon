@@ -3676,7 +3676,7 @@ class TestSetupReestablishesComponents:
         """The offloaded-ML path end to end, through the real _finalize_config."""
         import immich_accelerator.__main__ as m
 
-        m.save_config({"ml": False, "ml_url": "http://10.0.0.9:3003", "api_key": "k"})
+        m.save_config({"ml": False, "ml_url": "http://192.0.2.20:3003", "api_key": "k"})
         fresh = {"version": "3.0.2", "server_dir": "/srv", "node": "/node"}
         # _finalize_config's tail is interactive (the /build link and the
         # start prompt). Only the preserve-and-save half is under test.
@@ -3691,7 +3691,7 @@ class TestSetupReestablishesComponents:
 
         saved = m.load_config()
         assert saved["ml"] is False, "setup re-enabled an engine the user turned off"
-        assert saved["ml_url"] == "http://10.0.0.9:3003"
+        assert saved["ml_url"] == "http://192.0.2.20:3003"
 
 
 class TestWorkerConfigGate:

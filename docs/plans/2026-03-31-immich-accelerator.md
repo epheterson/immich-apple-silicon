@@ -88,7 +88,7 @@ Immich's supported scaling model is microservices replicas — multiple workers 
 ```bash
 # Setup
 immich-accelerator setup              # interactive wizard
-immich-accelerator setup --docker-host 10.0.0.14
+immich-accelerator setup --docker-host 192.0.2.10
 
 # Run
 immich-accelerator start              # start worker + ML

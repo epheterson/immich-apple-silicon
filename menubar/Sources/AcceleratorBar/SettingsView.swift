@@ -861,7 +861,7 @@ struct SettingsView: View {
         (config["upload_mount"] as? String) ?? "not configured"
     }
 
-    /// "nfs from 10.0.0.14:/volume1/ELP NAS", when the accelerator has
+    /// "nfs from 192.0.2.10:/volume1/Photo Library", when the accelerator has
     /// recorded how the mount is put together. It records it while the mount
     /// is up, because it cannot be read back once the mount is gone.
     private var libraryMount: String? {

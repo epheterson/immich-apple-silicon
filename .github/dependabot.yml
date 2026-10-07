@@ -2,6 +2,7 @@
 # Security updates are separate: they come as soon as an advisory lands, whatever the schedule
 # (Settings > Code security > Dependabot security updates).
 # There is no Python requirements file in the tree (the ML submodule carries its own pins).
+# docker/ is not tracked: its compose mirrors Immich's own, which is where its versions come from.
 version: 2
 
 updates:
@@ -16,8 +17,10 @@ updates:
       actions:
         patterns: ["*"]
 
-  # The native ML engine and the menu-bar app. mlx-swift is held to the validated 0.31.x by
-  # Package.resolved and the metallib pin in the workflows, so a bump there is a person's call.
+  # The native ML engine and the menu-bar app. mlx-swift is never proposed: every mlx version
+  # must pass scripts/ml-preflight.py and native-ml-preflight.py on real Apple Silicon first,
+  # and two releases that passed CI crashed the real service (#38, #103). Anything else here
+  # that touches native-ml needs the same gate before it merges.
   - package-ecosystem: swift
     directories:
       - /native-ml
@@ -31,15 +34,3 @@ updates:
         update-types: [minor, patch]
     ignore:
       - dependency-name: mlx-swift
-        update-types: [version-update:semver-major, version-update:semver-minor]
-
-  # The reference compose file's images (Immich server, Redis, Postgres/pgvecto-rs).
-  - package-ecosystem: docker-compose
-    directory: /docker
-    schedule:
-      interval: weekly
-      day: monday
-    labels: [dependencies]
-    ignore:
-      # Immich is tracked at :release on purpose; Postgres needs a dump and restore to move.
-      - dependency-name: tensorchord/pgvecto-rs
