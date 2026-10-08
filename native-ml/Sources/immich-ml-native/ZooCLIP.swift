@@ -395,6 +395,7 @@ final class ZooCLIP {
                   tower == "visual" || tower == "textual" else { return false }
             let rest = f.dropFirst(tower.count + 1)
             guard !rest.contains("/") else { return false }  // rknpu/ and friends
+            guard !rest.isEmpty, !rest.hasPrefix(".") else { return false }  // never "..", never hidden
             let lower = rest.lowercased()
             return !Self.nonWeightSuffixes.contains { lower.hasSuffix($0) }
         }
@@ -475,6 +476,7 @@ final class ZooCLIP {
                 let sem = DispatchSemaphore(value: 0)
                 var result: URL?
                 var status = 0
+                var expected = -1
                 var moveError: Error?
                 var transportError: Error?
                 let task = downloadSession.downloadTask(with: url) { tmp, resp, err in
@@ -485,12 +487,34 @@ final class ZooCLIP {
                         do { try FileManager.default.moveItem(at: t, to: hold); return hold }
                         catch { moveError = error; return nil }
                     }
-                    status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                    let http = resp as? HTTPURLResponse
+                    status = http?.statusCode ?? 0
+                    // Content-Length counts encoded bytes; URLSession hands us
+                    // decoded ones, so only an unencoded body can be compared.
+                    let encoding = http?.value(forHTTPHeaderField: "Content-Encoding") ?? "identity"
+                    if encoding == "identity" {
+                        expected = Int(http?.value(forHTTPHeaderField: "Content-Length") ?? "") ?? -1
+                    }
                     transportError = err
                     sem.signal()
                 }
                 task.resume()
                 sem.wait()
+
+                // Same guard as SigLIP's single-connection fetch: a short body
+                // would satisfy the fileSize > 0 cache check forever after.
+                if status == 200, let tmp = result, expected > 0 {
+                    let got = ((try? tmp.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) ?? 0
+                    if got != expected {
+                        try? FileManager.default.removeItem(at: tmp)
+                        lastError = "short body: got \(got) bytes, expected \(expected)"
+                        if attempt < 3 {
+                            print("[native-ml] retrying \(name)/\(f) (\(lastError))")
+                            Thread.sleep(forTimeInterval: Double(attempt) * 2)
+                        }
+                        continue
+                    }
+                }
 
                 guard status == 200, let tmp = result else {
                     lastError = "HTTP \(status)"

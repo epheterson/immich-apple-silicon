@@ -1659,6 +1659,7 @@ def download_immich_server(version: str) -> Path:
         try:
             resp = _get(f"{registry}/v2/{image}/blobs/{digest}")
             data = resp.read()
+            _check_blob_digest(data, digest)
 
             with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
                 names = tf.getnames()
@@ -1671,10 +1672,7 @@ def download_immich_server(version: str) -> Path:
                     # their targets to exist, so per-member extract breaks.
 
                     with tempfile.TemporaryDirectory() as tmpdir:
-                        try:
-                            tf.extractall(tmpdir, filter="tar")
-                        except TypeError:
-                            tf.extractall(tmpdir)
+                        tf.extractall(tmpdir, filter="tar")
                         src = Path(tmpdir) / "usr" / "src" / "app" / "server"
                         if src.exists():
                             if staging.exists():
@@ -1689,12 +1687,9 @@ def download_immich_server(version: str) -> Path:
                             # Rewrite "build/" -> "build-data/" so files land
                             # directly in our IMMICH_BUILD_DATA directory
                             member.name = "build-data" + member.name[5:]
-                            try:
-                                tf.extract(
-                                    member, str(build_data.parent), filter="data"
-                                )
-                            except TypeError:
-                                tf.extract(member, str(build_data.parent))
+                            tf.extract(
+                                member, str(build_data.parent), filter="data"
+                            )
                     found_build = True
 
         except Exception as e:
@@ -3197,6 +3192,42 @@ def start_dashboard() -> bool:
 _JF_FFMPEG_BASE = "https://repo.jellyfin.org/files/ffmpeg/macos/latest-7.x/arm64/"
 
 
+def _check_blob_digest(data: bytes, digest: str) -> None:
+    """Refuse a registry blob whose bytes don't hash to its content digest."""
+    import hashlib
+
+    algo, _, expected = digest.partition(":")
+    if algo != "sha256" or hashlib.sha256(data).hexdigest() != expected:
+        raise RuntimeError(f"layer {digest[:19]} failed its digest check")
+
+
+def _jf_ffmpeg_github_digest(filename: str) -> str | None:
+    """sha256 GitHub publishes for this jellyfin-ffmpeg build, or None.
+
+    repo.jellyfin.org publishes no checksum, but the same file is a release
+    asset on GitHub, and GitHub records each asset's sha256.
+    """
+    import urllib.request
+
+    m = re.match(r"jellyfin-ffmpeg_([0-9][^_]*)_", filename)
+    if not m:
+        return None
+    url = (
+        "https://api.github.com/repos/jellyfin/jellyfin-ffmpeg/releases/tags/"
+        f"v{m.group(1)}"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            release = json.loads(resp.read())
+    except Exception:
+        return None
+    for asset in release.get("assets", []):
+        if asset.get("name") == filename:
+            algo, _, value = (asset.get("digest") or "").partition(":")
+            return value if algo == "sha256" and value else None
+    return None
+
+
 def _find_jf_ffmpeg_url() -> str:
     """Find the latest jellyfin-ffmpeg download URL from the repo directory."""
     import urllib.request
@@ -3262,6 +3293,23 @@ def _ensure_jellyfin_ffmpeg() -> str:
         urllib.request.urlretrieve(url, str(tar_path))
     except Exception as e:
         raise RuntimeError(f"Failed to download jellyfin-ffmpeg: {e}")
+
+    import hashlib
+
+    expected = _jf_ffmpeg_github_digest(url.rsplit("/", 1)[-1])
+    if expected is None:
+        log.warning("  No published checksum found for %s; not verified", url)
+    else:
+        h = hashlib.sha256()
+        with open(tar_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != expected:
+            tar_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                "jellyfin-ffmpeg download does not match the checksum on its "
+                "GitHub release; refusing to install it"
+            )
 
     # Extract
     result = subprocess.run(
@@ -3884,16 +3932,8 @@ def _import_server(source: str, version: str) -> Path:
             shutil.rmtree(staging)
         staging.mkdir(parents=True, exist_ok=True)
         with tarfile.open(str(source_path), "r:gz") as tf:
-            # Prevent path traversal from crafted tarballs
-            try:
-                tf.extractall(str(staging), filter="data")
-            except TypeError:
-                # Python < 3.11.4 doesn't support filter=
-                for member in tf.getmembers():
-                    resolved = (staging / member.name).resolve()
-                    if not str(resolved).startswith(str(staging.resolve())):
-                        raise RuntimeError(f"Unsafe path in tarball: {member.name}")
-                tf.extractall(str(staging))
+            # filter="data" refuses path traversal and links out of staging
+            tf.extractall(str(staging), filter="data")
         # The tarball may have a top-level 'server' directory or not
         candidates = [staging, staging / "server"]
         found = None
@@ -3928,10 +3968,7 @@ def _import_server(source: str, version: str) -> Path:
                     shutil.rmtree(build_data)
                 build_data.mkdir(parents=True, exist_ok=True)
                 with tarfile.open(str(build_tar), "r:gz") as bf:
-                    try:
-                        bf.extractall(str(build_data), filter="data")
-                    except TypeError:
-                        bf.extractall(str(build_data))
+                    bf.extractall(str(build_data), filter="data")
                 # Stamp so the offline-imported build-data isn't seen as stale
                 # by the cache gate later (which would force a re-download that
                 # defeats the whole point of the offline import path).

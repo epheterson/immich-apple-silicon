@@ -555,6 +555,24 @@ class TestFastAPIApp:
         assert resp.status_code == 400
         assert "error" in resp.json()
 
+    def test_api_requeue_refuses_cross_site_post(self, sample_config):
+        # Any web page can send a form POST here without a preflight.
+        config_no_key = {**sample_config, "api_key": ""}
+        from starlette.testclient import TestClient
+
+        client = TestClient(create_app(config_no_key))
+        resp = client.post("/api/requeue", headers={"Origin": "https://evil.example"})
+        assert resp.status_code == 403
+        # The dashboard's own button sends its own origin and gets through.
+        resp = client.post("/api/requeue", headers={"Origin": "http://testserver"})
+        assert resp.status_code == 400  # past the guard, stopped by the missing key
+        # Behind a proxy that rewrites Host, the original host is forwarded.
+        resp = client.post(
+            "/api/requeue",
+            headers={"Origin": "https://photos.example", "X-Forwarded-Host": "photos.example"},
+        )
+        assert resp.status_code == 400
+
     def test_api_requeue_with_api_key(self, sample_config):
         app = create_app(sample_config)
         from starlette.testclient import TestClient

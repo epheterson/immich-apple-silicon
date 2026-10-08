@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.17.9 - 2026-10-07
+
+### Fixed
+- **Downloads are checked before they are used.** Server layers pulled from the registry must match their content digest, the jellyfin-ffmpeg download must match the checksum GitHub publishes for the same release, and a model file from the ONNX zoo must arrive at its full size. Before, a corrupted or truncated download could be installed, and a truncated model file stayed broken because it was never fetched again.
+- **Tarball extraction always refuses unsafe paths.** Importing a server tarball, its build data, or the server layers from the registry kept an unfiltered fallback for Pythons older than 3.11.4. The accelerator always runs on Homebrew's Python 3.11, so the fallback is gone and every extraction uses Python's safe tar filters.
+- **The ML service refuses images too large to decode.** A small file can declare a canvas that decodes to gigabytes. Anything over about 179 megapixels is now rejected before decoding, the same limit Immich's own ML container enforces.
+- **The dashboard can't be driven by another website.** Its requeue button now refuses requests sent from other sites, and an unrecognized Immich API failure shows the error type on the page while the full message goes to the log.
+
 ## 1.17.8 - 2026-10-06
 
 ### Changed

@@ -359,8 +359,9 @@ def get_status(config: dict) -> dict:
             elif "timed out" in err.lower():
                 jobs_api_error = "Immich API timed out (server under heavy load?)"
             else:
-                jobs_api_error = err[:200]
-            log.warning("jobs API unreachable: %s", jobs_api_error)
+                # The page is served on the LAN; the details stay in the log.
+                jobs_api_error = f"Immich API error ({type(e).__name__})"
+            log.warning("jobs API unreachable: %s", err)
     else:
         jobs_api_error = "no api_key configured"
 
@@ -472,6 +473,21 @@ def create_app(config: dict):
     from fastapi.responses import HTMLResponse, JSONResponse
 
     app = FastAPI(title="Immich Accelerator Dashboard")
+
+    # A plain cross-site form POST needs no preflight, so any web page the user
+    # opens could otherwise press the dashboard's buttons. Browsers send Origin
+    # on every POST; the dashboard's own page sends its own host. Behind a
+    # reverse proxy that rewrites Host, the original is in X-Forwarded-Host,
+    # which a cross-site form can't set.
+    @app.middleware("http")
+    async def same_origin_posts(request, call_next):
+        from urllib.parse import urlsplit
+
+        origin = request.headers.get("origin")
+        hosts = {request.headers.get("host"), request.headers.get("x-forwarded-host")}
+        if request.method == "POST" and origin and urlsplit(origin).netloc not in hosts:
+            return JSONResponse({"error": "cross-site request"}, status_code=403)
+        return await call_next(request)
 
     # The captured config is the fallback; every request re-reads the file, so a
     # component toggle or an added api_key takes effect without a restart.
