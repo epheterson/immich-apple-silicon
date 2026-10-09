@@ -4,6 +4,12 @@
 
 ### Fixed
 - **HEIC thumbnails work on Immich 3.3.** Immich 3.3 moved its server to ES modules, and its `import sharp from 'sharp'` loads Sharp's ESM build, which skipped the shim that sends HEVC HEIC files to Homebrew's libvips. Every HEVC HEIC thumbnail then failed with "Support for this compression format has not been built in: HEVC". The shim now catches the ESM import as well. Thanks to @jimmyhuang22 for the precise report and reproduction (#191).
+- **Job retries no longer depend on a NestJS detail.** On Immich 3.3 the retry shim only took effect because `@nestjs/bullmq` still loads bullmq the old way. It now catches Immich's own import directly.
+- **Thumbnails use native Sharp again, about 3x faster.** The installer read Sharp's version from pnpm's directory name, which also carries a `@types/node` version, so npm was asked for a darwin binary that does not exist, answered "up to date", and installed nothing. Sharp then quietly fell back to its WebAssembly build. The version now comes from Sharp's own `package.json`, a missing binary is an error, and the start-up check treats the WebAssembly fallback as broken, so existing installs repair themselves on the next start.
+
+### Added
+- **A self-test whenever either side changes.** The first time a new Immich or accelerator version starts, the accelerator runs Immich's own thumbnail code on a small HEVC HEIC and checks that Sharp is native and every shim reaches what it patches. A failure is logged with what broke, shown in `immich-accelerator status`, and re-checked on every start until it passes; the worker still starts. Run it any time with `immich-accelerator selftest`.
+- **A canary against Immich's latest release.** Every six hours CI runs the same self-test against the newest Immich on Apple Silicon and opens an issue if it fails, so an upstream change surfaces the day it ships.
 
 ## 1.17.9 - 2026-10-07
 
