@@ -3,7 +3,8 @@
 ## 1.17.11 - 2026-10-09
 
 ### Added
-- **The self-test now runs every kind of work, not just the shims.** On every Immich or accelerator version change, Immich's own code makes a JPEG and an iPhone HEIC thumbnail, reads EXIF metadata, probes a 1 second HDR video, makes its thumbnail and transcodes it to SDR H.264 through the VideoToolbox wrapper, and runs a backup through the pg_dump fix. Once the ML service is up it runs CLIP (image and text), face detection and recognition, and OCR on sample images. Each check names what it expected and what it got. `immich-accelerator selftest` runs it on demand, and the CI canary runs the non-ML half against Immich's latest release every six hours.
+- **The self-test now runs every kind of work, not just the shims.** On every Immich or accelerator version change, Immich's own code makes a JPEG and an iPhone HEIC thumbnail, reads EXIF metadata, probes a 1 second HDR video, makes its thumbnail and transcodes it to SDR H.264 through the VideoToolbox wrapper, and runs a backup through the pg_dump fix. Once the ML service is up it runs CLIP (image and text), face detection and recognition, and OCR on sample images. Each check names what it expected and what it got. `immich-accelerator selftest` runs it on demand.
+- **The CI canary runs only when something changed.** It used to test Immich's latest release on a Mac every six hours regardless. Now a few-second check every six hours looks for a new Immich release or a new commit on main, and only that runs the Mac job, which now covers video and backups too. A failure is reported once, not every six hours.
 
 ### Fixed
 - **The self-test no longer delays the worker or cries wolf on a busy Mac.** It runs beside the worker's start instead of before it, and a run that runs out of time is reported as inconclusive and retried next start, not as a failure. 1.17.10 timed out under heavy load and showed a false "FAILED" in `status`.
