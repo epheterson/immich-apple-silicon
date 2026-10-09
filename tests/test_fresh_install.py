@@ -1483,12 +1483,9 @@ const fake = () => {
         assert "immich-accelerator" in out["threw"]
         assert "pipe()" in out["threw"]
 
-    def test_esm_import_of_sharp_is_wrapped(self, tmp_path):
-        """Immich 3.3 is ESM and Sharp ships an ESM build, so `import sharp from
-        'sharp'` never reached the Module._load interposition and every HEVC
-        HEIC thumbnail failed (#191). A dual-format fake Sharp stands in for the
-        real one: the ESM import must come back wrapped, backed by the CommonJS
-        build, and be the same wrapper a require() gets."""
+    def _run_esm_app(self, tmp_path, exports, files):
+        """Run an ESM app doing `import sharp from 'sharp'` against a fake
+        Sharp package with the given exports map and files, shim preloaded."""
         import json
         import shutil
         import subprocess
@@ -1501,27 +1498,22 @@ const fake = () => {
         )
         if has_hooks.returncode != 0:
             pytest.skip("this node has no module.registerHooks")
-
         pkg = tmp_path / "node_modules" / "sharp"
         pkg.mkdir(parents=True)
-        (pkg / "package.json").write_text(json.dumps({
-            "name": "sharp",
-            "exports": {".": {"import": "./index.mjs", "require": "./index.cjs"}},
-        }))
-        (pkg / "index.cjs").write_text(
-            "function sharp() { return 'cjs'; }\nsharp.versions = { fake: 1 };\nmodule.exports = sharp;\n"
-        )
-        (pkg / "index.mjs").write_text("export default function sharp() { return 'esm'; }\n")
+        (pkg / "package.json").write_text(json.dumps({"name": "sharp", "exports": {".": exports}}))
+        for name, body in files.items():
+            (pkg / name).write_text(body)
         (tmp_path / "package.json").write_text('{"type": "module"}')
         (tmp_path / "app.js").write_text(
             "import sharp from 'sharp';\n"
             "import { createRequire } from 'node:module';\n"
-            "const viaRequire = createRequire(import.meta.url)('sharp');\n"
+            "let viaRequire = null;\n"
+            "try { viaRequire = createRequire(import.meta.url)('sharp'); } catch {}\n"
             "console.log('RESULT' + JSON.stringify({\n"
             "  wrapped: !!sharp.__heicShimWrapped,\n"
             "  backing: sharp('/x.jpg'),\n"
             "  statics: sharp.versions,\n"
-            "  sameAsRequire: sharp === viaRequire,\n"
+            "  require: viaRequire && !!viaRequire.__heicShimWrapped && viaRequire('/x.jpg'),\n"
             "}));\n"
         )
         proc = subprocess.run(
@@ -1530,8 +1522,29 @@ const fake = () => {
         )
         line = [x for x in proc.stdout.splitlines() if x.startswith("RESULT")]
         assert line, f"app produced no result:\n{proc.stdout}\n{proc.stderr}"
-        out = json.loads(line[0][len("RESULT"):])
-        assert out == {"wrapped": True, "backing": "cjs", "statics": {"fake": 1}, "sameAsRequire": True}
+        return json.loads(line[0][len("RESULT"):])
+
+    ESM_FAKE = "export default function sharp() { return 'esm'; }\nsharp.versions = { fake: 'esm' };\n"
+    CJS_FAKE = "function sharp() { return 'cjs'; }\nsharp.versions = { fake: 'cjs' };\nmodule.exports = sharp;\n"
+
+    def test_esm_import_of_sharp_is_wrapped(self, tmp_path):
+        """Immich 3.3 is ESM and Sharp ships an ESM build, so `import sharp from
+        'sharp'` never reached the Module._load interposition and every HEVC
+        HEIC thumbnail failed (#191). The ESM import must come back wrapped
+        around the very build Node resolved for it, statics intact, and
+        require() must keep working alongside it."""
+        out = self._run_esm_app(
+            tmp_path,
+            {"import": "./index.mjs", "require": "./index.cjs"},
+            {"index.mjs": self.ESM_FAKE, "index.cjs": self.CJS_FAKE},
+        )
+        assert out == {"wrapped": True, "backing": "esm", "statics": {"fake": "esm"}, "require": "cjs"}
+
+    def test_esm_only_sharp_is_wrapped(self, tmp_path):
+        """A future Sharp may drop its CommonJS build. The ESM path must not
+        depend on one existing."""
+        out = self._run_esm_app(tmp_path, {"import": "./index.mjs"}, {"index.mjs": self.ESM_FAKE})
+        assert out == {"wrapped": True, "backing": "esm", "statics": {"fake": "esm"}, "require": None}
 
     def test_shim_file_exists(self):
         assert self.SHIM.exists(), "heic_decode_shim.js must ship in hooks/"

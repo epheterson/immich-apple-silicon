@@ -1,11 +1,10 @@
 // ESM face of heic_decode_shim.js for `import sharp from 'sharp'` (#191).
-// The shim's resolve hook sends that import here with the importer's own
-// CommonJS Sharp entry in the query string; this module requires it and
-// exports the shim's shared wrapper around it.
+// The shim's resolve hook sends that import here with the URL Node resolved
+// for it; this module imports that URL (a plain URL, so the hook passes it
+// through) and exports the shim's wrapper around it.
 import { createRequire } from 'node:module';
 
-const require = createRequire(import.meta.url);
-const { wrappedSharp } = require('./heic_decode_shim.js');
-const entry = new URL(import.meta.url).searchParams.get('sharp');
+const { wrappedSharp } = createRequire(import.meta.url)('./heic_decode_shim.js');
+const real = await import(new URL(import.meta.url).searchParams.get('real'));
 
-export default wrappedSharp(require(entry));
+export default wrappedSharp(real.default);

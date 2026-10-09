@@ -440,12 +440,17 @@ function wrapSharp(realSharp) {
     return sharp;
 }
 
-// One wrapper per process, shared by the CommonJS and ESM paths below.
-let wrapped = null;
+// One wrapper per Sharp module object, shared by the CommonJS and ESM paths
+// below. Keyed by object because the two paths can load different copies.
+const wrappers = new WeakMap();
 function wrappedSharp(realSharp) {
     if (realSharp.__heicShimWrapped) return realSharp;
-    if (wrapped === null) wrapped = wrapSharp(realSharp);
-    return wrapped;
+    let w = wrappers.get(realSharp);
+    if (!w) {
+        w = wrapSharp(realSharp);
+        wrappers.set(realSharp, w);
+    }
+    return w;
 }
 
 // Intercept `require('sharp')` and return the wrapped factory. The preload
@@ -460,23 +465,22 @@ Module._load = function (request, parent, isMain) {
 };
 
 // Immich 3.3 is ESM (`import sharp from 'sharp'`), and Sharp ships an ESM
-// build, so that import never reaches Module._load (#191). Redirect it to a
-// bridge that requires Sharp's CommonJS entry, resolved from the importing
-// file so it is the same copy Immich would get, and exports wrappedSharp() of
-// it. registerHooks exists on Node 22.15+; Homebrew's node@22 has it.
+// build, so that import never reaches Module._load (#191). Resolve the import
+// exactly as Node would, then hand Immich a bridge module that imports that
+// same URL and exports wrappedSharp() of it. Nothing here depends on which
+// formats Sharp ships. registerHooks exists on Node 22.15+ (Homebrew's
+// node@22 has it).
 const ESM_BRIDGE = require('url').pathToFileURL(
     require('path').join(__dirname, 'sharp_esm_bridge.mjs')
 );
 if (typeof Module.registerHooks === 'function') {
     Module.registerHooks({
         resolve(specifier, context, nextResolve) {
+            const resolved = nextResolve(specifier, context);
             const conditions = context.conditions || [];
-            if (specifier !== 'sharp' || !conditions.includes('import') || !context.parentURL) {
-                return nextResolve(specifier, context);
-            }
-            const cjsEntry = Module.createRequire(context.parentURL).resolve('sharp');
+            if (specifier !== 'sharp' || !conditions.includes('import')) return resolved;
             const url = new URL(ESM_BRIDGE);
-            url.searchParams.set('sharp', cjsEntry);
+            url.searchParams.set('real', resolved.url);
             return { url: url.href, format: 'module', shortCircuit: true };
         },
     });
