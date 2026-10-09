@@ -246,7 +246,7 @@ def run_selftest(server_dir: str | Path, node: str, env: dict, version: str) -> 
             env=env,
             capture_output=True,
             text=True,
-            timeout=60,  # a few seconds normally; never hold the worker for long
+            timeout=30,  # a few seconds normally; never hold the worker for long
         )
         line = next(
             (x for x in r.stdout.splitlines() if x.startswith("SELFTEST ")), None
@@ -262,7 +262,10 @@ def run_selftest(server_dir: str | Path, node: str, env: dict, version: str) -> 
     result = {
         "immich_version": version.lstrip("v"),
         "accelerator_version": __version__,
-        "ok": bool(checks) and all(c["ok"] for c in checks),
+        # A harness error means the self-test could not exercise that path on
+        # this Immich (its code moved), not that the work is broken: it warns
+        # here and fails the CI canary, which is where it gets fixed.
+        "ok": bool(checks) and all(c["ok"] or c.get("harness") for c in checks),
         "checks": checks,
         "ran_at": datetime.datetime.now().isoformat(timespec="seconds"),
     }
@@ -286,7 +289,10 @@ def selftest_due(version: str) -> bool:
 
 
 def report_selftest(result: dict) -> None:
-    failed = [c for c in result["checks"] if not c["ok"]]
+    for c in result["checks"]:
+        if not c["ok"] and c.get("harness"):
+            log.warning("  Self-test could not check %s on this Immich: %s", c["name"], c["detail"])
+    failed = [c for c in result["checks"] if not c["ok"] and not c.get("harness")]
     if not failed:
         log.info("  Self-test passed (%s)", ", ".join(c["name"] for c in result["checks"]))
         return
@@ -1351,6 +1357,20 @@ def _rebuild_sharp(server_dir: Path) -> None:
 
 
 SHARP_WASM_MARKER = "sharp loaded its WebAssembly fallback"
+
+
+def _sharp_repair_failed_marker() -> Path:
+    return DATA_DIR / "sharp-native-repair-failed"
+
+
+def _sharp_repair_recently_failed() -> bool:
+    """A failed native repair (offline, npm down) waits a day before the next
+    try, so an offline machine doesn't spend minutes on npm at every start."""
+    try:
+        age = time.time() - _sharp_repair_failed_marker().stat().st_mtime
+    except OSError:
+        return False
+    return age < 24 * 3600
 
 
 def _verify_sharp_loads(server_dir: str, node: str) -> tuple[bool, str]:
@@ -6009,15 +6029,24 @@ def _cmd_start(args):
     # still fails, hard error with remediation. This turns a class of
     # opaque worker-crash bugs into a 1-second, clearly-labeled check.
     ok, err = _verify_sharp_loads(server_dir, node)
-    if not ok:
+    wasm_only = not ok and SHARP_WASM_MARKER in err
+    if wasm_only and _sharp_repair_recently_failed():
+        log.warning(
+            "Sharp is on its WebAssembly fallback (about 3x slower); the native "
+            "install failed within the last day, so not retrying it yet."
+        )
+    elif not ok:
         log.warning("Sharp failed to load — rebuilding against system libvips...")
         log.warning("  reason: %s", err.splitlines()[-1] if err else "(unknown)")
         try:
             _rebuild_sharp(Path(server_dir))
-        except RuntimeError as e:
+            _sharp_repair_failed_marker().unlink(missing_ok=True)
+        except (RuntimeError, subprocess.SubprocessError, OSError) as e:
             log.error("%s", e)
-            if SHARP_WASM_MARKER not in err:
+            if not wasm_only:
                 return
+            with contextlib.suppress(OSError):
+                _sharp_repair_failed_marker().touch()
         ok, err = _verify_sharp_loads(server_dir, node)
         if not ok and SHARP_WASM_MARKER in err:
             # Slow is better than down: the WebAssembly build decodes
@@ -6388,7 +6417,7 @@ def cmd_selftest(args):
         (log.info if c["ok"] else log.error)(
             "%s %s: %s", "ok  " if c["ok"] else "FAIL", c["name"], c["detail"]
         )
-    if not result["ok"]:
+    if not all(c["ok"] for c in result["checks"]):
         sys.exit(1)
 
 

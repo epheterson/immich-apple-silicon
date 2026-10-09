@@ -210,5 +210,10 @@ if (ENABLED) {
                 return resolved;
             },
         });
+    } else {
+        process.stderr.write(
+            '[immich-accelerator] warning: this Node has no module.registerHooks; ' +
+            'job retry relies on @nestjs/bullmq loading bullmq (Immich 3.3+)\n'
+        );
     }
 }

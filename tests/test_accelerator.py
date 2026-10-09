@@ -4582,3 +4582,36 @@ class TestSharpPreflightAtStart:
         broken = (False, "Error: Cannot find module 'sharp'")
         env = _worker_env_for({}, sharp_checks=[broken], rebuild_error=RuntimeError("npm offline"))
         assert env == {}
+
+    def test_an_npm_timeout_is_a_failed_repair_not_a_crash(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        env = _worker_env_for(
+            {}, sharp_checks=[self.WASM, self.WASM],
+            rebuild_error=subprocess.TimeoutExpired(cmd="npm", timeout=180),
+        )
+        assert env, "the worker must still be started"
+        assert m._sharp_repair_recently_failed(), "and the repair backs off"
+
+    def test_a_recent_failed_repair_is_not_retried(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        m._sharp_repair_failed_marker().parent.mkdir(parents=True, exist_ok=True)
+        m._sharp_repair_failed_marker().touch()
+        env = _worker_env_for(
+            {}, sharp_checks=[self.WASM], rebuild_error=AssertionError("must not rebuild")
+        )
+        assert env
+
+
+class TestSelftestHarnessErrors:
+    def test_harness_error_warns_and_does_not_force_reruns(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        out = ('SELFTEST {"checks": [{"name": "heic_thumbnail", "ok": false, '
+               '"detail": "cannot load MediaRepository", "harness": true}]}')
+        r = MagicMock(stdout=out, stderr="", returncode=0)
+        with patch.object(m, "DATA_DIR", tmp_path), patch("subprocess.run", return_value=r):
+            result = m.run_selftest(tmp_path, "node", {}, "3.4.0")
+            assert result["ok"], "a harness error is not a broken install"
+            assert not m.selftest_due("3.4.0")

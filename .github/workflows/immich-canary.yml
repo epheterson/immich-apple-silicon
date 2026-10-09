@@ -45,6 +45,7 @@ jobs:
           if [ -z "$v" ]; then
             v="$(gh api repos/immich-app/immich/releases/latest --jq .tag_name)"
           fi
+          if [ -z "$v" ]; then echo "::error::could not determine the Immich version"; exit 1; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "Testing Immich $v"
 
@@ -71,7 +72,7 @@ jobs:
           set -euo pipefail
           title="Immich ${VERSION} fails the accelerator self-test"
           log="$(tail -n 40 "$RUNNER_TEMP/selftest.log" 2>/dev/null || echo 'no log')"
-          body="$(printf 'The scheduled canary ran the self-test against Immich %s and it failed.\n\n```\n%s\n```\n\nRun: %s\n' "$VERSION" "$log" "$RUN_URL")"
+          body="$(printf 'The scheduled canary ran the self-test against Immich %s and it failed.\n\n~~~~\n%s\n~~~~\n\nRun: %s\n' "$VERSION" "$log" "$RUN_URL")"
           existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"

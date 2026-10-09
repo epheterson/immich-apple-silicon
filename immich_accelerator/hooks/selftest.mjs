@@ -16,13 +16,17 @@ const [serverDir, fixture, skipList = ''] = process.argv.slice(1);
 const skip = new Set(skipList.split(',').filter(Boolean));
 const checks = [];
 
+// Thrown when the self-test itself can't reach the code it means to exercise
+// (Immich moved it), as opposed to that code failing.
+class HarnessError extends Error {}
+
 async function check(name, fn) {
     if (skip.has(name)) return;
     try {
         checks.push({ name, ok: true, detail: String(await fn()) });
     } catch (e) {
         const msg = String((e && e.message) || e).split('\n').slice(0, 3).join(' | ');
-        checks.push({ name, ok: false, detail: msg });
+        checks.push({ name, ok: false, detail: msg, harness: e instanceof HarnessError });
     }
 }
 
@@ -30,12 +34,13 @@ async function check(name, fn) {
 // libvips has no HEVC decoder, so this only succeeds through the shim.
 await check('heic_thumbnail', async () => {
     const file = path.join(serverDir, 'dist', 'repositories', 'media.repository.js');
-    const { MediaRepository } = await import(pathToFileURL(file).href);
-    if (typeof MediaRepository !== 'function') {
-        throw new Error(`no MediaRepository in ${file}`);
+    let repo;
+    try {
+        const { MediaRepository } = await import(pathToFileURL(file).href);
+        repo = new MediaRepository(new Proxy({}, { get: () => () => false }));
+    } catch (e) {
+        throw new HarnessError(`cannot load Immich's MediaRepository: ${(e && e.message) || e}`);
     }
-    const logger = new Proxy({}, { get: () => () => false });
-    const repo = new MediaRepository(logger);
     if (typeof repo.decodeImage !== 'function') {
         // Older Immich: no decodeImage. Decode through the same bare import
         // Immich's files use, which still proves the shim reaches it.
