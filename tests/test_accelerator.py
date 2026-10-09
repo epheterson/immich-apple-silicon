@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import signal
@@ -2865,7 +2866,8 @@ class TestWorkerWithoutML:
         assert env["IMMICH_MACHINE_LEARNING_URL"] == "http://gpubox:3003"
 
 
-def _worker_env_for(overrides: dict, sharp_checks=None, rebuild_error=None) -> dict:
+def _worker_env_for(overrides: dict, sharp_checks=None, rebuild_error=None,
+                    selftest=None, on_worker=None) -> dict:
     """Run cmd_start far enough to capture the worker environment it builds.
 
     cmd_start is the most load-bearing function in the codebase, so this drives
@@ -2896,39 +2898,38 @@ def _worker_env_for(overrides: dict, sharp_checks=None, rebuild_error=None) -> d
 
     def capture(name, cmd, env, cwd):
         captured.update(env)
+        if on_worker:
+            on_worker()
+            return 4242
         raise RuntimeError("stop here, the env is what we came for")
 
-    with patch.object(m, "load_config", return_value=config), patch.object(
-        m, "save_config"
-    ), patch.object(m, "_kill_stale_processes"), patch.object(
-        m, "find_docker", side_effect=RuntimeError("no docker")
-    ), patch.object(
-        m, "read_pid", return_value=None
-    ), patch.object(
-        m, "find_node", return_value="/usr/bin/node"
-    ), patch.object(
-        m, "_check_node_engines_compat", return_value=(True, "")
-    ), patch.object(
-        m, "_verify_sharp_loads", side_effect=sharp_checks or [(True, "")]
-    ), patch.object(
-        m, "_rebuild_sharp", side_effect=rebuild_error
-    ), patch.object(
-        m, "selftest_due", return_value=False
-    ), patch.object(
-        m, "_build_link_ok", return_value=True
-    ), patch.object(
-        m, "_preflight_env_health", return_value=True
-    ), patch.object(
-        m, "ensure_media_ready", return_value=True
-    ), patch.object(
-        m, "_find_ml_dir", return_value=None
-    ), patch.object(
-        m, "_start_ml_preferred", return_value=(0, None, False)
-    ), patch.object(
-        m, "kill_pid"
-    ), patch.object(
-        m, "start_service", side_effect=capture
-    ):
+    stubs = {
+        "load_config": dict(return_value=config),
+        "save_config": {},
+        "_kill_stale_processes": {},
+        "find_docker": dict(side_effect=RuntimeError("no docker")),
+        "read_pid": dict(return_value=None),
+        "find_node": dict(return_value="/usr/bin/node"),
+        "_check_node_engines_compat": dict(return_value=(True, "")),
+        "_verify_sharp_loads": dict(side_effect=sharp_checks or [(True, "")]),
+        "_rebuild_sharp": dict(side_effect=rebuild_error),
+        "selftest_due": dict(return_value=selftest is not None),
+        "run_selftest": dict(side_effect=selftest),
+        "start_dashboard": {},
+        "_immich_clip_model": dict(return_value=None),
+        "add_ml_selftest": dict(side_effect=lambda result, *a: result),
+        "_prune_old_server_versions": {},
+        "_build_link_ok": dict(return_value=True),
+        "_preflight_env_health": dict(return_value=True),
+        "ensure_media_ready": dict(return_value=True),
+        "_find_ml_dir": dict(return_value=None),
+        "_start_ml_preferred": dict(return_value=(0, None, False)),
+        "kill_pid": {},
+        "start_service": dict(side_effect=capture),
+    }
+    with contextlib.ExitStack() as stack:
+        for name, kw in stubs.items():
+            stack.enter_context(patch.object(m, name, **kw))
         try:
             m.cmd_start(argparse.Namespace(force=True))
         except RuntimeError:
@@ -4562,9 +4563,12 @@ class TestSelftest:
     def test_selftest_ships_with_its_fixture(self):
         import immich_accelerator.__main__ as m
 
-        hooks = Path(m.__file__).parent / "hooks"
-        assert (hooks / "selftest.mjs").exists()
-        assert (hooks / "selftest.heic").read_bytes()[4:12] == b"ftypheic"
+        d = m.SELFTEST_DIR
+        assert (d / "selftest.mjs").exists()
+        assert (d / "iphone.heic").read_bytes()[4:12] == b"ftypheic"
+        assert (d / "face.jpg").read_bytes()[:2] == b"\xff\xd8"
+        assert (d / "ocr.jpg").read_bytes()[:2] == b"\xff\xd8"
+        assert (d / "hdr.mp4").read_bytes()[4:8] == b"ftyp"
 
 
 class TestSharpPreflightAtStart:
@@ -4615,3 +4619,80 @@ class TestSelftestHarnessErrors:
             result = m.run_selftest(tmp_path, "node", {}, "3.4.0")
             assert result["ok"], "a harness error is not a broken install"
             assert not m.selftest_due("3.4.0")
+
+
+class TestMlSelftest:
+    """The ML half runs against the live service once it answers, and a
+    service that is not up yet leaves the result pending, not passed."""
+
+    def test_not_answering_marks_pending_and_reruns(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        result = {"immich_version": "3.3.1", "accelerator_version": m.__version__,
+                  "ok": True, "checks": []}
+        with patch.object(m, "DATA_DIR", tmp_path), patch(
+            "urllib.request.urlopen", side_effect=OSError("refused")
+        ):
+            m._save_selftest(result)
+            m.add_ml_selftest(result, "http://localhost:3003", "ViT-B-32__openai")
+            m._save_selftest(result)
+            assert result["ml_pending"]
+            assert m.selftest_due("3.3.1"), "pending ML means the next start retries"
+
+    def test_checks_judge_the_real_outputs(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        replies = {
+            "clip_visual": {"clip": "[0.1, 0.2, 0.3]"},
+            "clip_text": {"clip": "[0.3, 0.2, 0.1]"},
+            "faces": {"facial-recognition": [{"embedding": "[1]", "score": 0.9, "boundingBox": {}}]},
+            "ocr": {"ocr": {"text": ["IMMICH 2026"]}},
+        }
+
+        def fake_predict(base, entries, image=None, text=None, timeout=120):
+            if "clip" in entries:
+                return replies["clip_text" if text else "clip_visual"]
+            return replies["faces" if "facial-recognition" in entries else "ocr"]
+
+        ping = MagicMock()
+        ping.__enter__ = lambda s: s
+        ping.__exit__ = lambda *a: False
+        with patch("urllib.request.urlopen", return_value=ping), patch.object(
+            m, "_ml_predict", side_effect=fake_predict
+        ):
+            checks = m._ml_selftest("http://x", "ViT-B-32__openai")
+            assert [c["ok"] for c in checks] == [True, True, True], checks
+            replies["faces"] = {"facial-recognition": []}
+            replies["ocr"] = {"ocr": {"text": []}}
+            replies["clip_text"] = {"clip": "[0.1]"}
+            checks = m._ml_selftest("http://x", "ViT-B-32__openai")
+            assert [c["ok"] for c in checks] == [False, False, False], checks
+
+
+class TestSelftestOnABusyMachine:
+    def test_timeout_is_inconclusive_not_a_failure(self, tmp_path):
+        """A swamped machine (load 800, seen on a real Mini) ran the self-test
+        past its deadline. That proves nothing: no FAILED, no script dump, and
+        the next start tries again."""
+        import immich_accelerator.__main__ as m
+
+        boom = subprocess.TimeoutExpired(cmd=["node", "-e", "x" * 5000], timeout=180)
+        with patch.object(m, "DATA_DIR", tmp_path), patch("subprocess.run", side_effect=boom):
+            result = m.run_selftest(tmp_path, "node", {}, "3.3.1")
+            assert result["inconclusive"] and "x" * 50 not in result["inconclusive"]
+            assert m.selftest_due("3.3.1")
+
+    def test_start_does_not_wait_for_the_selftest_before_the_worker(self, tmp_data_dir):
+        """The worker starts while the self-test is still running."""
+        import threading as _t
+
+        worker_started = _t.Event()
+        seen = {}
+
+        def slow_selftest(*a, **k):
+            seen["worker_first"] = worker_started.wait(10)
+            return {"ok": True, "checks": [], "inconclusive": ""}
+
+        env = _worker_env_for({}, selftest=slow_selftest, on_worker=worker_started.set)
+        assert env
+        assert seen.get("worker_first"), "the worker must not wait for the self-test"
