@@ -8,14 +8,14 @@ name: Immich canary
 # Immich loads its code (3.3 moving to ESM, #191) then opens an issue here the
 # day it ships, before users find it.
 #
-# It only runs when something changed: every six hours a few-second check asks
+# It only runs when something changed: every hour a few-second check asks
 # whether this pair (Immich's latest release, our main) has been tested yet,
 # and the Mac job runs only for a new pair. PRs that touch the shims, the
 # self-test or the ffmpeg wrapper always run it.
 
 on:
   schedule:
-    - cron: "23 */6 * * *" # check every six hours; test only what changed
+    - cron: "23 * * * *" # a few seconds every hour; the Mac job only when something changed
   workflow_dispatch:
     inputs:
       version:
