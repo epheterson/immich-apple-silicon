@@ -70,6 +70,8 @@ jobs:
     needs: decide
     if: needs.decide.outputs.run == 'true'
     runs-on: macos-15
+    outputs:
+      outcome: ${{ steps.selftest.outcome }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -91,7 +93,7 @@ jobs:
           python3 -m immich_accelerator selftest --immich-version "$VERSION" 2>&1 | tee "$RUNNER_TEMP/selftest.log"
 
       - name: Open or update the tracking issue
-        if: failure() && github.event_name == 'schedule'
+        if: failure() && steps.selftest.outcome == 'failure' && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.decide.outputs.version }}
@@ -109,11 +111,13 @@ jobs:
           fi
 
   # Pass or fail, this pair has now been tested: a failure is reported once and
-  # not re-run every six hours until Immich or main changes. Saved from the
-  # same OS that looks it up, so the cache entry always matches.
+  # not re-run every hour until Immich or main changes. Only a self-test that
+  # actually ran counts: a flaky brew install or download leaves the pair
+  # untested so the next hour tries again. Saved from the same OS that looks
+  # it up, so the cache entry always matches.
   remember:
     needs: [decide, selftest]
-    if: always() && github.event_name == 'schedule' && (needs.selftest.result == 'success' || needs.selftest.result == 'failure')
+    if: always() && github.event_name == 'schedule' && (needs.selftest.outputs.outcome == 'success' || needs.selftest.outputs.outcome == 'failure')
     runs-on: ubuntu-latest
     steps:
       - run: date -u > .canary-tested

@@ -2914,10 +2914,8 @@ def _worker_env_for(overrides: dict, sharp_checks=None, rebuild_error=None,
         "_verify_sharp_loads": dict(side_effect=sharp_checks or [(True, "")]),
         "_rebuild_sharp": dict(side_effect=rebuild_error),
         "selftest_due": dict(return_value=selftest is not None),
-        "run_selftest": dict(side_effect=selftest),
+        "_spawn_selftest": dict(side_effect=selftest),
         "start_dashboard": {},
-        "_immich_clip_model": dict(return_value=None),
-        "add_ml_selftest": dict(side_effect=lambda result, *a: result),
         "_prune_old_server_versions": {},
         "_build_link_ok": dict(return_value=True),
         "_preflight_env_health": dict(return_value=True),
@@ -4634,10 +4632,10 @@ class TestMlSelftest:
             "urllib.request.urlopen", side_effect=OSError("refused")
         ):
             m._save_selftest(result)
-            m.add_ml_selftest(result, "http://localhost:3003", "ViT-B-32__openai")
-            m._save_selftest(result)
+            assert not m.selftest_due("3.3.1")
+            m.add_ml_selftest(result, "http://localhost:3003", {})
             assert result["ml_pending"]
-            assert m.selftest_due("3.3.1"), "pending ML means the next start retries"
+            assert m.selftest_due("3.3.1"), "pending ML, as saved, means the next start retries"
 
     def test_checks_judge_the_real_outputs(self, tmp_path):
         import immich_accelerator.__main__ as m
@@ -4660,12 +4658,12 @@ class TestMlSelftest:
         with patch("urllib.request.urlopen", return_value=ping), patch.object(
             m, "_ml_predict", side_effect=fake_predict
         ):
-            checks = m._ml_selftest("http://x", "ViT-B-32__openai")
+            checks = m._ml_selftest("http://x", {})
             assert [c["ok"] for c in checks] == [True, True, True], checks
             replies["faces"] = {"facial-recognition": []}
             replies["ocr"] = {"ocr": {"text": []}}
             replies["clip_text"] = {"clip": "[0.1]"}
-            checks = m._ml_selftest("http://x", "ViT-B-32__openai")
+            checks = m._ml_selftest("http://x", {})
             assert [c["ok"] for c in checks] == [False, False, False], checks
 
 
@@ -4682,17 +4680,54 @@ class TestSelftestOnABusyMachine:
             assert result["inconclusive"] and "x" * 50 not in result["inconclusive"]
             assert m.selftest_due("3.3.1")
 
-    def test_start_does_not_wait_for_the_selftest_before_the_worker(self, tmp_data_dir):
-        """The worker starts while the self-test is still running."""
-        import threading as _t
+    def test_start_hands_the_selftest_to_a_background_process(self, tmp_data_dir):
+        """cmd_start never waits on the self-test: it spawns it with the
+        worker's environment and carries on to the worker."""
+        spawned = []
+        env = _worker_env_for({}, selftest=lambda e: spawned.append(e))
+        assert env and len(spawned) == 1
+        assert spawned[0] is not None and "heic_decode_shim.js" in spawned[0]["NODE_OPTIONS"]
 
-        worker_started = _t.Event()
-        seen = {}
 
-        def slow_selftest(*a, **k):
-            seen["worker_first"] = worker_started.wait(10)
-            return {"ok": True, "checks": [], "inconclusive": ""}
+class TestMlSelftestRealConfig:
+    def _ping(self):
+        ping = MagicMock()
+        ping.__enter__ = lambda s: s
+        ping.__exit__ = lambda *a: False
+        return ping
 
-        env = _worker_env_for({}, selftest=slow_selftest, on_worker=worker_started.set)
-        assert env
-        assert seen.get("worker_first"), "the worker must not wait for the self-test"
+    def test_uses_immichs_configured_models_and_skips_disabled(self):
+        import immich_accelerator.__main__ as m
+
+        sent = []
+
+        def fake_predict(base, entries, image=None, text=None, timeout=120):
+            sent.append(entries)
+            if "facial-recognition" in entries:
+                return {"facial-recognition": [{"embedding": "[1]"}]}
+            return {"clip": "[0.1]"}
+
+        ml = {"clip": {"enabled": True, "modelName": "ViT-B-16-SigLIP__webli"},
+              "facialRecognition": {"enabled": True, "modelName": "antelopev2", "minScore": 0.6},
+              "ocr": {"enabled": False}}
+        with patch("urllib.request.urlopen", return_value=self._ping()), patch.object(
+            m, "_ml_predict", side_effect=fake_predict
+        ):
+            checks = m._ml_selftest("http://x", ml)
+        assert [c["name"] for c in checks] == ["ml_clip", "ml_faces"], "OCR is off in Immich"
+        assert sent[0]["clip"]["visual"]["modelName"] == "ViT-B-16-SigLIP__webli"
+        face = sent[2]["facial-recognition"]["detection"]
+        assert face == {"modelName": "antelopev2", "options": {"minScore": 0.6}}
+
+    def test_a_timeout_is_pending_not_a_failure(self, tmp_path):
+        import socket
+        import immich_accelerator.__main__ as m
+
+        result = {"immich_version": "3.3.1", "accelerator_version": m.__version__,
+                  "ok": True, "checks": []}
+        with patch.object(m, "DATA_DIR", tmp_path), patch(
+            "urllib.request.urlopen", return_value=self._ping()
+        ), patch.object(m, "_ml_predict", side_effect=socket.timeout("read timed out")):
+            m.add_ml_selftest(result, "http://x", {})
+            assert result["ok"] and result["ml_pending"] and result["checks"] == []
+            assert m.selftest_due("3.3.1")

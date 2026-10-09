@@ -25,7 +25,6 @@ import signal
 import socket
 import subprocess
 import tempfile
-import threading
 import sys
 import time
 import uuid
@@ -272,6 +271,13 @@ def run_selftest(server_dir: str | Path, node: str, env: dict, version: str) -> 
         skip.append("job_retry")
     checks: list[dict] = []
     inconclusive = ""
+    # Its own temp dir, emptied each run, so a run killed at the timeout
+    # leaves nothing behind for long.
+    tmp = DATA_DIR / "selftest-tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    with contextlib.suppress(OSError):
+        tmp.mkdir(parents=True)
+    env = {**env, "TMPDIR": str(tmp)}
     try:
         r = subprocess.run(
             [
@@ -296,7 +302,7 @@ def run_selftest(server_dir: str | Path, node: str, env: dict, version: str) -> 
     except subprocess.TimeoutExpired:
         checks = []
         inconclusive = f"did not finish within {SELFTEST_TIMEOUT}s; the machine may be busy"
-    except (OSError, subprocess.SubprocessError, ValueError) as e:
+    except Exception as e:  # malformed output included; never kill the caller
         checks = [{"name": "selftest", "ok": False, "detail": f"{type(e).__name__}: {e}"[:300]}]
     result = {
         "immich_version": version.lstrip("v"),
@@ -361,9 +367,15 @@ def _ml_predict(base: str, entries: dict, image: bytes | None = None,
         raise RuntimeError(f"HTTP {e.code}: {e.read().decode(errors='replace')[:200]}")
 
 
-def _ml_selftest(base: str, clip_model: str) -> list[dict] | None:
+def _ml_selftest(base: str, ml: dict) -> list[dict] | None:
     """CLIP, faces and OCR against the live ML service, on the self-test's
-    fixtures, the way Immich calls it. None if the service isn't answering yet."""
+    fixtures, sent the way Immich sends them with the models and thresholds
+    Immich is configured with (its defaults if unknown). A feature switched
+    off in Immich is skipped. None if the service isn't answering yet; a
+    request that times out (a model still downloading) is pending, not failed.
+    """
+    import socket
+    import urllib.error
     import urllib.request
 
     try:
@@ -372,11 +384,23 @@ def _ml_selftest(base: str, clip_model: str) -> list[dict] | None:
     except OSError:
         return None
     face = (SELFTEST_DIR / "face.jpg").read_bytes()
+    clip_cfg = {"enabled": True, "modelName": "ViT-B-32__openai", **(ml.get("clip") or {})}
+    face_cfg = {"enabled": True, "modelName": "buffalo_l", "minScore": 0.7,
+                **(ml.get("facialRecognition") or {})}
+    ocr_cfg = {"enabled": True, "modelName": "PP-OCRv5_mobile", "minDetectionScore": 0.5,
+               "minRecognitionScore": 0.8, "maxResolution": 736, **(ml.get("ocr") or {})}
     checks: list[dict] = []
 
-    def check(name: str, fn) -> None:
+    def check(name: str, enabled: bool, fn) -> None:
+        if not enabled:
+            return
         try:
             checks.append({"name": name, "ok": True, "detail": fn()})
+        except (TimeoutError, socket.timeout) as e:
+            checks.append({"name": name, "ok": False, "pending": True, "detail": f"timed out ({e})"})
+        except urllib.error.URLError as e:
+            pending = isinstance(e.reason, (TimeoutError, socket.timeout))
+            checks.append({"name": name, "ok": False, "pending": pending, "detail": str(e)[:300]})
         except Exception as e:  # each check reports its own failure
             checks.append({"name": name, "ok": False, "detail": str(e)[:300]})
 
@@ -384,50 +408,94 @@ def _ml_selftest(base: str, clip_model: str) -> list[dict] | None:
         return json.loads(v) if isinstance(v, str) else (v or [])
 
     def clip() -> str:
-        img = vector(_ml_predict(base, {"clip": {"visual": {"modelName": clip_model}}}, image=face).get("clip"))
-        txt = vector(_ml_predict(base, {"clip": {"textual": {"modelName": clip_model}}},
+        model = clip_cfg["modelName"]
+        img = vector(_ml_predict(base, {"clip": {"visual": {"modelName": model}}}, image=face).get("clip"))
+        txt = vector(_ml_predict(base, {"clip": {"textual": {"modelName": model}}},
                                  text="a photo of an astronaut").get("clip"))
         if not img or len(img) != len(txt):
             raise RuntimeError(f"image embedding has {len(img)} dims, text {len(txt)}")
-        return f"{clip_model}, {len(img)} dims"
+        return f"{model}, {len(img)} dims"
 
     def faces() -> str:
+        model = face_cfg["modelName"]
         r = _ml_predict(base, {"facial-recognition": {
-            "detection": {"modelName": "buffalo_l", "options": {"minScore": 0.7}},
-            "recognition": {"modelName": "buffalo_l"}}}, image=face)
+            "detection": {"modelName": model, "options": {"minScore": face_cfg["minScore"]}},
+            "recognition": {"modelName": model}}}, image=face)
         found = r.get("facial-recognition") or []
         if len(found) != 1 or not found[0].get("embedding"):
             raise RuntimeError(f"found {len(found)} faces, expected 1 with an embedding")
-        return "1 face, embedded"
+        return f"{model}, 1 face, embedded"
 
     def ocr() -> str:
+        model = ocr_cfg["modelName"]
         r = _ml_predict(base, {"ocr": {
-            "detection": {"modelName": "default", "options": {}},
-            "recognition": {"modelName": "default", "options": {}}}},
+            "detection": {"modelName": model, "options": {
+                "minScore": ocr_cfg["minDetectionScore"], "maxResolution": ocr_cfg["maxResolution"]}},
+            "recognition": {"modelName": model, "options": {"minScore": ocr_cfg["minRecognitionScore"]}}}},
             image=(SELFTEST_DIR / "ocr.jpg").read_bytes())
         text = " ".join((r.get("ocr") or {}).get("text") or [])
         if "IMMICH" not in text.upper():
             raise RuntimeError(f"read {text!r}, expected IMMICH 2026")
-        return f"read {text!r}"
+        return f"{model}, read {text!r}"
 
-    check("ml_clip", clip)
-    check("ml_faces", faces)
-    check("ml_ocr", ocr)
+    enabled = ml.get("enabled", True)
+    check("ml_clip", enabled and clip_cfg["enabled"], clip)
+    check("ml_faces", enabled and face_cfg["enabled"], faces)
+    check("ml_ocr", enabled and ocr_cfg["enabled"], ocr)
     return checks
 
 
-def add_ml_selftest(result: dict, base: str, clip_model: str) -> dict:
-    """Fold the ML checks into a node self-test result. If the ML service
-    isn't answering yet, mark the result pending so the next start retries."""
-    ml = _ml_selftest(base, clip_model)
-    if ml is None:
-        result["ml_pending"] = True
-        return result
-    result["checks"] += ml
-    result.pop("ml_pending", None)
+def add_ml_selftest(result: dict, base: str, ml: dict) -> dict:
+    """Fold the ML checks into a node self-test result and save it. If the ML
+    service isn't answering, or a check timed out (a model still loading),
+    mark the result pending so the next start runs the ML checks again."""
+    found = _ml_selftest(base, ml)
+    done = [c for c in (found or []) if not c.get("pending")]
+    result["checks"] += done
+    result["ml_pending"] = found is None or len(done) < len(found)
     result["ok"] = all(c["ok"] or c.get("harness") for c in result["checks"])
     _save_selftest(result)
     return result
+
+
+def _selftest_lock():
+    """An exclusive lock while a self-test runs, or None if one already is."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        f = open(DATA_DIR / "selftest.lock", "w")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def selftest_running() -> bool:
+    lock = _selftest_lock()
+    if lock is None:
+        return True
+    lock.close()
+    return False
+
+
+def _spawn_selftest(worker_env: dict) -> None:
+    """Start `selftest --from-start` detached, with the worker's environment,
+    logging to selftest.log. It outlives a one-shot `start`."""
+    log.info("Self-test started in the background (`immich-accelerator status` "
+             "shows the result; log: %s/selftest.log)", LOG_DIR)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "selftest.log", "a") as out:
+            subprocess.Popen(
+                [sys.executable, "-m", "immich_accelerator", "selftest", "--from-start"],
+                env=worker_env, cwd=str(Path(__file__).parent.parent),
+                stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True,
+            )
+    except OSError as e:
+        log.warning("  Could not start the self-test: %s", e)
 
 
 def selftest_due(version: str) -> bool:
@@ -4195,19 +4263,17 @@ def _server_build_for(version: str) -> Path:
             raise RuntimeError(f"Could not download server {version}: {err}") from err
 
 
-def _immich_clip_model(config: dict) -> str | None:
-    """The CLIP model Immich is configured to send us, or None if unknown.
+def _immich_ml_config(config: dict) -> dict:
+    """Immich's machineLearning system config, or {} if it can't be read.
 
-    Read from Immich's own system config so `ml-test` can say what the running
-    setup actually uses instead of only the model it probes with (#116). Needs
-    an api_key; any failure is non-fatal (the caller just stays quiet).
-    """
+    Needs an api_key; any failure is non-fatal (callers fall back to Immich's
+    defaults or stay quiet)."""
     import urllib.error
     import urllib.request
 
     base, key = config.get("immich_url"), config.get("api_key")
     if not base or not key:
-        return None
+        return {}
     req = urllib.request.Request(
         f"{base}/api/system-config", headers={"x-api-key": key}
     )
@@ -4215,8 +4281,18 @@ def _immich_clip_model(config: dict) -> str | None:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
     except (urllib.error.URLError, OSError, ValueError):
-        return None
-    model = (data.get("machineLearning") or {}).get("clip", {}).get("modelName")
+        return {}
+    ml = data.get("machineLearning") if isinstance(data, dict) else None
+    return ml if isinstance(ml, dict) else {}
+
+
+def _immich_clip_model(config: dict) -> str | None:
+    """The CLIP model Immich is configured to send us, or None if unknown.
+
+    Read from Immich's own system config so `ml-test` can say what the running
+    setup actually uses instead of only the model it probes with (#116).
+    """
+    model = (_immich_ml_config(config).get("clip") or {}).get("modelName")
     return model if isinstance(model, str) and model else None
 
 
@@ -6370,20 +6446,12 @@ def _cmd_start(args):
         log.warning("No ml_dir configured — ML service will not start.")
         log.warning("  Re-run: immich-accelerator setup")
 
-    # The self-test runs beside the worker's start, never in front of it: it
-    # needs nothing the worker does, and a slow machine must not delay jobs.
-    # Its result is collected once the ML service is ready, below.
-    selftest_box: dict = {}
-    selftest_thread = None
+    # The self-test runs as its own process beside the worker, never in front
+    # of it: it needs nothing the worker does, a slow machine must not delay
+    # jobs, and its ML half waits for the ML service however long that takes.
+    # `status` shows the result.
     if selftest_due(config["version"]):
-        log.info("Self-testing Immich %s with accelerator %s in the background...",
-                 config["version"], __version__)
-        selftest_thread = threading.Thread(
-            target=lambda: selftest_box.update(
-                result=run_selftest(server_dir, node, dict(worker_env), config["version"])),
-            name="selftest", daemon=True,
-        )
-        selftest_thread.start()
+        _spawn_selftest(worker_env)
 
     # Start native Immich microservices worker
     log.info("Starting Immich worker (version %s)...", config["version"])
@@ -6411,24 +6479,6 @@ def _cmd_start(args):
         ml_pid, ml_engine = _ml_verify_or_fallback(config, ml_pid, ml_engine)
         if ml_pid:
             log.info("  ML service ready (PID %d, %s)", ml_pid, ml_engine)
-
-    # Collect the self-test, then add the ML half, which needs the ML service
-    # serving. Same URL the worker uses.
-    if selftest_thread is not None:
-        selftest_thread.join(SELFTEST_TIMEOUT + 10)
-        selftest = selftest_box.get("result")
-        if selftest is None:
-            log.warning("  Self-test still running; its result will show in `status`.")
-        else:
-            report_selftest(selftest)
-            ml_url = worker_env.get("IMMICH_MACHINE_LEARNING_URL")
-            if ml_url and not selftest.get("inconclusive"):
-                before = len(selftest["checks"])
-                add_ml_selftest(selftest, ml_url, _immich_clip_model(config) or "ViT-B-32__openai")
-                if selftest.get("ml_pending"):
-                    log.info("  ML self-test waits for the ML service at %s (next start)", ml_url)
-                else:
-                    report_selftest({**selftest, "checks": selftest["checks"][before:]})
 
     # Reclaim disk from superseded server builds now that the worker is up on
     # the current version. Done here, not during extraction, so a still-running
@@ -6568,10 +6618,19 @@ def brew_refuses_our_tap() -> bool:
 def cmd_selftest(args):
     """Run the self-test now and exit non-zero on any failure (CI uses this).
 
-    With --immich-version it downloads that server and runs everything except
-    the ML checks, which need a running ML service (the CI canary)."""
-    env = {**os.environ}
-    _preload_worker_shims(env)
+    --immich-version downloads that server and runs everything except the ML
+    checks, which need a running ML service (the CI canary). --from-start is
+    how `start` runs it in the background: the environment is already the
+    worker's, and the ML half waits for the ML service to answer."""
+    lock = _selftest_lock()
+    if lock is None:
+        log.info("A self-test is already running.")
+        return
+    if args.from_start:
+        env = {**os.environ}
+    else:
+        env = {**os.environ}
+        _preload_worker_shims(env)
     if args.immich_version:
         version = args.immich_version
         server_dir = download_immich_server(version)
@@ -6580,22 +6639,44 @@ def cmd_selftest(args):
     else:
         config = load_config()
         version, server_dir = config["version"], config["server_dir"]
-        if config.get("ffmpeg_path"):
+        if config.get("ffmpeg_path") and not args.from_start:
             _ffmpeg_env(config["ffmpeg_path"], env)
+    log.info("Self-testing Immich %s with accelerator %s", version, __version__)
     result = run_selftest(server_dir, find_node(), env, version)
-    if config is not None:
-        ml_url = config.get("ml_url") if not _component_enabled("ml", config) else (
-            f"http://localhost:{config.get('ml_port', 3003)}")
+    report_selftest(result)
+    if config is not None and not result.get("inconclusive"):
+        ml_url = env.get("IMMICH_MACHINE_LEARNING_URL") if args.from_start else (
+            config.get("ml_url") if not _component_enabled("ml", config)
+            else f"http://localhost:{config.get('ml_port', 3003)}")
         if ml_url:
-            add_ml_selftest(result, ml_url, _immich_clip_model(config) or "ViT-B-32__openai")
+            if args.from_start:
+                _wait_for_ml(ml_url)
+            before = len(result["checks"])
+            add_ml_selftest(result, ml_url, _immich_ml_config(config))
+            report_selftest({**result, "checks": result["checks"][before:]})
             if result.get("ml_pending"):
-                log.warning("ML service at %s is not answering; ML checks skipped", ml_url)
-    for c in result["checks"]:
-        (log.info if c["ok"] else log.error)(
-            "%s %s: %s", "ok  " if c["ok"] else "FAIL", c["name"], c["detail"]
-        )
-    if not all(c["ok"] for c in result["checks"]):
-        sys.exit(1)
+                log.warning("ML checks pending: %s is not answering yet; next start retries.", ml_url)
+    if not args.from_start:
+        for c in result["checks"]:
+            (log.info if c["ok"] else log.error)(
+                "%s %s: %s", "ok  " if c["ok"] else "FAIL", c["name"], c["detail"]
+            )
+        if result.get("inconclusive") or not all(c["ok"] for c in result["checks"]):
+            sys.exit(1)
+
+
+def _wait_for_ml(url: str, limit: float = 900) -> None:
+    """Give a cold ML service (first model download) time to answer."""
+    import urllib.request
+
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{url}/ping", timeout=5) as r:
+                r.read()
+            return
+        except OSError:
+            time.sleep(10)
 
 
 def cmd_status(_args):
@@ -6673,10 +6754,13 @@ def cmd_status(_args):
         log.info("Version:    %s", config.get("version", "?"))
         st = load_selftest()
         if st and st.get("immich_version") == str(config.get("version", "")).lstrip("v"):
-            if st.get("inconclusive"):
+            if selftest_running():
+                log.info("Self-test:  running")
+            elif st.get("inconclusive"):
                 log.warning("Self-test:  inconclusive (%s); runs again next start", st["inconclusive"])
             elif st.get("ok"):
-                log.info("Self-test:  passed (%s)", st.get("ran_at", "?"))
+                log.info("Self-test:  passed (%s)%s", st.get("ran_at", "?"),
+                         "; ML checks pending" if st.get("ml_pending") else "")
             else:
                 bad = ", ".join(c["name"] for c in st.get("checks", []) if not c["ok"])
                 log.error("Self-test:  FAILED (%s); `immich-accelerator selftest` for details", bad)
@@ -8734,6 +8818,7 @@ def main():
         "--immich-version",
         help="Download this Immich server version and test it instead of the installed one",
     )
+    st_p.add_argument("--from-start", action="store_true", help=argparse.SUPPRESS)
     enc_p = sub.add_parser(
         "encoding", help="Turn hardware encoding on or off (omit args to list)"
     )
