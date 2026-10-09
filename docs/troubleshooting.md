@@ -106,4 +106,4 @@ immich-accelerator stop && immich-accelerator start
 
 </details>
 
-Still stuck? Open an issue with the output of `immich-accelerator status` and `immich-accelerator ml-test`.
+Still stuck? Open an issue with the output of `immich-accelerator status`, `immich-accelerator ml-test` and `immich-accelerator selftest`.

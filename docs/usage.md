@@ -21,6 +21,7 @@ Every command is prefixed with `immich-accelerator` (e.g. `immich-accelerator se
 | `dashboard` | Web UI at http://localhost:8420 |
 | `component [name] [on\|off]` | Turn the [worker, ML, or dashboard](#choosing-what-runs) on or off (no args lists them) |
 | `ml-test` | Diagnose the ML service (health + CLIP + OCR round-trip) |
+| `selftest` | Check that every shim still reaches the Immich code it patches (runs on its own whenever Immich or the accelerator changes version) |
 | `encoding` | Show the hardware transcoding switches, or set one: `encoding hardware-video off` (see [below](#hardware-transcoding)) |
 | `encoding preset [software\|hardware]` | Move every switch to one end at once |
 | `compare <video>` | Encode one of your own files every way this Mac can and open a page with the numbers and a frame from each |

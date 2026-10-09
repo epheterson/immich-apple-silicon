@@ -440,22 +440,58 @@ function wrapSharp(realSharp) {
     return sharp;
 }
 
+// One wrapper per Sharp module object, shared by the CommonJS and ESM paths
+// below. Keyed by object because the two paths can load different copies.
+const wrappers = new WeakMap();
+function wrappedSharp(realSharp) {
+    if (realSharp.__heicShimWrapped) return realSharp;
+    let w = wrappers.get(realSharp);
+    if (!w) {
+        w = wrapSharp(realSharp);
+        wrappers.set(realSharp, w);
+    }
+    return w;
+}
+
 // Intercept `require('sharp')` and return the wrapped factory. The preload
 // runs before Immich's entrypoint, so this is installed before Sharp is first
 // required.
 const Module = require('module');
 const origLoad = Module._load;
-let wrapped = null;
 Module._load = function (request, parent, isMain) {
     const mod = origLoad.apply(this, arguments);
-    if (request === 'sharp' && mod && !mod.__heicShimWrapped) {
-        if (wrapped === null) wrapped = wrapSharp(mod);
-        return wrapped;
-    }
+    if (request === 'sharp' && mod) return wrappedSharp(mod);
     return mod;
 };
 
+// Immich 3.3 is ESM (`import sharp from 'sharp'`), and Sharp ships an ESM
+// build, so that import never reaches Module._load (#191). Resolve the import
+// exactly as Node would, then hand Immich a bridge module that imports that
+// same URL and exports wrappedSharp() of it. Nothing here depends on which
+// formats Sharp ships. registerHooks exists on Node 22.15+ (Homebrew's
+// node@22 has it).
+const ESM_BRIDGE = require('url').pathToFileURL(
+    require('path').join(__dirname, 'sharp_esm_bridge.mjs')
+);
+if (typeof Module.registerHooks === 'function') {
+    Module.registerHooks({
+        resolve(specifier, context, nextResolve) {
+            const resolved = nextResolve(specifier, context);
+            const conditions = context.conditions || [];
+            if (specifier !== 'sharp' || !conditions.includes('import')) return resolved;
+            const url = new URL(ESM_BRIDGE);
+            url.searchParams.set('real', resolved.url);
+            return { url: url.href, format: 'module', shortCircuit: true };
+        },
+    });
+} else {
+    process.stderr.write(
+        '[immich-accelerator] warning: this Node has no module.registerHooks; ' +
+        'HEIC decoding will not reach ESM imports of sharp (Immich 3.3+)\n'
+    );
+}
+
 // Loaded via `node --require`, where exports go unused. They exist so the
 // chain-replay behaviour can be driven directly from a test rather than
-// inferred from thumbnails.
-module.exports = { wrapSharp, lazyDecodedSharp };
+// inferred from thumbnails, and so the ESM bridge shares the one wrapper.
+module.exports = { wrapSharp, lazyDecodedSharp, wrappedSharp };

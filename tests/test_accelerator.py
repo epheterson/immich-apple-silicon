@@ -2865,7 +2865,7 @@ class TestWorkerWithoutML:
         assert env["IMMICH_MACHINE_LEARNING_URL"] == "http://gpubox:3003"
 
 
-def _worker_env_for(overrides: dict) -> dict:
+def _worker_env_for(overrides: dict, sharp_checks=None, rebuild_error=None) -> dict:
     """Run cmd_start far enough to capture the worker environment it builds.
 
     cmd_start is the most load-bearing function in the codebase, so this drives
@@ -2909,7 +2909,11 @@ def _worker_env_for(overrides: dict) -> dict:
     ), patch.object(
         m, "_check_node_engines_compat", return_value=(True, "")
     ), patch.object(
-        m, "_verify_sharp_loads", return_value=(True, "")
+        m, "_verify_sharp_loads", side_effect=sharp_checks or [(True, "")]
+    ), patch.object(
+        m, "_rebuild_sharp", side_effect=rebuild_error
+    ), patch.object(
+        m, "selftest_due", return_value=False
     ), patch.object(
         m, "_build_link_ok", return_value=True
     ), patch.object(
@@ -2925,8 +2929,10 @@ def _worker_env_for(overrides: dict) -> dict:
     ), patch.object(
         m, "start_service", side_effect=capture
     ):
-        with pytest.raises(RuntimeError):
+        try:
             m.cmd_start(argparse.Namespace(force=True))
+        except RuntimeError:
+            pass
     return captured
 
 
@@ -4126,10 +4132,9 @@ class TestNodeShimPreload:
 
         hooks = Path(m.__file__).parent / "hooks"
         on_disk = {p.name for p in hooks.glob("*_shim.js")}
-        src = Path(m.__file__).read_text()
-        wired = {
-            name for name in on_disk if f'_preload_node_shim(worker_env, "{name}")' in src
-        }
+        env: dict[str, str] = {}
+        m._preload_worker_shims(env)
+        wired = {name for name in on_disk if f'/{name}"' in env["NODE_OPTIONS"]}
         assert (
             on_disk == wired
         ), f"present but never preloaded: {sorted(on_disk - wired)}"
@@ -4496,3 +4501,117 @@ class TestDownloadIntegrity:
                 acc._ensure_jellyfin_ffmpeg()
         run.assert_not_called()
         assert not (tmp_path / "jellyfin-ffmpeg" / "jellyfin-ffmpeg.tar.xz").exists()
+
+
+class TestSelftest:
+    """The self-test runs once per Immich/accelerator version pair, records what
+    it found, and never stops the worker from starting."""
+
+    def _proc(self, stdout="", stderr="", rc=0):
+        r = MagicMock()
+        r.stdout, r.stderr, r.returncode = stdout, stderr, rc
+        return r
+
+    def test_passing_run_is_recorded_and_not_repeated(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        out = 'SELFTEST {"checks": [{"name": "heic_thumbnail", "ok": true, "detail": "96x64"}]}'
+        with patch.object(m, "DATA_DIR", tmp_path), patch(
+            "subprocess.run", return_value=self._proc(out)
+        ) as run:
+            assert m.selftest_due("v3.3.1")
+            result = m.run_selftest(tmp_path, "node", {}, "v3.3.1")
+            assert result["ok"] and result["immich_version"] == "3.3.1"
+            assert not m.selftest_due("v3.3.1")
+            assert m.selftest_due("v3.3.2"), "a new Immich version re-runs it"
+            with patch.object(m, "__version__", "99.0.0"):
+                assert m.selftest_due("v3.3.1"), "a new accelerator version re-runs it"
+        assert run.call_args.kwargs["cwd"] == str(tmp_path / "dist")
+
+    def test_failure_is_recorded_and_retried_next_start(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        out = 'SELFTEST {"checks": [{"name": "heic_thumbnail", "ok": false, "detail": "HEVC"}]}'
+        with patch.object(m, "DATA_DIR", tmp_path), patch(
+            "subprocess.run", return_value=self._proc(out)
+        ):
+            result = m.run_selftest(tmp_path, "node", {}, "3.3.1")
+            assert not result["ok"]
+            assert m.selftest_due("3.3.1")
+
+    def test_crash_without_output_is_a_failure_not_a_pass(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "DATA_DIR", tmp_path), patch(
+            "subprocess.run", return_value=self._proc("", "SyntaxError: boom", 1)
+        ):
+            result = m.run_selftest(tmp_path, "node", {}, "3.3.1")
+        assert not result["ok"]
+        assert "boom" in result["checks"][0]["detail"]
+
+    def test_disabled_job_retry_is_skipped(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        out = 'SELFTEST {"checks": []}'
+        with patch.object(m, "DATA_DIR", tmp_path), patch(
+            "subprocess.run", return_value=self._proc(out)
+        ) as run:
+            m.run_selftest(tmp_path, "node", {"IMMICH_ACCEL_JOB_RETRY": "0"}, "3.3.1")
+        assert run.call_args.args[0][-1] == "job_retry"
+
+    def test_selftest_ships_with_its_fixture(self):
+        import immich_accelerator.__main__ as m
+
+        hooks = Path(m.__file__).parent / "hooks"
+        assert (hooks / "selftest.mjs").exists()
+        assert (hooks / "selftest.heic").read_bytes()[4:12] == b"ftypheic"
+
+
+class TestSharpPreflightAtStart:
+    WASM = (False, "sharp loaded its WebAssembly fallback, not the native macOS build\n")
+
+    def test_wasm_with_a_failed_repair_still_starts_the_worker(self, tmp_data_dir):
+        """The WebAssembly build is slow but correct. An offline restart whose
+        native repair cannot reach npm must not turn slow into down."""
+        env = _worker_env_for(
+            {}, sharp_checks=[self.WASM, self.WASM], rebuild_error=RuntimeError("npm offline")
+        )
+        assert env, "the worker must still be started"
+
+    def test_a_sharp_that_cannot_load_still_blocks_start(self, tmp_data_dir):
+        broken = (False, "Error: Cannot find module 'sharp'")
+        env = _worker_env_for({}, sharp_checks=[broken], rebuild_error=RuntimeError("npm offline"))
+        assert env == {}
+
+    def test_an_npm_timeout_is_a_failed_repair_not_a_crash(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        env = _worker_env_for(
+            {}, sharp_checks=[self.WASM, self.WASM],
+            rebuild_error=subprocess.TimeoutExpired(cmd="npm", timeout=180),
+        )
+        assert env, "the worker must still be started"
+        assert m._sharp_repair_recently_failed(), "and the repair backs off"
+
+    def test_a_recent_failed_repair_is_not_retried(self, tmp_data_dir):
+        import immich_accelerator.__main__ as m
+
+        m._sharp_repair_failed_marker().parent.mkdir(parents=True, exist_ok=True)
+        m._sharp_repair_failed_marker().touch()
+        env = _worker_env_for(
+            {}, sharp_checks=[self.WASM], rebuild_error=AssertionError("must not rebuild")
+        )
+        assert env
+
+
+class TestSelftestHarnessErrors:
+    def test_harness_error_warns_and_does_not_force_reruns(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        out = ('SELFTEST {"checks": [{"name": "heic_thumbnail", "ok": false, '
+               '"detail": "cannot load MediaRepository", "harness": true}]}')
+        r = MagicMock(stdout=out, stderr="", returncode=0)
+        with patch.object(m, "DATA_DIR", tmp_path), patch("subprocess.run", return_value=r):
+            result = m.run_selftest(tmp_path, "node", {}, "3.4.0")
+            assert result["ok"], "a harness error is not a broken install"
+            assert not m.selftest_due("3.4.0")

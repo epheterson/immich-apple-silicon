@@ -155,22 +155,65 @@ function patchBullmq(bullmq) {
     );
 }
 
+// Patching mutates bullmq's Queue and Worker prototypes, which every copy of
+// the module object shares, so a WeakSet of prototypes (not a flag on the
+// module object, which is frozen when it is an ESM namespace) guards against
+// wrapping twice.
+const patchedProtos = new WeakSet();
+
+function ensurePatched(mod) {
+    const proto = mod && mod.Queue && mod.Queue.prototype;
+    if (!proto || patchedProtos.has(proto)) return;
+    try {
+        patchBullmq(mod);
+        patchedProtos.add(proto);
+        proto.add.__immichAccelJobRetry = true;
+    } catch (e) {
+        process.stderr.write(
+            '[immich-accelerator] job retry shim failed: ' +
+            String((e && e.message) || e) + '\n'
+        );
+    }
+}
+
 if (ENABLED) {
     const Module = require('module');
     const origLoad = Module._load;
     Module._load = function (request, parent, isMain) {
         const mod = origLoad.apply(this, arguments);
-        if (request === 'bullmq' && mod && !mod.__jobRetryPatched) {
-            try {
-                patchBullmq(mod);
-                mod.__jobRetryPatched = true;
-            } catch (e) {
-                process.stderr.write(
-                    '[immich-accelerator] job retry shim failed: ' +
-                    String((e && e.message) || e) + '\n'
-                );
-            }
-        }
+        if (request === 'bullmq') ensurePatched(mod);
         return mod;
     };
+
+    // Immich 3.3 is ESM: its `import { Worker } from 'bullmq'` never passes
+    // through Module._load with the request 'bullmq'. Until now the patch only
+    // landed because @nestjs/bullmq still require()s it. Catch the import
+    // itself: load the file Node resolved for it (the same module instance the
+    // import then gets) and patch it before Immich sees it.
+    if (typeof Module.registerHooks === 'function') {
+        const { fileURLToPath } = require('url');
+        Module.registerHooks({
+            resolve(specifier, context, nextResolve) {
+                const resolved = nextResolve(specifier, context);
+                const conditions = context.conditions || [];
+                if (specifier === 'bullmq' && conditions.includes('import') &&
+                        resolved.url.startsWith('file:')) {
+                    try {
+                        ensurePatched(require(fileURLToPath(resolved.url)));
+                    } catch (e) {
+                        process.stderr.write(
+                            '[immich-accelerator] job retry shim could not patch the ' +
+                            'ESM import of bullmq: ' + String((e && e.message) || e) + '\n'
+                        );
+                    }
+                }
+                return resolved;
+            },
+        });
+    } else {
+        process.stderr.write(
+            '[immich-accelerator] warning: this Node has no module.registerHooks; ' +
+            'job retry relies on @nestjs/bullmq loading bullmq (Immich 3.3+)\n'
+        );
+    }
 }

@@ -1263,6 +1263,61 @@ class TestNodeVersionPreflight:
         assert not ok
         assert err  # we want actionable stderr back
 
+    def test_verify_sharp_loads_rejects_the_wasm_fallback(self, tmp_path):
+        """Without the darwin binary Sharp falls back to WebAssembly: it loads
+        and decodes, about 3x slower. The preflight must treat that as broken so
+        start repairs it, instead of passing it forever."""
+        import shutil as _shutil
+
+        node = _shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        pkg = tmp_path / "node_modules" / "sharp"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text('{"name": "sharp", "main": "index.js"}')
+        (pkg / "index.js").write_text(
+            "module.exports = { versions: { vips: '8.18.3', emscripten: '6.0.1' } };"
+        )
+        ok, err = _verify_sharp_loads(str(tmp_path), node)
+        assert not ok and "WebAssembly" in err
+        (pkg / "index.js").write_text("module.exports = { versions: { vips: '8.18.7' } };")
+        assert _verify_sharp_loads(str(tmp_path), node) == (True, "")
+
+    def _pnpm_sharp(self, tmp_path, version, dirname):
+        sharp_dir = tmp_path / "node_modules" / ".pnpm" / dirname / "node_modules" / "sharp"
+        sharp_dir.mkdir(parents=True)
+        (sharp_dir / "package.json").write_text(json.dumps({"name": "sharp", "version": version}))
+        return sharp_dir
+
+    def test_rebuild_sharp_asks_npm_for_sharps_own_version(self, tmp_path):
+        """pnpm appends peer versions to the directory name; the last "@" field
+        there is @types/node's version, which npm silently ignores (#191
+        follow-up). The version must come from Sharp's package.json."""
+        sharp_dir = self._pnpm_sharp(tmp_path, "0.35.3", "sharp@0.35.3_@types+node@24.13.3")
+
+        def fake_npm(cmd, **kw):
+            (sharp_dir / "node_modules" / "@img" / "sharp-darwin-arm64").mkdir(parents=True)
+            return subprocess.CompletedProcess(cmd, 0, "added 1 package", "")
+
+        with patch("immich_accelerator.__main__.find_npm", return_value="npm"), patch(
+            "immich_accelerator.__main__.find_node", return_value="/x/node"
+        ), patch("immich_accelerator.__main__.subprocess.run", side_effect=fake_npm) as run:
+            _rebuild_sharp(tmp_path)
+        assert "@img/sharp-darwin-arm64@0.35.3" in run.call_args.args[0]
+
+    def test_rebuild_sharp_fails_when_npm_installs_nothing(self, tmp_path):
+        """npm's "up to date" with exit 0 and no package installed was taken as
+        success, leaving Sharp on its WebAssembly fallback."""
+        self._pnpm_sharp(tmp_path, "0.35.5", "sharp@0.35.5_@types+node@24.19.0")
+        with patch("immich_accelerator.__main__.find_npm", return_value="npm"), patch(
+            "immich_accelerator.__main__.find_node", return_value="/x/node"
+        ), patch(
+            "immich_accelerator.__main__.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, "up to date", ""),
+        ):
+            with pytest.raises(RuntimeError, match="sharp-darwin-arm64@0.35.5"):
+                _rebuild_sharp(tmp_path)
+
     def test_formula_template_pins_node_22(self):
         """Static check: the generated Homebrew formula must pin node@22.
         A regression to `depends_on "node"` re-ships the mainline-node bug.
@@ -1483,6 +1538,69 @@ const fake = () => {
         assert "immich-accelerator" in out["threw"]
         assert "pipe()" in out["threw"]
 
+    def _run_esm_app(self, tmp_path, exports, files):
+        """Run an ESM app doing `import sharp from 'sharp'` against a fake
+        Sharp package with the given exports map and files, shim preloaded."""
+        import json
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        has_hooks = subprocess.run(
+            [node, "-e", "process.exit(typeof require('module').registerHooks === 'function' ? 0 : 1)"]
+        )
+        if has_hooks.returncode != 0:
+            pytest.skip("this node has no module.registerHooks")
+        pkg = tmp_path / "node_modules" / "sharp"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text(json.dumps({"name": "sharp", "exports": {".": exports}}))
+        for name, body in files.items():
+            (pkg / name).write_text(body)
+        (tmp_path / "package.json").write_text('{"type": "module"}')
+        (tmp_path / "app.js").write_text(
+            "import sharp from 'sharp';\n"
+            "import { createRequire } from 'node:module';\n"
+            "let viaRequire = null;\n"
+            "try { viaRequire = createRequire(import.meta.url)('sharp'); } catch {}\n"
+            "console.log('RESULT' + JSON.stringify({\n"
+            "  wrapped: !!sharp.__heicShimWrapped,\n"
+            "  backing: sharp('/x.jpg'),\n"
+            "  statics: sharp.versions,\n"
+            "  require: viaRequire && !!viaRequire.__heicShimWrapped && viaRequire('/x.jpg'),\n"
+            "}));\n"
+        )
+        proc = subprocess.run(
+            [node, "--require", str(self.SHIM), str(tmp_path / "app.js")],
+            capture_output=True, text=True, timeout=60, cwd=tmp_path,
+        )
+        line = [x for x in proc.stdout.splitlines() if x.startswith("RESULT")]
+        assert line, f"app produced no result:\n{proc.stdout}\n{proc.stderr}"
+        return json.loads(line[0][len("RESULT"):])
+
+    ESM_FAKE = "export default function sharp() { return 'esm'; }\nsharp.versions = { fake: 'esm' };\n"
+    CJS_FAKE = "function sharp() { return 'cjs'; }\nsharp.versions = { fake: 'cjs' };\nmodule.exports = sharp;\n"
+
+    def test_esm_import_of_sharp_is_wrapped(self, tmp_path):
+        """Immich 3.3 is ESM and Sharp ships an ESM build, so `import sharp from
+        'sharp'` never reached the Module._load interposition and every HEVC
+        HEIC thumbnail failed (#191). The ESM import must come back wrapped
+        around the very build Node resolved for it, statics intact, and
+        require() must keep working alongside it."""
+        out = self._run_esm_app(
+            tmp_path,
+            {"import": "./index.mjs", "require": "./index.cjs"},
+            {"index.mjs": self.ESM_FAKE, "index.cjs": self.CJS_FAKE},
+        )
+        assert out == {"wrapped": True, "backing": "esm", "statics": {"fake": "esm"}, "require": "cjs"}
+
+    def test_esm_only_sharp_is_wrapped(self, tmp_path):
+        """A future Sharp may drop its CommonJS build. The ESM path must not
+        depend on one existing."""
+        out = self._run_esm_app(tmp_path, {"import": "./index.mjs"}, {"index.mjs": self.ESM_FAKE})
+        assert out == {"wrapped": True, "backing": "esm", "statics": {"fake": "esm"}, "require": None}
+
     def test_shim_file_exists(self):
         assert self.SHIM.exists(), "heic_decode_shim.js must ship in hooks/"
 
@@ -1492,7 +1610,8 @@ const fake = () => {
         # Not a grep for "--require": that string lives inside
         # _preload_node_shim itself, so the old `or` clause was true no matter
         # what and the assertion checked nothing at all.
-        assert '_preload_node_shim(worker_env, "heic_decode_shim.js")' in src
+        assert '_preload_node_shim(env, "heic_decode_shim.js")' in src
+        assert "_preload_worker_shims(worker_env)" in src
 
     def test_shim_syntax_valid(self):
         import shutil
@@ -3029,6 +3148,46 @@ class TestJobRetryShim:
 
     def test_shim_file_exists(self):
         assert self.SHIM_PATH.exists(), f"hook shim missing: {self.SHIM_PATH}"
+
+    def test_esm_import_is_patched_without_a_require(self, tmp_path):
+        """Immich 3.3's `import { Queue } from 'bullmq'` never reaches
+        Module._load as 'bullmq'; the patch used to land only because
+        @nestjs/bullmq also require()s it. An ESM import alone must be enough,
+        and a later require() must not wrap it a second time."""
+        import json
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        has_hooks = subprocess.run(
+            [node, "-e", "process.exit(typeof require('module').registerHooks === 'function' ? 0 : 1)"]
+        )
+        if has_hooks.returncode != 0:
+            pytest.skip("this node has no module.registerHooks")
+        self._write_fake_bullmq(tmp_path / "node_modules" / "bullmq")
+        (tmp_path / "package.json").write_text('{"type": "module"}')
+        (tmp_path / "app.js").write_text(
+            # Default import: the fake's getter exports are invisible to Node's
+            # named-export detection; real bullmq's compiled form is not.
+            "import bullmq from 'bullmq';\n"
+            "import { createRequire } from 'node:module';\n"
+            "const { Queue } = bullmq;\n"
+            "const first = new Queue('q').add('j', {}, {});\n"
+            "createRequire(import.meta.url)('bullmq');\n"
+            "const second = new Queue('q').add('j', {}, {});\n"
+            "console.log('RESULT' + JSON.stringify({ first: first.opts, second: second.opts }));\n"
+        )
+        proc = subprocess.run(
+            [node, "--require", str(self.SHIM_PATH), str(tmp_path / "app.js")],
+            capture_output=True, text=True, timeout=60, cwd=tmp_path,
+        )
+        line = [x for x in proc.stdout.splitlines() if x.startswith("RESULT")]
+        assert line, f"no result:\n{proc.stdout}\n{proc.stderr}"
+        out = json.loads(line[0][len("RESULT"):])
+        assert out["first"]["attempts"] > 1, "the ESM import alone must be patched"
+        assert out["first"] == out["second"]
+        assert proc.stderr.count("job retry enabled") == 1, "patched exactly once"
 
     def test_shim_is_referenced_by_cmd_start(self):
         src = (REPO_ROOT / "immich_accelerator" / "__main__.py").read_text()

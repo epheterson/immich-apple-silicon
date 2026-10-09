@@ -179,6 +179,135 @@ def _preload_node_shim(env: dict[str, str], shim: str) -> None:
     env["NODE_OPTIONS"] = f"{existing} {arg}".strip()
 
 
+def _preload_worker_shims(env: dict) -> None:
+    """Every shim the worker runs with. The self-test loads the same set."""
+    # pg_dump shim (issue #24): Immich hardcodes the Linux postgres client path
+    # `/usr/lib/postgresql/<ver>/bin/pg_dump` in its DatabaseBackupService. On
+    # macOS that path does not exist and upstream offers no env-var escape
+    # hatch, so the shim rewrites it to the Homebrew libpq bin dir at call time.
+    _preload_node_shim(env, "pg_dump_shim.js")
+
+    # HEIC + camera-RAW decode shim (issues #62, #99): Sharp's prebuilt libvips
+    # ships without an HEVC decoder (AVIF-only) and without a dcraw/libraw
+    # loader, so iPhone HEICs and Canon/Nikon/Sony RAW files fail to decode and
+    # never get thumbnails. This preload wraps the `sharp` module to route those
+    # file paths through Homebrew libvips (to a lossless TIFF) before Sharp.
+    # Same --require interposition; Immich's source on disk is untouched.
+    _preload_node_shim(env, "heic_decode_shim.js")
+
+    # pg keepalive shim (issue #74): in a split deployment a stateful firewall
+    # between the worker and a remote Postgres can silently reap an idle
+    # connection, after which the next read hangs to ETIMEDOUT and the worker
+    # never recovers. Immich doesn't expose a keepalive env var, so we wrap the
+    # `pg` module to set keepAlive on every connection. Same --require
+    # interposition; Immich's source is untouched. No-op for same-host setups.
+    _preload_node_shim(env, "pg_keepalive_shim.js")
+
+    # job retry shim: Immich hardcodes `attempts: 1` (no retry) for every
+    # BullMQ queue. In a split deployment a transient connection drop to a
+    # remote Postgres/Redis or a brief SMB hiccup permanently fails the job
+    # instead of retrying. We wrap `bullmq`'s Queue constructor to raise the
+    # attempt count with exponential backoff. Same --require interposition;
+    # Immich's source is untouched.
+    _preload_node_shim(env, "job_retry_shim.js")
+
+
+# The self-test (hooks/selftest.mjs) asks each shim whether it still reaches
+# the Immich code it exists for, by running Immich's own modules with the
+# shims loaded. Upstream changing how Immich loads a module (Immich 3.3 moving
+# to ESM, #191) then shows up as a named failure the first time that version
+# starts, instead of a shim that logs "active" while doing nothing.
+def _selftest_file() -> Path:
+    return DATA_DIR / "selftest.json"
+
+
+def load_selftest() -> dict | None:
+    try:
+        return json.loads(_selftest_file().read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def run_selftest(server_dir: str | Path, node: str, env: dict, version: str) -> dict:
+    """Run the self-test against server_dir with env's shims; save and return it."""
+    hooks = Path(__file__).parent / "hooks"
+    # A shim switched off on purpose has nothing to prove.
+    skip = []
+    if env.get("IMMICH_ACCEL_JOB_RETRY") == "0":
+        skip.append("job_retry")
+    checks: list[dict] = []
+    try:
+        r = subprocess.run(
+            [
+                node, "--input-type=module", "-e", (hooks / "selftest.mjs").read_text(),
+                str(server_dir), str(hooks / "selftest.heic"), ",".join(skip),
+            ],
+            cwd=str(Path(server_dir) / "dist"),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,  # a few seconds normally; never hold the worker for long
+        )
+        line = next(
+            (x for x in r.stdout.splitlines() if x.startswith("SELFTEST ")), None
+        )
+        if line:
+            checks = json.loads(line[len("SELFTEST "):])["checks"]
+        else:
+            tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
+            checks = [{"name": "selftest", "ok": False,
+                       "detail": " | ".join(tail) or f"exit {r.returncode}"}]
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        checks = [{"name": "selftest", "ok": False, "detail": str(e)}]
+    result = {
+        "immich_version": version.lstrip("v"),
+        "accelerator_version": __version__,
+        # A harness error means the self-test could not exercise that path on
+        # this Immich (its code moved), not that the work is broken: it warns
+        # here and fails the CI canary, which is where it gets fixed.
+        "ok": bool(checks) and all(c["ok"] or c.get("harness") for c in checks),
+        "checks": checks,
+        "ran_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _selftest_file().write_text(json.dumps(result, indent=2))
+    except OSError:
+        pass
+    return result
+
+
+def selftest_due(version: str) -> bool:
+    """Run on any version change on either side, and again after a failure."""
+    last = load_selftest()
+    return not (
+        last
+        and last.get("ok")
+        and last.get("immich_version") == version.lstrip("v")
+        and last.get("accelerator_version") == __version__
+    )
+
+
+def report_selftest(result: dict) -> None:
+    for c in result["checks"]:
+        if not c["ok"] and c.get("harness"):
+            log.warning("  Self-test could not check %s on this Immich: %s", c["name"], c["detail"])
+    failed = [c for c in result["checks"] if not c["ok"] and not c.get("harness")]
+    if not failed:
+        log.info("  Self-test passed (%s)", ", ".join(c["name"] for c in result["checks"]))
+        return
+    log.error(
+        "Self-test FAILED for Immich %s with accelerator %s:",
+        result["immich_version"], result["accelerator_version"],
+    )
+    for c in failed:
+        log.error("  %s: %s", c["name"], c["detail"])
+    log.error(
+        "  The worker still starts, but the work above is broken. Please report it: "
+        "https://github.com/epheterson/immich-apple-silicon/issues"
+    )
+
+
 # Service logs are opened in append mode and the worker can spew stack traces
 # for unsupported files (e.g. videos mislabeled .heic) — left unmanaged a log
 # grew to 10GB. Cap each log; the watch loop and start enforce it.
@@ -1178,10 +1307,15 @@ def _rebuild_sharp(server_dir: Path) -> None:
         )
     sharp_dir = sharp_dirs[0]
 
-    # Extract the Sharp version from the pnpm path (sharp@0.34.5)
-    sharp_version = sharp_dir.parent.parent.name.split("@")[-1]
-    if not sharp_version or not sharp_version[0].isdigit():
-        sharp_version = "0.34.5"  # fallback
+    # The version comes from Sharp's own package.json. The pnpm directory name
+    # carries peer versions after it (sharp@0.35.3_@types+node@24.13.3), and
+    # taking its last "@" field asked npm for sharp-darwin-arm64@24.13.3,
+    # which npm answers with "up to date" and installs nothing. Sharp then
+    # silently ran its WebAssembly fallback, about 3x slower.
+    try:
+        sharp_version = json.loads((sharp_dir / "package.json").read_text())["version"]
+    except (OSError, ValueError, KeyError):
+        sharp_version = sharp_dir.parent.parent.name.split("@", 1)[-1].split("_", 1)[0]
 
     log.info("Installing Sharp pre-built binary for macOS (v%s)...", sharp_version)
 
@@ -1200,7 +1334,9 @@ def _rebuild_sharp(server_dir: Path) -> None:
         timeout=180,
         env=env,
     )
-    if result.returncode != 0:
+    if result.returncode != 0 or not (
+        sharp_dir / "node_modules" / "@img" / "sharp-darwin-arm64"
+    ).is_dir():
         tail = (result.stderr or result.stdout or "")[-600:]
         raise RuntimeError(
             f"Failed to install @img/sharp-darwin-arm64@{sharp_version}.\n"
@@ -1220,6 +1356,23 @@ def _rebuild_sharp(server_dir: Path) -> None:
     log.info("  Sharp pre-built binary installed")
 
 
+SHARP_WASM_MARKER = "sharp loaded its WebAssembly fallback"
+
+
+def _sharp_repair_failed_marker() -> Path:
+    return DATA_DIR / "sharp-native-repair-failed"
+
+
+def _sharp_repair_recently_failed() -> bool:
+    """A failed native repair (offline, npm down) waits a day before the next
+    try, so an offline machine doesn't spend minutes on npm at every start."""
+    try:
+        age = time.time() - _sharp_repair_failed_marker().stat().st_mtime
+    except OSError:
+        return False
+    return age < 24 * 3600
+
+
 def _verify_sharp_loads(server_dir: str, node: str) -> tuple[bool, str]:
     """Run ``require('sharp')`` via node and return (ok, stderr_tail).
 
@@ -1231,7 +1384,16 @@ def _verify_sharp_loads(server_dir: str, node: str) -> tuple[bool, str]:
     """
     try:
         result = subprocess.run(
-            [node, "-e", "require('sharp'); console.log('sharp-ok')"],
+            # Loading is not enough: without the native darwin binary Sharp
+            # falls back to WebAssembly, which works but is about 3x slower.
+            [
+                node, "-e",
+                "const s = require('sharp');"
+                "if (s.versions.emscripten) {"
+                f" console.error('{SHARP_WASM_MARKER}, not the native macOS build');"
+                " process.exit(3); }"
+                "console.log('sharp-ok')",
+            ],
             cwd=server_dir,
             capture_output=True,
             text=True,
@@ -5867,16 +6029,33 @@ def _cmd_start(args):
     # still fails, hard error with remediation. This turns a class of
     # opaque worker-crash bugs into a 1-second, clearly-labeled check.
     ok, err = _verify_sharp_loads(server_dir, node)
-    if not ok:
+    wasm_only = not ok and SHARP_WASM_MARKER in err
+    if wasm_only and _sharp_repair_recently_failed():
+        log.warning(
+            "Sharp is on its WebAssembly fallback (about 3x slower); the native "
+            "install failed within the last day, so not retrying it yet."
+        )
+    elif not ok:
         log.warning("Sharp failed to load — rebuilding against system libvips...")
         log.warning("  reason: %s", err.splitlines()[-1] if err else "(unknown)")
         try:
             _rebuild_sharp(Path(server_dir))
-        except RuntimeError as e:
+            _sharp_repair_failed_marker().unlink(missing_ok=True)
+        except (RuntimeError, subprocess.SubprocessError, OSError) as e:
             log.error("%s", e)
-            return
+            if not wasm_only:
+                return
+            with contextlib.suppress(OSError):
+                _sharp_repair_failed_marker().touch()
         ok, err = _verify_sharp_loads(server_dir, node)
-        if not ok:
+        if not ok and SHARP_WASM_MARKER in err:
+            # Slow is better than down: the WebAssembly build decodes
+            # correctly, so start on it and try the repair again next start.
+            log.warning(
+                "Sharp is on its WebAssembly fallback (about 3x slower); "
+                "starting anyway and retrying the native install next start."
+            )
+        elif not ok:
             log.error("Sharp still fails to load after rebuild:")
             for line in err.splitlines()[-10:]:
                 log.error("  %s", line)
@@ -5942,35 +6121,7 @@ def _cmd_start(args):
     if config.get("upload_mount"):
         worker_env["IMMICH_MEDIA_LOCATION"] = config["upload_mount"]
 
-    # pg_dump shim (issue #24): Immich hardcodes the Linux postgres client path
-    # `/usr/lib/postgresql/<ver>/bin/pg_dump` in its DatabaseBackupService. On
-    # macOS that path does not exist and upstream offers no env-var escape
-    # hatch, so the shim rewrites it to the Homebrew libpq bin dir at call time.
-    _preload_node_shim(worker_env, "pg_dump_shim.js")
-
-    # HEIC + camera-RAW decode shim (issues #62, #99): Sharp's prebuilt libvips
-    # ships without an HEVC decoder (AVIF-only) and without a dcraw/libraw
-    # loader, so iPhone HEICs and Canon/Nikon/Sony RAW files fail to decode and
-    # never get thumbnails. This preload wraps the `sharp` module to route those
-    # file paths through Homebrew libvips (to a lossless TIFF) before Sharp.
-    # Same --require interposition; Immich's source on disk is untouched.
-    _preload_node_shim(worker_env, "heic_decode_shim.js")
-
-    # pg keepalive shim (issue #74): in a split deployment a stateful firewall
-    # between the worker and a remote Postgres can silently reap an idle
-    # connection, after which the next read hangs to ETIMEDOUT and the worker
-    # never recovers. Immich doesn't expose a keepalive env var, so we wrap the
-    # `pg` module to set keepAlive on every connection. Same --require
-    # interposition; Immich's source is untouched. No-op for same-host setups.
-    _preload_node_shim(worker_env, "pg_keepalive_shim.js")
-
-    # job retry shim: Immich hardcodes `attempts: 1` (no retry) for every
-    # BullMQ queue. In a split deployment a transient connection drop to a
-    # remote Postgres/Redis or a brief SMB hiccup permanently fails the job
-    # instead of retrying. We wrap `bullmq`'s Queue constructor to raise the
-    # attempt count with exponential backoff. Same --require interposition;
-    # Immich's source is untouched.
-    _preload_node_shim(worker_env, "job_retry_shim.js")
+    _preload_worker_shims(worker_env)
 
     # /build link points to our build-data dir (set up during setup).
     # Required for Immich 2.7+ plugin WASM paths stored in the shared DB.
@@ -6084,6 +6235,10 @@ def _cmd_start(args):
     elif not config.get("ml_dir"):
         log.warning("No ml_dir configured — ML service will not start.")
         log.warning("  Re-run: immich-accelerator setup")
+
+    if selftest_due(config["version"]):
+        log.info("Self-testing Immich %s with accelerator %s...", config["version"], __version__)
+        report_selftest(run_selftest(server_dir, node, worker_env, config["version"]))
 
     # Start native Immich microservices worker
     log.info("Starting Immich worker (version %s)...", config["version"])
@@ -6247,6 +6402,25 @@ def brew_refuses_our_tap() -> bool:
     )
 
 
+def cmd_selftest(args):
+    """Run the self-test now and exit non-zero on any failure (CI uses this)."""
+    if args.immich_version:
+        version = args.immich_version
+        server_dir = download_immich_server(version)
+    else:
+        config = load_config()
+        version, server_dir = config["version"], config["server_dir"]
+    env = {**os.environ}
+    _preload_worker_shims(env)
+    result = run_selftest(server_dir, find_node(), env, version)
+    for c in result["checks"]:
+        (log.info if c["ok"] else log.error)(
+            "%s %s: %s", "ok  " if c["ok"] else "FAIL", c["name"], c["detail"]
+        )
+    if not all(c["ok"] for c in result["checks"]):
+        sys.exit(1)
+
+
 def cmd_status(_args):
     worker_pid = read_pid("worker")
     ml_pid = read_pid("ml")
@@ -6320,6 +6494,13 @@ def cmd_status(_args):
 
     if config:
         log.info("Version:    %s", config.get("version", "?"))
+        st = load_selftest()
+        if st and st.get("immich_version") == str(config.get("version", "")).lstrip("v"):
+            if st.get("ok"):
+                log.info("Self-test:  passed (%s)", st.get("ran_at", "?"))
+            else:
+                bad = ", ".join(c["name"] for c in st.get("checks", []) if not c["ok"])
+                log.error("Self-test:  FAILED (%s); `immich-accelerator selftest` for details", bad)
         if config.get("ffmpeg_path"):
             log.info("FFmpeg:     %s (VideoToolbox)", config["ffmpeg_path"])
 
@@ -8366,6 +8547,14 @@ def main():
         "ml-test",
         help="Diagnose the ML service (health + CLIP + OCR round-trip)",
     )
+    st_p = sub.add_parser(
+        "selftest",
+        help="Check that every shim still reaches the Immich code it patches",
+    )
+    st_p.add_argument(
+        "--immich-version",
+        help="Download this Immich server version and test it instead of the installed one",
+    )
     enc_p = sub.add_parser(
         "encoding", help="Turn hardware encoding on or off (omit args to list)"
     )
@@ -8451,6 +8640,7 @@ def main():
             "dashboard": cmd_dashboard,
             "component": cmd_component,
             "ml-test": cmd_ml_test,
+            "selftest": cmd_selftest,
             "encoding": cmd_encoding,
             "compare": cmd_compare,
             "encode-compare": cmd_encode_compare,
