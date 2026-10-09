@@ -1483,6 +1483,56 @@ const fake = () => {
         assert "immich-accelerator" in out["threw"]
         assert "pipe()" in out["threw"]
 
+    def test_esm_import_of_sharp_is_wrapped(self, tmp_path):
+        """Immich 3.3 is ESM and Sharp ships an ESM build, so `import sharp from
+        'sharp'` never reached the Module._load interposition and every HEVC
+        HEIC thumbnail failed (#191). A dual-format fake Sharp stands in for the
+        real one: the ESM import must come back wrapped, backed by the CommonJS
+        build, and be the same wrapper a require() gets."""
+        import json
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not installed")
+        has_hooks = subprocess.run(
+            [node, "-e", "process.exit(typeof require('module').registerHooks === 'function' ? 0 : 1)"]
+        )
+        if has_hooks.returncode != 0:
+            pytest.skip("this node has no module.registerHooks")
+
+        pkg = tmp_path / "node_modules" / "sharp"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text(json.dumps({
+            "name": "sharp",
+            "exports": {".": {"import": "./index.mjs", "require": "./index.cjs"}},
+        }))
+        (pkg / "index.cjs").write_text(
+            "function sharp() { return 'cjs'; }\nsharp.versions = { fake: 1 };\nmodule.exports = sharp;\n"
+        )
+        (pkg / "index.mjs").write_text("export default function sharp() { return 'esm'; }\n")
+        (tmp_path / "package.json").write_text('{"type": "module"}')
+        (tmp_path / "app.js").write_text(
+            "import sharp from 'sharp';\n"
+            "import { createRequire } from 'node:module';\n"
+            "const viaRequire = createRequire(import.meta.url)('sharp');\n"
+            "console.log('RESULT' + JSON.stringify({\n"
+            "  wrapped: !!sharp.__heicShimWrapped,\n"
+            "  backing: sharp('/x.jpg'),\n"
+            "  statics: sharp.versions,\n"
+            "  sameAsRequire: sharp === viaRequire,\n"
+            "}));\n"
+        )
+        proc = subprocess.run(
+            [node, "--require", str(self.SHIM), str(tmp_path / "app.js")],
+            capture_output=True, text=True, timeout=60, cwd=tmp_path,
+        )
+        line = [x for x in proc.stdout.splitlines() if x.startswith("RESULT")]
+        assert line, f"app produced no result:\n{proc.stdout}\n{proc.stderr}"
+        out = json.loads(line[0][len("RESULT"):])
+        assert out == {"wrapped": True, "backing": "cjs", "statics": {"fake": 1}, "sameAsRequire": True}
+
     def test_shim_file_exists(self):
         assert self.SHIM.exists(), "heic_decode_shim.js must ship in hooks/"
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.10 - 2026-10-08
+
+### Fixed
+- **HEIC thumbnails work on Immich 3.3.** Immich 3.3 moved its server to ES modules, and its `import sharp from 'sharp'` loads Sharp's ESM build, which skipped the shim that sends HEVC HEIC files to Homebrew's libvips. Every HEVC HEIC thumbnail then failed with "Support for this compression format has not been built in: HEVC". The shim now catches the ESM import as well. Thanks to @jimmyhuang22 for the precise report and reproduction (#191).
+
 ## 1.17.9 - 2026-10-07
 
 ### Fixed
