@@ -246,7 +246,7 @@ def run_selftest(server_dir: str | Path, node: str, env: dict, version: str) -> 
             env=env,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=60,  # a few seconds normally; never hold the worker for long
         )
         line = next(
             (x for x in r.stdout.splitlines() if x.startswith("SELFTEST ")), None
@@ -1350,6 +1350,9 @@ def _rebuild_sharp(server_dir: Path) -> None:
     log.info("  Sharp pre-built binary installed")
 
 
+SHARP_WASM_MARKER = "sharp loaded its WebAssembly fallback"
+
+
 def _verify_sharp_loads(server_dir: str, node: str) -> tuple[bool, str]:
     """Run ``require('sharp')`` via node and return (ok, stderr_tail).
 
@@ -1367,7 +1370,7 @@ def _verify_sharp_loads(server_dir: str, node: str) -> tuple[bool, str]:
                 node, "-e",
                 "const s = require('sharp');"
                 "if (s.versions.emscripten) {"
-                " console.error('sharp loaded its WebAssembly fallback, not the native macOS build');"
+                f" console.error('{SHARP_WASM_MARKER}, not the native macOS build');"
                 " process.exit(3); }"
                 "console.log('sharp-ok')",
             ],
@@ -6013,9 +6016,17 @@ def _cmd_start(args):
             _rebuild_sharp(Path(server_dir))
         except RuntimeError as e:
             log.error("%s", e)
-            return
+            if SHARP_WASM_MARKER not in err:
+                return
         ok, err = _verify_sharp_loads(server_dir, node)
-        if not ok:
+        if not ok and SHARP_WASM_MARKER in err:
+            # Slow is better than down: the WebAssembly build decodes
+            # correctly, so start on it and try the repair again next start.
+            log.warning(
+                "Sharp is on its WebAssembly fallback (about 3x slower); "
+                "starting anyway and retrying the native install next start."
+            )
+        elif not ok:
             log.error("Sharp still fails to load after rebuild:")
             for line in err.splitlines()[-10:]:
                 log.error("  %s", line)

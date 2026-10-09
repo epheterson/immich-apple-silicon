@@ -2865,7 +2865,7 @@ class TestWorkerWithoutML:
         assert env["IMMICH_MACHINE_LEARNING_URL"] == "http://gpubox:3003"
 
 
-def _worker_env_for(overrides: dict) -> dict:
+def _worker_env_for(overrides: dict, sharp_checks=None, rebuild_error=None) -> dict:
     """Run cmd_start far enough to capture the worker environment it builds.
 
     cmd_start is the most load-bearing function in the codebase, so this drives
@@ -2909,7 +2909,11 @@ def _worker_env_for(overrides: dict) -> dict:
     ), patch.object(
         m, "_check_node_engines_compat", return_value=(True, "")
     ), patch.object(
-        m, "_verify_sharp_loads", return_value=(True, "")
+        m, "_verify_sharp_loads", side_effect=sharp_checks or [(True, "")]
+    ), patch.object(
+        m, "_rebuild_sharp", side_effect=rebuild_error
+    ), patch.object(
+        m, "selftest_due", return_value=False
     ), patch.object(
         m, "_build_link_ok", return_value=True
     ), patch.object(
@@ -2925,8 +2929,10 @@ def _worker_env_for(overrides: dict) -> dict:
     ), patch.object(
         m, "start_service", side_effect=capture
     ):
-        with pytest.raises(RuntimeError):
+        try:
             m.cmd_start(argparse.Namespace(force=True))
+        except RuntimeError:
+            pass
     return captured
 
 
@@ -4559,3 +4565,20 @@ class TestSelftest:
         hooks = Path(m.__file__).parent / "hooks"
         assert (hooks / "selftest.mjs").exists()
         assert (hooks / "selftest.heic").read_bytes()[4:12] == b"ftypheic"
+
+
+class TestSharpPreflightAtStart:
+    WASM = (False, "sharp loaded its WebAssembly fallback, not the native macOS build\n")
+
+    def test_wasm_with_a_failed_repair_still_starts_the_worker(self, tmp_data_dir):
+        """The WebAssembly build is slow but correct. An offline restart whose
+        native repair cannot reach npm must not turn slow into down."""
+        env = _worker_env_for(
+            {}, sharp_checks=[self.WASM, self.WASM], rebuild_error=RuntimeError("npm offline")
+        )
+        assert env, "the worker must still be started"
+
+    def test_a_sharp_that_cannot_load_still_blocks_start(self, tmp_data_dir):
+        broken = (False, "Error: Cannot find module 'sharp'")
+        env = _worker_env_for({}, sharp_checks=[broken], rebuild_error=RuntimeError("npm offline"))
+        assert env == {}
