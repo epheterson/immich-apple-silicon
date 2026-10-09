@@ -4126,10 +4126,9 @@ class TestNodeShimPreload:
 
         hooks = Path(m.__file__).parent / "hooks"
         on_disk = {p.name for p in hooks.glob("*_shim.js")}
-        src = Path(m.__file__).read_text()
-        wired = {
-            name for name in on_disk if f'_preload_node_shim(worker_env, "{name}")' in src
-        }
+        env: dict[str, str] = {}
+        m._preload_worker_shims(env)
+        wired = {name for name in on_disk if f'/{name}"' in env["NODE_OPTIONS"]}
         assert (
             on_disk == wired
         ), f"present but never preloaded: {sorted(on_disk - wired)}"
@@ -4496,3 +4495,67 @@ class TestDownloadIntegrity:
                 acc._ensure_jellyfin_ffmpeg()
         run.assert_not_called()
         assert not (tmp_path / "jellyfin-ffmpeg" / "jellyfin-ffmpeg.tar.xz").exists()
+
+
+class TestSelftest:
+    """The self-test runs once per Immich/accelerator version pair, records what
+    it found, and never stops the worker from starting."""
+
+    def _proc(self, stdout="", stderr="", rc=0):
+        r = MagicMock()
+        r.stdout, r.stderr, r.returncode = stdout, stderr, rc
+        return r
+
+    def test_passing_run_is_recorded_and_not_repeated(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        out = 'SELFTEST {"checks": [{"name": "heic_thumbnail", "ok": true, "detail": "96x64"}]}'
+        with patch.object(m, "DATA_DIR", tmp_path), patch(
+            "subprocess.run", return_value=self._proc(out)
+        ) as run:
+            assert m.selftest_due("v3.3.1")
+            result = m.run_selftest(tmp_path, "node", {}, "v3.3.1")
+            assert result["ok"] and result["immich_version"] == "3.3.1"
+            assert not m.selftest_due("v3.3.1")
+            assert m.selftest_due("v3.3.2"), "a new Immich version re-runs it"
+            with patch.object(m, "__version__", "99.0.0"):
+                assert m.selftest_due("v3.3.1"), "a new accelerator version re-runs it"
+        assert run.call_args.kwargs["cwd"] == str(tmp_path / "dist")
+
+    def test_failure_is_recorded_and_retried_next_start(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        out = 'SELFTEST {"checks": [{"name": "heic_thumbnail", "ok": false, "detail": "HEVC"}]}'
+        with patch.object(m, "DATA_DIR", tmp_path), patch(
+            "subprocess.run", return_value=self._proc(out)
+        ):
+            result = m.run_selftest(tmp_path, "node", {}, "3.3.1")
+            assert not result["ok"]
+            assert m.selftest_due("3.3.1")
+
+    def test_crash_without_output_is_a_failure_not_a_pass(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        with patch.object(m, "DATA_DIR", tmp_path), patch(
+            "subprocess.run", return_value=self._proc("", "SyntaxError: boom", 1)
+        ):
+            result = m.run_selftest(tmp_path, "node", {}, "3.3.1")
+        assert not result["ok"]
+        assert "boom" in result["checks"][0]["detail"]
+
+    def test_disabled_job_retry_is_skipped(self, tmp_path):
+        import immich_accelerator.__main__ as m
+
+        out = 'SELFTEST {"checks": []}'
+        with patch.object(m, "DATA_DIR", tmp_path), patch(
+            "subprocess.run", return_value=self._proc(out)
+        ) as run:
+            m.run_selftest(tmp_path, "node", {"IMMICH_ACCEL_JOB_RETRY": "0"}, "3.3.1")
+        assert run.call_args.args[0][-1] == "job_retry"
+
+    def test_selftest_ships_with_its_fixture(self):
+        import immich_accelerator.__main__ as m
+
+        hooks = Path(m.__file__).parent / "hooks"
+        assert (hooks / "selftest.mjs").exists()
+        assert (hooks / "selftest.heic").read_bytes()[4:12] == b"ftypheic"
