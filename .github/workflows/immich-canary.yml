@@ -1,8 +1,10 @@
 name: Immich canary
 
 # Runs the accelerator's self-test against Immich's latest release on a real
-# Apple Silicon runner: Immich's own thumbnail code decodes an HEVC HEIC, and
-# every shim must still reach the module it patches. Upstream changing how
+# Apple Silicon runner: Immich's own code makes image and video thumbnails,
+# reads metadata, transcodes HDR video through the ffmpeg wrapper, and runs a
+# backup through the pg_dump shim, on tiny fixtures (ML needs a running engine
+# and is checked on users' machines instead). Upstream changing how
 # Immich loads its code (3.3 moving to ESM, #191) then opens an issue here the
 # day it ships, before users find it. Also runs on PRs that touch the shims,
 # so our side can't break them either.
@@ -18,6 +20,8 @@ on:
   pull_request:
     paths:
       - "immich_accelerator/hooks/**"
+      - "immich_accelerator/selftest/**"
+      - "immich_accelerator/ffmpeg-wrapper.sh"
       - "immich_accelerator/__main__.py"
       - ".github/workflows/immich-canary.yml"
 
@@ -50,7 +54,7 @@ jobs:
           echo "Testing Immich $v"
 
       - name: Install the runtime the worker uses
-        run: brew install node@22 vips
+        run: brew install node@22 vips libpq
 
       - name: Self-test
         id: selftest
