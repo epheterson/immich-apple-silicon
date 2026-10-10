@@ -71,13 +71,15 @@ jobs:
     if: needs.decide.outputs.run == 'true'
     runs-on: macos-15
     outputs:
-      outcome: ${{ steps.selftest.outcome }}
+      rc: ${{ steps.selftest.outputs.rc }}
     timeout-minutes: 45
     permissions:
       contents: read
       issues: write # open or update the tracking issue on a scheduled failure
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Install the runtime the worker uses
         run: brew install node@22 vips libpq
@@ -87,13 +89,17 @@ jobs:
         env:
           HOME: ${{ runner.temp }}/home
           VERSION: ${{ needs.decide.outputs.version }}
+        # Exit 0 passed, 1 failed, 2 timed out (proves nothing, retried).
         run: |
-          set -o pipefail
           mkdir -p "$HOME"
+          set +e
           python3 -m immich_accelerator selftest --immich-version "$VERSION" 2>&1 | tee "$RUNNER_TEMP/selftest.log"
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       - name: Open or update the tracking issue
-        if: failure() && steps.selftest.outcome == 'failure' && github.event_name == 'schedule'
+        if: failure() && steps.selftest.outputs.rc == '1' && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.decide.outputs.version }}
@@ -112,12 +118,12 @@ jobs:
 
   # Pass or fail, this pair has now been tested: a failure is reported once and
   # not re-run every hour until Immich or main changes. Only a self-test that
-  # actually ran counts: a flaky brew install or download leaves the pair
-  # untested so the next hour tries again. Saved from the same OS that looks
-  # it up, so the cache entry always matches.
+  # actually finished counts: a flaky brew install or download, or a run that
+  # timed out, leaves the pair untested so the next hour tries again. Saved
+  # from the same OS that looks it up, so the cache entry always matches.
   remember:
     needs: [decide, selftest]
-    if: always() && github.event_name == 'schedule' && (needs.selftest.outputs.outcome == 'success' || needs.selftest.outputs.outcome == 'failure')
+    if: always() && github.event_name == 'schedule' && (needs.selftest.outputs.rc == '0' || needs.selftest.outputs.rc == '1')
     runs-on: ubuntu-latest
     steps:
       - run: date -u > .canary-tested

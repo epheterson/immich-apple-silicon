@@ -6616,7 +6616,7 @@ def brew_refuses_our_tap() -> bool:
 
 
 def cmd_selftest(args):
-    """Run the self-test now and exit non-zero on any failure (CI uses this).
+    """Run the self-test now: exit 1 on any failure, 2 if it timed out (CI uses this).
 
     --immich-version downloads that server and runs everything except the ML
     checks, which need a running ML service (the CI canary). --from-start is
@@ -6661,8 +6661,10 @@ def cmd_selftest(args):
             (log.info if c["ok"] else log.error)(
                 "%s %s: %s", "ok  " if c["ok"] else "FAIL", c["name"], c["detail"]
             )
-        if result.get("inconclusive") or not all(c["ok"] for c in result["checks"]):
+        if not all(c["ok"] for c in result["checks"]):
             sys.exit(1)
+        if result.get("inconclusive"):
+            sys.exit(2)  # timed out on a busy machine: proves nothing, run it again
 
 
 def _wait_for_ml(url: str, limit: float = 900) -> None:

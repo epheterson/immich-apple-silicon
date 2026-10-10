@@ -4680,6 +4680,29 @@ class TestSelftestOnABusyMachine:
             assert result["inconclusive"] and "x" * 50 not in result["inconclusive"]
             assert m.selftest_due("3.3.1")
 
+    def test_inconclusive_exits_2_so_the_canary_retries(self, tmp_path):
+        """The canary opens an issue and marks the version tested on exit 1;
+        a timeout must not do either, so it exits 2. A real failure still
+        exits 1 even if the run also timed out."""
+        import argparse
+        import immich_accelerator.__main__ as m
+
+        def run(result):
+            args = argparse.Namespace(from_start=False, immich_version="v3.3.1")
+            with patch.object(m, "_selftest_lock", return_value=object()), \
+                    patch.object(m, "download_immich_server", return_value=tmp_path), \
+                    patch.object(m, "_ensure_jellyfin_ffmpeg", return_value="/x/ffmpeg"), \
+                    patch.object(m, "_ffmpeg_env"), patch.object(m, "_preload_worker_shims"), \
+                    patch.object(m, "find_node", return_value="node"), \
+                    patch.object(m, "run_selftest", return_value=result), \
+                    pytest.raises(SystemExit) as exc:
+                m.cmd_selftest(args)
+            return exc.value.code
+
+        assert run({"checks": [], "inconclusive": "timed out", "ok": False}) == 2
+        failed = {"name": "heic_thumbnail", "ok": False, "detail": "no"}
+        assert run({"checks": [failed], "inconclusive": "timed out", "ok": False}) == 1
+
     def test_start_hands_the_selftest_to_a_background_process(self, tmp_data_dir):
         """cmd_start never waits on the self-test: it spawns it with the
         worker's environment and carries on to the worker."""
