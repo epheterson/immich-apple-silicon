@@ -1,5 +1,6 @@
-# Gemini Code Assist: the automatic reviewer on every PR. Advisory, not a
-# required check. CodeRabbit (.coderabbit.yaml) is the on-demand fallback.
+# One of two independent reviewers on every push (the other is CodeRabbit,
+# .coderabbit.yaml). Gemini reviews a PR when it opens; gemini-review.yml asks
+# it again after each push. Advisory, never a required check.
 have_fun: false
 code_review:
   disable: false

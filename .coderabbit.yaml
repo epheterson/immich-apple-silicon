@@ -1,8 +1,8 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# On-demand fallback reviewer: Gemini Code Assist (.gemini/) reviews every PR
-# automatically; comment `@coderabbitai review` when a second opinion is
-# wanted or Gemini is out of quota. Advisory, never a required check. Kept
-# quiet: no summary written into the PR description, no walkthrough extras.
+# One of two independent reviewers on every push (the other is Gemini Code
+# Assist, .gemini/). Advisory, never a required check: findings are fixed or
+# answered like any outside contribution. Kept quiet: no summary written into
+# the PR description, no walkthrough extras.
 language: en-US
 reviews:
   profile: chill
@@ -19,7 +19,9 @@ reviews:
   suggested_labels: false
   suggested_reviewers: false
   auto_review:
-    enabled: false
+    enabled: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 0
     drafts: false
   path_filters:
     - "!immich_accelerator/selftest/*.heic"

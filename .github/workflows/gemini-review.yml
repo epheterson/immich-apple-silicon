@@ -1,0 +1,31 @@
+name: Gemini re-review
+
+# Gemini Code Assist reviews a PR when it opens but not on later pushes, so
+# ask it again after each one. CodeRabbit re-reviews pushes by itself. A burst
+# of pushes gets one review: a newer push cancels the waiting run. Fork PRs
+# get a read-only token, so they keep the review Gemini gives when they open.
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions: {}
+
+concurrency:
+  group: gemini-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ask:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - run: sleep 120
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: gh pr comment "$PR" --repo "$REPO" --body "/gemini review"
