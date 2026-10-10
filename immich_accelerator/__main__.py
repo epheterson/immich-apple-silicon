@@ -202,7 +202,7 @@ def _ffmpeg_env(ffmpeg_path: str, env: dict) -> None:
     )
     if not wrapper_dst.exists() or wrapper_dst.read_text() != wrapper_content:
         wrapper_dst.write_text(wrapper_content)
-        os.chmod(wrapper_dst, 0o755)
+        os.chmod(wrapper_dst, 0o700)  # only the worker, as this user, runs it
     # Wrapper dir first in PATH, and set FFMPEG_PATH so fluent-ffmpeg uses our wrapper
     env["PATH"] = f"{wrapper_dir}:{ffmpeg_dir}:{env.get('PATH', '')}"
     env["FFMPEG_PATH"] = str(wrapper_dst)
