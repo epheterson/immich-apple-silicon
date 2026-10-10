@@ -1,6 +1,6 @@
-# One of two independent reviewers on every push (the other is CodeRabbit,
-# .coderabbit.yaml). Gemini reviews a PR when it opens; gemini-review.yml asks
-# it again after each push. Advisory, never a required check.
+# One of two independent reviewers (the other is CodeRabbit, .coderabbit.yaml).
+# Both review a PR once, when it opens; comment `/gemini review` for another
+# pass after later pushes. Advisory, never a required check.
 have_fun: false
 code_review:
   disable: false

@@ -1,8 +1,9 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# One of two independent reviewers on every push (the other is Gemini Code
-# Assist, .gemini/). Advisory, never a required check: findings are fixed or
-# answered like any outside contribution. Kept quiet: no summary written into
-# the PR description, no walkthrough extras.
+# One of two independent reviewers (the other is Gemini Code Assist, .gemini/).
+# Both review a PR once, when it opens; comment `@coderabbitai review` for
+# another pass after later pushes. Advisory, never a required check: findings
+# are fixed or answered like any outside contribution. Kept quiet: no summary
+# written into the PR description, no walkthrough extras.
 language: en-US
 reviews:
   profile: chill
@@ -24,8 +25,7 @@ reviews:
   suggested_reviewers: false
   auto_review:
     enabled: true
-    auto_incremental_review: true
-    auto_pause_after_reviewed_commits: 0
+    auto_incremental_review: false
     drafts: false
   path_filters:
     - "!immich_accelerator/selftest/*.heic"
