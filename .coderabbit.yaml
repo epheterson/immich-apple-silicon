@@ -12,6 +12,10 @@ reviews:
   review_status: false
   in_progress_fortune: false
   collapse_walkthrough: true
+  changed_files_summary: false
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
   sequence_diagrams: false
   estimate_code_review_effort: false
   related_issues: false
