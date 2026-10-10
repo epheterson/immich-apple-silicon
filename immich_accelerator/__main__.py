@@ -179,6 +179,35 @@ def _preload_node_shim(env: dict[str, str], shim: str) -> None:
     env["NODE_OPTIONS"] = f"{existing} {arg}".strip()
 
 
+def _ffmpeg_env(ffmpeg_path: str, env: dict) -> None:
+    """Point Immich at the VideoToolbox ffmpeg wrapper.
+
+    Immich doesn't support videotoolbox as an accel option, so a wrapper
+    script earlier in PATH remaps software encoders to VideoToolbox hardware
+    encoders (h264 → h264_videotoolbox, etc.). The worker and the self-test
+    both use this, so the self-test exercises the same ffmpeg the worker does.
+    """
+    wrapper_src = Path(__file__).parent / "ffmpeg-wrapper.sh"
+    ffmpeg_dir = Path(ffmpeg_path).parent
+    if not wrapper_src.exists():
+        env["PATH"] = f"{ffmpeg_dir}:{env.get('PATH', '')}"
+        return
+    wrapper_dir = DATA_DIR / "bin"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    wrapper_dst = wrapper_dir / "ffmpeg"
+    # Inject the real ffmpeg path into the wrapper (may differ from /opt/homebrew/bin)
+    wrapper_content = wrapper_src.read_text().replace(
+        'REAL_FFMPEG="/opt/homebrew/bin/ffmpeg"',
+        f'REAL_FFMPEG="{ffmpeg_path}"',
+    )
+    if not wrapper_dst.exists() or wrapper_dst.read_text() != wrapper_content:
+        wrapper_dst.write_text(wrapper_content)
+        os.chmod(wrapper_dst, 0o700)  # only the worker, as this user, runs it
+    # Wrapper dir first in PATH, and set FFMPEG_PATH so fluent-ffmpeg uses our wrapper
+    env["PATH"] = f"{wrapper_dir}:{ffmpeg_dir}:{env.get('PATH', '')}"
+    env["FFMPEG_PATH"] = str(wrapper_dst)
+
+
 def _preload_worker_shims(env: dict) -> None:
     """Every shim the worker runs with. The self-test loads the same set."""
     # pg_dump shim (issue #24): Immich hardcodes the Linux postgres client path
@@ -217,6 +246,12 @@ def _preload_worker_shims(env: dict) -> None:
 # shims loaded. Upstream changing how Immich loads a module (Immich 3.3 moving
 # to ESM, #191) then shows up as a named failure the first time that version
 # starts, instead of a shim that logs "active" while doing nothing.
+SELFTEST_DIR = Path(__file__).parent / "selftest"
+# About five seconds on an idle M-series Mac; generous because it runs in the
+# background and a loaded machine should not read as a broken one.
+SELFTEST_TIMEOUT = 180
+
+
 def _selftest_file() -> Path:
     return DATA_DIR / "selftest.json"
 
@@ -230,23 +265,30 @@ def load_selftest() -> dict | None:
 
 def run_selftest(server_dir: str | Path, node: str, env: dict, version: str) -> dict:
     """Run the self-test against server_dir with env's shims; save and return it."""
-    hooks = Path(__file__).parent / "hooks"
     # A shim switched off on purpose has nothing to prove.
     skip = []
     if env.get("IMMICH_ACCEL_JOB_RETRY") == "0":
         skip.append("job_retry")
     checks: list[dict] = []
+    inconclusive = ""
+    # Its own temp dir, emptied each run, so a run killed at the timeout
+    # leaves nothing behind for long.
+    tmp = DATA_DIR / "selftest-tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    with contextlib.suppress(OSError):
+        tmp.mkdir(parents=True)
+    env = {**env, "TMPDIR": str(tmp)}
     try:
         r = subprocess.run(
             [
-                node, "--input-type=module", "-e", (hooks / "selftest.mjs").read_text(),
-                str(server_dir), str(hooks / "selftest.heic"), ",".join(skip),
+                node, "--input-type=module", "-e", (SELFTEST_DIR / "selftest.mjs").read_text(),
+                str(server_dir), str(SELFTEST_DIR), ",".join(skip),
             ],
             cwd=str(Path(server_dir) / "dist"),
             env=env,
             capture_output=True,
             text=True,
-            timeout=30,  # a few seconds normally; never hold the worker for long
+            timeout=SELFTEST_TIMEOUT,
         )
         line = next(
             (x for x in r.stdout.splitlines() if x.startswith("SELFTEST ")), None
@@ -257,8 +299,11 @@ def run_selftest(server_dir: str | Path, node: str, env: dict, version: str) -> 
             tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
             checks = [{"name": "selftest", "ok": False,
                        "detail": " | ".join(tail) or f"exit {r.returncode}"}]
-    except (OSError, subprocess.SubprocessError, ValueError) as e:
-        checks = [{"name": "selftest", "ok": False, "detail": str(e)}]
+    except subprocess.TimeoutExpired:
+        checks = []
+        inconclusive = f"did not finish within {SELFTEST_TIMEOUT}s; the machine may be busy"
+    except Exception as e:  # malformed output included; never kill the caller
+        checks = [{"name": "selftest", "ok": False, "detail": f"{type(e).__name__}: {e}"[:300]}]
     result = {
         "immich_version": version.lstrip("v"),
         "accelerator_version": __version__,
@@ -266,15 +311,191 @@ def run_selftest(server_dir: str | Path, node: str, env: dict, version: str) -> 
         # this Immich (its code moved), not that the work is broken: it warns
         # here and fails the CI canary, which is where it gets fixed.
         "ok": bool(checks) and all(c["ok"] or c.get("harness") for c in checks),
+        # Ran out of time (a swamped machine), so it proved nothing either way:
+        # not a failure, and the next start runs it again.
+        "inconclusive": inconclusive,
         "checks": checks,
         "ran_at": datetime.datetime.now().isoformat(timespec="seconds"),
     }
+    _save_selftest(result)
+    return result
+
+
+def _save_selftest(result: dict) -> None:
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         _selftest_file().write_text(json.dumps(result, indent=2))
     except OSError:
         pass
+
+
+def _ml_predict(base: str, entries: dict, image: bytes | None = None,
+                text: str | None = None, timeout: int = 120) -> dict:
+    """POST /predict the way Immich does: multipart entries plus image or text."""
+    import urllib.error
+    import urllib.request
+
+    boundary = "----iac-selftest"
+    parts = [
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="entries"\r\n\r\n',
+        json.dumps(entries).encode() + b"\r\n",
+    ]
+    if image is not None:
+        parts += [
+            f"--{boundary}\r\n".encode(),
+            b'Content-Disposition: form-data; name="image"; filename="t.jpg"\r\n'
+            b"Content-Type: image/jpeg\r\n\r\n",
+            image, b"\r\n",
+        ]
+    if text is not None:
+        parts += [
+            f"--{boundary}\r\n".encode(),
+            b'Content-Disposition: form-data; name="text"\r\n\r\n',
+            text.encode() + b"\r\n",
+        ]
+    parts.append(f"--{boundary}--\r\n".encode())
+    req = urllib.request.Request(
+        f"{base}/predict", data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                 "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code}: {e.read().decode(errors='replace')[:200]}")
+
+
+def _ml_selftest(base: str, ml: dict) -> list[dict] | None:
+    """CLIP, faces and OCR against the live ML service, on the self-test's
+    fixtures, sent the way Immich sends them with the models and thresholds
+    Immich is configured with (its defaults if unknown). A feature switched
+    off in Immich is skipped. None if the service isn't answering yet; a
+    request that times out (a model still downloading) is pending, not failed.
+    """
+    import socket
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{base}/ping", timeout=5) as r:
+            r.read()
+    except OSError:
+        return None
+    face = (SELFTEST_DIR / "face.jpg").read_bytes()
+    clip_cfg = {"enabled": True, "modelName": "ViT-B-32__openai", **(ml.get("clip") or {})}
+    face_cfg = {"enabled": True, "modelName": "buffalo_l", "minScore": 0.7,
+                **(ml.get("facialRecognition") or {})}
+    ocr_cfg = {"enabled": True, "modelName": "PP-OCRv5_mobile", "minDetectionScore": 0.5,
+               "minRecognitionScore": 0.8, "maxResolution": 736, **(ml.get("ocr") or {})}
+    checks: list[dict] = []
+
+    def check(name: str, enabled: bool, fn) -> None:
+        if not enabled:
+            return
+        try:
+            checks.append({"name": name, "ok": True, "detail": fn()})
+        except (TimeoutError, socket.timeout) as e:
+            checks.append({"name": name, "ok": False, "pending": True, "detail": f"timed out ({e})"})
+        except urllib.error.URLError as e:
+            pending = isinstance(e.reason, (TimeoutError, socket.timeout))
+            checks.append({"name": name, "ok": False, "pending": pending, "detail": str(e)[:300]})
+        except Exception as e:  # each check reports its own failure
+            checks.append({"name": name, "ok": False, "detail": str(e)[:300]})
+
+    def vector(v) -> list:
+        return json.loads(v) if isinstance(v, str) else (v or [])
+
+    def clip() -> str:
+        model = clip_cfg["modelName"]
+        img = vector(_ml_predict(base, {"clip": {"visual": {"modelName": model}}}, image=face).get("clip"))
+        txt = vector(_ml_predict(base, {"clip": {"textual": {"modelName": model}}},
+                                 text="a photo of an astronaut").get("clip"))
+        if not img or len(img) != len(txt):
+            raise RuntimeError(f"image embedding has {len(img)} dims, text {len(txt)}")
+        return f"{model}, {len(img)} dims"
+
+    def faces() -> str:
+        model = face_cfg["modelName"]
+        r = _ml_predict(base, {"facial-recognition": {
+            "detection": {"modelName": model, "options": {"minScore": face_cfg["minScore"]}},
+            "recognition": {"modelName": model}}}, image=face)
+        found = r.get("facial-recognition") or []
+        if len(found) != 1 or not found[0].get("embedding"):
+            raise RuntimeError(f"found {len(found)} faces, expected 1 with an embedding")
+        return f"{model}, 1 face, embedded"
+
+    def ocr() -> str:
+        model = ocr_cfg["modelName"]
+        r = _ml_predict(base, {"ocr": {
+            "detection": {"modelName": model, "options": {
+                "minScore": ocr_cfg["minDetectionScore"], "maxResolution": ocr_cfg["maxResolution"]}},
+            "recognition": {"modelName": model, "options": {"minScore": ocr_cfg["minRecognitionScore"]}}}},
+            image=(SELFTEST_DIR / "ocr.jpg").read_bytes())
+        text = " ".join((r.get("ocr") or {}).get("text") or [])
+        if "IMMICH" not in text.upper():
+            raise RuntimeError(f"read {text!r}, expected IMMICH 2026")
+        return f"{model}, read {text!r}"
+
+    enabled = ml.get("enabled", True)
+    check("ml_clip", enabled and clip_cfg["enabled"], clip)
+    check("ml_faces", enabled and face_cfg["enabled"], faces)
+    check("ml_ocr", enabled and ocr_cfg["enabled"], ocr)
+    return checks
+
+
+def add_ml_selftest(result: dict, base: str, ml: dict) -> dict:
+    """Fold the ML checks into a node self-test result and save it. If the ML
+    service isn't answering, or a check timed out (a model still loading),
+    mark the result pending so the next start runs the ML checks again."""
+    found = _ml_selftest(base, ml)
+    done = [c for c in (found or []) if not c.get("pending")]
+    result["checks"] += done
+    result["ml_pending"] = found is None or len(done) < len(found)
+    result["ok"] = all(c["ok"] or c.get("harness") for c in result["checks"])
+    _save_selftest(result)
     return result
+
+
+def _selftest_lock():
+    """An exclusive lock while a self-test runs, or None if one already is."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        f = open(DATA_DIR / "selftest.lock", "w")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def selftest_running() -> bool:
+    lock = _selftest_lock()
+    if lock is None:
+        return True
+    lock.close()
+    return False
+
+
+def _spawn_selftest(worker_env: dict) -> None:
+    """Start `selftest --from-start` detached, with the worker's environment,
+    logging to selftest.log. It outlives a one-shot `start`."""
+    log.info("Self-test started in the background (`immich-accelerator status` "
+             "shows the result; log: %s/selftest.log)", LOG_DIR)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "selftest.log", "a") as out:
+            subprocess.Popen(
+                [sys.executable, "-m", "immich_accelerator", "selftest", "--from-start"],
+                env=worker_env, cwd=str(Path(__file__).parent.parent),
+                stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True,
+            )
+    except OSError as e:
+        log.warning("  Could not start the self-test: %s", e)
 
 
 def selftest_due(version: str) -> bool:
@@ -283,12 +504,17 @@ def selftest_due(version: str) -> bool:
     return not (
         last
         and last.get("ok")
+        and not last.get("ml_pending")
+        and not last.get("inconclusive")
         and last.get("immich_version") == version.lstrip("v")
         and last.get("accelerator_version") == __version__
     )
 
 
 def report_selftest(result: dict) -> None:
+    if result.get("inconclusive"):
+        log.warning("  Self-test inconclusive: %s. It runs again next start.", result["inconclusive"])
+        return
     for c in result["checks"]:
         if not c["ok"] and c.get("harness"):
             log.warning("  Self-test could not check %s on this Immich: %s", c["name"], c["detail"])
@@ -4037,19 +4263,17 @@ def _server_build_for(version: str) -> Path:
             raise RuntimeError(f"Could not download server {version}: {err}") from err
 
 
-def _immich_clip_model(config: dict) -> str | None:
-    """The CLIP model Immich is configured to send us, or None if unknown.
+def _immich_ml_config(config: dict) -> dict:
+    """Immich's machineLearning system config, or {} if it can't be read.
 
-    Read from Immich's own system config so `ml-test` can say what the running
-    setup actually uses instead of only the model it probes with (#116). Needs
-    an api_key; any failure is non-fatal (the caller just stays quiet).
-    """
+    Needs an api_key; any failure is non-fatal (callers fall back to Immich's
+    defaults or stay quiet)."""
     import urllib.error
     import urllib.request
 
     base, key = config.get("immich_url"), config.get("api_key")
     if not base or not key:
-        return None
+        return {}
     req = urllib.request.Request(
         f"{base}/api/system-config", headers={"x-api-key": key}
     )
@@ -4057,8 +4281,18 @@ def _immich_clip_model(config: dict) -> str | None:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
     except (urllib.error.URLError, OSError, ValueError):
-        return None
-    model = (data.get("machineLearning") or {}).get("clip", {}).get("modelName")
+        return {}
+    ml = data.get("machineLearning") if isinstance(data, dict) else None
+    return ml if isinstance(ml, dict) else {}
+
+
+def _immich_clip_model(config: dict) -> str | None:
+    """The CLIP model Immich is configured to send us, or None if unknown.
+
+    Read from Immich's own system config so `ml-test` can say what the running
+    setup actually uses instead of only the model it probes with (#116).
+    """
+    model = (_immich_ml_config(config).get("clip") or {}).get("modelName")
     return model if isinstance(model, str) and model else None
 
 
@@ -6148,35 +6382,11 @@ def _cmd_start(args):
         # Pre-2.7, no plugins — IMMICH_BUILD_DATA fallback is sufficient
         worker_env["IMMICH_BUILD_DATA"] = str(build_data)
 
-    # Set up VideoToolbox ffmpeg wrapper.
-    # Immich doesn't support videotoolbox as an accel option, so we put a
-    # wrapper script earlier in PATH that remaps software encoders to
-    # VideoToolbox hardware encoders (h264 → h264_videotoolbox, etc.)
-    wrapper_dir = DATA_DIR / "bin"
-    wrapper_src = Path(__file__).parent / "ffmpeg-wrapper.sh"
     if not config.get("ffmpeg_path"):
         log.warning("No ffmpeg configured — video transcoding and thumbnails may fail.")
         log.warning("  Re-run setup to download jellyfin-ffmpeg.")
-    elif wrapper_src.exists():
-        wrapper_dir.mkdir(parents=True, exist_ok=True)
-        wrapper_dst = wrapper_dir / "ffmpeg"
-        # Inject the real ffmpeg path into the wrapper (may differ from /opt/homebrew/bin)
-        wrapper_content = wrapper_src.read_text().replace(
-            'REAL_FFMPEG="/opt/homebrew/bin/ffmpeg"',
-            f'REAL_FFMPEG="{config["ffmpeg_path"]}"',
-        )
-        if not wrapper_dst.exists() or wrapper_dst.read_text() != wrapper_content:
-            wrapper_dst.write_text(wrapper_content)
-            os.chmod(wrapper_dst, 0o755)
-        # Wrapper dir first in PATH, and set FFMPEG_PATH so fluent-ffmpeg uses our wrapper
-        worker_env["PATH"] = (
-            f"{wrapper_dir}:{Path(config['ffmpeg_path']).parent}:{worker_env['PATH']}"
-        )
-        worker_env["FFMPEG_PATH"] = str(wrapper_dst)
-    elif config.get("ffmpeg_path"):
-        worker_env["PATH"] = (
-            str(Path(config["ffmpeg_path"]).parent) + ":" + worker_env["PATH"]
-        )
+    else:
+        _ffmpeg_env(config["ffmpeg_path"], worker_env)
 
     # Environment health checks — auto-detect and fix common issues
     # (ImageMagick HEIC codec, NFS mount, DB/Redis reachability).
@@ -6236,9 +6446,12 @@ def _cmd_start(args):
         log.warning("No ml_dir configured — ML service will not start.")
         log.warning("  Re-run: immich-accelerator setup")
 
+    # The self-test runs as its own process beside the worker, never in front
+    # of it: it needs nothing the worker does, a slow machine must not delay
+    # jobs, and its ML half waits for the ML service however long that takes.
+    # `status` shows the result.
     if selftest_due(config["version"]):
-        log.info("Self-testing Immich %s with accelerator %s...", config["version"], __version__)
-        report_selftest(run_selftest(server_dir, node, worker_env, config["version"]))
+        _spawn_selftest(worker_env)
 
     # Start native Immich microservices worker
     log.info("Starting Immich worker (version %s)...", config["version"])
@@ -6403,22 +6616,69 @@ def brew_refuses_our_tap() -> bool:
 
 
 def cmd_selftest(args):
-    """Run the self-test now and exit non-zero on any failure (CI uses this)."""
+    """Run the self-test now: exit 1 on any failure, 2 if it timed out (CI uses this).
+
+    --immich-version downloads that server and runs everything except the ML
+    checks, which need a running ML service (the CI canary). --from-start is
+    how `start` runs it in the background: the environment is already the
+    worker's, and the ML half waits for the ML service to answer."""
+    lock = _selftest_lock()
+    if lock is None:
+        log.info("A self-test is already running.")
+        return
+    if args.from_start:
+        env = {**os.environ}
+    else:
+        env = {**os.environ}
+        _preload_worker_shims(env)
     if args.immich_version:
         version = args.immich_version
         server_dir = download_immich_server(version)
+        _ffmpeg_env(_ensure_jellyfin_ffmpeg(), env)
+        config = None
     else:
         config = load_config()
         version, server_dir = config["version"], config["server_dir"]
-    env = {**os.environ}
-    _preload_worker_shims(env)
+        if config.get("ffmpeg_path") and not args.from_start:
+            _ffmpeg_env(config["ffmpeg_path"], env)
+    log.info("Self-testing Immich %s with accelerator %s", version, __version__)
     result = run_selftest(server_dir, find_node(), env, version)
-    for c in result["checks"]:
-        (log.info if c["ok"] else log.error)(
-            "%s %s: %s", "ok  " if c["ok"] else "FAIL", c["name"], c["detail"]
-        )
-    if not all(c["ok"] for c in result["checks"]):
-        sys.exit(1)
+    report_selftest(result)
+    if config is not None and not result.get("inconclusive"):
+        ml_url = env.get("IMMICH_MACHINE_LEARNING_URL") if args.from_start else (
+            config.get("ml_url") if not _component_enabled("ml", config)
+            else f"http://localhost:{config.get('ml_port', 3003)}")
+        if ml_url:
+            if args.from_start:
+                _wait_for_ml(ml_url)
+            before = len(result["checks"])
+            add_ml_selftest(result, ml_url, _immich_ml_config(config))
+            report_selftest({**result, "checks": result["checks"][before:]})
+            if result.get("ml_pending"):
+                log.warning("ML checks pending: %s is not answering yet; next start retries.", ml_url)
+    if not args.from_start:
+        for c in result["checks"]:
+            (log.info if c["ok"] else log.error)(
+                "%s %s: %s", "ok  " if c["ok"] else "FAIL", c["name"], c["detail"]
+            )
+        if not all(c["ok"] for c in result["checks"]):
+            sys.exit(1)
+        if result.get("inconclusive"):
+            sys.exit(2)  # timed out on a busy machine: proves nothing, run it again
+
+
+def _wait_for_ml(url: str, limit: float = 900) -> None:
+    """Give a cold ML service (first model download) time to answer."""
+    import urllib.request
+
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{url}/ping", timeout=5) as r:
+                r.read()
+            return
+        except OSError:
+            time.sleep(10)
 
 
 def cmd_status(_args):
@@ -6496,8 +6756,13 @@ def cmd_status(_args):
         log.info("Version:    %s", config.get("version", "?"))
         st = load_selftest()
         if st and st.get("immich_version") == str(config.get("version", "")).lstrip("v"):
-            if st.get("ok"):
-                log.info("Self-test:  passed (%s)", st.get("ran_at", "?"))
+            if selftest_running():
+                log.info("Self-test:  running")
+            elif st.get("inconclusive"):
+                log.warning("Self-test:  inconclusive (%s); runs again next start", st["inconclusive"])
+            elif st.get("ok"):
+                log.info("Self-test:  passed (%s)%s", st.get("ran_at", "?"),
+                         "; ML checks pending" if st.get("ml_pending") else "")
             else:
                 bad = ", ".join(c["name"] for c in st.get("checks", []) if not c["ok"])
                 log.error("Self-test:  FAILED (%s); `immich-accelerator selftest` for details", bad)
@@ -8555,6 +8820,7 @@ def main():
         "--immich-version",
         help="Download this Immich server version and test it instead of the installed one",
     )
+    st_p.add_argument("--from-start", action="store_true", help=argparse.SUPPRESS)
     enc_p = sub.add_parser(
         "encoding", help="Turn hardware encoding on or off (omit args to list)"
     )

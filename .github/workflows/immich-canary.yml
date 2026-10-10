@@ -1,15 +1,21 @@
 name: Immich canary
 
 # Runs the accelerator's self-test against Immich's latest release on a real
-# Apple Silicon runner: Immich's own thumbnail code decodes an HEVC HEIC, and
-# every shim must still reach the module it patches. Upstream changing how
+# Apple Silicon runner: Immich's own code makes image and video thumbnails,
+# reads metadata, transcodes HDR video through the ffmpeg wrapper, and runs a
+# backup through the pg_dump shim, on tiny fixtures (ML needs a running engine
+# and is checked on users' machines instead). Upstream changing how
 # Immich loads its code (3.3 moving to ESM, #191) then opens an issue here the
-# day it ships, before users find it. Also runs on PRs that touch the shims,
-# so our side can't break them either.
+# day it ships, before users find it.
+#
+# It only runs when something changed: every hour a few-second check asks
+# whether this pair (Immich's latest release, our main) has been tested yet,
+# and the Mac job runs only for a new pair. PRs that touch the shims, the
+# self-test or the ffmpeg wrapper always run it.
 
 on:
   schedule:
-    - cron: "23 */6 * * *" # every six hours
+    - cron: "23 * * * *" # a few seconds every hour; the Mac job only when something changed
   workflow_dispatch:
     inputs:
       version:
@@ -18,6 +24,8 @@ on:
   pull_request:
     paths:
       - "immich_accelerator/hooks/**"
+      - "immich_accelerator/selftest/**"
+      - "immich_accelerator/ffmpeg-wrapper.sh"
       - "immich_accelerator/__main__.py"
       - ".github/workflows/immich-canary.yml"
 
@@ -25,20 +33,19 @@ permissions:
   contents: read
 
 jobs:
-  selftest:
-    runs-on: macos-15
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      issues: write # open or update the tracking issue on a scheduled failure
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      key: ${{ steps.ver.outputs.key }}
+      run: ${{ github.event_name != 'schedule' || steps.seen.outputs.cache-hit != 'true' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
       - name: Pick the Immich version
         id: ver
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           v="${INPUT_VERSION:-}"
@@ -47,26 +54,55 @@ jobs:
           fi
           if [ -z "$v" ]; then echo "::error::could not determine the Immich version"; exit 1; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "Testing Immich $v"
+          echo "key=immich-canary-$v-$SHA" >> "$GITHUB_OUTPUT"
+          echo "Immich $v against ${SHA:0:7}"
+
+      - name: Already tested this pair?
+        id: seen
+        if: github.event_name == 'schedule'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .canary-tested
+          key: ${{ steps.ver.outputs.key }}
+          lookup-only: true
+
+  selftest:
+    needs: decide
+    if: needs.decide.outputs.run == 'true'
+    runs-on: macos-15
+    outputs:
+      rc: ${{ steps.selftest.outputs.rc }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: write # open or update the tracking issue on a scheduled failure
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Install the runtime the worker uses
-        run: brew install node@22 vips
+        run: brew install node@22 vips libpq
 
       - name: Self-test
         id: selftest
         env:
           HOME: ${{ runner.temp }}/home
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.decide.outputs.version }}
+        # Exit 0 passed, 1 failed, 2 timed out (proves nothing, retried).
         run: |
-          set -o pipefail
           mkdir -p "$HOME"
+          set +e
           python3 -m immich_accelerator selftest --immich-version "$VERSION" 2>&1 | tee "$RUNNER_TEMP/selftest.log"
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       - name: Open or update the tracking issue
-        if: failure() && github.event_name == 'schedule'
+        if: failure() && steps.selftest.outputs.rc == '1' && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.decide.outputs.version }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -79,3 +115,19 @@ jobs:
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
           fi
+
+  # Pass or fail, this pair has now been tested: a failure is reported once and
+  # not re-run every hour until Immich or main changes. Only a self-test that
+  # actually finished counts: a flaky brew install or download, or a run that
+  # timed out, leaves the pair untested so the next hour tries again. Saved
+  # from the same OS that looks it up, so the cache entry always matches.
+  remember:
+    needs: [decide, selftest]
+    if: always() && github.event_name == 'schedule' && (needs.selftest.outputs.rc == '0' || needs.selftest.outputs.rc == '1')
+    runs-on: ubuntu-latest
+    steps:
+      - run: date -u > .canary-tested
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .canary-tested
+          key: ${{ needs.decide.outputs.key }}
