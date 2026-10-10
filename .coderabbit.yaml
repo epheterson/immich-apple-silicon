@@ -20,6 +20,7 @@ reviews:
   sequence_diagrams: false
   estimate_code_review_effort: false
   related_issues: false
+  assess_linked_issues: false
   related_prs: false
   suggested_labels: false
   suggested_reviewers: false
