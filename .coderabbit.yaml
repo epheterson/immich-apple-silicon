@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Advisory review on every PR. Not a required check: findings are read and
+# answered like any outside contribution. Kept quiet: no summary written
+# into the PR description, no walkthrough extras.
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: false
+  poem: false
+  review_status: false
+  in_progress_fortune: false
+  collapse_walkthrough: true
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  suggested_reviewers: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!immich_accelerator/selftest/*.heic"
+    - "!immich_accelerator/selftest/*.jpg"
+    - "!immich_accelerator/selftest/*.mp4"
+  path_instructions:
+    - path: "immich_accelerator/**"
+      instructions: >-
+        Runs Immich's microservices natively on macOS. The goal is output
+        identical to Docker Immich; flag any behavior change that would make
+        thumbnails, metadata, transcodes, backups or ML results differ from
+        Docker. Never block or slow the worker's start.
+    - path: "immich_accelerator/hooks/**"
+      instructions: >-
+        Node --require shims loaded into Immich's worker. Immich 3.3+ is ESM,
+        so interception must work through module.registerHooks as well as
+        Module._load. Check that a failure warns and degrades, never crashes
+        the worker.
+    - path: ".github/workflows/**"
+      instructions: >-
+        Actions must be pinned to full commit SHAs with least-privilege
+        permissions. Scheduled jobs must do heavy work only when an input
+        changed. Releases are automated from VERSION on merge to main.
+chat:
+  auto_reply: true
