@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.12 - 2026-10-18
+
+### Fixed
+- **Smart Search works in Cyrillic, Chinese, Japanese and with emoji on the Python ML engine.** Its CLIP text tokenizer looked characters up in the vocabulary directly instead of through CLIP's byte encoding, so a search for "мария" failed with a server error. It now encodes text exactly as Immich's own ML container does, token for token, and trims long queries to CLIP's 77-token limit instead of failing. The native engine was not affected. Thanks to @Xa6ep for the clear report (#194).
+
 ## 1.17.11 - 2026-10-09
 
 ### Added
