@@ -90,16 +90,18 @@ jobs:
           HOME: ${{ runner.temp }}/home
           VERSION: ${{ needs.decide.outputs.version }}
         # Exit 0 passed, 1 failed, 2 timed out (proves nothing, retried).
+        # Published as "exit-N", never a bare number: a job that did not run
+        # has a null output, and GitHub's == coerces null to 0.
         run: |
           mkdir -p "$HOME"
           set +e
           python3 -m immich_accelerator selftest --immich-version "$VERSION" 2>&1 | tee "$RUNNER_TEMP/selftest.log"
           rc=${PIPESTATUS[0]}
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "rc=exit-$rc" >> "$GITHUB_OUTPUT"
           exit "$rc"
 
       - name: Open or update the tracking issue
-        if: failure() && steps.selftest.outputs.rc == '1' && github.event_name == 'schedule'
+        if: failure() && steps.selftest.outputs.rc == 'exit-1' && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.decide.outputs.version }}
@@ -123,7 +125,7 @@ jobs:
   # from the same OS that looks it up, so the cache entry always matches.
   remember:
     needs: [decide, selftest]
-    if: always() && github.event_name == 'schedule' && (needs.selftest.outputs.rc == '0' || needs.selftest.outputs.rc == '1')
+    if: always() && github.event_name == 'schedule' && (needs.selftest.outputs.rc == 'exit-0' || needs.selftest.outputs.rc == 'exit-1')
     runs-on: ubuntu-latest
     steps:
       - run: date -u > .canary-tested
