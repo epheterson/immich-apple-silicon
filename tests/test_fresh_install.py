@@ -1648,7 +1648,7 @@ const fake = () => {
 
     def _stub(self, path_, body):
         # Decoder stubs: the output path is always the last argument (vips
-        # `autorot in out[compression=deflate]`, sips `... --out out`). vips
+        # `autorot in out[compression=deflate,level=1]`, sips `... --out out`). vips
         # accepts a trailing `[options]` suffix on the save target and writes to
         # the base path; strip it (`[[]` is a glob for a literal `[`) so the stub
         # writes where the shim reads back.
@@ -1770,6 +1770,24 @@ const fake = () => {
             ln for ln in result.stdout.splitlines() if ln.startswith("INPUT_TYPE:")
         ]
         assert types == ["INPUT_TYPE:buffer", "INPUT_TYPE:string"], result.stdout
+
+    def test_vips_deflates_the_intermediate_at_level_1(self, tmp_path):
+        """The intermediate TIFF stays lossless deflate, to keep the buffer and
+        tmp file small, but at level 1: the default level cost ~10x the decode
+        itself on a 24MP HEIC."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        args = tmp_path / "vips_args"
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(vips, f'printf "%s\\n" "$@" > "{args}"\n' + self._TIFF)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+        result = self._run(tmp_path, node, {"IMMICH_ACCELERATOR_VIPS": str(vips)}, [str(heic)])
+        assert result.returncode == 0, result.stderr
+        assert "INPUT_TYPE:buffer" in result.stdout
+        argv = args.read_text().splitlines()
+        assert argv[0] == "autorot"
+        assert argv[-1].endswith(".tiff[compression=deflate,level=1]"), argv
 
     def test_prefers_vips_over_sips(self, tmp_path):
         """vips (libheif, headless) is tried first; when it succeeds sips is
