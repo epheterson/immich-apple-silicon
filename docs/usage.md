@@ -184,6 +184,14 @@ Setting them in the shell environment does not work on a Homebrew install, which
 
 Only `IMMICH_ACCEL*` names are accepted. Everything else a service needs is worked out at startup, and anything else in that block is ignored with a warning.
 
+### HEIC input staging
+
+Before decoding a HEIC, the worker copies it to its temporary directory and decodes the copy, then deletes it. libheif reads a HEIC in thousands of tiny pieces, and on an SMB share each of those is a round trip to the NAS, so decoding straight from the share can take 20 seconds or more per photo. The copy is one sequential read.
+
+Keep the temporary directory on local disk, or the copy gains nothing. RAW files are not copied.
+
+`IMMICH_ACCELERATOR_HEIC_STAGE_MAX_BYTES` caps the copy at 128 MiB by default. Set it to `0` to turn staging off. A file over the cap, or a copy that fails, is decoded from the share as before. The copy counts against the same `IMMICH_ACCELERATOR_HEIC_DECODE_BUDGET_MS` as the decode.
+
 ### Hardware transcoding
 
 Three switches decide how much of transcoding runs on the video hardware rather than on the CPU. Settings shows them under Hardware Transcoding; the CLI sets the same values.

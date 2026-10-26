@@ -52,6 +52,9 @@ const path = require('path');
 const cp = require('child_process');
 const util = require('util');
 
+const { Transform } = require('stream');
+const { pipeline } = require('stream/promises');
+
 const execFileAsync = util.promisify(cp.execFile);
 
 // Resolve a decoder binary. An explicit env override is honored VERBATIM: an
@@ -193,6 +196,66 @@ function isRawPath(input) {
 // library (e.g. SMB) can take 20+ seconds for a normal read, not a hang.
 const DECODE_BUDGET_MS = Number(process.env.IMMICH_ACCELERATOR_HEIC_DECODE_BUDGET_MS) || 120000;
 
+// libheif reads a HEIC through vips in tiny pieces: ~30,000 read(2) calls for
+// a 3MB photo, most of them one byte. On local disk the page cache absorbs
+// them; on an SMB mount each one is a network round trip, which is where the
+// 20+ second NAS decodes come from. Copying the file sequentially first takes
+// a fraction of a second. HEIC only: RAW can be large and needs its sidecars
+// next to it. The cap is enforced while streaming; 0 turns staging off.
+const stageMaxBytes = Number((process.env.IMMICH_ACCELERATOR_HEIC_STAGE_MAX_BYTES || '').trim() || NaN);
+const HEIC_STAGE_MAX_BYTES = Number.isSafeInteger(stageMaxBytes) && stageMaxBytes >= 0
+    ? stageMaxBytes : 128 * 1024 * 1024;
+
+function removeStagedHeic(dir) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); }
+    catch (e) {
+        process.stderr.write(`[immich-accelerator] HEIC staging cleanup failed: ${e.message}\n`);
+    }
+}
+
+async function stageHeic(input, deadline) {
+    let dir;
+    let output;
+    let timer;
+    let complete = false;
+    try {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error('decode deadline reached');
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iaa-heic-input-'));
+        const file = path.join(dir, 'input.heic');
+        const controller = new AbortController();
+        timer = setTimeout(() => controller.abort(), remaining);
+        let bytes = 0;
+        const limit = new Transform({
+            transform(chunk, _encoding, callback) {
+                bytes += chunk.length;
+                callback(bytes > HEIC_STAGE_MAX_BYTES
+                    ? new Error('HEIC staging byte limit exceeded') : null, chunk);
+            },
+        });
+        output = fs.createWriteStream(file, { flags: 'wx', mode: 0o600 });
+        await pipeline(
+            // end is inclusive: read at most cap + 1 to detect oversize, even
+            // if the source grows continually; never write that extra byte.
+            fs.createReadStream(input, { end: HEIC_STAGE_MAX_BYTES }), limit, output,
+            { signal: controller.signal }
+        );
+        complete = true;
+        return { dir, file };
+    } catch (e) {
+        process.stderr.write(
+            `[immich-accelerator] HEIC staging failed for ${input}: ${e.message}; using original input\n`
+        );
+        return null;
+    } finally {
+        clearTimeout(timer);
+        if (!complete) {
+            if (output) output.destroy();
+            if (dir) removeStagedHeic(dir);
+        }
+    }
+}
+
 // A real TIFF starts with "II*\0" (little-endian) or "MM\0*" (big-endian). Both
 // our decoders emit TIFF; requiring the magic rejects an empty or half-written
 // file (e.g. a GUI-less sips) so the next decoder gets a turn instead of feeding
@@ -299,6 +362,18 @@ async function decodeToBuffer(input) {
 
 async function decodeToBufferUnthrottled(input) {
     const deadline = Date.now() + DECODE_BUDGET_MS;
+    // Staging holds the same semaphore slot and spends the same total budget
+    // as the decoders. RAW keeps the original path for sidecar resolution.
+    const staged = HEIC_STAGE_MAX_BYTES > 0 && !isRawPath(input) && isHevcHeicPath(input)
+        ? await stageHeic(input, deadline) : null;
+    try {
+        return await decodeWithDeadline(input, deadline, staged ? staged.file : input);
+    } finally {
+        if (staged) removeStagedHeic(staged.dir);
+    }
+}
+
+async function decodeWithDeadline(input, deadline, decoderInput) {
     let attempted = 0;
     for (const dec of DECODERS) {
         if (!dec.bin) continue;
@@ -310,7 +385,7 @@ async function decodeToBufferUnthrottled(input) {
             `iaa-heic-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e9)}.tiff`
         );
         try {
-            await execFileAsync(dec.bin, dec.args(input, tmp), {
+            await execFileAsync(dec.bin, dec.args(decoderInput, tmp), {
                 timeout: remaining,
                 env: decoderEnv(),
                 // The synchronous version ignored stdout and piped stderr.
@@ -335,7 +410,11 @@ async function decodeToBufferUnthrottled(input) {
             try { fs.unlinkSync(tmp); } catch (_e) { /* ignore */ }
         }
     }
-    if (attempted === 0) {
+    if (attempted === 0 && Date.now() >= deadline) {
+        process.stderr.write(
+            `[immich-accelerator] HEIC/RAW decode budget exhausted for ${input}; falling back to Sharp\n`
+        );
+    } else if (attempted === 0) {
         process.stderr.write(
             '[immich-accelerator] No HEIC/RAW decoder found (install vips for ' +
             'headless HEIC and camera-RAW support); falling back to Sharp.\n'
