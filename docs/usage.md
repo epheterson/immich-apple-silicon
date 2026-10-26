@@ -192,6 +192,8 @@ Keep the temporary directory on local disk, or the copy gains nothing. RAW files
 
 `IMMICH_ACCELERATOR_HEIC_STAGE_MAX_BYTES` caps the copy at 128 MiB by default. Set it to `0` to turn staging off. A file over the cap, or a copy that fails, is decoded from the share as before. The copy counts against the same `IMMICH_ACCELERATOR_HEIC_DECODE_BUDGET_MS` as the decode.
 
+Up to 3 HEIC and RAW decodes run at once, set by `IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY`. Each one holds a full decoded frame in memory, so lower it on a Mac with little RAM. If you turn staging off and the library is on a NAS, set it to `1`: concurrent decodes straight from an SMB share are slower than one at a time.
+
 ### Hardware transcoding
 
 Three switches decide how much of transcoding runs on the video hardware rather than on the CPU. Settings shows them under Hardware Transcoding; the CLI sets the same values.

@@ -2084,13 +2084,10 @@ const fake = () => {
             timeout=20,
         )
 
-    def test_decode_concurrency_defaults_to_serialized(self, tmp_path):
-        """Async execFile let BullMQ's job concurrency fire multiple
-        concurrent decodes at once; measured on a real NAS/SMB share, that
-        made things SLOWER, not faster (a modest NAS degrades under
-        concurrent reads rather than parallelizing them). Default
-        concurrency is 1 — verify two decodes issued at the same time never
-        actually overlap."""
+    def test_decode_concurrency_1_serializes(self, tmp_path):
+        """Concurrent decodes straight from an SMB share are slower than one
+        at a time, so 1 has to mean 1 for anyone who turns staging off on a
+        NAS. Verify two decodes issued at the same time never overlap."""
         node = self._node_or_skip()
         self._fake_sharp(tmp_path)
         lock_dir = tmp_path / "running.lock"
@@ -2102,36 +2099,60 @@ const fake = () => {
             "sleep 0.15\n"
             f'rmdir "{lock_dir}"\n' + self._TIFF,
         )
-        result = self._run_two_concurrently(tmp_path, node, vips, {})
+        result = self._run_two_concurrently(
+            tmp_path, node, vips, {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "1"}
+        )
         assert result.returncode == 0, result.stderr
         assert "DONE" in result.stdout
         assert (
             not violations.exists()
-        ), "two decodes ran concurrently despite the default concurrency of 1"
+        ), "two decodes ran concurrently with concurrency set to 1"
 
-    def test_decode_concurrency_env_override_allows_parallel_decodes(self, tmp_path):
-        """IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY raises the limit for an
-        operator on storage that can actually take concurrent reads —
-        confirm it isn't a no-op by proving decodes DO overlap once raised."""
+    def test_decode_concurrency_defaults_to_three(self, tmp_path):
+        """With HEICs staged to local disk, a few decodes in parallel finish a
+        batch faster. The default lets 3 run at once and holds the 4th."""
         node = self._node_or_skip()
         self._fake_sharp(tmp_path)
-        lock_dir = tmp_path / "running.lock"
-        overlapped = tmp_path / "overlapped"
+        slots = tmp_path / "slots"
+        slots.mkdir()
+        used = tmp_path / "used"
         vips = tmp_path / "vips_stub.sh"
+        # Each decoder takes the lowest free slot, so the highest slot ever
+        # taken is how many ran at once.
         self._stub(
             vips,
-            f'if ! mkdir "{lock_dir}" 2>/dev/null; then touch "{overlapped}"; fi\n'
-            "sleep 0.15\n"
-            f'rmdir "{lock_dir}" 2>/dev/null\n' + self._TIFF,
+            "for i in 1 2 3 4; do\n"
+            f'  if mkdir "{slots}/$i" 2>/dev/null; then s=$i; break; fi\n'
+            "done\n"
+            f'echo "$s" >> "{used}"\n'
+            "sleep 0.5\n"
+            f'rmdir "{slots}/$s"\n' + self._TIFF,
         )
-        result = self._run_two_concurrently(
-            tmp_path, node, vips, {"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "2"}
+        files = []
+        for name in "abcd":
+            heic = tmp_path / f"{name}.heic"
+            heic.write_bytes(self._HEIC_BYTES)
+            files.append(str(heic))
+        driver = tmp_path / "driver.js"
+        driver.write_text(
+            "const sharp=require('sharp');"
+            "Promise.all(process.argv.slice(2).map(f=>sharp(f).metadata()))"
+            ".then(()=>process.stdout.write('DONE\\n'))"
+            ".catch(e=>{console.error(e);process.exit(1);});\n"
+        )
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver), *files],
+            cwd=str(tmp_path),
+            env={"PATH": "/usr/bin:/bin", "IMMICH_ACCELERATOR_VIPS": str(vips)},
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
         assert result.returncode == 0, result.stderr
         assert "DONE" in result.stdout
-        assert (
-            overlapped.exists()
-        ), "raising concurrency to 2 should let two decodes run at once"
+        taken = [int(s) for s in used.read_text().split()]
+        assert len(taken) == 4
+        assert max(taken) == 3, f"expected 3 decodes at once, slots taken: {taken}"
 
     def _staging_probe(self, tmp_path, *, suffix=".heic", env=None, preload="",
                        vips_output="tiff", sips_output="tiff"):
@@ -2266,6 +2287,7 @@ fs.createReadStream=input=>Readable.from((async function*(){
 """)
         result = self._run_two_concurrently(tmp_path, node, vips, {
             "NODE_OPTIONS": f'--require "{hook}"', "TMPDIR": str(tmp_path),
+            "IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": "1",
         })
         assert result.returncode == 0, result.stderr
         assert result.stdout.count("STAGE_STARTED") == 2
