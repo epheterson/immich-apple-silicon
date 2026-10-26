@@ -2120,9 +2120,12 @@ const fake = () => {
             not violations.exists()
         ), "two decodes ran concurrently with concurrency set to 1"
 
-    def test_decode_concurrency_defaults_to_three(self, tmp_path):
+    @pytest.mark.parametrize("setting", [None, "0", "-1", "0.5", "three"])
+    def test_decode_concurrency_defaults_to_three(self, tmp_path, setting):
         """With HEICs staged to local disk, a few decodes in parallel finish a
-        batch faster. The default lets 3 run at once and holds the 4th."""
+        batch faster. The default lets 3 run at once and holds the 4th. A
+        value with no whole slot in it would stall every decode, so it gets
+        the default too."""
         node = self._node_or_skip()
         self._fake_sharp(tmp_path)
         slots = tmp_path / "slots"
@@ -2155,7 +2158,11 @@ const fake = () => {
         result = subprocess.run(
             [node, "--require", str(self.SHIM), str(driver), *files],
             cwd=str(tmp_path),
-            env={"PATH": "/usr/bin:/bin", "IMMICH_ACCELERATOR_VIPS": str(vips)},
+            env={
+                "PATH": "/usr/bin:/bin",
+                "IMMICH_ACCELERATOR_VIPS": str(vips),
+                **({"IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY": setting} if setting else {}),
+            },
             capture_output=True,
             text=True,
             timeout=20,
@@ -2290,6 +2297,59 @@ fs.createReadStream=()=>{
         assert "INPUT_TYPE:string" in result.stdout
         assert source.read_bytes() == self._HEIC_BYTES
         assert list(local.iterdir()) == []
+
+    @pytest.mark.parametrize("stall", ["stat", "read"])
+    def test_heic_staging_gives_up_on_a_hung_mount(self, tmp_path, stall):
+        """A read stuck in the kernel on a hung share never lets its stream
+        close. Staging must still stop at the budget and free the decode slot
+        instead of waiting on it forever."""
+        hang = {
+            "stat": "fs.promises.stat=()=>new Promise(()=>{});",
+            "read": "const {Readable}=require('stream');"
+                    "fs.createReadStream=()=>new Readable({read(){},destroy(_e,_cb){}});",
+        }[stall]
+        source, local, result, records = self._staging_probe(
+            tmp_path,
+            env={"IMMICH_ACCELERATOR_HEIC_DECODE_BUDGET_MS": "200"},
+            preload="const fs=require('fs');setTimeout(()=>{},3000).unref();" + hang,
+        )
+        assert not records
+        assert "staging ran out of decode budget" in result.stderr
+        assert "INPUT_TYPE:string" in result.stdout
+        assert list(local.iterdir()) == []
+
+    def test_startup_clears_staging_left_by_a_killed_worker(self, tmp_path):
+        """A worker killed mid-decode leaves its copy behind; the next start
+        removes leftovers over an hour old and leaves recent ones alone."""
+        import os
+        import time
+
+        local = tmp_path / "local"
+        local.mkdir()
+        old = local / "iaa-heic-input-old"
+        old.mkdir()
+        (old / "input.heic").write_bytes(b"x" * 64)
+        recent = local / "iaa-heic-input-recent"
+        recent.mkdir()
+        unrelated = local / "someone-elses-file"
+        unrelated.write_text("keep")
+        hours_ago = time.time() - 2 * 3600
+        for p in (old / "input.heic", old, unrelated):
+            os.utime(p, (hours_ago, hours_ago))
+        node = self._node_or_skip()
+        driver = tmp_path / "driver.js"
+        driver.write_text("setTimeout(()=>{},500);\n")
+        result = subprocess.run(
+            [node, "--require", str(self.SHIM), str(driver)],
+            cwd=str(tmp_path),
+            env={"PATH": "/usr/bin:/bin", "TMPDIR": str(local)},
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not old.exists()
+        assert recent.exists() and unrelated.exists()
 
     def test_heic_staging_itself_holds_the_decode_slot(self, tmp_path):
         node = self._node_or_skip()
