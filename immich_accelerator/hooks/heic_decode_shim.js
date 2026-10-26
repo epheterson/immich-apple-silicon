@@ -219,9 +219,13 @@ fs.promises.readdir(os.tmpdir()).then((names) => {
             if (Date.now() - st.mtimeMs > 3600000) {
                 return fs.promises.rm(stale, { recursive: true, force: true });
             }
-        }).catch(() => {});
+        }).catch(warnStaleCleanup);
     }
-}, () => {});
+}, warnStaleCleanup);
+function warnStaleCleanup(e) {
+    if (e.code === 'ENOENT') return; // already gone
+    process.stderr.write(`[immich-accelerator] clearing old HEIC staging failed: ${e.message}\n`);
+}
 
 function removeStagedHeic(dir) {
     try { fs.rmSync(dir, { recursive: true, force: true }); }
