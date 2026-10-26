@@ -1986,6 +1986,60 @@ const fake = () => {
             f"ticks in ~300ms of decode time); output: {result.stdout}"
         )
 
+    def _counting_vips(self, tmp_path, body=None):
+        calls = tmp_path / "vips_calls"
+        vips = tmp_path / "vips_stub.sh"
+        self._stub(vips, f'echo x >> "{calls}"\n' + (self._TIFF if body is None else body))
+        return vips, calls
+
+    def test_the_next_open_of_the_same_file_reuses_the_decode_once(self, tmp_path):
+        """Immich decodes a HEIC original and then opens the same path again
+        for metadata() (hasAlpha). That second open must not run the decoder
+        chain again; a third open is a new decode, since the shared frame is
+        handed over once and then let go."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        vips, calls = self._counting_vips(tmp_path)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+        result = self._run(tmp_path, node, {"IMMICH_ACCELERATOR_VIPS": str(vips)}, [str(heic)] * 3)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.count("INPUT_TYPE:buffer") == 3, result.stdout
+        assert len(calls.read_text().splitlines()) == 2
+
+    def test_a_changed_file_or_failed_decode_is_decoded_again(self, tmp_path):
+        """Reuse is keyed on mtime and size, so an original replaced in place
+        gets a fresh decode, and a failed decode is never handed on."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        heic = tmp_path / "photo.heic"
+        heic.write_bytes(self._HEIC_BYTES)
+        driver = tmp_path / "driver.js"
+        driver.write_text(
+            "const sharp=require('sharp'),fs=require('fs');const p=process.argv[2];"
+            "(async () => {"
+            "  await sharp(p).metadata();"
+            "  if (process.argv[3] === 'touch') fs.utimesSync(p, new Date(), new Date(Date.now() + 5000));"
+            "  await sharp(p).metadata();"
+            "})().catch(e => { console.error(e); process.exit(1); });\n"
+        )
+        failing = tmp_path / "sips_stub.sh"
+        self._stub(failing, "exit 1\n")
+        for mode, body in (("touch", None), ("same", "exit 1\n")):
+            vips, calls = self._counting_vips(tmp_path, body)
+            calls.unlink(missing_ok=True)
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "IMMICH_ACCELERATOR_VIPS": str(vips),
+                "IMMICH_ACCELERATOR_SIPS": str(failing),
+            }
+            result = subprocess.run(
+                [node, "--require", str(self.SHIM), str(driver), str(heic), mode],
+                cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=20,
+            )
+            assert result.returncode == 0, result.stderr
+            assert len(calls.read_text().splitlines()) == 2, mode
+
     def _run_two_concurrently(self, tmp_path, node, vips, env_extra):
         heic1 = tmp_path / "a.heic"
         heic1.write_bytes(self._HEIC_BYTES)
