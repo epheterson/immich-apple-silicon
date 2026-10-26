@@ -2061,6 +2061,146 @@ const fake = () => {
             overlapped.exists()
         ), "raising concurrency to 2 should let two decodes run at once"
 
+    def _staging_probe(self, tmp_path, *, suffix=".heic", env=None, preload="",
+                       vips_output="tiff", sips_output="tiff"):
+        """Inspect actual decoder inputs, not implementation text or exports."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        source = tmp_path / ("original with spaces" + suffix)
+        source.write_bytes(self._HEIC_BYTES)
+        local = tmp_path / "local"
+        local.mkdir()
+        record = tmp_path / "decoder-inputs.jsonl"
+        decoders = {}
+        for name, output in (("vips", vips_output), ("sips", sips_output)):
+            stub = tmp_path / name
+            stub.write_text(
+                f"#!{node}\n"
+                "const fs=require('fs'),path=require('path'),crypto=require('crypto');\n"
+                f"const input=process.argv[{3 if name == 'vips' else 5}];\n"
+                "const st=fs.lstatSync(input),dir=path.dirname(input);\n"
+                "const rec={input,real:fs.realpathSync(input),dev:st.dev,ino:st.ino,"
+                "mode:st.mode&0o777,links:st.nlink,symlink:st.isSymbolicLink(),"
+                "dirMode:fs.statSync(dir).mode&0o777,"
+                "hash:crypto.createHash('sha256').update(fs.readFileSync(input)).digest('hex'),"
+                f"decoder:{json.dumps(name)},args:process.argv.slice(2)}};\n"
+                f"fs.appendFileSync({json.dumps(str(record))},JSON.stringify(rec)+'\\n');\n"
+                "const out=process.argv.at(-1).replace(/\\[.*$/, '');\n"
+                + ("fs.writeFileSync(out,Buffer.from('49492a0053545542','hex'));\n"
+                   if output == "tiff" else "process.exit(1);\n")
+            )
+            stub.chmod(0o755)
+            decoders["IMMICH_ACCELERATOR_" + name.upper()] = str(stub)
+        extra = {"TMPDIR": str(local), **decoders, **(env or {})}
+        if preload:
+            hook = tmp_path / "stage-probe.cjs"
+            hook.write_text(preload)
+            extra["NODE_OPTIONS"] = f'--require "{hook}"'
+        result = self._run(tmp_path, node, extra, [str(source)])
+        assert result.returncode == 0, result.stderr
+        records = [json.loads(line) for line in record.read_text().splitlines()] if record.exists() else []
+        return source, local, result, records
+
+    @pytest.mark.parametrize("vips_output,sips_output,expected", [
+        ("tiff", "tiff", ["vips"]),
+        ("fail", "tiff", ["vips", "sips"]),
+        ("fail", "fail", ["vips", "sips"]),
+    ])
+    def test_heic_staging_is_private_identical_and_cleaned(
+        self, tmp_path, vips_output, sips_output, expected
+    ):
+        import hashlib
+
+        source, local, result, records = self._staging_probe(
+            tmp_path, vips_output=vips_output, sips_output=sips_output
+        )
+        digest = hashlib.sha256(self._HEIC_BYTES).hexdigest()
+        assert [r["decoder"] for r in records] == expected
+        assert records[0]["args"][0] == "autorot"
+        for r in records:
+            staged = Path(r["input"])
+            assert staged != source, "decoder must read the local copy, not the NAS original"
+            assert staged.parent.parent == local
+            assert r["real"] != str(source.resolve())
+            assert (r["dev"], r["ino"]) != (source.stat().st_dev, source.stat().st_ino)
+            assert not r["symlink"] and r["links"] == 1
+            assert r["mode"] == 0o600 and r["dirMode"] == 0o700
+            assert r["hash"] == digest
+            assert not staged.exists() and not staged.parent.exists()
+        assert len({r["input"] for r in records}) == 1, "reuse one copy across decoder fallback"
+        assert list(local.iterdir()) == []
+        assert hashlib.sha256(source.read_bytes()).hexdigest() == digest
+        assert "INPUT_TYPE:" + ("string" if sips_output == vips_output == "fail" else "buffer") in result.stdout
+
+    @pytest.mark.parametrize("suffix,env", [
+        (".CR3", {}),  # even HEIC-branded RAW retains its original path / sidecars
+        (".heic", {"IMMICH_ACCELERATOR_HEIC_STAGE_MAX_BYTES": "0"}),
+        (".heic", {"IMMICH_ACCELERATOR_HEIC_STAGE_MAX_BYTES": "16"}),
+    ])
+    def test_heic_staging_raw_optout_and_oversize_use_original(self, tmp_path, suffix, env):
+        source, local, result, records = self._staging_probe(tmp_path, suffix=suffix, env=env)
+        assert records[0]["input"] == str(source)
+        assert source.read_bytes() == self._HEIC_BYTES
+        assert "INPUT_TYPE:buffer" in result.stdout
+        assert list(local.iterdir()) == []
+
+    def test_heic_staging_write_failure_preserves_direct_decoder_fallback(self, tmp_path):
+        source, local, result, records = self._staging_probe(
+            tmp_path, preload="const fs=require('fs');fs.createWriteStream=()=>{throw Error('stage write denied');};"
+        )
+        assert records[0]["input"] == str(source)
+        assert "stage write denied" in result.stderr
+        assert "INPUT_TYPE:buffer" in result.stdout
+        assert source.read_bytes() == self._HEIC_BYTES
+        assert list(local.iterdir()) == []
+
+    def test_heic_staging_deadline_aborts_copy_without_resetting_decode_budget(self, tmp_path):
+        source, local, result, records = self._staging_probe(
+            tmp_path,
+            env={"IMMICH_ACCELERATOR_HEIC_DECODE_BUDGET_MS": "100"},
+            preload="""
+const fs=require('fs'),{PassThrough}=require('stream');
+fs.createReadStream=()=>{
+    const stalled=new PassThrough();
+    stalled.on('close',()=>process.stdout.write('STAGE_CLOSED\\n'));
+    return stalled;
+};
+""",
+        )
+        assert not records, "staging must consume the existing total decode budget"
+        assert "STAGE_CLOSED" in result.stdout
+        assert "INPUT_TYPE:string" in result.stdout
+        assert source.read_bytes() == self._HEIC_BYTES
+        assert list(local.iterdir()) == []
+
+    def test_heic_staging_itself_holds_the_decode_slot(self, tmp_path):
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        vips = tmp_path / "vips"
+        self._stub(vips, self._TIFF)
+        hook = tmp_path / "slow-stage.cjs"
+        hook.write_text("""
+const fs=require('fs'),{Readable}=require('stream');
+let active=0;
+fs.createReadStream=input=>Readable.from((async function*(){
+    active++;
+    process.stdout.write('STAGE_STARTED\\n');
+    if(active>1) process.stdout.write('STAGE_OVERLAP\\n');
+    try {
+        await new Promise(r=>setTimeout(r,100));
+        yield fs.readFileSync(input);
+    } finally { active--; }
+})());
+""")
+        result = self._run_two_concurrently(tmp_path, node, vips, {
+            "NODE_OPTIONS": f'--require "{hook}"', "TMPDIR": str(tmp_path),
+        })
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.count("STAGE_STARTED") == 2
+        assert "STAGE_OVERLAP" not in result.stdout
+        assert "DONE" in result.stdout
+        assert not list(tmp_path.glob("iaa-heic-input-*"))
+
 
 class TestHardwareEncodingCanBeTurnedOff:
     """Hardware encoding is a choice, not a law.
