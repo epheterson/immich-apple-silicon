@@ -360,6 +360,44 @@ async function decodeToBuffer(input) {
     }
 }
 
+// Immich opens each HEIC original twice per thumbnail job: decodeImage() for
+// the pixels, then getImageMetadata() to check for transparency. Under Docker
+// that second call only reads the file header. Here metadata() is a terminal
+// call, so it ran the whole decoder chain a second time on the same file.
+// Give the next open of the same unchanged file (path, mtime, size) the decode
+// that already ran, once, within a short window, then let it go so the frame
+// isn't kept alive. A failed decode is never reused.
+const DECODE_REUSE_MS = 10000;
+const recentDecodes = new Map();
+function decodeOnceForReuse(input) {
+    let key;
+    try {
+        const st = fs.statSync(input);
+        key = `${st.mtimeMs}:${st.size}`;
+    } catch (_e) {
+        return decodeToBuffer(input);
+    }
+    const hit = recentDecodes.get(input);
+    if (hit) {
+        recentDecodes.delete(input);
+        clearTimeout(hit.timer);
+        if (hit.key === key) return hit.promise;
+    }
+    const entry = { key, promise: decodeToBuffer(input), timer: null };
+    recentDecodes.set(input, entry);
+    const forget = () => {
+        if (recentDecodes.get(input) === entry) recentDecodes.delete(input);
+    };
+    entry.promise.then((buf) => {
+        if (recentDecodes.get(input) !== entry) return;
+        if (buf === null) return forget();
+        entry.timer = setTimeout(forget, DECODE_REUSE_MS);
+        // An idle worker must still be able to exit.
+        entry.timer.unref();
+    }, forget);
+    return entry.promise;
+}
+
 async function decodeToBufferUnthrottled(input) {
     const deadline = Date.now() + DECODE_BUDGET_MS;
     // Staging holds the same semaphore slot and spends the same total budget
@@ -455,7 +493,7 @@ function lazyDecodedSharp(input, options, realSharp) {
     // so nothing triggers it today — but this shim wraps whatever Immich the
     // user is running, and an upstream change to reuse one pipeline would
     // silently double-transform their thumbnails with no error anywhere.
-    const decoded = decodeToBuffer(input).then((buf) => (buf !== null ? buf : input));
+    const decoded = decodeOnceForReuse(input).then((buf) => (buf !== null ? buf : input));
     // Never an unhandled rejection: nothing awaits `decoded` until a terminal
     // method runs, and if no terminal ever runs (an exception between sharp()
     // and .toBuffer(), say) an unattached rejection would take the worker down
