@@ -2025,6 +2025,18 @@ const fake = () => {
         assert result.stdout.count("INPUT_TYPE:buffer") == 3, result.stdout
         assert len(calls.read_text().splitlines()) == 2
 
+    def test_raw_decodes_are_not_held_for_reuse(self, tmp_path):
+        """Only HEIC gets the second open (RAW isn't transparency-capable), so
+        a RAW frame held for reuse would sit in memory with nothing to claim it."""
+        node = self._node_or_skip()
+        self._fake_sharp(tmp_path)
+        vips, calls = self._counting_vips(tmp_path)
+        nef = tmp_path / "photo.nef"
+        nef.write_bytes(b"II*\x00whatever")
+        result = self._run(tmp_path, node, {"IMMICH_ACCELERATOR_VIPS": str(vips)}, [str(nef)] * 2)
+        assert result.returncode == 0, result.stderr
+        assert len(calls.read_text().splitlines()) == 2
+
     def test_a_changed_file_or_failed_decode_is_decoded_again(self, tmp_path):
         """Reuse is keyed on mtime and size, so an original replaced in place
         gets a fresh decode, and a failed decode is never handed on."""
@@ -2235,6 +2247,19 @@ const fake = () => {
         assert records[0]["input"] == str(source)
         assert source.read_bytes() == self._HEIC_BYTES
         assert "INPUT_TYPE:buffer" in result.stdout
+        assert list(local.iterdir()) == []
+
+    def test_heic_staging_never_reads_a_file_known_to_be_over_the_cap(self, tmp_path):
+        """On a slow share, reading cap + 1 bytes only to discard them can use
+        up the budget the decoders need for the original."""
+        source, local, result, records = self._staging_probe(
+            tmp_path,
+            env={"IMMICH_ACCELERATOR_HEIC_STAGE_MAX_BYTES": "16"},
+            preload="const fs=require('fs');const c=fs.createReadStream;"
+            "fs.createReadStream=(...a)=>{process.stdout.write('STAGE_READ\\n');return c(...a);};",
+        )
+        assert records[0]["input"] == str(source)
+        assert "STAGE_READ" not in result.stdout
         assert list(local.iterdir()) == []
 
     def test_heic_staging_write_failure_preserves_direct_decoder_fallback(self, tmp_path):

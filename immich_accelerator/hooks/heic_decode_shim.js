@@ -223,6 +223,11 @@ async function stageHeic(input, deadline) {
     try {
         const remaining = deadline - Date.now();
         if (remaining <= 0) throw new Error('decode deadline reached');
+        // Reading cap + 1 bytes of a file already known to be too big would
+        // spend the decode budget on a copy that gets thrown away.
+        if ((await fs.promises.stat(input)).size > HEIC_STAGE_MAX_BYTES) {
+            throw new Error('larger than the staging cap');
+        }
         dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iaa-heic-input-'));
         const file = path.join(dir, 'input.heic');
         const controller = new AbortController();
@@ -372,10 +377,12 @@ async function decodeToBuffer(input) {
 // call, so it ran the whole decoder chain a second time on the same file.
 // Give the next open of the same unchanged file (path, mtime, size) the decode
 // that already ran, once, within a short window, then let it go so the frame
-// isn't kept alive. A failed decode is never reused.
+// isn't kept alive. A failed decode is never reused. HEIC only: RAW isn't
+// transparency-capable, so nothing would claim its frame.
 const DECODE_REUSE_MS = 10000;
 const recentDecodes = new Map();
 function decodeOnceForReuse(input) {
+    if (isRawPath(input)) return decodeToBuffer(input);
     let key;
     try {
         const st = fs.statSync(input);
