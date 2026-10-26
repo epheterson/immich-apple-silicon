@@ -290,15 +290,18 @@ function decoderEnv() {
     return process.env;
 }
 
-// Async execFile lets BullMQ run several decodes concurrently, but a modest
-// NAS degrades under concurrent reads instead of parallelizing them —
-// measured, 4 concurrent vips decodes took 37s+ (still not done) vs 20.7s for
-// one alone. Cap concurrent decoder processes; default 1 matches what
-// execFileSync gave for free before.
+// Async execFile lets BullMQ run several decodes concurrently. Reading a HEIC
+// straight off an SMB share, that was slower, not faster: 4 concurrent vips
+// decodes took 37s+ (still not done) vs 20.7s for one alone, because libheif's
+// tiny reads each wait on the NAS. HEICs are now staged to local disk first
+// (stageHeic), and with that, decoding 3 at a time finished a batch about 2x
+// faster than 1 on an M4. Past 3 the gain is small and memory keeps climbing,
+// since every decoder holds a full frame. Immich's thumbnail job concurrency
+// is the real ceiling, so a higher value here only matters up to that.
 // A queued decode gives up rather than waiting forever; see acquireDecodeSlot.
 const DECODE_QUEUE_TIMEOUT_MS =
     Number(process.env.IMMICH_ACCELERATOR_HEIC_QUEUE_TIMEOUT_MS) || 180000;
-const DECODE_CONCURRENCY = Number(process.env.IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY) || 1;
+const DECODE_CONCURRENCY = Number(process.env.IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY) || 3;
 let activeDecodes = 0;
 const decodeWaitQueue = [];
 function acquireDecodeSlot() {
@@ -310,8 +313,9 @@ function acquireDecodeSlot() {
     // HEIC and RAW thumbnail on the machine. execFile's timeout only sends
     // SIGTERM, and a vips blocked in uninterruptible I/O on a stalled SMB
     // mount (precisely the NAS case this is for) ignores it and never exits:
-    // its promise never settles, the finally never runs, and with the default
-    // concurrency of 1 the single slot is gone for the life of the worker.
+    // its promise never settles, the finally never runs, and the slot it holds
+    // is gone for the life of the worker; once every slot is lost that way,
+    // nothing decodes again.
     // Before this rewrite the decode was synchronous with a hard 30s ceiling,
     // so that could not happen; giving up the slot restores that guarantee.
     return new Promise((resolve, reject) => {
