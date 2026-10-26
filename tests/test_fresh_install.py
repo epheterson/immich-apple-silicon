@@ -2994,6 +2994,52 @@ class TestFfmpegWrapperQuickLookFallback:
         assert "-q:v" not in received
         assert received[received.index("-crf") + 1] == "23"
 
+    # Immich leaves -g out unless a GOP size is set. libx264 then uses its own
+    # keyint of 250; VideoToolbox would get ffmpeg's generic 12.
+    def test_videotoolbox_gets_a_gop_when_immich_sends_none(self, tmp_path):
+        for codec in ("h264", "hevc"):
+            out = str(tmp_path / "out.mp4")
+            received = self._capture_ffmpeg_args(
+                tmp_path,
+                ["-i", str(tmp_path / "in.mov"), "-c:v", codec, "-crf", "23", out],
+            )
+            assert received.count("-g") == 1, received
+            assert received[received.index("-g") + 1] == "250"
+            assert received[-1] == out, "the output path must stay last"
+
+    def test_a_gop_size_set_in_immich_is_kept(self, tmp_path):
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "h264",
+                "-g",
+                "120",
+                "-crf",
+                "23",
+                str(tmp_path / "out.mp4"),
+            ],
+        )
+        assert received.count("-g") == 1, received
+        assert received[received.index("-g") + 1] == "120"
+
+    def test_software_encode_gets_no_gop(self, tmp_path):
+        received = self._capture_ffmpeg_args(
+            tmp_path,
+            [
+                "-i",
+                str(tmp_path / "in.mov"),
+                "-c:v",
+                "libvpx-vp9",
+                "-crf",
+                "23",
+                str(tmp_path / "out.webm"),
+            ],
+        )
+        assert "-g" not in received
+
 
 class TestPgKeepaliveShim:
     """The pg keepalive shim sets keepAlive on Immich's Postgres connections so
