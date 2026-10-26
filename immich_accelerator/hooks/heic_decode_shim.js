@@ -91,11 +91,13 @@ const DECODERS = [
         // Write the intermediate TIFF with lossless deflate compression. Sharp
         // ingests the whole file into a Node Buffer, and a camera RAW decodes to
         // a large frame (tens of MB uncompressed, ~40% smaller deflated), so this
-        // trims peak memory and tmp I/O for no pixel change and negligible CPU
-        // (the decode dominates). The magic bytes are unaffected, so isTiff still
-        // gates it. sips (fallback) has no equivalent option and is left plain.
+        // trims peak memory and tmp I/O for no pixel change. Level 1, because at
+        // the default level deflate took far longer than the decode (24MP HEIC:
+        // 0.37s to decode and rotate, 3.9s to deflate; level 1 ~0.5s for a ~20%
+        // larger file). The magic bytes are unaffected, so isTiff still gates
+        // it. sips (fallback) has no equivalent option and is left plain.
         bin: VIPS,
-        args: (input, out) => ['autorot', input, `${out}[compression=deflate]`],
+        args: (input, out) => ['autorot', input, `${out}[compression=deflate,level=1]`],
     },
     {
         name: 'sips',
