@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.17.13 - 2026-10-26
+
+### Changed
+- **HEIC and RAW thumbnails are much faster, most of all on a NAS.** Each HEIC up to 128 MB is copied to local disk before decoding, because libheif reads it in tens of thousands of tiny pieces and on an SMB share every one is a network round trip (5 HEICs went from 276 s to about 50 s on SMB). The transparency check Immich runs after each HEIC thumbnail reuses the decode instead of running it again. The intermediate TIFF is compressed at deflate level 1 instead of the default, which took most of the decode time. Up to 3 decodes now run at once instead of 1 (`IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY`); that costs about 0.5 GB more peak memory, so lower it on a Mac with little RAM. Together, 20 HEICs from an NFS share took 5 s instead of 97 s, with byte-identical output. Thanks to @hanyuan97 for tracking this down and measuring every step (#196, #197, #198, #199).
+- **Hardware video transcodes are about 18% smaller at the same quality.** VideoToolbox has no keyframe interval of its own and got ffmpeg's generic 12 frames when Immich sets none; it now gets 250, the same as x264 and x265 use, so keyframe spacing matches Docker's output. A GOP size set in Immich is still used as is. Thanks to @hanyuan97 (#200).
+
 ## 1.17.12 - 2026-10-18
 
 ### Fixed

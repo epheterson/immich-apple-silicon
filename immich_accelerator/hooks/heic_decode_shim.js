@@ -208,6 +208,25 @@ const stageMaxBytes = Number((process.env.IMMICH_ACCELERATOR_HEIC_STAGE_MAX_BYTE
 const HEIC_STAGE_MAX_BYTES = Number.isSafeInteger(stageMaxBytes) && stageMaxBytes >= 0
     ? stageMaxBytes : 128 * 1024 * 1024;
 
+// A worker killed mid-decode leaves its copy and its TIFF behind. Clear any
+// over an hour old at startup, in the background; a live decode is never
+// that old (the budget is 120 s).
+fs.promises.readdir(os.tmpdir()).then((names) => {
+    for (const name of names) {
+        if (!name.startsWith('iaa-heic-')) continue;
+        const stale = path.join(os.tmpdir(), name);
+        fs.promises.stat(stale).then((st) => {
+            if (Date.now() - st.mtimeMs > 3600000) {
+                return fs.promises.rm(stale, { recursive: true, force: true });
+            }
+        }).catch(warnStaleCleanup);
+    }
+}, warnStaleCleanup);
+function warnStaleCleanup(e) {
+    if (e.code === 'ENOENT') return; // already gone
+    process.stderr.write(`[immich-accelerator] clearing old HEIC staging failed: ${e.message}\n`);
+}
+
 function removeStagedHeic(dir) {
     try { fs.rmSync(dir, { recursive: true, force: true }); }
     catch (e) {
@@ -223,10 +242,28 @@ async function stageHeic(input, deadline) {
     try {
         const remaining = deadline - Date.now();
         if (remaining <= 0) throw new Error('decode deadline reached');
+        const controller = new AbortController();
+        // A read stuck on a hung mount never lets the streams close, so the
+        // pipeline would never settle and the decode slot never come back.
+        // Stop waiting at the deadline; the stuck read is left to finish.
+        const timedOut = new Promise((_resolve, reject) => {
+            timer = setTimeout(() => {
+                controller.abort();
+                reject(new Error('staging ran out of decode budget'));
+            }, remaining);
+        });
+        timedOut.catch(() => {});
+        const inTime = (work) => {
+            work.catch(() => {});
+            return Promise.race([work, timedOut]);
+        };
+        // Reading cap + 1 bytes of a file already known to be too big would
+        // spend the decode budget on a copy that gets thrown away.
+        if ((await inTime(fs.promises.stat(input))).size > HEIC_STAGE_MAX_BYTES) {
+            throw new Error('larger than the staging cap');
+        }
         dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iaa-heic-input-'));
         const file = path.join(dir, 'input.heic');
-        const controller = new AbortController();
-        timer = setTimeout(() => controller.abort(), remaining);
         let bytes = 0;
         const limit = new Transform({
             transform(chunk, _encoding, callback) {
@@ -236,12 +273,12 @@ async function stageHeic(input, deadline) {
             },
         });
         output = fs.createWriteStream(file, { flags: 'wx', mode: 0o600 });
-        await pipeline(
+        await inTime(pipeline(
             // end is inclusive: read at most cap + 1 to detect oversize, even
             // if the source grows continually; never write that extra byte.
             fs.createReadStream(input, { end: HEIC_STAGE_MAX_BYTES }), limit, output,
             { signal: controller.signal }
-        );
+        ));
         complete = true;
         return { dir, file };
     } catch (e) {
@@ -301,7 +338,10 @@ function decoderEnv() {
 // A queued decode gives up rather than waiting forever; see acquireDecodeSlot.
 const DECODE_QUEUE_TIMEOUT_MS =
     Number(process.env.IMMICH_ACCELERATOR_HEIC_QUEUE_TIMEOUT_MS) || 180000;
-const DECODE_CONCURRENCY = Number(process.env.IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY) || 3;
+const decodeConcurrency = Number(process.env.IMMICH_ACCELERATOR_HEIC_DECODE_CONCURRENCY);
+// Zero, a negative or a fraction would leave no whole slot and stall every decode.
+const DECODE_CONCURRENCY = Number.isSafeInteger(decodeConcurrency) && decodeConcurrency >= 1
+    ? decodeConcurrency : 3;
 let activeDecodes = 0;
 const decodeWaitQueue = [];
 function acquireDecodeSlot() {
@@ -372,10 +412,15 @@ async function decodeToBuffer(input) {
 // call, so it ran the whole decoder chain a second time on the same file.
 // Give the next open of the same unchanged file (path, mtime, size) the decode
 // that already ran, once, within a short window, then let it go so the frame
-// isn't kept alive. A failed decode is never reused.
+// isn't kept alive. A failed decode is never reused. HEIC only: RAW isn't
+// transparency-capable, so nothing would claim its frame.
 const DECODE_REUSE_MS = 10000;
+// A caller that never opens the file again would otherwise leave every frame
+// here for the full window; keep only the most recent few.
+const DECODE_REUSE_MAX = 8;
 const recentDecodes = new Map();
 function decodeOnceForReuse(input) {
+    if (isRawPath(input)) return decodeToBuffer(input);
     let key;
     try {
         const st = fs.statSync(input);
@@ -390,6 +435,11 @@ function decodeOnceForReuse(input) {
         if (hit.key === key) return hit.promise;
     }
     const entry = { key, promise: decodeToBuffer(input), timer: null };
+    if (recentDecodes.size >= DECODE_REUSE_MAX) {
+        const [oldest, old] = recentDecodes.entries().next().value;
+        clearTimeout(old.timer);
+        recentDecodes.delete(oldest);
+    }
     recentDecodes.set(input, entry);
     const forget = () => {
         if (recentDecodes.get(input) === entry) recentDecodes.delete(input);
@@ -408,7 +458,8 @@ async function decodeToBufferUnthrottled(input) {
     const deadline = Date.now() + DECODE_BUDGET_MS;
     // Staging holds the same semaphore slot and spends the same total budget
     // as the decoders. RAW keeps the original path for sidecar resolution.
-    const staged = HEIC_STAGE_MAX_BYTES > 0 && !isRawPath(input) && isHevcHeicPath(input)
+    // Only HEVC HEIC and RAW reach here (wrapSharp), so not RAW means HEIC.
+    const staged = HEIC_STAGE_MAX_BYTES > 0 && !isRawPath(input)
         ? await stageHeic(input, deadline) : null;
     try {
         return await decodeWithDeadline(input, deadline, staged ? staged.file : input);
