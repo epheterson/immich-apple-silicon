@@ -120,11 +120,14 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           VERSION="${TAG#v}"
-          if [ -n "${KEYCHAIN_PATH:-}" ]; then
-            MACOS_SIGN_ID="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
-              | grep 'Developer ID Application' | head -1 | sed 's/.*"\(.*\)"/\1/')"
-            export MACOS_SIGN_ID
+          # Ad-hoc would change the launcher's identity every release, which is
+          # the prompt-on-every-upgrade bug it exists to fix. Refuse instead.
+          if [ -z "${KEYCHAIN_PATH:-}" ]; then
+            echo "No signing keychain: the service launcher must be Developer ID signed"; exit 1
           fi
+          MACOS_SIGN_ID="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep 'Developer ID Application' | head -1 | sed 's/.*"\(.*\)"/\1/')"
+          export MACOS_SIGN_ID
           bash service/build.sh "$VERSION"
           TARBALL="service/immich-accelerator-service-${VERSION}.tar.gz"
           echo "sha256=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
@@ -322,9 +325,11 @@ jobs:
           export SRC_URL="https://github.com/${REPO}/archive/refs/tags/v${VERSION}.tar.gz"
           export ML_URL="https://github.com/${OWNER}/immich-ml-metal/archive/${ML_COMMIT}.tar.gz"
           export NATIVE_URL="https://github.com/${REPO}/releases/download/${TAG}/immich-ml-native-${VERSION}-macos-arm64.tar.gz"
-          if [ -n "$SERVICE_SHA" ]; then
-            export SERVICE_URL="https://github.com/${REPO}/releases/download/${TAG}/immich-accelerator-service-${VERSION}.tar.gz"
-          fi
+          # Unconditional: installs that already run the service through the
+          # launcher have a launchd plist naming it, so a formula without it
+          # would leave them pointing at a path that no longer exists. A
+          # missing sha fails the render instead.
+          export SERVICE_URL="https://github.com/${REPO}/releases/download/${TAG}/immich-accelerator-service-${VERSION}.tar.gz"
           # ML models are fetched by the accelerator on first native start, not
           # at install time (see _maybe_fetch_native_models), so no model URL here.
           bash acc/scripts/render-formula.sh

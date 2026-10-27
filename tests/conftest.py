@@ -103,6 +103,10 @@ def tmp_data_dir(tmp_path, monkeypatch):
     Same class of trap as read_pid's global process scan: the fixture looks
     isolating and is not.
     """
+    # Under the brew service, cmd_watch would ask brew to restart the real
+    # service (_move_onto_launcher). A test run from that environment must not.
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("IMMICH_ACCELERATOR_LAUNCHER", raising=False)
     data_dir = tmp_path / ".immich-accelerator"
     data_dir.mkdir()
     pid_dir = data_dir / "pids"

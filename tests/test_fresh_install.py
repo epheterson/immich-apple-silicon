@@ -1407,6 +1407,10 @@ class TestNodeVersionPreflight:
         render = render[: render.index("- name:", 10)]
         assert "SERVICE_SHA: ${{ needs.build-native.outputs.service_sha256 }}" in render
         assert "immich-accelerator-service-${VERSION}.tar.gz" in render
+        # Never conditional: migrated installs have a plist naming the launcher.
+        assert 'if [ -n "$SERVICE_SHA" ]' not in render
+        # And never ad-hoc: that would change its identity every release.
+        assert "must be Developer ID signed" in step and "exit 1" in step
         build = (REPO_ROOT / "service" / "build.sh").read_text()
         assert 'immich-accelerator-service-${VERSION}.tar.gz' in build
 

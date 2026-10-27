@@ -44,6 +44,8 @@ cat > "$STAGE/$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>${VERSION}</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSBackgroundOnly</key><true/>
+    <key>NSNetworkVolumesUsageDescription</key><string>Immich Accelerator reads and writes your photo library on this network volume.</string>
+    <key>NSLocalNetworkUsageDescription</key><string>Immich Accelerator connects to Immich's database and cache on your network.</string>
 </dict>
 </plist>
 PLIST

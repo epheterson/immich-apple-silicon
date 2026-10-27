@@ -6658,6 +6658,7 @@ def cmd_stop(_args):
     # An explicit stop is not a pause. Leaving the marker behind would have
     # status blame a missing library for a worker the user turned off.
     set_paused("")
+    set_notice("")
     stopped = False
     for name in ("worker", "ml", "dashboard"):
         if kill_pid(name):
@@ -7038,6 +7039,9 @@ def _watch_without_worker(config: dict) -> str | None:
     hand over to the worker loop without this function knowing about it.
     """
     log.info("Watching ML-only service (Ctrl+C to stop)...")
+    # No worker reads the library here, so nothing would ever clear a notice
+    # about reading it, and the menu bar would stay amber over it.
+    set_notice("")
 
     # `brew services stop`/`restart` send SIGTERM to this watcher. The
     # dashboard runs detached (own session) and would survive; an ML this
@@ -7569,6 +7573,8 @@ def _watch_worker(config: dict) -> str | None:
                         set_paused(
                             "library-unreachable", config.get("upload_mount") or ""
                         )
+                        # The library is gone, not waiting on a prompt.
+                        clear_notice("media-permission")
                     if read_pid("worker"):
                         kill_pid("worker")
                     continue
@@ -7621,6 +7627,10 @@ def _watch_worker(config: dict) -> str | None:
                                 log.warning(line)
                         set_notice("media-permission", root)
                         detail = ""  # said above, in the words that apply
+                    else:
+                        # Failing some other way now, a stuck server for one.
+                        # Telling someone to click Allow would be wrong advice.
+                        clear_notice("media-permission")
                 if not healthy and detail and detail not in shown_media_warnings:
                     shown_media_warnings.add(detail)
                     log.warning(

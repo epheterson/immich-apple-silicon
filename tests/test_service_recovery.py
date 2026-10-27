@@ -2195,7 +2195,14 @@ class TestAPendingPermissionIsNamed:
             ),
             "is_mounted": MagicMock(return_value=True),
             "media_io_healthy": MagicMock(side_effect=reads),
-            "mount_answers": MagicMock(return_value=answers),
+            # True/False for every call, or a list answered in turn.
+            "mount_answers": MagicMock(
+                **(
+                    {"side_effect": answers}
+                    if isinstance(answers, list)
+                    else {"return_value": answers}
+                )
+            ),
             "read_pid": MagicMock(return_value=4242),
             "kill_pid": MagicMock(),
             "cmd_start": MagicMock(),
@@ -2253,6 +2260,31 @@ class TestAPendingPermissionIsNamed:
         m.set_notice("local-network", "nas")
         m.clear_notice("media-permission")
         assert m.read_notice()["reason"] == "local-network"
+
+    def test_a_prompt_that_turns_into_a_stuck_nas_drops_the_advice(self, tmp_data_dir):
+        """statfs answered, then stopped answering: the NAS is now the problem,
+        and "click Allow" is the wrong thing to tell anyone."""
+        mocks = self._drive([(False, "probe timed out after 10s")] * 2, answers=[True, False])
+        assert mocks["mount_answers"].call_count == 2
+        assert m.read_notice() is None
+
+    def test_stopping_clears_it(self, tmp_data_dir):
+        m.set_notice("media-permission", "/nas/immich")
+        with patch.object(m, "read_pid", return_value=None), patch.object(m, "log"):
+            m.cmd_stop(argparse.Namespace())
+        assert m.read_notice() is None
+
+    def test_a_watcher_with_no_worker_clears_it(self, tmp_data_dir):
+        m.set_notice("media-permission", "/nas/immich")
+        # Stop at the first thing it does after starting up.
+        with patch.object(m, "_start_without_worker", side_effect=KeyboardInterrupt()), \
+             patch.object(m, "load_config", side_effect=KeyboardInterrupt()), \
+             patch.object(m, "log"), patch.object(m.signal, "signal"):
+            try:
+                m._watch_without_worker({"worker": False})
+            except KeyboardInterrupt:
+                pass
+        assert m.read_notice() is None
 
     def test_since_is_when_it_started_not_the_last_cycle(self, tmp_data_dir):
         with patch.object(m.time, "time", return_value=100.0):
