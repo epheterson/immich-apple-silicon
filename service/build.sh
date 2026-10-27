@@ -24,7 +24,9 @@ if [ "$SIGN_ID" != "-" ]; then
     sign_flags+=(--options runtime --timestamp)
 fi
 
-STAGE="$(mktemp -d)"
+# One top-level folder around the bundle: Homebrew steps into a lone folder
+# when it unpacks a resource, which would otherwise leave it inside the .app.
+STAGE="$(mktemp -d)/immich-accelerator-service"
 mkdir -p "$STAGE/$APP/Contents/MacOS"
 swiftc -O -target arm64-apple-macos13 main.swift \
     -o "$STAGE/$APP/Contents/MacOS/immich-accelerator-service"
@@ -49,6 +51,6 @@ codesign "${sign_flags[@]}" "$STAGE/$APP"
 codesign --verify --strict "$STAGE/$APP"
 codesign -dvv "$STAGE/$APP" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier)=' || true
 
-tar -czf "$TARBALL" -C "$STAGE" "$APP"
+tar -czf "$TARBALL" -C "$(dirname "$STAGE")" "$(basename "$STAGE")"
 echo "tarball : $TARBALL"
 echo "sha256  : $(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"

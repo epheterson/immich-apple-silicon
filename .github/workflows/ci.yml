@@ -110,6 +110,11 @@ jobs:
       - name: swift build -c release
         working-directory: native-ml
         run: swift build -c release
+      # The brew service's launcher (service/main.swift) ships in every release
+      # and nothing else compiles it before the tag. Ad-hoc here; the release
+      # signs it with the Developer ID.
+      - name: Build the service launcher
+        run: bash service/build.sh ci
 
   fresh-install-macos:
     # Runs on a clean macOS Apple Silicon runner — no global pip
@@ -247,6 +252,12 @@ jobs:
           export ML_SHA="0000000000000000000000000000000000000000000000000000000000000000"
           bash scripts/render-formula.sh
           ruby -c "$OUT"
+          # The release renders with the native bundle and the service launcher
+          # too, which changes the install and service blocks. Check that shape.
+          NATIVE_URL=https://example.invalid/n.tar.gz NATIVE_SHA="$SRC_SHA" \
+            SERVICE_URL=https://example.invalid/s.tar.gz SERVICE_SHA="$SRC_SHA" \
+            OUT=/tmp/immich-accelerator-release.rb bash scripts/render-formula.sh
+          ruby -c /tmp/immich-accelerator-release.rb
           # A backtick or $( ) in the heredoc would command-substitute and inject
           # shell output (e.g. ImageMagick's `import` help) into the formula. Guard
           # against it even if the result happens to still parse as Ruby.

@@ -27,6 +27,7 @@ jobs:
       sha256: ${{ steps.pkg.outputs.sha256 }}
       menubar_sha256: ${{ steps.menubar.outputs.sha256 }}
       menubar_notarized: ${{ steps.menubar.outputs.notarized }}
+      service_sha256: ${{ steps.service.outputs.sha256 }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -106,6 +107,28 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      # The program the brew service runs (service/main.swift), signed with the
+      # same Developer ID as the menu-bar app. That signature is what lets macOS
+      # keep a user's network-volume Allow across updates, so unlike the menu-bar
+      # app this is not best-effort: the formula's service points at it.
+      - name: Build + upload service launcher asset
+        id: service
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${TAG#v}"
+          if [ -n "${KEYCHAIN_PATH:-}" ]; then
+            MACOS_SIGN_ID="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+              | grep 'Developer ID Application' | head -1 | sed 's/.*"\(.*\)"/\1/')"
+            export MACOS_SIGN_ID
+          fi
+          bash service/build.sh "$VERSION"
+          TARBALL="service/immich-accelerator-service-${VERSION}.tar.gz"
+          echo "sha256=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          gh release upload "$TAG" "$TARBALL" --clobber
 
       - name: Build + notarize + upload menu-bar app asset
         id: menubar
@@ -294,10 +317,14 @@ jobs:
           REPO: ${{ github.repository }}
           OWNER: ${{ github.repository_owner }}
           NATIVE_SHA: ${{ needs.build-native.outputs.sha256 }}
+          SERVICE_SHA: ${{ needs.build-native.outputs.service_sha256 }}
         run: |
           export SRC_URL="https://github.com/${REPO}/archive/refs/tags/v${VERSION}.tar.gz"
           export ML_URL="https://github.com/${OWNER}/immich-ml-metal/archive/${ML_COMMIT}.tar.gz"
           export NATIVE_URL="https://github.com/${REPO}/releases/download/${TAG}/immich-ml-native-${VERSION}-macos-arm64.tar.gz"
+          if [ -n "$SERVICE_SHA" ]; then
+            export SERVICE_URL="https://github.com/${REPO}/releases/download/${TAG}/immich-accelerator-service-${VERSION}.tar.gz"
+          fi
           # ML models are fetched by the accelerator on first native start, not
           # at install time (see _maybe_fetch_native_models), so no model URL here.
           bash acc/scripts/render-formula.sh
