@@ -42,7 +42,75 @@ struct QueueProgress: Equatable, Identifiable {
     var remaining: Int { max(total - done, 0) }
 }
 
+/// Something only a person can fix, from the two files the watch loop writes:
+/// notice.json (macOS waiting on a permission, say) and paused.json (why it
+/// stopped the worker). Same wording as attention() in common.py.
+struct Attention: Equatable, Sendable {
+    var reason: String
+    var title: String
+    var action: String
+    /// The System Settings pane that fixes it, when there is one.
+    var settingsURL: URL?
+
+    /// Both files are small, local and written by us: reading them cannot
+    /// block on the NAS, which is the situation this exists to report.
+    ///
+    /// ACCEL_ATTENTION_DIR points it elsewhere, so `render menu` can draw each
+    /// case without writing into a live install's data directory.
+    static func read(from dir: URL = ProcessInfo.processInfo.environment["ACCEL_ATTENTION_DIR"]
+        .map { URL(fileURLWithPath: $0) } ?? Paths.dataDir) -> Attention? {
+        func load(_ name: String) -> [String: Any]? {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return nil }
+            return obj
+        }
+        let privacy = "x-apple.systempreferences:com.apple.preference.security?"
+        if let n = load("notice.json") {
+            let who = (n["who"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Python"
+            switch n["reason"] as? String {
+            case "media-permission":
+                return Attention(
+                    reason: "media-permission",
+                    title: "macOS is waiting for permission to read the library",
+                    action: "Click Allow on the prompt on this Mac\u{2019}s screen, or turn on "
+                        + "\u{201C}\(who)\u{201D} in Privacy & Security \u{203A} Files & Folders.",
+                    settingsURL: URL(string: privacy + "Privacy_FilesAndFolders"))
+            case "local-network":
+                return Attention(
+                    reason: "local-network",
+                    title: "macOS is blocking the connection to the database",
+                    action: "Turn on \u{201C}\(who)\u{201D} in Privacy & Security \u{203A} Local Network.",
+                    settingsURL: URL(string: privacy + "Privacy_LocalNetwork"))
+            default:
+                break
+            }
+        }
+        if let pz = load("paused.json") {
+            let detail = (pz["detail"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "?"
+            switch pz["reason"] as? String {
+            case "library-unreachable":
+                return Attention(
+                    reason: "library-unreachable",
+                    title: "Worker paused: the library is not reachable",
+                    action: "It starts again on its own when \(detail) is back.",
+                    settingsURL: nil)
+            case "backend-unreachable":
+                return Attention(
+                    reason: "backend-unreachable",
+                    title: "Worker paused: \(detail) not answering",
+                    action: "It starts again on its own when they are back.",
+                    settingsURL: nil)
+            default:
+                break
+            }
+        }
+        return nil
+    }
+}
+
 struct Snapshot: Equatable {
+    var attention: Attention?
     var workerUp = false
     var mlUp = false          // process alive
     var mlHealthy = false     // /ping answered
@@ -109,7 +177,11 @@ struct Snapshot: Equatable {
         // reports its own state separately.
         if wanted == 0 { return .stopped }
 
-        if healthy == wanted { return .running }
+        // Every process up is not the same as working: a service whose reads
+        // are held by a macOS prompt looks perfectly healthy from here. The
+        // icon is the only part of this app most people ever see, so it has to
+        // carry that too.
+        if healthy == wanted { return attention == nil ? .running : .degraded }
         // Something is enabled and not healthy. Distinguish "not started yet"
         // from "started and broken", counting the dashboard as a sign of life
         // even though it does not count toward health.
@@ -121,6 +193,7 @@ struct Snapshot: Equatable {
 // The result of the blocking pidfile/ps/config probes, gathered off the main
 // actor. Sendable (only value types) so it can cross back to the MainActor.
 struct ProcessProbe: Sendable {
+    var attention: Attention?
     var workerUp = false
     var mlUp = false
     var mlEngine: MLEngine = .unknown
@@ -251,6 +324,7 @@ final class StatusModel: ObservableObject {
         let p = await Task.detached(priority: .utility) { Self.probeProcesses() }.value
 
         var s = Snapshot()
+        s.attention = p.attention
         s.workerUp = p.workerUp
         s.mlUp = p.mlUp
         s.mlEngine = p.mlEngine
@@ -374,6 +448,7 @@ final class StatusModel: ObservableObject {
     // foreign process a mis-adopted pidfile points at, e.g. OrbStack).
     nonisolated static func probeProcesses() -> ProcessProbe {
         var p = ProcessProbe()
+        p.attention = Attention.read()
         p.workerUp = pidAlive("worker") != nil
         if let mlPid = pidAlive("ml") {
             p.mlUp = true

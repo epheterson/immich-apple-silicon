@@ -30,7 +30,14 @@ import time
 import uuid
 from pathlib import Path
 
-from .common import COMPONENTS, DEFAULT_TIMEOUT, component_enabled, run_ok, run_output
+from .common import (
+    COMPONENTS,
+    DEFAULT_TIMEOUT,
+    NOTICE_TEXT,
+    component_enabled,
+    run_ok,
+    run_output,
+)
 
 
 def _read_version() -> str:
@@ -3093,21 +3100,6 @@ def clear_notice(reason: str) -> None:
     current = read_notice()
     if current and current.get("reason") == reason:
         set_notice("")
-
-
-# What status says for each notice, as (what is wrong, what to do). The menu
-# bar (MenuView.swift) and the dashboard say the same in their own words.
-NOTICE_TEXT = {
-    "media-permission": (
-        "macOS is waiting for permission to read the library",
-        'Click Allow on the prompt on this Mac\'s screen, or turn on "{who}" in '
-        "System Settings > Privacy & Security > Files & Folders.",
-    ),
-    "local-network": (
-        "macOS is blocking the connection to the database",
-        'Turn on "{who}" in System Settings > Privacy & Security > Local Network.',
-    ),
-}
 
 
 # What macOS calls the service in its prompts and in System Settings. Under the

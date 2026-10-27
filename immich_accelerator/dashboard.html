@@ -88,6 +88,31 @@
   }
 
   /* Services */
+  /* Something only a person can fix: macOS waiting on a permission, or why
+     the worker is paused. Amber, not red: nothing is broken, someone is needed. */
+  .attention {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    background: color-mix(in srgb, var(--amber) 10%, var(--card));
+    border: 1px solid color-mix(in srgb, var(--amber) 45%, var(--card-border));
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 20px;
+  }
+  .attention[hidden] { display: none; }
+  .attention-icon {
+    flex: none;
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: var(--amber);
+    color: var(--bg);
+    font-weight: 700; font-size: 14px; line-height: 22px;
+    text-align: center;
+  }
+  .attention-title { font-weight: 600; font-size: 14px; color: var(--text); }
+  .attention-action { font-size: 13px; color: var(--text-dim); margin-top: 3px; line-height: 1.45; }
+
   .services {
     display: flex;
     gap: 10px;
@@ -274,6 +299,14 @@
     </div>
   </header>
 
+  <div class="attention" id="attention" role="status" hidden>
+    <div class="attention-icon" aria-hidden="true">!</div>
+    <div>
+      <div class="attention-title" id="attention-title"></div>
+      <div class="attention-action" id="attention-action"></div>
+    </div>
+  </div>
+
   <div class="services" id="svc">
     <div class="service"><div class="dot"></div><div class="service-label" style="color:var(--text-muted)">Microservices Worker</div></div>
     <div class="service"><div class="dot"></div><div class="service-label" style="color:var(--text-muted)">ML Service</div></div>
@@ -386,6 +419,14 @@ function render(d) {
   // Immich link
   const link = document.getElementById('immich-link');
   link.href = window.location.protocol + '//' + window.location.hostname + ':2283';
+
+  // Something a person has to do, if anything
+  const att = document.getElementById('attention');
+  att.hidden = !d.attention;
+  if (d.attention) {
+    document.getElementById('attention-title').textContent = d.attention.title;
+    document.getElementById('attention-action').textContent = d.attention.action;
+  }
 
   // Services
   const svcEl = document.getElementById('svc');

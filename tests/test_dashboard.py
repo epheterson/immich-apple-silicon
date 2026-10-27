@@ -653,3 +653,83 @@ class TestDashboardHtmlDoneLabel:
             "in dashboard.html's rateText chain, or a still-active queue "
             "renders as 'done' whenever the DB-derived ratio is already ~100%"
         )
+
+
+class TestAttention:
+    """What needs a person: shown as a banner on the dashboard and a row in the
+    menu bar, from the two files the watch loop writes."""
+
+    def test_nothing_to_say(self, tmp_path):
+        from immich_accelerator.common import attention
+
+        assert attention(tmp_path) is None
+
+    def test_a_pending_permission_names_the_program_to_allow(self, tmp_path):
+        from immich_accelerator.common import attention
+
+        (tmp_path / "notice.json").write_text(
+            json.dumps(
+                {
+                    "reason": "media-permission",
+                    "detail": "/nas/immich",
+                    "since": 1.0,
+                    "who": "Immich Accelerator Service",
+                }
+            )
+        )
+        got = attention(tmp_path)
+        assert got["reason"] == "media-permission"
+        assert "permission to read the library" in got["title"]
+        assert '"Immich Accelerator Service"' in got["action"]
+        assert "Files & Folders" in got["action"]
+
+    def test_a_notice_outranks_a_pause(self, tmp_path):
+        """The notice is the thing they can act on."""
+        from immich_accelerator.common import attention
+
+        (tmp_path / "paused.json").write_text(
+            json.dumps({"reason": "backend-unreachable", "detail": "Postgres"})
+        )
+        assert "Postgres not answering" in attention(tmp_path)["title"]
+        (tmp_path / "notice.json").write_text(
+            json.dumps({"reason": "local-network", "who": "Python"})
+        )
+        assert attention(tmp_path)["reason"] == "local-network"
+
+    def test_unknown_or_broken_files_are_ignored(self, tmp_path):
+        from immich_accelerator.common import attention
+
+        (tmp_path / "notice.json").write_text("{not json")
+        (tmp_path / "paused.json").write_text(json.dumps({"reason": "something-new"}))
+        assert attention(tmp_path) is None
+
+    def test_status_carries_it(self, tmp_data_dir, sample_config):
+        import immich_accelerator.dashboard as d
+
+        tmp_data_dir["notice_file"].write_text(
+            json.dumps({"reason": "media-permission", "who": "Python"})
+        )
+        d._cache, d._cache_ts = {}, 0
+        d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
+        try:
+            with patch("urllib.request.urlopen", side_effect=OSError), patch(
+                "immich_accelerator.dashboard._query_db",
+                return_value="200|100|10|150|80|70|120|5",
+            ), patch(
+                "immich_accelerator.dashboard._run", return_value="{ 1.50 2.00 3.00 }"
+            ):
+                status = get_status(sample_config)
+        finally:
+            d._cache, d._cache_ts, d._static_hw = {}, 0, None
+        assert status["attention"]["reason"] == "media-permission"
+
+    def test_the_page_draws_it_as_text(self):
+        """textContent, never innerHTML: the detail is a path a user chose."""
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        assert 'id="attention"' in html
+        assert "d.attention.title" in html
+        render = html[html.index("// Something a person has to do") :]
+        render = render[: render.index("// Services")]
+        assert "innerHTML" not in render

@@ -22,7 +22,7 @@ import os
 import subprocess
 import time
 
-from .common import component_enabled, run_output
+from .common import attention, component_enabled, run_output
 from pathlib import Path
 
 log = logging.getLogger("dashboard")
@@ -454,6 +454,8 @@ def get_status(config: dict) -> dict:
         "queue_active": queue_status,
         "queue_counts": queue_counts,
         "jobs_api_error": jobs_api_error,
+        # Beside CONFIG_FILE, so the tests' fixture redirects it with the rest.
+        "attention": attention(CONFIG_FILE.parent),
     }
 
     _cache = status

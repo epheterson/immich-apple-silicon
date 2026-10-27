@@ -1027,3 +1027,22 @@ def test_no_script_imports_a_name_it_also_defines():
         "a shared import shadows a local function of the same name:\n  "
         + "\n  ".join(offenders)
     )
+
+
+def test_the_menu_bar_knows_every_reason_the_watcher_can_write():
+    """The watch loop writes a reason; the menu bar turns it into words. A
+    reason the panel has no case for draws nothing, which on the day it matters
+    looks exactly like everything being fine."""
+    import re
+    from pathlib import Path
+
+    from immich_accelerator.common import NOTICE_TEXT, PAUSE_TEXT
+
+    root = Path(__file__).parent.parent
+    model = (root / "menubar/Sources/AcceleratorBar/StatusModel.swift").read_text()
+    block = model[model.index("struct Attention") : model.index("struct Snapshot")]
+    cases = set(re.findall(r'case "([a-z-]+)":', block))
+    assert cases == set(NOTICE_TEXT) | set(PAUSE_TEXT)
+    # And the panel names the same System Settings panes status sends people to.
+    assert "Files & Folders" in block and "Files & Folders" in NOTICE_TEXT["media-permission"][1]
+    assert "Local Network" in block and "Local Network" in NOTICE_TEXT["local-network"][1]

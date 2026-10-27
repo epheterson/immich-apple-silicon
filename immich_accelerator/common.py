@@ -15,8 +15,10 @@ here rather than in either of them.
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
+from pathlib import Path
 
 log = logging.getLogger("accelerator")
 
@@ -117,3 +119,55 @@ def run_ok(
     the two were byte-identical apart from the return value.
     """
     return run_output(cmd, timeout=timeout, input=input) is not None
+
+
+# Things only a person can fix, as (what is wrong, what to do). The watch loop
+# writes the reason to notice.json; status, the dashboard and the menu bar
+# (MenuView.swift says the same in its own words) turn it into these. {who} is
+# the program macOS shows in its prompt and in System Settings.
+NOTICE_TEXT = {
+    "media-permission": (
+        "macOS is waiting for permission to read the library",
+        'Click Allow on the prompt on this Mac\'s screen, or turn on "{who}" in '
+        "System Settings > Privacy & Security > Files & Folders.",
+    ),
+    "local-network": (
+        "macOS is blocking the connection to the database",
+        'Turn on "{who}" in System Settings > Privacy & Security > Local Network.',
+    ),
+}
+
+# Why the watch loop stopped the worker (paused.json).
+PAUSE_TEXT = {
+    "library-unreachable": (
+        "The worker is paused: the library is not reachable",
+        "It starts again on its own when {detail} is back.",
+    ),
+    "backend-unreachable": (
+        "The worker is paused: {detail} not answering",
+        "It starts again on its own when they are back.",
+    ),
+}
+
+
+def attention(data_dir: Path) -> dict | None:
+    """What needs a person right now, if anything: a notice first, since it is
+    something they can act on, else why the worker is paused. Reads two small
+    local files and nothing else, so it can sit on any status path."""
+    for name, texts in (("notice.json", NOTICE_TEXT), ("paused.json", PAUSE_TEXT)):
+        try:
+            entry = json.loads((data_dir / name).read_text())
+        except (OSError, ValueError):
+            continue
+        reason = entry.get("reason")
+        if reason not in texts:
+            continue
+        fill = {"who": entry.get("who") or "Python", "detail": entry.get("detail") or "?"}
+        title, action = (part.format(**fill) for part in texts[reason])
+        return {
+            "reason": reason,
+            "title": title,
+            "action": action,
+            "since": entry.get("since"),
+        }
+    return None
