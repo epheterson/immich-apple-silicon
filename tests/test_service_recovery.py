@@ -2168,3 +2168,189 @@ class TestAServiceRefusedByMacOSIsNamedAsSuch:
         text = self._status(caplog, down_from_here=["Postgres", "Redis"])
         assert "Local Network" not in text
         assert "starts again on its own when they are back" in text
+
+
+class TestAPendingPermissionIsNamed:
+    """2026-10-26: brew upgraded Python, macOS put a network-volume prompt on a
+    screen nobody was watching, and every read of the NAS in the service blocked
+    on it. The watcher saw the read time out and said so only in a log file.
+    Now it tells that apart from a stuck NAS and leaves a notice that status,
+    the menu bar and the dashboard show."""
+
+    CFG = {
+        "worker": True,
+        "ml": False,
+        "upload_mount": "/nas/immich",
+        "media_id": "abc123",
+        "mount_recipe": {"fstype": "nfs", "spec": "nas:/x", "mountpoint": "/nas"},
+    }
+
+    def _drive(self, reads, answers=True):
+        """Run the watch loop with the worker up and the mount present, the
+        marker read giving `reads` in turn, statfs answering or not."""
+        cycles = len(reads)
+        mocks = {
+            "load_config": MagicMock(
+                side_effect=[dict(self.CFG)] * (cycles + 1) + [KeyboardInterrupt()]
+            ),
+            "is_mounted": MagicMock(return_value=True),
+            "media_io_healthy": MagicMock(side_effect=reads),
+            "mount_answers": MagicMock(return_value=answers),
+            "read_pid": MagicMock(return_value=4242),
+            "kill_pid": MagicMock(),
+            "cmd_start": MagicMock(),
+            "cmd_stop": MagicMock(),
+            "reconcile_components": MagicMock(),
+            "cap_service_logs": MagicMock(),
+            "backends_down": MagicMock(return_value=[]),
+            "_upgraded_on_disk": MagicMock(return_value=False),
+            "_worker_fd_total": MagicMock(return_value=None),
+            "_worker_version_stale": MagicMock(return_value=False),
+            "mount_recipe_for": MagicMock(return_value=self.CFG["mount_recipe"]),
+            "save_config": MagicMock(),
+            "_attempt_remount": MagicMock(),
+            "diagnose_worker_log": MagicMock(return_value=None),
+            "time": MagicMock(sleep=MagicMock(), monotonic=MagicMock(return_value=0.0), time=MagicMock(return_value=0.0)),
+            "MEDIA_IO_EVERY": 1,
+            "log": MagicMock(),
+        }
+        mocks = {k: v for k, v in mocks.items() if hasattr(m, k)}
+        with patch.multiple(m, **mocks):
+            try:
+                m._watch_worker(dict(self.CFG))
+            except KeyboardInterrupt:
+                pass
+        return mocks
+
+    def test_a_read_held_by_macos_leaves_a_notice_naming_who_to_allow(self, tmp_data_dir):
+        self._drive([(False, "probe timed out after 10s")])
+        notice = m.read_notice()
+        assert notice["reason"] == "media-permission"
+        assert notice["detail"] == "/nas/immich"
+        assert notice["who"] == "Python"
+
+    def test_under_the_launcher_the_notice_names_the_launcher(self, tmp_data_dir, monkeypatch):
+        monkeypatch.setenv("IMMICH_ACCELERATOR_LAUNCHER", "/x/Immich Accelerator Service.app")
+        self._drive([(False, "probe timed out after 10s")])
+        assert m.read_notice()["who"] == "Immich Accelerator Service"
+
+    def test_a_stuck_nas_is_not_blamed_on_macos(self, tmp_data_dir):
+        """A server that stopped answering blocks statfs too. Telling that user
+        to go click Allow would send them to the wrong machine."""
+        self._drive([(False, "probe timed out after 10s")], answers=False)
+        assert m.read_notice() is None
+
+    def test_a_refused_read_is_not_a_pending_prompt(self, tmp_data_dir):
+        self._drive([(False, "PermissionError: [Errno 13]")])
+        assert m.read_notice() is None
+
+    def test_the_notice_clears_on_the_first_clean_read(self, tmp_data_dir):
+        mocks = self._drive([(False, "probe timed out after 10s"), (True, "")])
+        assert m.read_notice() is None
+        assert mocks["media_io_healthy"].call_count == 2
+
+    def test_a_clean_read_does_not_clear_someone_elses_notice(self, tmp_data_dir):
+        m.set_notice("local-network", "nas")
+        m.clear_notice("media-permission")
+        assert m.read_notice()["reason"] == "local-network"
+
+    def test_since_is_when_it_started_not_the_last_cycle(self, tmp_data_dir):
+        with patch.object(m.time, "time", return_value=100.0):
+            m.set_notice("media-permission", "/nas/immich")
+        with patch.object(m.time, "time", return_value=500.0):
+            m.set_notice("media-permission", "/nas/immich")
+        assert m.read_notice()["since"] == 100.0
+
+    def test_start_names_a_pending_permission_instead_of_full_disk_access(self, tmp_data_dir):
+        cfg = dict(self.CFG)
+        with patch.object(m, "_media_probe", return_value=(False, [], "probe timed out after 15s")), \
+             patch.object(m, "mount_recipe_for", return_value=cfg["mount_recipe"]), \
+             patch.object(m, "is_mounted", return_value=True), \
+             patch.object(m, "mount_answers", return_value=True), \
+             patch.object(m, "log") as log:
+            assert m.ensure_media_ready(cfg) is True
+        said = " ".join(str(c.args[0]) for c in log.warning.call_args_list)
+        assert "Files & Folders" in said
+        assert "Full Disk Access" not in said
+        assert m.read_notice()["reason"] == "media-permission"
+
+    def test_statfs_is_the_only_thing_the_tell_does_to_the_mount(self, tmp_data_dir):
+        """It runs while reads are blocked; anything that opens a file would
+        block with them."""
+        with patch.object(m.subprocess, "run", return_value=MagicMock(returncode=0)) as run:
+            assert m.mount_answers("/nas/immich") is True
+        argv = run.call_args.args[0]
+        assert argv[-1] == "/nas/immich"
+        assert argv[2] == "import os,sys; os.statvfs(sys.argv[1])"
+        assert run.call_args.kwargs["timeout"] == 3
+
+    def test_status_says_what_to_click(self, tmp_data_dir, monkeypatch):
+        monkeypatch.setenv("IMMICH_ACCELERATOR_LAUNCHER", "/x")
+        m.set_notice("media-permission", "/nas/immich")
+        with patch.object(m, "read_pid", return_value=None), \
+             patch.object(m, "log") as log:
+            m.cmd_status(argparse.Namespace())
+        said = " ".join(str(c.args) for c in log.warning.call_args_list)
+        assert "waiting for permission to read the library" in said
+        assert "Immich Accelerator Service" in said
+
+
+class TestTheServiceMovesOntoTheLauncher:
+    """brew upgrade installs the launcher but leaves launchd's plist starting
+    the CLI directly; only `brew services restart` rewrites it."""
+
+    def _run(self, tmp_path, monkeypatch, *, label="sh.brew.immich-accelerator",
+             launcher=True, under=False, tried=None):
+        opt = tmp_path / "opt"
+        (opt / "libexec").mkdir(parents=True)
+        if launcher:
+            (opt / "libexec" / m.LAUNCHER_APP).mkdir()
+        if label:
+            monkeypatch.setenv("XPC_SERVICE_NAME", label)
+        else:
+            monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+        if under:
+            monkeypatch.setenv("IMMICH_ACCELERATOR_LAUNCHER", "/x")
+        else:
+            monkeypatch.delenv("IMMICH_ACCELERATOR_LAUNCHER", raising=False)
+        if tried:
+            m.LAUNCHER_MOVE_FILE.write_text(tried)
+        with patch.object(m, "_opt_dir", return_value=opt), \
+             patch.object(m, "_installed_version", return_value="1.18.0"), \
+             patch.object(m, "_brew_prefix", return_value="/opt/homebrew"), \
+             patch.object(m.subprocess, "Popen") as popen, \
+             patch.object(m.time, "sleep") as sleep, \
+             patch.object(m, "log"):
+            m._move_onto_launcher()
+        return popen, sleep
+
+    def test_restarts_the_brew_service_once_in_its_own_session(self, tmp_path, monkeypatch, tmp_data_dir):
+        popen, sleep = self._run(tmp_path, monkeypatch)
+        argv = popen.call_args.args[0]
+        assert argv == ["/opt/homebrew/bin/brew", "services", "restart", "immich-accelerator"]
+        assert popen.call_args.kwargs["start_new_session"] is True
+        # Waits to be stopped rather than starting a worker brew is about to kill.
+        sleep.assert_called_once()
+        assert m.LAUNCHER_MOVE_FILE.read_text() == "1.18.0"
+
+    def test_not_tried_twice_for_the_same_version(self, tmp_path, monkeypatch, tmp_data_dir):
+        popen, _ = self._run(tmp_path, monkeypatch, tried="1.18.0")
+        popen.assert_not_called()
+
+    def test_tried_again_after_the_next_upgrade(self, tmp_path, monkeypatch, tmp_data_dir):
+        popen, _ = self._run(tmp_path, monkeypatch, tried="1.17.14")
+        popen.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            {"under": True},  # already there
+            {"label": None},  # run from a shell, not the service
+            {"label": "com.immich.accelerator"},  # the source-install plist
+            {"launcher": False},  # a release without it
+        ],
+    )
+    def test_left_alone(self, tmp_path, monkeypatch, tmp_data_dir, kw):
+        popen, sleep = self._run(tmp_path, monkeypatch, **kw)
+        popen.assert_not_called()
+        sleep.assert_not_called()

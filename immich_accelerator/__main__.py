@@ -55,6 +55,12 @@ LOG_DIR = DATA_DIR / "logs"
 # status and the menu bar read it so a paused worker reads as "the library is
 # gone" instead of a bare "Stopped" the user cannot explain.
 PAUSE_FILE = DATA_DIR / "paused.json"
+# Something only a person can fix that does not stop the worker, such as macOS
+# waiting for someone to click Allow. Same shape and readers as PAUSE_FILE.
+NOTICE_FILE = DATA_DIR / "notice.json"
+# The version a move onto the signed service launcher was last tried for, so a
+# restart that did not take is tried once per release, not on every start.
+LAUNCHER_MOVE_FILE = DATA_DIR / "launcher-move.version"
 
 # Records the package version the running worker was started with, so the watch
 # loop can tell when a `brew upgrade` left the worker on stale code.
@@ -3045,6 +3051,115 @@ def read_paused() -> dict | None:
         return None
 
 
+def set_notice(reason: str, detail: str = "") -> None:
+    """Record something a person has to act on, or clear it when reason is
+    empty. Rewritten only when the reason changes, so `since` stays the moment
+    it started."""
+    try:
+        if not reason:
+            NOTICE_FILE.unlink(missing_ok=True)
+            return
+        current = read_notice()
+        if current and current.get("reason") == reason:
+            return
+        NOTICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        NOTICE_FILE.write_text(
+            json.dumps(
+                {
+                    "reason": reason,
+                    "detail": detail,
+                    "since": time.time(),
+                    # Named here because only the service knows what macOS
+                    # sees it as; status, the menu bar and the dashboard do not
+                    # run under it.
+                    "who": service_identity(),
+                }
+            )
+        )
+    except OSError:
+        pass  # a status nicety; never worth failing the loop over
+
+
+def read_notice() -> dict | None:
+    try:
+        return json.loads(NOTICE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def clear_notice(reason: str) -> None:
+    """Clear the notice only if it is this one, so fixing one problem does not
+    hide another."""
+    current = read_notice()
+    if current and current.get("reason") == reason:
+        set_notice("")
+
+
+# What status says for each notice, as (what is wrong, what to do). The menu
+# bar (MenuView.swift) and the dashboard say the same in their own words.
+NOTICE_TEXT = {
+    "media-permission": (
+        "macOS is waiting for permission to read the library",
+        'Click Allow on the prompt on this Mac\'s screen, or turn on "{who}" in '
+        "System Settings > Privacy & Security > Files & Folders.",
+    ),
+    "local-network": (
+        "macOS is blocking the connection to the database",
+        'Turn on "{who}" in System Settings > Privacy & Security > Local Network.',
+    ),
+}
+
+
+# What macOS calls the service in its prompts and in System Settings. Under the
+# signed launcher that is the launcher; run any other way, it is whichever
+# program launchd started, which for the CLI is Python.
+def service_identity() -> str:
+    if os.environ.get("IMMICH_ACCELERATOR_LAUNCHER"):
+        return "Immich Accelerator Service"
+    return "Python"
+
+
+def mount_answers(root: str, timeout: float = 3) -> bool:
+    """Does the filesystem under `root` answer a statfs() promptly?
+
+    This is what tells a permission prompt from a stuck server. While macOS
+    waits for someone to allow network-volume access, opening or listing
+    anything on the mount blocks, but statfs() returns at once (measured on
+    the release Mac). A server that has stopped answering blocks both. Run in
+    a child for the same reason as the marker probe: an NFS hang is
+    uninterruptible.
+    """
+    try:
+        return (
+            subprocess.run(
+                [sys.executable, "-c", "import os,sys; os.statvfs(sys.argv[1])", root],
+                capture_output=True,
+                timeout=timeout,
+            ).returncode
+            == 0
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def waiting_on_macos(root: str, probe_detail: str) -> bool:
+    """A marker read that timed out on a mount that still answers statfs():
+    macOS is holding the read for a permission, not the NAS."""
+    return probe_detail.startswith("probe timed out") and mount_answers(root)
+
+
+def media_permission_hint(root: str) -> list[str]:
+    who = service_identity()
+    return [
+        f"Reads of {root} are blocked, but the mount itself answers, so macOS is "
+        f"most likely waiting for someone to allow \"{who}\" to access files on "
+        "a network volume.",
+        "  Click Allow on that prompt on this Mac's screen, or turn it on in "
+        "System Settings > Privacy & Security > Files & Folders. Work picks up "
+        "on its own once it is allowed.",
+    ]
+
+
 def _mount_covers(point: str, root: str) -> bool:
     """Is `point` the mount that would provide `root`: the path itself, or an
     ancestor of it?"""
@@ -3208,6 +3323,7 @@ def ensure_media_ready(config: dict) -> bool:
     if media_id:
         ok, dangling, detail = _media_probe("verify", media_root, media_id)
         if ok:
+            clear_notice("media-permission")
             return True
         if dangling:
             _report_dangling(dangling)
@@ -3233,11 +3349,16 @@ def ensure_media_ready(config: dict) -> bool:
                 detail or "no detail",
                 point,
             )
-            log.warning(
-                "  If this keeps happening, give the accelerator Full Disk "
-                "Access in System Settings > Privacy & Security: a background "
-                "service reading a network volume can block without it."
-            )
+            if waiting_on_macos(media_root, detail):
+                for line in media_permission_hint(media_root):
+                    log.warning(line)
+                set_notice("media-permission", media_root)
+            else:
+                log.warning(
+                    "  If this keeps happening, give the accelerator Full Disk "
+                    "Access in System Settings > Privacy & Security: a background "
+                    "service reading a network volume can block without it."
+                )
             return True
 
         log.error(
@@ -6713,6 +6834,12 @@ def cmd_status(_args):
         )
         log.warning("            It starts again on its own when the mount is back.")
 
+    notice = read_notice()
+    if notice and notice.get("reason") in NOTICE_TEXT:
+        title, action = NOTICE_TEXT[notice["reason"]]
+        log.warning("Attention:  %s", title)
+        log.warning("            %s", action.format(who=notice.get("who") or "Python"))
+
     if not worker_pid and not ml_pid:
         # "Disabled" and "stopped" are different facts, and a user who turned a
         # component off should never be told their install is broken.
@@ -7015,6 +7142,7 @@ def cmd_watch(_args):
     """
     global _SUPERVISING_ML
     _SUPERVISING_ML = True
+    _move_onto_launcher()
     while True:
         config = load_config()
         if _component_enabled("worker", config):
@@ -7027,6 +7155,77 @@ def cmd_watch(_args):
 
 # Returned by a watch loop that wants cmd_watch to re-dispatch to the other one.
 _SWITCH = "switch"
+
+
+# The brew service's label, as launchd hands it to the job.
+_BREW_SERVICE_LABELS = ("sh.brew.immich-accelerator", "homebrew.mxcl.immich-accelerator")
+LAUNCHER_APP = "Immich Accelerator Service.app"
+
+
+def _move_onto_launcher(wait: float = 60) -> None:
+    """Put an existing install's service onto the signed launcher.
+
+    `brew upgrade` installs the launcher but leaves the service's launchd plist
+    as it was, still starting this CLI directly, and only `brew services
+    restart` rewrites it. So when the brew service starts us without the
+    launcher above us and the launcher is installed, ask brew to restart the
+    service, which brings it back under the launcher.
+
+    The restart runs in its own session: launchd tears down this job's process
+    group when brew stops it, and the restart must outlive that. Then wait to be
+    stopped instead of starting anything. Tried once per installed version; if
+    it does not take, carry on as before and say how to finish it by hand.
+    """
+    if os.environ.get("IMMICH_ACCELERATOR_LAUNCHER"):
+        return
+    if os.environ.get("XPC_SERVICE_NAME") not in _BREW_SERVICE_LABELS:
+        return
+    if not (_opt_dir() / "libexec" / LAUNCHER_APP).is_dir():
+        return
+    version = _installed_version()
+    try:
+        tried = LAUNCHER_MOVE_FILE.read_text().strip()
+    except OSError:
+        tried = ""
+    if tried == version:
+        log.warning(
+            "The service still runs without %s, so macOS may ask again for "
+            "network-volume access after the next Homebrew Python update. To "
+            "finish the move: brew services restart immich-accelerator",
+            LAUNCHER_APP,
+        )
+        return
+    try:
+        LAUNCHER_MOVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LAUNCHER_MOVE_FILE.write_text(version)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "launcher-move.log", "a") as out:
+            subprocess.Popen(
+                [
+                    str(Path(_brew_prefix()) / "bin" / "brew"),
+                    "services",
+                    "restart",
+                    "immich-accelerator",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=out,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        log.warning("Could not restart the service onto %s: %s", LAUNCHER_APP, exc)
+        return
+    log.info(
+        "Restarting the service under %s, so macOS remembers its permissions "
+        "across updates.",
+        LAUNCHER_APP,
+    )
+    time.sleep(wait)
+    log.warning(
+        "The service was not restarted within %ds (see %s). Carrying on as before.",
+        int(wait),
+        LOG_DIR / "launcher-move.log",
+    )
 
 
 def _attempt_remount(config: dict, state: dict) -> None:
@@ -7188,6 +7387,7 @@ def _watch_worker(config: dict) -> str | None:
     # This loop's state starts clean, so any marker from a previous run is
     # stale and would make status report a pause that is not happening.
     set_paused("")
+    set_notice("")
 
     # A detached worker survives `brew services restart`, so a freshly-launched
     # watch (new code) would otherwise adopt a worker still running the OLD code
@@ -7297,6 +7497,7 @@ def _watch_worker(config: dict) -> str | None:
                         int(MEDIA_UNREACHABLE_GRACE),
                     )
                     if local_network_refused(config):
+                        set_notice("local-network", config.get("db_hostname") or "")
                         log.warning(
                             "  The connection was refused instantly, which is how "
                             "macOS blocks a service it has not given Local Network "
@@ -7318,6 +7519,7 @@ def _watch_worker(config: dict) -> str | None:
                     continue
             elif backend_down_since is not None:
                 backend_down_since = None
+                clear_notice("local-network")
                 if backend_paused:
                     backend_paused = False
                     if media_paused:
@@ -7406,11 +7608,27 @@ def _watch_worker(config: dict) -> str | None:
                 # minutes, which is often enough for something nobody acts on
                 # automatically. Skipped entirely when no worker is running,
                 # because then nothing is reading the library anyway.
+                #
+                # Except while macOS is waiting on a permission: then someone is
+                # about to click Allow, and the notice saying so should go away
+                # within a cycle of that, not five minutes later.
                 media_io_countdown -= 1
                 healthy, detail = True, ""
-                if read_pid("worker") and media_io_countdown <= 0:
+                awaiting = (read_notice() or {}).get("reason") == "media-permission"
+                if read_pid("worker") and (media_io_countdown <= 0 or awaiting):
                     media_io_countdown = MEDIA_IO_EVERY
                     healthy, detail = media_io_healthy(config)
+                    root = config.get("upload_mount") or ""
+                    if healthy:
+                        if awaiting:
+                            log.info("The library at %s reads again.", root)
+                        clear_notice("media-permission")
+                    elif waiting_on_macos(root, detail):
+                        if not awaiting:
+                            for line in media_permission_hint(root):
+                                log.warning(line)
+                        set_notice("media-permission", root)
+                        detail = ""  # said above, in the words that apply
                 if not healthy and detail and detail not in shown_media_warnings:
                     shown_media_warnings.add(detail)
                     log.warning(
