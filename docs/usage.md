@@ -54,6 +54,23 @@ This uses the formula's own service definition, survives `brew upgrade`, and res
 
 Either way the service uses `watch` mode with `KeepAlive`. Confirm everything is healthy with `immich-accelerator status` and `immich-accelerator ml-test`.
 
+### macOS permissions
+
+macOS asks before a background service can read files on a network volume (your NAS) or connect to other machines on your network (a database on the NAS). Until someone answers, the service waits: on a NAS library that means the worker runs but gets no work done. The prompt appears once, on the Mac's own screen, from **Immich Accelerator Service**. Click Allow. If you missed it, turn it on in System Settings > Privacy & Security > Files & Folders (or Local Network).
+
+macOS asks on behalf of the program launchd started, and everything that program runs inherits the answer: Python, Node, ffmpeg, libvips, exiftool and the ML engine all read your library under it. Homebrew installs since 1.18.0 start a small launcher, `Immich Accelerator Service.app`, signed with the project's Developer ID. macOS remembers an Allow by that signature, so it carries over to every later update of the accelerator and of Homebrew's Python and Node. Before 1.18.0 the service ran Homebrew's Python directly, which is not signed by anyone macOS can track, so each Python update could bring the prompt back unseen.
+
+While the service is waiting on a prompt, `immich-accelerator status`, the menu bar app and the dashboard say so and name the setting. The menu bar icon turns amber.
+
+| Program | Signed | Needs its own permission |
+|---|---|---|
+| Immich Accelerator Service (launcher) | Developer ID | yes, the one you allow |
+| Python, Node, ffmpeg, libvips, exiftool, ML engine | ad hoc or Apple | no, covered by the launcher |
+| Menu bar app | Developer ID, notarized | no, it does not read the library |
+| `immich-accelerator` in Terminal or over SSH | | no, Terminal and SSH carry their own |
+
+A git (non-Homebrew) install's LaunchAgent still runs Python directly, so it can be asked again after a Python update.
+
 ## Updates
 
 The accelerator handles Immich updates automatically:

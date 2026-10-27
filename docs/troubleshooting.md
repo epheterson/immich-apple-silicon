@@ -3,6 +3,17 @@
 The accelerator will tell you what's wrong. Click a symptom below for the fix.
 
 <details>
+<summary><b>The worker is running but nothing gets processed (library on a NAS)</b></summary>
+
+Symptom: often right after `brew upgrade`. Status shows the worker running, but thumbnails and other jobs sit queued, and the log says the library "did not read cleanly: probe timed out".
+
+Cause: macOS is waiting for someone to allow the service to read files on a network volume. The prompt is on the Mac's own screen, which on a headless Mac nobody sees, and every read of the library waits for it.
+
+Fix: click Allow on that prompt (Screen Sharing works), or turn the service on in System Settings > Privacy & Security > Files & Folders. Work resumes on its own. Since 1.18.0 `status`, the menu bar app and the dashboard say when this is happening, and the Homebrew service runs under a signed launcher that macOS remembers, so you are asked once rather than after every Python update. See [macOS permissions](usage.md#macos-permissions).
+
+</details>
+
+<details>
 <summary><b>Setup says "Upload: not detected"</b></summary>
 
 Symptom: `immich-accelerator setup` finds your Immich container but reports `Upload: not detected`.
