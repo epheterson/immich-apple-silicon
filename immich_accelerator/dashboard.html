@@ -88,6 +88,43 @@
   }
 
   /* Services */
+  /* Whether the whole library has everything, apart from what is running now.
+     The chip cards below are about the work; this is about the library. */
+  .coverage {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 24px;
+  }
+  .coverage-verdict {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 14px; font-weight: 600; color: var(--text);
+  }
+  .coverage-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-muted); flex: none; }
+  .coverage[data-state="complete"] .coverage-dot { background: var(--green); }
+  .coverage[data-state="catching-up"] .coverage-dot { background: var(--blue); }
+  .coverage[data-state="needs-queue"] .coverage-dot { background: var(--amber); }
+  .coverage-rows {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 12px;
+  }
+  .cov { min-width: 0; }
+  .cov-label { font-size: 12px; color: var(--text-dim); }
+  .cov-pct { font-size: 18px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .cov-bar { height: 4px; background: var(--card-border); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+  .cov-bar > div { height: 100%; background: var(--green); }
+  .cov[data-state="catching-up"] .cov-bar > div { background: var(--blue); }
+  .cov[data-state="needs-queue"] .cov-bar > div { background: var(--amber); }
+  .cov[data-state="policy"] .cov-bar > div { background: var(--text-muted); }
+  .cov-note { font-size: 11px; color: var(--text-muted); margin-top: 5px; font-variant-numeric: tabular-nums; }
+  .cov[data-state="needs-queue"] .cov-note { color: var(--amber); }
+  @media (max-width: 700px) {
+    .coverage-rows { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
   .services {
     display: flex;
     gap: 10px;
@@ -281,7 +318,7 @@
   </div>
 
   <div class="section" style="display:flex; justify-content:space-between; align-items:center;">
-    <span>Apple Silicon</span>
+    <span>Library</span>
     <button id="requeue-btn" style="
       background: var(--card); border: 1px solid var(--card-border);
       color: var(--text-dim); font-size: 11px; padding: 4px 12px;
@@ -291,6 +328,12 @@
        onmouseout="this.style.borderColor='var(--card-border)'; this.style.color='var(--text-dim)'"
     >Re-queue Missing ↻</button>
   </div>
+  <div class="coverage" id="coverage">
+    <div class="coverage-verdict"><span class="coverage-dot"></span><span id="coverage-text">Loading…</span></div>
+    <div class="coverage-rows" id="coverage-rows"></div>
+  </div>
+
+  <div class="section">Apple Silicon</div>
   <div class="chip-grid" id="chips">
     <div class="chip-card"><div class="chip-header cpu">CPU (NEON)</div><div class="task-row"><div class="task-top"><div class="task-label">Thumbnails</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill cpu" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
     <div class="chip-card"><div class="chip-header gpu">Metal GPU</div><div class="task-row"><div class="task-top"><div class="task-label">CLIP Embeddings</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill gpu" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
@@ -374,8 +417,70 @@ function etaStr(remaining, rate) {
   return (h / 24).toFixed(1) + 'd left';
 }
 
+// What each stage is called when talking about the library, not the hardware.
+const COVERAGE = [
+  ['thumbnails', 'Thumbnails'],
+  ['clip', 'Search'],
+  ['faces', 'Faces'],
+  ['ocr', 'Text'],
+  ['video', 'Video'],
+];
+
+// complete: nothing missing. catching-up: missing, and its queue is running.
+// needs-queue: missing and nothing is running it, so it stays missing until
+// someone presses Re-queue Missing. That last one is the state worth noticing,
+// and the one the job cards cannot show, since an idle queue looks the same
+// whether the library is done or forgotten.
+function coverageState(p, active) {
+  if (p.total - p.done <= 0) return 'complete';
+  return active ? 'catching-up' : 'needs-queue';
+}
+
+function renderCoverage(d) {
+  const rows = document.getElementById('coverage-rows');
+  rows.textContent = '';
+  let waiting = 0, forgotten = 0, worst = 'complete';
+  const rank = { 'complete': 0, 'catching-up': 1, 'needs-queue': 2 };
+  for (const [key, label] of COVERAGE) {
+    const p = d.progress[key];
+    if (!p || !p.total) continue;
+    const active = !!(d.queue_active && d.queue_active[key]);
+    let state = coverageState(p, active);
+    // Immich transcodes only the videos its policy selects, so an idle video
+    // queue with videos left is usually Immich's choice, not a gap. Shown,
+    // but kept out of the verdict.
+    if (key === 'video' && state === 'needs-queue') state = 'policy';
+    const missing = Math.max(p.total - p.done, 0);
+    if (state === 'catching-up') waiting = Math.max(waiting, missing);
+    if (state === 'needs-queue') forgotten = Math.max(forgotten, missing);
+    if (state in rank && rank[state] > rank[worst]) worst = state;
+
+    const cell = document.createElement('div');
+    cell.className = 'cov';
+    cell.dataset.state = state;
+    const l = document.createElement('div'); l.className = 'cov-label'; l.textContent = label;
+    const pc = document.createElement('div'); pc.className = 'cov-pct'; pc.textContent = p.pct + '%';
+    const bar = document.createElement('div'); bar.className = 'cov-bar';
+    const fill = document.createElement('div'); fill.style.width = p.pct + '%'; bar.appendChild(fill);
+    const note = document.createElement('div'); note.className = 'cov-note';
+    note.textContent = state === 'complete' ? 'all ' + n(p.total)
+      : state === 'policy' ? n(missing) + ' not transcoded, by Immich\'s policy'
+      : n(missing) + (state === 'catching-up' ? ' in progress' : ' missing, not queued');
+    cell.append(l, pc, bar, note);
+    rows.appendChild(cell);
+  }
+  document.getElementById('coverage').dataset.state = worst;
+  const parts = [];
+  if (forgotten) parts.push(n(forgotten) + ' items are missing work and nothing is running it. '
+    + 'Re-queue Missing queues it; files that cannot be read stay missing.');
+  if (waiting) parts.push('Catching up on ' + n(waiting) + ' more.');
+  document.getElementById('coverage-text').textContent =
+    parts.length ? parts.join(' ') : 'Every photo and video has everything';
+}
+
 function render(d) {
   calcRates(d.progress);
+  renderCoverage(d);
 
   // Versions
   document.getElementById('ver').textContent = 'v' + d.version;

@@ -653,3 +653,39 @@ class TestDashboardHtmlDoneLabel:
             "in dashboard.html's rateText chain, or a still-active queue "
             "renders as 'done' whenever the DB-derived ratio is already ~100%"
         )
+
+
+class TestLibraryCoverage:
+    """Whether the library has everything, apart from what is running now.
+    An idle queue looks the same whether the library is done or forgotten,
+    which is how 40,162 photos sat without search, faces or text for months
+    behind job cards that said "idle"."""
+
+    def _html(self):
+        import immich_accelerator.dashboard as d
+
+        return (Path(d.__file__).parent / "dashboard.html").read_text()
+
+    def test_the_card_sits_apart_from_the_job_cards_with_the_requeue_button(self):
+        html = self._html()
+        body = html[html.index("<body>") :]
+        assert body.index('id="coverage"') < body.index('id="chips"')
+        library = body[body.index("<span>Library</span>") : body.index('id="coverage"')]
+        assert 'id="requeue-btn"' in library
+
+    def test_missing_work_nothing_runs_is_its_own_state(self):
+        html = self._html()
+        fn = html[html.index("function coverageState") :]
+        fn = fn[: fn.index("\n}\n")]
+        assert "'complete'" in fn and "'catching-up'" in fn and "'needs-queue'" in fn
+
+    def test_videos_immich_chose_not_to_transcode_do_not_raise_the_alarm(self):
+        html = self._html()
+        render = html[html.index("function renderCoverage") :]
+        assert "key === 'video' && state === 'needs-queue'" in render
+        assert "state in rank" in render
+
+    def test_drawn_as_text(self):
+        html = self._html()
+        render = html[html.index("function renderCoverage") : html.index("function render(d)")]
+        assert "innerHTML" not in render
