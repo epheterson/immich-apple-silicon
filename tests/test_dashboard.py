@@ -679,11 +679,12 @@ class TestLibraryCoverage:
         fn = fn[: fn.index("\n}\n")]
         assert "'complete'" in fn and "'catching-up'" in fn and "'needs-queue'" in fn
 
-    def test_videos_immich_chose_not_to_transcode_do_not_raise_the_alarm(self):
+    def test_video_stays_with_the_job_cards(self):
+        """Immich transcodes only the videos its policy picks, so a video gap
+        is usually not a gap. It read as one here, so it is left out."""
         html = self._html()
-        render = html[html.index("function renderCoverage") :]
-        assert "key === 'video' && state === 'needs-queue'" in render
-        assert "state in rank" in render
+        table = html[html.index("const COVERAGE") : html.index("];", html.index("const COVERAGE"))]
+        assert "'video'" not in table
 
     def test_drawn_as_text(self):
         html = self._html()

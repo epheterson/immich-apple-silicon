@@ -107,7 +107,7 @@
   .coverage[data-state="needs-queue"] .coverage-dot { background: var(--amber); }
   .coverage-rows {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 12px;
     margin-top: 12px;
   }
@@ -118,7 +118,6 @@
   .cov-bar > div { height: 100%; background: var(--green); }
   .cov[data-state="catching-up"] .cov-bar > div { background: var(--blue); }
   .cov[data-state="needs-queue"] .cov-bar > div { background: var(--amber); }
-  .cov[data-state="policy"] .cov-bar > div { background: var(--text-muted); }
   .cov-note { font-size: 11px; color: var(--text-muted); margin-top: 5px; font-variant-numeric: tabular-nums; }
   .cov[data-state="needs-queue"] .cov-note { color: var(--amber); }
   @media (max-width: 700px) {
@@ -326,7 +325,7 @@
       transition: all 0.15s;
     " onmouseover="this.style.borderColor='var(--accent)'; this.style.color='var(--text)'"
        onmouseout="this.style.borderColor='var(--card-border)'; this.style.color='var(--text-dim)'"
-    >Re-queue Missing ↻</button>
+    >Re-queue Missing</button>
   </div>
   <div class="coverage" id="coverage">
     <div class="coverage-verdict"><span class="coverage-dot"></span><span id="coverage-text">Loading…</span></div>
@@ -423,7 +422,6 @@ const COVERAGE = [
   ['clip', 'Search'],
   ['faces', 'Faces'],
   ['ocr', 'Text'],
-  ['video', 'Video'],
 ];
 
 // complete: nothing missing. catching-up: missing, and its queue is running.
@@ -445,15 +443,11 @@ function renderCoverage(d) {
     const p = d.progress[key];
     if (!p || !p.total) continue;
     const active = !!(d.queue_active && d.queue_active[key]);
-    let state = coverageState(p, active);
-    // Immich transcodes only the videos its policy selects, so an idle video
-    // queue with videos left is usually Immich's choice, not a gap. Shown,
-    // but kept out of the verdict.
-    if (key === 'video' && state === 'needs-queue') state = 'policy';
+    const state = coverageState(p, active);
     const missing = Math.max(p.total - p.done, 0);
     if (state === 'catching-up') waiting = Math.max(waiting, missing);
     if (state === 'needs-queue') forgotten = Math.max(forgotten, missing);
-    if (state in rank && rank[state] > rank[worst]) worst = state;
+    if (rank[state] > rank[worst]) worst = state;
 
     const cell = document.createElement('div');
     cell.className = 'cov';
@@ -464,18 +458,16 @@ function renderCoverage(d) {
     const fill = document.createElement('div'); fill.style.width = p.pct + '%'; bar.appendChild(fill);
     const note = document.createElement('div'); note.className = 'cov-note';
     note.textContent = state === 'complete' ? 'all ' + n(p.total)
-      : state === 'policy' ? n(missing) + ' not transcoded, by Immich\'s policy'
       : n(missing) + (state === 'catching-up' ? ' in progress' : ' missing, not queued');
     cell.append(l, pc, bar, note);
     rows.appendChild(cell);
   }
   document.getElementById('coverage').dataset.state = worst;
   const parts = [];
-  if (forgotten) parts.push(n(forgotten) + ' items are missing work and nothing is running it. '
-    + 'Re-queue Missing queues it; files that cannot be read stay missing.');
-  if (waiting) parts.push('Catching up on ' + n(waiting) + ' more.');
+  if (waiting) parts.push('Processing ' + n(waiting) + ' items');
+  if (forgotten) parts.push(waiting ? n(forgotten) + ' not queued' : n(forgotten) + ' items not processed');
   document.getElementById('coverage-text').textContent =
-    parts.length ? parts.join(' ') : 'Every photo and video has everything';
+    parts.length ? parts.join(' · ') : 'Processing complete';
 }
 
 function render(d) {
@@ -641,10 +633,10 @@ document.getElementById('requeue-btn').addEventListener('click', async function(
     const r = await fetch('/api/requeue', { method: 'POST' });
     const d = await r.json();
     btn.textContent = 'Queued ✓';
-    setTimeout(() => { btn.textContent = 'Re-queue Missing ↻'; btn.disabled = false; }, 3000);
+    setTimeout(() => { btn.textContent = 'Re-queue Missing'; btn.disabled = false; }, 3000);
   } catch(e) {
     btn.textContent = 'Failed';
-    setTimeout(() => { btn.textContent = 'Re-queue Missing ↻'; btn.disabled = false; }, 3000);
+    setTimeout(() => { btn.textContent = 'Re-queue Missing'; btn.disabled = false; }, 3000);
   }
 });
 
