@@ -525,7 +525,9 @@ def create_app(config: dict):
     async def api_auto_requeue(request):
         """Switch the watcher's daily re-queue of missing work on or off."""
         try:
-            enabled = bool((await request.json())["enabled"])
+            enabled = (await request.json())["enabled"]
+            if not isinstance(enabled, bool):
+                raise ValueError("enabled must be true or false")
         except Exception:
             return JSONResponse({"error": "expected {\"enabled\": true|false}"}, status_code=400)
         try:

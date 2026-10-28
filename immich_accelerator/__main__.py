@@ -7247,7 +7247,7 @@ def _move_onto_launcher(wait: float = 60) -> None:
         LAUNCHER_MOVE_FILE.write_text(version)
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         with open(LOG_DIR / "launcher-move.log", "a") as out:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 [
                     str(Path(_brew_prefix()) / "bin" / "brew"),
                     "services",
@@ -7267,7 +7267,24 @@ def _move_onto_launcher(wait: float = 60) -> None:
         "across updates.",
         LAUNCHER_APP,
     )
-    time.sleep(wait)
+    # A restart that worked stops this process from outside, somewhere inside
+    # this wait. One that failed says so by exiting nonzero: no point waiting
+    # out the rest of the minute for a stop that is not coming.
+    deadline = time.monotonic() + wait
+    try:
+        rc = proc.wait(timeout=wait)
+    except subprocess.TimeoutExpired:
+        rc = None
+    if rc:
+        log.warning(
+            "Could not restart the service onto %s (brew exited %d, see %s). "
+            "Carrying on as before.",
+            LAUNCHER_APP,
+            rc,
+            LOG_DIR / "launcher-move.log",
+        )
+        return
+    time.sleep(max(0.0, deadline - time.monotonic()))
     log.warning(
         "The service was not restarted within %ds (see %s). Carrying on as before.",
         int(wait),

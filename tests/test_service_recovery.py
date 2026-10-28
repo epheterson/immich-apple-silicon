@@ -2333,7 +2333,10 @@ class TestTheServiceMovesOntoTheLauncher:
     the CLI directly; only `brew services restart` rewrites it."""
 
     def _run(self, tmp_path, monkeypatch, *, label="sh.brew.immich-accelerator",
-             launcher=True, under=False, tried=None):
+             launcher=True, under=False, tried=None, brew_rc=0):
+        proc = MagicMock()
+        proc.wait.return_value = brew_rc
+        popen_kw = {"return_value": proc}
         opt = tmp_path / "opt"
         (opt / "libexec").mkdir(parents=True)
         if launcher:
@@ -2351,7 +2354,7 @@ class TestTheServiceMovesOntoTheLauncher:
         with patch.object(m, "_opt_dir", return_value=opt), \
              patch.object(m, "_installed_version", return_value="1.18.0"), \
              patch.object(m, "_brew_prefix", return_value="/opt/homebrew"), \
-             patch.object(m.subprocess, "Popen") as popen, \
+             patch.object(m.subprocess, "Popen", **popen_kw) as popen, \
              patch.object(m.time, "sleep") as sleep, \
              patch.object(m, "log"):
             m._move_onto_launcher()
@@ -2365,6 +2368,11 @@ class TestTheServiceMovesOntoTheLauncher:
         # Waits to be stopped rather than starting a worker brew is about to kill.
         sleep.assert_called_once()
         assert m.LAUNCHER_MOVE_FILE.read_text() == "1.18.0"
+
+    def test_a_failed_restart_does_not_wait_out_the_minute(self, tmp_path, monkeypatch, tmp_data_dir):
+        popen, sleep = self._run(tmp_path, monkeypatch, brew_rc=1)
+        popen.assert_called_once()
+        sleep.assert_not_called()
 
     def test_not_tried_twice_for_the_same_version(self, tmp_path, monkeypatch, tmp_data_dir):
         popen, _ = self._run(tmp_path, monkeypatch, tried="1.18.0")

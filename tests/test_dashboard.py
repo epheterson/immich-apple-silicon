@@ -803,8 +803,10 @@ class TestAutoRequeueSwitch:
         from fastapi.testclient import TestClient
 
         tmp_data_dir["config_file"].write_text(json.dumps(sample_config))
-        r = TestClient(create_app(sample_config)).post("/api/auto-requeue", json={})
-        assert r.status_code == 400
+        client = TestClient(create_app(sample_config))
+        for body in ({}, {"enabled": "false"}, {"enabled": 0}, {"enabled": None}):
+            assert client.post("/api/auto-requeue", json=body).status_code == 400, body
+        assert not (tmp_data_dir["data_dir"] / "auto-requeue.off").exists()
 
     def test_the_page_puts_it_beside_the_button(self):
         import immich_accelerator.dashboard as d
