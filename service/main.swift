@@ -6,8 +6,9 @@
 // that process was Homebrew's Python, ad-hoc signed and replaced on every
 // `brew upgrade`, each upgrade was a stranger to macOS: a new prompt on a
 // screen nobody was watching, and every NAS read in the service blocked on it.
-// This bundle is Developer ID signed under a fixed identifier, so the Allow a
-// person gives it once survives our updates, Python's and Node's.
+// This bundle is signed with the project's own certificate under a fixed
+// identifier, so the Allow a person gives it once survives our updates,
+// Python's and Node's.
 //
 // It takes no arguments and only ever runs the accelerator next to it, so a
 // signed program holding that permission is not a way to run anything else

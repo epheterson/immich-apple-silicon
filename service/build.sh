@@ -3,8 +3,8 @@
 # (see main.swift for why it exists), and package it as a release asset that
 # the formula installs into libexec.
 #
-# Signing follows menubar/scripts/build_app.sh: MACOS_SIGN_ID set to a
-# Developer ID identity gives hardened runtime and a secure timestamp; unset is
+# Signed with the project's own certificate in a release (MACOS_SIGN_ID, a
+# SHA-1 or name, and MACOS_SIGN_KEYCHAIN, see update-homebrew.yml); unset is
 # ad-hoc, which runs fine but loses the point, since macOS then forgets the
 # user's Allow on every rebuild.
 #
@@ -21,7 +21,12 @@ TARBALL="$PWD/immich-accelerator-service-${VERSION}.tar.gz"
 SIGN_ID="${MACOS_SIGN_ID:--}"
 sign_flags=(--force --sign "$SIGN_ID")
 if [ "$SIGN_ID" != "-" ]; then
-    sign_flags+=(--options runtime --timestamp)
+    # No --timestamp: Apple's timestamp service only countersigns its own
+    # certificates, and nothing here is notarized.
+    sign_flags+=(--options runtime)
+fi
+if [ -n "${MACOS_SIGN_KEYCHAIN:-}" ]; then
+    sign_flags+=(--keychain "$MACOS_SIGN_KEYCHAIN")
 fi
 
 # One top-level folder around the bundle: Homebrew steps into a lone folder

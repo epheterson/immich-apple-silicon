@@ -108,26 +108,47 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
-      # The program the brew service runs (service/main.swift), signed with the
-      # same Developer ID as the menu-bar app. That signature is what lets macOS
-      # keep a user's network-volume Allow across updates, so unlike the menu-bar
-      # app this is not best-effort: the formula's service points at it.
+      # The program the brew service runs (service/main.swift). Signed with the
+      # project's own certificate, not the Developer ID: macOS keeps a user's
+      # network-volume Allow by that certificate across updates, and Homebrew
+      # does not quarantine, so Gatekeeper never asks for Apple's. Not
+      # best-effort like the menu-bar app: the formula's service points at it.
+      #
+      # The fingerprint is pinned. A different certificate would still sign,
+      # and would quietly cost every user another prompt nobody sees.
       - name: Build + upload service launcher asset
         id: service
         env:
           TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          SERVICE_SIGNING_P12_BASE64: ${{ secrets.SERVICE_SIGNING_P12_BASE64 }}
+          SERVICE_SIGNING_P12_PASSWORD: ${{ secrets.SERVICE_SIGNING_P12_PASSWORD }}
+          SERVICE_SIGNING_SHA1: CE2FC5A27427FE9BEB9AE65E1C45147D128D96C2
         run: |
           VERSION="${TAG#v}"
-          # Ad-hoc would change the launcher's identity every release, which is
-          # the prompt-on-every-upgrade bug it exists to fix. Refuse instead.
-          if [ -z "${KEYCHAIN_PATH:-}" ]; then
-            echo "No signing keychain: the service launcher must be Developer ID signed"; exit 1
+          if [ -z "$SERVICE_SIGNING_P12_BASE64" ]; then
+            echo "No SERVICE_SIGNING_P12_BASE64: the service launcher must be signed with the project certificate"; exit 1
           fi
-          MACOS_SIGN_ID="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
-            | grep 'Developer ID Application' | head -1 | sed 's/.*"\(.*\)"/\1/')"
-          export MACOS_SIGN_ID
+          SK="$RUNNER_TEMP/service-signing.keychain-db"
+          SK_PASSWORD="$(openssl rand -hex 12)"
+          security create-keychain -p "$SK_PASSWORD" "$SK"
+          security set-keychain-settings -lut 21600 "$SK"
+          security unlock-keychain -p "$SK_PASSWORD" "$SK"
+          echo "$SERVICE_SIGNING_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/service-signing.p12"
+          security import "$RUNNER_TEMP/service-signing.p12" -P "$SERVICE_SIGNING_P12_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$SK"
+          security set-key-partition-list -S apple-tool:,apple: -k "$SK_PASSWORD" "$SK"
+          # Keep the menu-bar keychain on the search list beside this one.
+          security list-keychains -d user -s "$SK" $(security list-keychains -d user | tr -d '"')
+          # codesign only uses an identity the runner trusts. A throwaway VM;
+          # nothing on users' Macs is asked to trust it.
+          security find-certificate -c "Immich Accelerator" -p "$SK" > "$RUNNER_TEMP/service-signing.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$RUNNER_TEMP/service-signing.pem"
+          security find-identity -v -p codesigning "$SK" | grep -q "$SERVICE_SIGNING_SHA1" \
+            || { echo "The service signing certificate is not the pinned one"; exit 1; }
+          export MACOS_SIGN_ID="$SERVICE_SIGNING_SHA1" MACOS_SIGN_KEYCHAIN="$SK"
           bash service/build.sh "$VERSION"
           TARBALL="service/immich-accelerator-service-${VERSION}.tar.gz"
           echo "sha256=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"

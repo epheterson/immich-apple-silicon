@@ -1409,14 +1409,17 @@ class TestNodeVersionPreflight:
         assert "immich-accelerator-service-${VERSION}.tar.gz" in render
         # Never conditional: migrated installs have a plist naming the launcher.
         assert 'if [ -n "$SERVICE_SHA" ]' not in render
-        # And never ad-hoc: that would change its identity every release.
-        assert "must be Developer ID signed" in step and "exit 1" in step
+        # And never ad-hoc, and never another certificate: either would change
+        # its identity and cost every user a prompt nobody sees.
+        assert "must be signed with the project certificate" in step and "exit 1" in step
+        assert "SERVICE_SIGNING_SHA1: CE2FC5A27427FE9BEB9AE65E1C45147D128D96C2" in step
+        assert "is not the pinned one" in step
         build = (REPO_ROOT / "service" / "build.sh").read_text()
         assert 'immich-accelerator-service-${VERSION}.tar.gz' in build
 
     def test_launcher_stays_the_parent_and_runs_only_the_accelerator(self):
         """exec would hand the process over to Python, which is exactly the
-        identity macOS keeps forgetting. And a Developer ID signed program that
+        identity macOS keeps forgetting. And a signed program that
         runs whatever it is given would lend its permission to anything."""
         src = (REPO_ROOT / "service" / "main.swift").read_text()
         code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("//"))
