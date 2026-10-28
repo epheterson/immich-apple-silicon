@@ -123,11 +123,10 @@ jobs:
     # it reaches users. The slow marker enables the venv+pip
     # integration test that builds a pristine fastapi+uvicorn env.
     #
-    # EMERGENCY OVERRIDE: if macos-14 runners become flaky and this
-    # blocks a release, trigger `update-homebrew.yml` manually via
-    # `gh workflow run update-homebrew.yml -f tag=vX.Y.Z` — that
-    # workflow bypasses CI entirely.
-    runs-on: macos-14
+    # macos-15, like every other Mac job here: in October 2026 macos-14
+    # jobs sat queued with no runner until GitHub cancelled them, three
+    # times running on one PR.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
