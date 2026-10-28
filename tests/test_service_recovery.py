@@ -2419,7 +2419,14 @@ class TestTheWatcherQueuesMissingWorkDaily:
         assert not m.AUTO_REQUEUE_FILE.exists(), "a skipped day must be retried"
 
     def test_switched_off_means_off(self, tmp_data_dir):
-        assert not self._run(cfg={**self.CFG, "auto_requeue": False}).called
+        (tmp_data_dir["data_dir"] / "auto-requeue.off").touch()
+        assert not self._run().called
+
+    def test_a_local_install_asks_the_immich_on_this_mac(self, tmp_data_dir):
+        """Local setup records no immich_url. Skipping on that left the switch
+        saying On while nothing ever ran."""
+        rq = self._run(cfg={"api_key": "k"})
+        rq.assert_called_once_with("http://127.0.0.1:2283", "k")
 
     def test_not_without_a_worker_to_do_it(self, tmp_data_dir):
         assert not self._run(worker=None).called

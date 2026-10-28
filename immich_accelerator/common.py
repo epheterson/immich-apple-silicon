@@ -188,7 +188,7 @@ MISSING_QUEUES = (
 )
 
 # How often the watcher queues missing work on its own, when it is switched on
-# (auto_requeue in config.json). Daily: a gap that formed overnight is closed
+# (the dashboard's Auto switch). Daily: a gap that formed overnight is closed
 # by the next evening, and an idle Immich asked once a day costs nothing.
 AUTO_REQUEUE_EVERY = 24 * 3600
 
@@ -235,16 +235,22 @@ def requeue_missing(url: str, api_key: str) -> dict:
     return results
 
 
-def set_config_value(config_file: Path, key: str, value) -> dict:
-    """Change one key in config.json and write it back the way save_config
-    does: whole file, atomically, owner-only (it holds the database password).
-    Returns the config as written."""
-    config = json.loads(config_file.read_text())
-    config[key] = value
-    tmp = config_file.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")
-    os.chmod(tmp, 0o600)
-    tmp.rename(config_file)
-    return config
+# Auto re-queue is on unless this file exists. A file of its own, not a key in
+# config.json: the watcher rewrites config.json from a copy it read at the top
+# of a cycle that can last minutes (following an Immich upgrade downloads a
+# server), so a switch flipped from the dashboard in that window was silently
+# put back.
+AUTO_REQUEUE_OFF = "auto-requeue.off"
+
+
+def auto_requeue_enabled(data_dir: Path) -> bool:
+    return not (data_dir / AUTO_REQUEUE_OFF).exists()
+
+
+def set_auto_requeue(data_dir: Path, enabled: bool) -> None:
+    marker = data_dir / AUTO_REQUEUE_OFF
+    if enabled:
+        marker.unlink(missing_ok=True)
+    else:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        marker.touch()

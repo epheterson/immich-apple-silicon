@@ -27,7 +27,8 @@ from .common import (
     component_enabled,
     requeue_missing,
     run_output,
-    set_config_value,
+    auto_requeue_enabled,
+    set_auto_requeue,
 )
 from pathlib import Path
 
@@ -462,7 +463,7 @@ def get_status(config: dict) -> dict:
         "jobs_api_error": jobs_api_error,
         # Beside CONFIG_FILE, so the tests' fixture redirects it with the rest.
         "attention": attention(CONFIG_FILE.parent),
-        "auto_requeue": bool(config.get("auto_requeue", True)),
+        "auto_requeue": auto_requeue_enabled(CONFIG_FILE.parent),
     }
 
     _cache = status
@@ -528,7 +529,7 @@ def create_app(config: dict):
         except Exception:
             return JSONResponse({"error": "expected {\"enabled\": true|false}"}, status_code=400)
         try:
-            set_config_value(CONFIG_FILE, "auto_requeue", enabled)
+            set_auto_requeue(CONFIG_FILE.parent, enabled)
         except OSError as e:
             log.warning("could not save auto_requeue: %s", e)
             return JSONResponse({"error": "could not save the setting"}, status_code=500)

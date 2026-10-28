@@ -32,6 +32,7 @@ from pathlib import Path
 
 from .common import (
     AUTO_REQUEUE_EVERY,
+    auto_requeue_enabled,
     COMPONENTS,
     DEFAULT_TIMEOUT,
     NOTICE_TEXT,
@@ -7166,14 +7167,17 @@ def _auto_requeue(config: dict, now: float | None = None) -> None:
     queues only what is missing, so on a complete library this does nothing.
 
     Only while every queue is idle, so it never lands on top of real work,
-    and not at all when Immich cannot be asked. On by default; the dashboard
-    switches it (auto_requeue in config.json).
+    and not at all when Immich cannot be asked. A queue someone paused with
+    jobs waiting counts as busy, which leaves it alone, as it should. On by
+    default; the dashboard's Auto switch turns it off (auto-requeue.off).
     """
-    if not config.get("auto_requeue", True):
+    if not auto_requeue_enabled(DATA_DIR):
         return
     api_key = config.get("api_key") or ""
-    url = config.get("immich_url") or ""
-    if not api_key or not url or not read_pid("worker"):
+    # A local install records no immich_url: Immich is on this Mac. 127.0.0.1,
+    # not localhost, for the reason given in _setup_local.
+    url = config.get("immich_url") or "http://127.0.0.1:2283"
+    if not api_key or not read_pid("worker"):
         return
     now = time.time() if now is None else now
     try:

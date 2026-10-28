@@ -785,17 +785,19 @@ class TestLibraryCoverage:
 
 
 class TestAutoRequeueSwitch:
-    def test_the_switch_writes_config_and_status_reports_it(self, tmp_data_dir, sample_config):
+    def test_the_switch_is_saved_apart_from_config_and_status_reports_it(self, tmp_data_dir, sample_config):
+        """Not in config.json: the watcher rewrites that file from a copy that
+        can be minutes old, which put a flipped switch back."""
         from fastapi.testclient import TestClient
 
         tmp_data_dir["config_file"].write_text(json.dumps(sample_config))
+        before = tmp_data_dir["config_file"].read_text()
         client = TestClient(create_app(sample_config))
-        r = client.post("/api/auto-requeue", json={"enabled": False})
-        assert r.status_code == 200
-        saved = json.loads(tmp_data_dir["config_file"].read_text())
-        assert saved["auto_requeue"] is False
-        assert saved["api_key"] == sample_config.get("api_key"), "only one key changes"
-        assert oct(tmp_data_dir["config_file"].stat().st_mode & 0o777) == "0o600"
+        assert client.post("/api/auto-requeue", json={"enabled": False}).status_code == 200
+        assert (tmp_data_dir["data_dir"] / "auto-requeue.off").exists()
+        assert tmp_data_dir["config_file"].read_text() == before
+        assert client.post("/api/auto-requeue", json={"enabled": True}).status_code == 200
+        assert not (tmp_data_dir["data_dir"] / "auto-requeue.off").exists()
 
     def test_rejects_anything_but_a_clear_answer(self, tmp_data_dir, sample_config):
         from fastapi.testclient import TestClient
@@ -816,4 +818,38 @@ class TestAutoRequeueSwitch:
         import immich_accelerator.dashboard as d
 
         html = (Path(d.__file__).parent / "dashboard.html").read_text()
-        assert "document.getElementById('engines').hidden = !anyWorking;" in html
+        assert "document.getElementById('engines').hidden = !anyWorking && !d.jobs_api_error;" in html
+
+
+class TestCoverageNeverClaimsMoreThanItKnows:
+    def _js(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        return html[html.index("function coverageState") : html.index("function render(d)")]
+
+    def test_unreadable_queues_are_unknown_not_forgotten(self):
+        """With a bad api_key every gap read "missing, not queued" while
+        Immich may have been working through it."""
+        js = self._js()
+        assert "if (!known) return 'unknown';" in js
+        assert "p.unqueued > 0 ? 'needs-queue'" in js
+
+    def test_an_unreadable_library_is_not_complete(self):
+        js = self._js()
+        assert "if (!drawn) worst = 'unknown';" in js
+        assert "'No library data'" in js
+
+    def test_the_jobs_error_stays_on_screen(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        assert "hidden = !anyWorking && !d.jobs_api_error" in html
+
+    def test_a_stale_status_cannot_flip_the_switch_back(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        assert "if (d._clicks === autoClicks)" in html
+        refresh = html[html.index("async function refresh") :]
+        assert refresh.index("const clicks = autoClicks") < refresh.index("fetch('/api/status')")
