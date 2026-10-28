@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import urllib.error
+import urllib.request
 import subprocess
 from pathlib import Path
 
@@ -171,3 +174,77 @@ def attention(data_dir: Path) -> dict | None:
             "since": entry.get("since"),
         }
     return None
+# Immich's "missing" runs, in pipeline order: each stage only picks up assets
+# the one before has finished, and asking for "missing" (force false) queues
+# nothing for an asset that already has the result. Metadata leads because an
+# asset that never had it never gets a thumbnail either.
+MISSING_QUEUES = (
+    "metadataExtraction",
+    "thumbnailGeneration",
+    "smartSearch",
+    "faceDetection",
+    "ocr",
+    "videoConversion",
+)
+
+# How often the watcher queues missing work on its own, when it is switched on
+# (auto_requeue in config.json). Daily: a gap that formed overnight is closed
+# by the next evening, and an idle Immich asked once a day costs nothing.
+AUTO_REQUEUE_EVERY = 24 * 3600
+
+
+def _immich(url: str, api_key: str, path: str, body: bytes | None = None, timeout: float = 10):
+    req = urllib.request.Request(
+        f"{url.rstrip('/')}{path}",
+        data=body,
+        method="PUT" if body is not None else "GET",
+        headers={"x-api-key": api_key, "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return json.loads(raw) if raw.strip() else {}
+
+
+def immich_busy(url: str, api_key: str) -> bool | None:
+    """Is any Immich queue running or holding work? None when it cannot be
+    asked, which callers must treat as "do not touch it"."""
+    try:
+        jobs = _immich(url, api_key, "/api/jobs", timeout=5)
+    except Exception:
+        return None
+    return any(
+        (q.get("jobCounts", {}).get("active", 0) + q.get("jobCounts", {}).get("waiting", 0)) > 0
+        for q in jobs.values()
+        if isinstance(q, dict)
+    )
+
+
+def requeue_missing(url: str, api_key: str) -> dict:
+    """Ask Immich to queue whatever it has not done yet, stage by stage, the
+    same as each queue's "Missing" button on its Jobs page."""
+    results = {}
+    for queue in MISSING_QUEUES:
+        try:
+            _immich(url, api_key, f"/api/jobs/{queue}", b'{"command": "start", "force": false}')
+            results[queue] = "ok"
+        except urllib.error.HTTPError as e:
+            # 400 is "already running": it is queued, which is what we asked.
+            results[queue] = "ok" if e.code == 400 else "failed"
+        except Exception:
+            results[queue] = "failed"
+    return results
+
+
+def set_config_value(config_file: Path, key: str, value) -> dict:
+    """Change one key in config.json and write it back the way save_config
+    does: whole file, atomically, owner-only (it holds the database password).
+    Returns the config as written."""
+    config = json.loads(config_file.read_text())
+    config[key] = value
+    tmp = config_file.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    tmp.rename(config_file)
+    return config

@@ -112,6 +112,63 @@
   }
   .attention-title { font-weight: 600; font-size: 14px; color: var(--text); }
   .attention-action { font-size: 13px; color: var(--text-dim); margin-top: 3px; line-height: 1.45; }
+  /* Whether the whole library has everything, apart from what is running now.
+     The chip cards below are about the work; this is about the library. */
+  .library-actions { display: flex; align-items: center; gap: 12px; }
+  .auto-toggle {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 500; letter-spacing: normal; text-transform: none;
+    color: var(--text-dim); cursor: pointer; user-select: none;
+  }
+  .auto-toggle input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .auto-toggle .switch {
+    width: 26px; height: 15px; border-radius: 8px; position: relative;
+    background: var(--card-border); transition: background 0.15s;
+  }
+  .auto-toggle .switch::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 11px; height: 11px; border-radius: 50%; background: var(--text-dim);
+    transition: transform 0.15s, background 0.15s;
+  }
+  .auto-toggle input:checked + .switch { background: var(--accent); }
+  .auto-toggle input:checked + .switch::after { transform: translateX(11px); background: var(--text); }
+  .auto-toggle input:focus-visible + .switch { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #engines[hidden] { display: none; }
+
+  .coverage {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 24px;
+  }
+  .coverage-verdict {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 14px; font-weight: 600; color: var(--text);
+  }
+  .coverage-total { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--text-dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .coverage-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-muted); flex: none; }
+  .coverage[data-state="complete"] .coverage-dot { background: var(--green); }
+  .coverage[data-state="catching-up"] .coverage-dot { background: var(--blue); }
+  .coverage[data-state="needs-queue"] .coverage-dot { background: var(--amber); }
+  .coverage-rows {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 12px;
+  }
+  .cov { min-width: 0; }
+  .cov-label { font-size: 12px; color: var(--text-dim); }
+  .cov-pct { font-size: 18px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .cov-bar { height: 4px; background: var(--card-border); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+  .cov-bar > div { height: 100%; background: var(--green); }
+  .cov[data-state="catching-up"] .cov-bar > div { background: var(--blue); }
+  .cov[data-state="needs-queue"] .cov-bar > div { background: var(--amber); }
+  .cov-note { font-size: 11px; color: var(--text-muted); margin-top: 5px; font-variant-numeric: tabular-nums; }
+  .cov[data-state="needs-queue"] .cov-note { color: var(--amber); }
+  @media (max-width: 700px) {
+    .coverage-rows { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
 
   .services {
     display: flex;
@@ -190,11 +247,14 @@
 
   .task-row:last-child { margin-bottom: 0; }
 
+  /* One height whether the right side is a big rate or a small "Idle", so a
+     label sits at the same height in every card of a row. */
   .task-top {
     display: flex;
     justify-content: space-between;
-    align-items: baseline;
-    margin-bottom: 4px;
+    align-items: center;
+    min-height: 34px;
+    margin-bottom: 2px;
   }
 
   .task-label { font-size: 13px; font-weight: 500; color: var(--text-dim); }
@@ -214,6 +274,12 @@
     font-size: 20px;
   }
 
+  /* A word, not a number: small, flat, and dim when nothing is happening. */
+  .task-top .task-pct.word {
+    font-size: 14px; font-weight: 500; letter-spacing: 0;
+    background: none; -webkit-text-fill-color: var(--text-dim);
+  }
+  .task-top .task-pct.word.idle { -webkit-text-fill-color: var(--text-muted); }
   .bar-bg {
     height: 4px;
     background: var(--card-border);
@@ -314,7 +380,8 @@
   </div>
 
   <div class="section" style="display:flex; justify-content:space-between; align-items:center;">
-    <span>Apple Silicon</span>
+    <span>Library</span>
+    <div class="library-actions">
     <button id="requeue-btn" style="
       background: var(--card); border: 1px solid var(--card-border);
       color: var(--text-dim); font-size: 11px; padding: 4px 12px;
@@ -322,8 +389,21 @@
       transition: all 0.15s;
     " onmouseover="this.style.borderColor='var(--accent)'; this.style.color='var(--text)'"
        onmouseout="this.style.borderColor='var(--card-border)'; this.style.color='var(--text-dim)'"
-    >Re-queue Missing ↻</button>
+    >Re-queue Missing</button>
+    <label class="auto-toggle" title="Re-queue missing work by itself once a day, when Immich is idle">
+      <input type="checkbox" id="auto-requeue" role="switch">
+      <span class="switch" aria-hidden="true"></span>
+      Auto
+    </label>
+    </div>
   </div>
+  <div class="coverage" id="coverage">
+    <div class="coverage-verdict"><span class="coverage-dot"></span><span id="coverage-text">Loading…</span><span class="coverage-total" id="coverage-total"></span></div>
+    <div class="coverage-rows" id="coverage-rows"></div>
+  </div>
+
+  <div id="engines">
+  <div class="section">Apple Silicon</div>
   <div class="chip-grid" id="chips">
     <div class="chip-card"><div class="chip-header cpu">CPU (NEON)</div><div class="task-row"><div class="task-top"><div class="task-label">Thumbnails</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill cpu" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
     <div class="chip-card"><div class="chip-header gpu">Metal GPU</div><div class="task-row"><div class="task-top"><div class="task-label">CLIP Embeddings</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill gpu" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
@@ -331,6 +411,7 @@
     <div class="chip-card"><div class="chip-header vtb">VideoToolbox</div><div class="task-row"><div class="task-top"><div class="task-label">Video Transcode</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill vtb" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
   </div>
 
+  </div>
   <div class="sys" id="sys">
     <span>Load <span class="v">—</span></span>
     <span>CPUs <span class="v">—</span></span>
@@ -407,8 +488,73 @@ function etaStr(remaining, rate) {
   return (h / 24).toFixed(1) + 'd left';
 }
 
+// What each stage is called when talking about the library, not the hardware.
+const COVERAGE = [
+  ['thumbnails', 'Thumbnails'],
+  ['clip', 'Search'],
+  ['faces', 'Faces'],
+  ['ocr', 'Text'],
+];
+
+// complete: nothing missing. catching-up: missing, and its queue is running.
+// needs-queue: missing and nothing is running it, so it stays missing until
+// someone presses Re-queue Missing. That last one is the state worth noticing,
+// and the one the job cards cannot show, since an idle queue looks the same
+// whether the library is done or forgotten.
+function coverageState(p, active) {
+  if (p.total - p.done <= 0) return 'complete';
+  return active ? 'catching-up' : 'needs-queue';
+}
+
+function renderCoverage(d) {
+  const rows = document.getElementById('coverage-rows');
+  rows.textContent = '';
+  let waiting = 0, forgotten = 0, worst = 'complete';
+  const rank = { 'complete': 0, 'catching-up': 1, 'needs-queue': 2 };
+  for (const [key, label] of COVERAGE) {
+    const p = d.progress[key];
+    if (!p || !p.total) continue;
+    const active = !!(d.queue_active && d.queue_active[key]);
+    const state = coverageState(p, active);
+    const missing = Math.max(p.total - p.done, 0);
+    if (state === 'catching-up') waiting = Math.max(waiting, missing);
+    if (state === 'needs-queue') forgotten = Math.max(forgotten, missing);
+    if (rank[state] > rank[worst]) worst = state;
+
+    const cell = document.createElement('div');
+    cell.className = 'cov';
+    cell.dataset.state = state;
+    const l = document.createElement('div'); l.className = 'cov-label'; l.textContent = label;
+    // Never round up to 100% while anything is missing.
+    const shown = missing > 0 ? Math.min(p.pct, 99.9) : 100;
+    const pc = document.createElement('div'); pc.className = 'cov-pct'; pc.textContent = shown + '%';
+    const bar = document.createElement('div'); bar.className = 'cov-bar';
+    const fill = document.createElement('div'); fill.style.width = p.pct + '%'; bar.appendChild(fill);
+    const note = document.createElement('div'); note.className = 'cov-note';
+    note.textContent = state === 'complete' ? 'all ' + n(p.total)
+      : n(missing) + (state === 'catching-up' ? ' in progress' : ' missing, not queued');
+    cell.append(l, pc, bar, note);
+    rows.appendChild(cell);
+  }
+  document.getElementById('coverage').dataset.state = worst;
+  // Live assets, all types; video is its own count.
+  const all = (d.progress.thumbnails || {}).total || 0;
+  const videos = (d.progress.video || {}).total || 0;
+  document.getElementById('coverage-total').textContent =
+    all ? n(all - videos) + ' photos · ' + n(videos) + ' videos' : '';
+  const parts = [];
+  if (waiting) parts.push('Processing ' + n(waiting) + ' items');
+  if (forgotten) parts.push(waiting ? n(forgotten) + ' not queued' : n(forgotten) + ' items not processed');
+  document.getElementById('coverage-text').textContent =
+    parts.length ? parts.join(' · ') : 'Processing complete';
+}
+
+let autoPending = false;
+
 function render(d) {
   calcRates(d.progress);
+  renderCoverage(d);
+  if (!autoPending) document.getElementById('auto-requeue').checked = d.auto_requeue !== false;
 
   // Versions
   document.getElementById('ver').textContent = 'v' + d.version;
@@ -449,6 +595,9 @@ function render(d) {
   // Chip cards
   const chipsEl = document.getElementById('chips');
   chipsEl.textContent = '';
+  // The engines are about work in progress. With none, the Library card
+  // already says everything there is to say, so they step aside.
+  let anyWorking = false;
 
   for (const chip of CHIPS) {
     const card = document.createElement('div');
@@ -470,23 +619,6 @@ function render(d) {
       const eta = etaStr(rem, rate);
       const qActive = d.queue_active && d.queue_active[t.key];
       const noApi = !d.queue_active || Object.keys(d.queue_active).length === 0;
-      let rateText;
-      if (rate > 0) {
-        rateText = rate + '/min' + (eta ? ' \u00b7 ' + eta : '') + (qc > 0 ? ' \u00b7 ' + qc + ' queued' : '');
-      } else if (qActive) {
-        // Checked before the pct>=99.9 "done" branch below: a queue that's
-        // still active (jobs re-queued for already-processed assets, a fresh
-        // upload not yet counted in the DB total) must never render "done"
-        // just because the DB-derived ratio happens to already be ~100%.
-        rateText = 'processing' + (qc > 0 ? ' \u00b7 ' + qc + ' queued' : '');
-      } else if (p.pct >= 99.9) {
-        rateText = 'done';
-      } else if (noApi && p.done < p.total) {
-        rateText = d.jobs_api_error ? 'no job data: ' + d.jobs_api_error : 'no job data (check api_key in config)';
-      } else {
-        rateText = 'idle';
-      }
-
       // Divider between tasks
       if (idx > 0) {
         const hr = document.createElement('hr');
@@ -497,46 +629,49 @@ function render(d) {
       const row = document.createElement('div');
       row.className = 'task-row';
 
-      // Top: label + pct
+      // Activity only. How much of the library is done lives in the Library
+      // card; repeating it here put five big percentages on a page whose
+      // engines were all doing nothing.
+      const working = rate > 0 || qActive;
+      if (working) anyWorking = true;
       const top = document.createElement('div');
       top.className = 'task-top';
       const label = document.createElement('div');
       label.className = 'task-label';
       label.textContent = t.label;
-      const pct = document.createElement('div');
-      pct.className = 'task-pct' + (isMulti ? ' sub' : '');
-      pct.textContent = p.pct + '%';
+      const now = document.createElement('div');
+      // A rate needs two polls, so a queue that just started says Working.
+      now.className = 'task-pct' + (isMulti ? ' sub' : '')
+        + (rate > 0 ? '' : ' word') + (working ? '' : ' idle');
+      now.textContent = rate > 0 ? n(rate) + '/min' : (working ? 'Working' : 'Idle');
       top.appendChild(label);
-      top.appendChild(pct);
+      top.appendChild(now);
       row.appendChild(top);
 
-      // Bar
-      const barBg = document.createElement('div');
-      barBg.className = 'bar-bg';
-      const barFill = document.createElement('div');
-      barFill.className = 'bar-fill ' + chip.chip;
-      barFill.style.width = p.pct + '%';
-      barBg.appendChild(barFill);
-      row.appendChild(barBg);
-
-      // Stats
-      const stats = document.createElement('div');
-      stats.className = 'task-stats';
-      const countSpan = document.createElement('span');
-      countSpan.textContent = n(p.done) + ' / ' + n(p.total)
-        + (p.unqueued > 0 ? ' · ' + n(p.unqueued) + ' not queued' : '');
-      const rateSpan = document.createElement('span');
-      rateSpan.className = 'task-rate';
-      rateSpan.textContent = rateText;
-      stats.appendChild(countSpan);
-      stats.appendChild(rateSpan);
-      row.appendChild(stats);
+      if (working) {
+        const stats = document.createElement('div');
+        stats.className = 'task-stats';
+        const left = document.createElement('span');
+        left.textContent = qc > 0 ? n(qc) + ' queued' : 'finishing';
+        const right = document.createElement('span');
+        right.className = 'task-rate';
+        right.textContent = eta;
+        stats.appendChild(left);
+        stats.appendChild(right);
+        row.appendChild(stats);
+      } else if (noApi && p.done < p.total) {
+        const stats = document.createElement('div');
+        stats.className = 'task-stats';
+        stats.textContent = d.jobs_api_error ? 'no job data: ' + d.jobs_api_error : 'no job data (check api_key in config)';
+        row.appendChild(stats);
+      }
 
       card.appendChild(row);
     });
 
     chipsEl.appendChild(card);
   }
+  document.getElementById('engines').hidden = !anyWorking;
 
   // System
   const sysEl = document.getElementById('sys');
@@ -569,6 +704,23 @@ async function refresh() {
 }
 
 // Re-queue button
+document.getElementById('auto-requeue').addEventListener('change', async function() {
+  const box = this;
+  autoPending = true;
+  try {
+    const r = await fetch('/api/auto-requeue', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: box.checked }),
+    });
+    if (!r.ok) throw new Error(r.status);
+  } catch (e) {
+    box.checked = !box.checked;  // it did not save; show what is in effect
+  } finally {
+    autoPending = false;
+  }
+});
+
 document.getElementById('requeue-btn').addEventListener('click', async function() {
   const btn = this;
   btn.textContent = 'Queuing...';
@@ -577,10 +729,10 @@ document.getElementById('requeue-btn').addEventListener('click', async function(
     const r = await fetch('/api/requeue', { method: 'POST' });
     const d = await r.json();
     btn.textContent = 'Queued ✓';
-    setTimeout(() => { btn.textContent = 'Re-queue Missing ↻'; btn.disabled = false; }, 3000);
+    setTimeout(() => { btn.textContent = 'Re-queue Missing'; btn.disabled = false; }, 3000);
   } catch(e) {
     btn.textContent = 'Failed';
-    setTimeout(() => { btn.textContent = 'Re-queue Missing ↻'; btn.disabled = false; }, 3000);
+    setTimeout(() => { btn.textContent = 'Re-queue Missing'; btn.disabled = false; }, 3000);
   }
 });
 

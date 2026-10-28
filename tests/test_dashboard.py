@@ -644,15 +644,14 @@ class TestDashboardHtmlDoneLabel:
 
     HTML_PATH = Path(__file__).parent.parent / "immich_accelerator" / "dashboard.html"
 
-    def test_qactive_checked_before_pct_done(self):
+    def test_an_active_queue_always_reads_as_working(self):
+        """The cards no longer say "done" at all (completion moved to the
+        Library card), and a queue Immich still reports active reads as
+        working even before a rate has been measured."""
         src = self.HTML_PATH.read_text()
-        qactive_branch = src.index("} else if (qActive) {")
-        pct_done_branch = src.index("} else if (p.pct >= 99.9) {")
-        assert qactive_branch < pct_done_branch, (
-            "the qActive branch must come before the pct>=99.9 'done' branch "
-            "in dashboard.html's rateText chain, or a still-active queue "
-            "renders as 'done' whenever the DB-derived ratio is already ~100%"
-        )
+        chips = src[src.index("// Chip cards\n") : src.index("// System")]
+        assert "const working = rate > 0 || qActive;" in chips
+        assert "'done'" not in chips
 
 
 class TestAttention:
@@ -733,3 +732,88 @@ class TestAttention:
         render = html[html.index("// Something a person has to do") :]
         render = render[: render.index("// Services")]
         assert "innerHTML" not in render
+
+
+class TestLibraryCoverage:
+    """Whether the library has everything, apart from what is running now.
+    An idle queue looks the same whether the library is done or forgotten,
+    which is how 40,162 photos sat without search, faces or text for months
+    behind job cards that said "idle"."""
+
+    def _html(self):
+        import immich_accelerator.dashboard as d
+
+        return (Path(d.__file__).parent / "dashboard.html").read_text()
+
+    def test_the_card_sits_apart_from_the_job_cards_with_the_requeue_button(self):
+        html = self._html()
+        body = html[html.index("<body>") :]
+        assert body.index('id="coverage"') < body.index('id="chips"')
+        library = body[body.index("<span>Library</span>") : body.index('id="coverage"')]
+        assert 'id="requeue-btn"' in library
+
+    def test_missing_work_nothing_runs_is_its_own_state(self):
+        html = self._html()
+        fn = html[html.index("function coverageState") :]
+        fn = fn[: fn.index("\n}\n")]
+        assert "'complete'" in fn and "'catching-up'" in fn and "'needs-queue'" in fn
+
+    def test_video_stays_with_the_job_cards(self):
+        """Immich transcodes only the videos its policy picks, so a video gap
+        is usually not a gap. It read as one here, so it is left out."""
+        html = self._html()
+        table = html[html.index("const COVERAGE") : html.index("];", html.index("const COVERAGE"))]
+        assert "'video'" not in table
+
+    def test_drawn_as_text(self):
+        html = self._html()
+        render = html[html.index("function renderCoverage") : html.index("function render(d)")]
+        assert "innerHTML" not in render
+
+    def test_the_engine_cards_show_activity_not_completion(self):
+        """Completion is the Library card's job. The engine cards said 99.9%
+        five times over on a page where nothing was running."""
+        html = self._html()
+        chips = html[html.index("// Chip cards\n") : html.index("// System")]
+        assert "p.pct" not in chips
+        assert "'Idle'" in chips
+
+    def test_never_shows_100_percent_while_anything_is_missing(self):
+        html = self._html()
+        render = html[html.index("function renderCoverage") : html.index("function render(d)")]
+        assert "missing > 0 ? Math.min(p.pct, 99.9) : 100" in render
+
+
+class TestAutoRequeueSwitch:
+    def test_the_switch_writes_config_and_status_reports_it(self, tmp_data_dir, sample_config):
+        from fastapi.testclient import TestClient
+
+        tmp_data_dir["config_file"].write_text(json.dumps(sample_config))
+        client = TestClient(create_app(sample_config))
+        r = client.post("/api/auto-requeue", json={"enabled": False})
+        assert r.status_code == 200
+        saved = json.loads(tmp_data_dir["config_file"].read_text())
+        assert saved["auto_requeue"] is False
+        assert saved["api_key"] == sample_config.get("api_key"), "only one key changes"
+        assert oct(tmp_data_dir["config_file"].stat().st_mode & 0o777) == "0o600"
+
+    def test_rejects_anything_but_a_clear_answer(self, tmp_data_dir, sample_config):
+        from fastapi.testclient import TestClient
+
+        tmp_data_dir["config_file"].write_text(json.dumps(sample_config))
+        r = TestClient(create_app(sample_config)).post("/api/auto-requeue", json={})
+        assert r.status_code == 400
+
+    def test_the_page_puts_it_beside_the_button(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        actions = html[html.index('class="library-actions"') :]
+        actions = actions[: actions.index("</label>")]
+        assert actions.index('id="requeue-btn"') < actions.index('id="auto-requeue"')
+
+    def test_idle_engines_step_aside(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        assert "document.getElementById('engines').hidden = !anyWorking;" in html
