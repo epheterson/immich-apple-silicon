@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -124,6 +124,10 @@ def tmp_data_dir(tmp_path, monkeypatch):
         LOG_DIR=log_dir,
         LOCK_FILE=lock_file,
         PAUSE_FILE=pause_file,
+        AUTO_REQUEUE_FILE=data_dir / "auto-requeue.json",
+        # The watch loop's daily re-queue asks Immich over HTTP. Never from a
+        # test: None is "could not ask", which leaves Immich alone.
+        immich_busy=MagicMock(return_value=None),
         # A real install has this file, and two tests wrote to and removed the
         # user's actual /etc/synthetic.d entry.
         SYNTHETIC_CONF=synthetic_conf,

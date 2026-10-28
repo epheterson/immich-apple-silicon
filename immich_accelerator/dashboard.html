@@ -90,6 +90,27 @@
   /* Services */
   /* Whether the whole library has everything, apart from what is running now.
      The chip cards below are about the work; this is about the library. */
+  .library-actions { display: flex; align-items: center; gap: 12px; }
+  .auto-toggle {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 500; letter-spacing: normal; text-transform: none;
+    color: var(--text-dim); cursor: pointer; user-select: none;
+  }
+  .auto-toggle input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .auto-toggle .switch {
+    width: 26px; height: 15px; border-radius: 8px; position: relative;
+    background: var(--card-border); transition: background 0.15s;
+  }
+  .auto-toggle .switch::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 11px; height: 11px; border-radius: 50%; background: var(--text-dim);
+    transition: transform 0.15s, background 0.15s;
+  }
+  .auto-toggle input:checked + .switch { background: var(--accent); }
+  .auto-toggle input:checked + .switch::after { transform: translateX(11px); background: var(--text); }
+  .auto-toggle input:focus-visible + .switch { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #engines[hidden] { display: none; }
+
   .coverage {
     background: var(--card);
     border: 1px solid var(--card-border);
@@ -202,11 +223,14 @@
 
   .task-row:last-child { margin-bottom: 0; }
 
+  /* One height whether the right side is a big rate or a small "Idle", so a
+     label sits at the same height in every card of a row. */
   .task-top {
     display: flex;
     justify-content: space-between;
-    align-items: baseline;
-    margin-bottom: 4px;
+    align-items: center;
+    min-height: 34px;
+    margin-bottom: 2px;
   }
 
   .task-label { font-size: 13px; font-weight: 500; color: var(--text-dim); }
@@ -325,6 +349,7 @@
 
   <div class="section" style="display:flex; justify-content:space-between; align-items:center;">
     <span>Library</span>
+    <div class="library-actions">
     <button id="requeue-btn" style="
       background: var(--card); border: 1px solid var(--card-border);
       color: var(--text-dim); font-size: 11px; padding: 4px 12px;
@@ -333,12 +358,19 @@
     " onmouseover="this.style.borderColor='var(--accent)'; this.style.color='var(--text)'"
        onmouseout="this.style.borderColor='var(--card-border)'; this.style.color='var(--text-dim)'"
     >Re-queue Missing</button>
+    <label class="auto-toggle" title="Re-queue missing work by itself once a day, when Immich is idle">
+      <input type="checkbox" id="auto-requeue" role="switch">
+      <span class="switch" aria-hidden="true"></span>
+      Auto
+    </label>
+    </div>
   </div>
   <div class="coverage" id="coverage">
     <div class="coverage-verdict"><span class="coverage-dot"></span><span id="coverage-text">Loading…</span><span class="coverage-total" id="coverage-total"></span></div>
     <div class="coverage-rows" id="coverage-rows"></div>
   </div>
 
+  <div id="engines">
   <div class="section">Apple Silicon</div>
   <div class="chip-grid" id="chips">
     <div class="chip-card"><div class="chip-header cpu">CPU (NEON)</div><div class="task-row"><div class="task-top"><div class="task-label">Thumbnails</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill cpu" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
@@ -347,6 +379,7 @@
     <div class="chip-card"><div class="chip-header vtb">VideoToolbox</div><div class="task-row"><div class="task-top"><div class="task-label">Video Transcode</div><div class="task-pct" style="color:var(--text-muted)">—</div></div><div class="bar-bg"><div class="bar-fill vtb" style="width:0"></div></div><div class="task-stats"><span style="color:var(--text-muted)">loading</span></div></div></div>
   </div>
 
+  </div>
   <div class="sys" id="sys">
     <span>Load <span class="v">—</span></span>
     <span>CPUs <span class="v">—</span></span>
@@ -484,9 +517,12 @@ function renderCoverage(d) {
     parts.length ? parts.join(' · ') : 'Processing complete';
 }
 
+let autoPending = false;
+
 function render(d) {
   calcRates(d.progress);
   renderCoverage(d);
+  if (!autoPending) document.getElementById('auto-requeue').checked = d.auto_requeue !== false;
 
   // Versions
   document.getElementById('ver').textContent = 'v' + d.version;
@@ -519,6 +555,9 @@ function render(d) {
   // Chip cards
   const chipsEl = document.getElementById('chips');
   chipsEl.textContent = '';
+  // The engines are about work in progress. With none, the Library card
+  // already says everything there is to say, so they step aside.
+  let anyWorking = false;
 
   for (const chip of CHIPS) {
     const card = document.createElement('div');
@@ -554,6 +593,7 @@ function render(d) {
       // card; repeating it here put five big percentages on a page whose
       // engines were all doing nothing.
       const working = rate > 0 || qActive;
+      if (working) anyWorking = true;
       const top = document.createElement('div');
       top.className = 'task-top';
       const label = document.createElement('div');
@@ -591,6 +631,7 @@ function render(d) {
 
     chipsEl.appendChild(card);
   }
+  document.getElementById('engines').hidden = !anyWorking;
 
   // System
   const sysEl = document.getElementById('sys');
@@ -623,6 +664,23 @@ async function refresh() {
 }
 
 // Re-queue button
+document.getElementById('auto-requeue').addEventListener('change', async function() {
+  const box = this;
+  autoPending = true;
+  try {
+    const r = await fetch('/api/auto-requeue', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: box.checked }),
+    });
+    if (!r.ok) throw new Error(r.status);
+  } catch (e) {
+    box.checked = !box.checked;  // it did not save; show what is in effect
+  } finally {
+    autoPending = false;
+  }
+});
+
 document.getElementById('requeue-btn').addEventListener('click', async function() {
   const btn = this;
   btn.textContent = 'Queuing...';

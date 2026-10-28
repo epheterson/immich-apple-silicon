@@ -30,7 +30,16 @@ import time
 import uuid
 from pathlib import Path
 
-from .common import COMPONENTS, DEFAULT_TIMEOUT, component_enabled, run_ok, run_output
+from .common import (
+    AUTO_REQUEUE_EVERY,
+    COMPONENTS,
+    DEFAULT_TIMEOUT,
+    component_enabled,
+    immich_busy,
+    requeue_missing,
+    run_ok,
+    run_output,
+)
 
 
 def _read_version() -> str:
@@ -55,6 +64,9 @@ LOG_DIR = DATA_DIR / "logs"
 # status and the menu bar read it so a paused worker reads as "the library is
 # gone" instead of a bare "Stopped" the user cannot explain.
 PAUSE_FILE = DATA_DIR / "paused.json"
+# When the watcher last queued missing work by itself, so a restart does not
+# make it ask again.
+AUTO_REQUEUE_FILE = DATA_DIR / "auto-requeue.json"
 
 # Records the package version the running worker was started with, so the watch
 # loop can tell when a `brew upgrade` left the worker on stale code.
@@ -7025,6 +7037,47 @@ def cmd_watch(_args):
             return
 
 
+def _auto_requeue(config: dict, now: float | None = None) -> None:
+    """Once a day, ask Immich to queue whatever it has not done.
+
+    Immich queues each stage when the one before finishes, and nothing ever
+    goes back for work that fell out of the queue: a Redis restart in the
+    middle of a big import, a run of failures before the retry fix. On the
+    release Mac 40,162 photos sat without search, faces or text for months
+    that way, behind queues that all said idle. Asking Immich for "missing"
+    queues only what is missing, so on a complete library this does nothing.
+
+    Only while every queue is idle, so it never lands on top of real work,
+    and not at all when Immich cannot be asked. On by default; the dashboard
+    switches it (auto_requeue in config.json).
+    """
+    if not config.get("auto_requeue", True):
+        return
+    api_key = config.get("api_key") or ""
+    url = config.get("immich_url") or ""
+    if not api_key or not url or not read_pid("worker"):
+        return
+    now = time.time() if now is None else now
+    try:
+        last = float(json.loads(AUTO_REQUEUE_FILE.read_text()).get("last", 0))
+    except (OSError, ValueError, AttributeError):
+        last = 0.0
+    if now - last < AUTO_REQUEUE_EVERY:
+        return
+    if immich_busy(url, api_key) is not False:
+        return  # busy, or could not ask: try again on a later cycle
+    results = requeue_missing(url, api_key)
+    failed = [q for q, r in results.items() if r != "ok"]
+    try:
+        AUTO_REQUEUE_FILE.write_text(json.dumps({"last": now, "results": results}))
+    except OSError:
+        pass
+    if failed:
+        log.warning("Daily check for missing work: Immich refused %s", ", ".join(failed))
+    else:
+        log.info("Daily check for missing work: asked Immich to queue anything not yet done.")
+
+
 # Returned by a watch loop that wants cmd_watch to re-dispatch to the other one.
 _SWITCH = "switch"
 
@@ -7517,6 +7570,7 @@ def _watch_worker(config: dict) -> str | None:
                     follow_retry_at = time.monotonic() + _FOLLOW_RETRY_AFTER
             if due and not worker_handled:
                 check_count = 0
+                _auto_requeue(config)
 
                 # Check for accelerator self-update (once per watch session).
                 # Stays on the slow timer: GitHub allows 60 unauthenticated

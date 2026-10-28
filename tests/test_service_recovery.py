@@ -11,6 +11,7 @@ starting again.
 """
 
 import argparse
+import json
 import os
 import signal
 import socket
@@ -2168,3 +2169,49 @@ class TestAServiceRefusedByMacOSIsNamedAsSuch:
         text = self._status(caplog, down_from_here=["Postgres", "Redis"])
         assert "Local Network" not in text
         assert "starts again on its own when they are back" in text
+
+
+class TestTheWatcherQueuesMissingWorkDaily:
+    """Nothing in Immich goes back for work that fell out of its queue. On the
+    release Mac that left 40,162 photos without search, faces or text for
+    months behind queues that all said idle."""
+
+    CFG = {"api_key": "k", "immich_url": "http://immich:2283"}
+
+    def _run(self, cfg=None, busy=False, worker=4242, last=None, now=1_000_000.0):
+        if last is not None:
+            m.AUTO_REQUEUE_FILE.write_text(json.dumps({"last": last}))
+        with patch.object(m, "immich_busy", return_value=busy), patch.object(
+            m, "requeue_missing", return_value={"smartSearch": "ok"}
+        ) as rq, patch.object(m, "read_pid", return_value=worker), patch.object(m, "log"):
+            m._auto_requeue(dict(self.CFG if cfg is None else cfg), now=now)
+        return rq
+
+    def test_asks_immich_when_it_is_idle_and_remembers_when(self, tmp_data_dir):
+        rq = self._run()
+        rq.assert_called_once_with("http://immich:2283", "k")
+        assert json.loads(m.AUTO_REQUEUE_FILE.read_text())["last"] == 1_000_000.0
+
+    def test_once_a_day_across_restarts(self, tmp_data_dir):
+        assert not self._run(last=1_000_000.0 - 3600).called
+        assert self._run(last=1_000_000.0 - m.AUTO_REQUEUE_EVERY).called
+
+    @pytest.mark.parametrize("busy", [True, None])
+    def test_never_on_top_of_real_work_or_blind(self, tmp_data_dir, busy):
+        rq = self._run(busy=busy)
+        rq.assert_not_called()
+        assert not m.AUTO_REQUEUE_FILE.exists(), "a skipped day must be retried"
+
+    def test_switched_off_means_off(self, tmp_data_dir):
+        assert not self._run(cfg={**self.CFG, "auto_requeue": False}).called
+
+    def test_not_without_a_worker_to_do_it(self, tmp_data_dir):
+        assert not self._run(worker=None).called
+
+    def test_metadata_leads_the_stages(self):
+        """An asset that never had metadata never gets a thumbnail, and so
+        nothing after it. 251 on the release Mac were stuck exactly there."""
+        from immich_accelerator.common import MISSING_QUEUES
+
+        assert MISSING_QUEUES[0] == "metadataExtraction"
+        assert MISSING_QUEUES.index("thumbnailGeneration") < MISSING_QUEUES.index("smartSearch")

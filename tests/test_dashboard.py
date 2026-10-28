@@ -702,3 +702,38 @@ class TestLibraryCoverage:
         html = self._html()
         render = html[html.index("function renderCoverage") : html.index("function render(d)")]
         assert "missing > 0 ? Math.min(p.pct, 99.9) : 100" in render
+
+
+class TestAutoRequeueSwitch:
+    def test_the_switch_writes_config_and_status_reports_it(self, tmp_data_dir, sample_config):
+        from fastapi.testclient import TestClient
+
+        tmp_data_dir["config_file"].write_text(json.dumps(sample_config))
+        client = TestClient(create_app(sample_config))
+        r = client.post("/api/auto-requeue", json={"enabled": False})
+        assert r.status_code == 200
+        saved = json.loads(tmp_data_dir["config_file"].read_text())
+        assert saved["auto_requeue"] is False
+        assert saved["api_key"] == sample_config.get("api_key"), "only one key changes"
+        assert oct(tmp_data_dir["config_file"].stat().st_mode & 0o777) == "0o600"
+
+    def test_rejects_anything_but_a_clear_answer(self, tmp_data_dir, sample_config):
+        from fastapi.testclient import TestClient
+
+        tmp_data_dir["config_file"].write_text(json.dumps(sample_config))
+        r = TestClient(create_app(sample_config)).post("/api/auto-requeue", json={})
+        assert r.status_code == 400
+
+    def test_the_page_puts_it_beside_the_button(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        actions = html[html.index('class="library-actions"') :]
+        actions = actions[: actions.index("</label>")]
+        assert actions.index('id="requeue-btn"') < actions.index('id="auto-requeue"')
+
+    def test_idle_engines_step_aside(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        assert "document.getElementById('engines').hidden = !anyWorking;" in html
