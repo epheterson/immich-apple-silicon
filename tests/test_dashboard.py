@@ -644,15 +644,14 @@ class TestDashboardHtmlDoneLabel:
 
     HTML_PATH = Path(__file__).parent.parent / "immich_accelerator" / "dashboard.html"
 
-    def test_qactive_checked_before_pct_done(self):
+    def test_an_active_queue_always_reads_as_working(self):
+        """The cards no longer say "done" at all (completion moved to the
+        Library card), and a queue Immich still reports active reads as
+        working even before a rate has been measured."""
         src = self.HTML_PATH.read_text()
-        qactive_branch = src.index("} else if (qActive) {")
-        pct_done_branch = src.index("} else if (p.pct >= 99.9) {")
-        assert qactive_branch < pct_done_branch, (
-            "the qActive branch must come before the pct>=99.9 'done' branch "
-            "in dashboard.html's rateText chain, or a still-active queue "
-            "renders as 'done' whenever the DB-derived ratio is already ~100%"
-        )
+        chips = src[src.index("// Chip cards\n") : src.index("// System")]
+        assert "const working = rate > 0 || qActive;" in chips
+        assert "'done'" not in chips
 
 
 class TestLibraryCoverage:
@@ -690,3 +689,16 @@ class TestLibraryCoverage:
         html = self._html()
         render = html[html.index("function renderCoverage") : html.index("function render(d)")]
         assert "innerHTML" not in render
+
+    def test_the_engine_cards_show_activity_not_completion(self):
+        """Completion is the Library card's job. The engine cards said 99.9%
+        five times over on a page where nothing was running."""
+        html = self._html()
+        chips = html[html.index("// Chip cards\n") : html.index("// System")]
+        assert "p.pct" not in chips
+        assert "'Idle'" in chips
+
+    def test_never_shows_100_percent_while_anything_is_missing(self):
+        html = self._html()
+        render = html[html.index("function renderCoverage") : html.index("function render(d)")]
+        assert "missing > 0 ? Math.min(p.pct, 99.9) : 100" in render

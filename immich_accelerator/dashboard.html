@@ -101,6 +101,7 @@
     display: flex; align-items: center; gap: 10px;
     font-size: 14px; font-weight: 600; color: var(--text);
   }
+  .coverage-total { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--text-dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .coverage-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-muted); flex: none; }
   .coverage[data-state="complete"] .coverage-dot { background: var(--green); }
   .coverage[data-state="catching-up"] .coverage-dot { background: var(--blue); }
@@ -225,6 +226,12 @@
     font-size: 20px;
   }
 
+  /* A word, not a number: small, flat, and dim when nothing is happening. */
+  .task-top .task-pct.word {
+    font-size: 14px; font-weight: 500; letter-spacing: 0;
+    background: none; -webkit-text-fill-color: var(--text-dim);
+  }
+  .task-top .task-pct.word.idle { -webkit-text-fill-color: var(--text-muted); }
   .bar-bg {
     height: 4px;
     background: var(--card-border);
@@ -328,7 +335,7 @@
     >Re-queue Missing</button>
   </div>
   <div class="coverage" id="coverage">
-    <div class="coverage-verdict"><span class="coverage-dot"></span><span id="coverage-text">Loading…</span></div>
+    <div class="coverage-verdict"><span class="coverage-dot"></span><span id="coverage-text">Loading…</span><span class="coverage-total" id="coverage-total"></span></div>
     <div class="coverage-rows" id="coverage-rows"></div>
   </div>
 
@@ -453,7 +460,9 @@ function renderCoverage(d) {
     cell.className = 'cov';
     cell.dataset.state = state;
     const l = document.createElement('div'); l.className = 'cov-label'; l.textContent = label;
-    const pc = document.createElement('div'); pc.className = 'cov-pct'; pc.textContent = p.pct + '%';
+    // Never round up to 100% while anything is missing.
+    const shown = missing > 0 ? Math.min(p.pct, 99.9) : 100;
+    const pc = document.createElement('div'); pc.className = 'cov-pct'; pc.textContent = shown + '%';
     const bar = document.createElement('div'); bar.className = 'cov-bar';
     const fill = document.createElement('div'); fill.style.width = p.pct + '%'; bar.appendChild(fill);
     const note = document.createElement('div'); note.className = 'cov-note';
@@ -463,6 +472,11 @@ function renderCoverage(d) {
     rows.appendChild(cell);
   }
   document.getElementById('coverage').dataset.state = worst;
+  // Live assets, all types; video is its own count.
+  const all = (d.progress.thumbnails || {}).total || 0;
+  const videos = (d.progress.video || {}).total || 0;
+  document.getElementById('coverage-total').textContent =
+    all ? n(all - videos) + ' photos · ' + n(videos) + ' videos' : '';
   const parts = [];
   if (waiting) parts.push('Processing ' + n(waiting) + ' items');
   if (forgotten) parts.push(waiting ? n(forgotten) + ' not queued' : n(forgotten) + ' items not processed');
@@ -526,23 +540,6 @@ function render(d) {
       const eta = etaStr(rem, rate);
       const qActive = d.queue_active && d.queue_active[t.key];
       const noApi = !d.queue_active || Object.keys(d.queue_active).length === 0;
-      let rateText;
-      if (rate > 0) {
-        rateText = rate + '/min' + (eta ? ' \u00b7 ' + eta : '') + (qc > 0 ? ' \u00b7 ' + qc + ' queued' : '');
-      } else if (qActive) {
-        // Checked before the pct>=99.9 "done" branch below: a queue that's
-        // still active (jobs re-queued for already-processed assets, a fresh
-        // upload not yet counted in the DB total) must never render "done"
-        // just because the DB-derived ratio happens to already be ~100%.
-        rateText = 'processing' + (qc > 0 ? ' \u00b7 ' + qc + ' queued' : '');
-      } else if (p.pct >= 99.9) {
-        rateText = 'done';
-      } else if (noApi && p.done < p.total) {
-        rateText = d.jobs_api_error ? 'no job data: ' + d.jobs_api_error : 'no job data (check api_key in config)';
-      } else {
-        rateText = 'idle';
-      }
-
       // Divider between tasks
       if (idx > 0) {
         const hr = document.createElement('hr');
@@ -553,40 +550,41 @@ function render(d) {
       const row = document.createElement('div');
       row.className = 'task-row';
 
-      // Top: label + pct
+      // Activity only. How much of the library is done lives in the Library
+      // card; repeating it here put five big percentages on a page whose
+      // engines were all doing nothing.
+      const working = rate > 0 || qActive;
       const top = document.createElement('div');
       top.className = 'task-top';
       const label = document.createElement('div');
       label.className = 'task-label';
       label.textContent = t.label;
-      const pct = document.createElement('div');
-      pct.className = 'task-pct' + (isMulti ? ' sub' : '');
-      pct.textContent = p.pct + '%';
+      const now = document.createElement('div');
+      // A rate needs two polls, so a queue that just started says Working.
+      now.className = 'task-pct' + (isMulti ? ' sub' : '')
+        + (rate > 0 ? '' : ' word') + (working ? '' : ' idle');
+      now.textContent = rate > 0 ? n(rate) + '/min' : (working ? 'Working' : 'Idle');
       top.appendChild(label);
-      top.appendChild(pct);
+      top.appendChild(now);
       row.appendChild(top);
 
-      // Bar
-      const barBg = document.createElement('div');
-      barBg.className = 'bar-bg';
-      const barFill = document.createElement('div');
-      barFill.className = 'bar-fill ' + chip.chip;
-      barFill.style.width = p.pct + '%';
-      barBg.appendChild(barFill);
-      row.appendChild(barBg);
-
-      // Stats
-      const stats = document.createElement('div');
-      stats.className = 'task-stats';
-      const countSpan = document.createElement('span');
-      countSpan.textContent = n(p.done) + ' / ' + n(p.total)
-        + (p.unqueued > 0 ? ' · ' + n(p.unqueued) + ' not queued' : '');
-      const rateSpan = document.createElement('span');
-      rateSpan.className = 'task-rate';
-      rateSpan.textContent = rateText;
-      stats.appendChild(countSpan);
-      stats.appendChild(rateSpan);
-      row.appendChild(stats);
+      if (working) {
+        const stats = document.createElement('div');
+        stats.className = 'task-stats';
+        const left = document.createElement('span');
+        left.textContent = qc > 0 ? n(qc) + ' queued' : 'finishing';
+        const right = document.createElement('span');
+        right.className = 'task-rate';
+        right.textContent = eta;
+        stats.appendChild(left);
+        stats.appendChild(right);
+        row.appendChild(stats);
+      } else if (noApi && p.done < p.total) {
+        const stats = document.createElement('div');
+        stats.className = 'task-stats';
+        stats.textContent = d.jobs_api_error ? 'no job data: ' + d.jobs_api_error : 'no job data (check api_key in config)';
+        row.appendChild(stats);
+      }
 
       card.appendChild(row);
     });
