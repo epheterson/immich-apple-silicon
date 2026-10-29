@@ -15,8 +15,13 @@ here rather than in either of them.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import urllib.error
+import urllib.request
 import subprocess
+from pathlib import Path
 
 log = logging.getLogger("accelerator")
 
@@ -117,3 +122,139 @@ def run_ok(
     the two were byte-identical apart from the return value.
     """
     return run_output(cmd, timeout=timeout, input=input) is not None
+
+
+# Things only a person can fix, as (what is wrong, what to do). The watch loop
+# writes the reason to notice.json; status, the dashboard and the menu bar
+# (MenuView.swift says the same in its own words) turn it into these. {who} is
+# the program macOS shows in its prompt and in System Settings.
+NOTICE_TEXT = {
+    "media-permission": (
+        "macOS is waiting for permission to read the library",
+        'Click Allow on the prompt on this Mac\'s screen, or turn on "{who}" in '
+        "System Settings > Privacy & Security > Files & Folders.",
+    ),
+    "local-network": (
+        "macOS is blocking the connection to the database",
+        'Turn on "{who}" in System Settings > Privacy & Security > Local Network.',
+    ),
+}
+
+# Why the watch loop stopped the worker (paused.json).
+PAUSE_TEXT = {
+    "library-unreachable": (
+        "The worker is paused: the library is not reachable",
+        # Not the path: the dashboard serves this to anyone on the LAN.
+        "It starts again on its own when the library is back.",
+    ),
+    "backend-unreachable": (
+        "The worker is paused: {detail} not answering",
+        "It starts again on its own when they are back.",
+    ),
+}
+
+
+def attention(data_dir: Path) -> dict | None:
+    """What needs a person right now, if anything: a notice first, since it is
+    something they can act on, else why the worker is paused. Reads two small
+    local files and nothing else, so it can sit on any status path."""
+    for name, texts in (("notice.json", NOTICE_TEXT), ("paused.json", PAUSE_TEXT)):
+        try:
+            entry = json.loads((data_dir / name).read_text())
+        except (OSError, ValueError):
+            continue
+        reason = entry.get("reason")
+        if reason not in texts:
+            continue
+        fill = {"who": entry.get("who") or "Python", "detail": entry.get("detail") or "?"}
+        title, action = (part.format(**fill) for part in texts[reason])
+        return {
+            "reason": reason,
+            "title": title,
+            "action": action,
+            "since": entry.get("since"),
+        }
+    return None
+# Immich's "missing" runs, in pipeline order: each stage only picks up assets
+# the one before has finished, and asking for "missing" (force false) queues
+# nothing for an asset that already has the result. Metadata leads because an
+# asset that never had it never gets a thumbnail either.
+MISSING_QUEUES = (
+    "metadataExtraction",
+    "thumbnailGeneration",
+    "smartSearch",
+    "faceDetection",
+    "ocr",
+    "videoConversion",
+)
+
+# How often the watcher queues missing work on its own, when it is switched on
+# (the dashboard's Auto switch). Daily: a gap that formed overnight is closed
+# by the next evening, and an idle Immich asked once a day costs nothing.
+AUTO_REQUEUE_EVERY = 24 * 3600
+
+
+def _immich(url: str, api_key: str, path: str, body: bytes | None = None, timeout: float = 10) -> dict:
+    req = urllib.request.Request(
+        f"{url.rstrip('/')}{path}",
+        data=body,
+        method="PUT" if body is not None else "GET",
+        headers={"x-api-key": api_key, "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return json.loads(raw) if raw.strip() else {}
+
+
+def immich_busy(url: str, api_key: str) -> bool | None:
+    """Is any Immich queue running or holding work? None when it cannot be
+    asked, which callers must treat as "do not touch it"."""
+    try:
+        jobs = _immich(url, api_key, "/api/jobs", timeout=5)
+    except Exception:
+        return None
+    if not jobs:
+        return None  # an empty answer is not an idle Immich
+    # Delayed is work too: retries waiting out their backoff.
+    return any(
+        sum(q.get("jobCounts", {}).get(k, 0) for k in ("active", "waiting", "delayed")) > 0
+        for q in jobs.values()
+        if isinstance(q, dict)
+    )
+
+
+def requeue_missing(url: str, api_key: str) -> dict:
+    """Ask Immich to queue whatever it has not done yet, stage by stage, the
+    same as each queue's "Missing" button on its Jobs page."""
+    results = {}
+    for queue in MISSING_QUEUES:
+        try:
+            _immich(url, api_key, f"/api/jobs/{queue}", b'{"command": "start", "force": false}')
+            results[queue] = "ok"
+        except urllib.error.HTTPError as e:
+            # 400 is "already running": it is queued, which is what we asked.
+            results[queue] = "ok" if e.code == 400 else "failed"
+        except Exception:
+            results[queue] = "failed"
+    return results
+
+
+# Auto re-queue is on unless this file exists. A file of its own, not a key in
+# config.json: the watcher rewrites config.json from a copy it read at the top
+# of a cycle that can last minutes (following an Immich upgrade downloads a
+# server), so a switch flipped from the dashboard in that window was silently
+# put back.
+AUTO_REQUEUE_OFF = "auto-requeue.off"
+
+
+def auto_requeue_enabled(data_dir: Path) -> bool:
+    return not (data_dir / AUTO_REQUEUE_OFF).exists()
+
+
+def set_auto_requeue(data_dir: Path, enabled: bool) -> None:
+    marker = data_dir / AUTO_REQUEUE_OFF
+    if enabled:
+        marker.unlink(missing_ok=True)
+    else:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        marker.touch()

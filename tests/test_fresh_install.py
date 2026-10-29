@@ -1342,6 +1342,106 @@ class TestNodeVersionPreflight:
         ), "no backticks in the formula heredoc (command substitution)"
         assert "$(" not in body, "no $( ) in the formula heredoc (command substitution)"
 
+    def _render_formula(self, tmp_path, **extra) -> str:
+        out = tmp_path / "f.rb"
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "OUT": str(out),
+            "SRC_URL": "https://example.invalid/src.tar.gz",
+            "SRC_SHA": "0" * 64,
+            "ML_URL": "https://example.invalid/ml.tar.gz",
+            "ML_SHA": "0" * 64,
+            "REPO": "o/r",
+            "OWNER": "o",
+            "VERSION": "1.0.0",
+            **extra,
+        }
+        subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts" / "render-formula.sh")],
+            env=env,
+            check=True,
+        )
+        return out.read_text()
+
+    def test_release_formula_runs_the_service_through_the_signed_launcher(
+        self, tmp_path
+    ):
+        """The point of the launcher is that launchd starts it, so macOS asks
+        about the NAS on its behalf and not on Python's. A formula that installs
+        it but still runs the CLI directly would ship it and change nothing."""
+        formula = self._render_formula(
+            tmp_path,
+            SERVICE_URL="https://example.invalid/s.tar.gz",
+            SERVICE_SHA="1" * 64,
+        )
+        assert 'resource "service_launcher"' in formula
+        assert 'resource("service_launcher").stage' in formula
+        service = formula[formula.index("service do") :]
+        build = (REPO_ROOT / "service" / "build.sh").read_text()
+        assert 'APP="Immich Accelerator Service.app"' in build
+        assert (
+            'opt_libexec/"Immich Accelerator Service.app/Contents/MacOS/'
+            'immich-accelerator-service"' in service
+        )
+        assert '"watch"' not in service
+
+    def test_formula_without_the_launcher_runs_the_cli_as_before(self, tmp_path):
+        formula = self._render_formula(tmp_path)
+        assert "service_launcher" not in formula
+        assert 'run [bin/"immich-accelerator", "watch"]' in formula
+
+    def test_release_builds_and_publishes_the_launcher_it_points_at(self):
+        """The formula fetches immich-accelerator-service-VERSION.tar.gz from the
+        release. The workflow has to upload exactly that, and must not treat the
+        build as best-effort the way it treats the menu-bar app: a release
+        without it would point every install at a missing asset."""
+        wf = (REPO_ROOT / ".github" / "workflows" / "update-homebrew.yml").read_text()
+        step = wf[wf.index("- name: Build + upload service launcher asset") :]
+        step = step[: step.index("- name:", 10)]
+        assert "id: service" in step
+        assert "continue-on-error" not in step
+        assert "bash service/build.sh" in step
+        assert "immich-accelerator-service-${VERSION}.tar.gz" in step
+        assert "service_sha256: ${{ steps.service.outputs.sha256 }}" in wf
+        render = wf[wf.index("- name: Render formula") :]
+        render = render[: render.index("- name:", 10)]
+        assert "SERVICE_SHA: ${{ needs.build-native.outputs.service_sha256 }}" in render
+        assert "immich-accelerator-service-${VERSION}.tar.gz" in render
+        # Never conditional: migrated installs have a plist naming the launcher.
+        assert 'if [ -n "$SERVICE_SHA" ]' not in render
+        # And never ad-hoc, and never another certificate: either would change
+        # its identity and cost every user a prompt nobody sees.
+        assert "must be signed with the project certificate" in step and "exit 1" in step
+        assert "SERVICE_SIGNING_SHA1: CE2FC5A27427FE9BEB9AE65E1C45147D128D96C2" in step
+        assert "is not the pinned one" in step
+        build = (REPO_ROOT / "service" / "build.sh").read_text()
+        assert 'immich-accelerator-service-${VERSION}.tar.gz' in build
+
+    def test_launcher_stays_the_parent_and_runs_only_the_accelerator(self):
+        """exec would hand the process over to Python, which is exactly the
+        identity macOS keeps forgetting. And a signed program that
+        runs whatever it is given would lend its permission to anything."""
+        src = (REPO_ROOT / "service" / "main.swift").read_text()
+        code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("//"))
+        assert "posix_spawn(" in code
+        assert "exec" not in code.replace("execut", "")
+        assert "CommandLine.arguments" not in code
+        assert 'appendingPathComponent("bin/immich-accelerator")' in code
+        assert 'strdup("watch")' in code
+        # A stop that lands during the spawn is held, not lost; and the child
+        # gets the signals back at their defaults.
+        assert code.index("makeSignalSource") < code.index("posix_spawn(")
+        assert "POSIX_SPAWN_SETSIGDEF" in code
+
+    def test_launcher_bundle_identifier_never_changes(self):
+        """macOS remembers the user's Allow by this identifier. Changing it would
+        cost every NAS user another prompt on a screen nobody watches."""
+        build = (REPO_ROOT / "service" / "build.sh").read_text()
+        assert (
+            "<key>CFBundleIdentifier</key>"
+            "<string>com.epheterson.immich-accelerator.service</string>" in build
+        )
+
     def test_find_node_prefers_node_22_keg(self):
         """find_node must prefer /opt/homebrew/opt/node@22/bin/node
         when it exists. Simulated by patching os.path.isfile.

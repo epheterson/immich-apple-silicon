@@ -54,6 +54,23 @@ This uses the formula's own service definition, survives `brew upgrade`, and res
 
 Either way the service uses `watch` mode with `KeepAlive`. Confirm everything is healthy with `immich-accelerator status` and `immich-accelerator ml-test`.
 
+### macOS permissions
+
+macOS asks before a background service can read files on a network volume (your NAS) or connect to other machines on your network (a database on the NAS). Until someone answers, the service waits: on a NAS library that means the worker runs but gets no work done. The prompt appears once, on the Mac's own screen, from **Immich Accelerator Service**. Click Allow. If you missed it, turn it on in System Settings > Privacy & Security > Files & Folders (or Local Network).
+
+macOS asks on behalf of the program launchd started, and everything that program runs inherits the answer: Python, Node, ffmpeg, libvips, exiftool and the ML engine all read your library under it. Homebrew installs since 1.18.0 start a small launcher, `Immich Accelerator Service.app`, signed with the project's own certificate. macOS remembers an Allow by that certificate, so it carries over to every later update of the accelerator and of Homebrew's Python and Node. Before 1.18.0 the service ran Homebrew's Python directly, which is not signed by anyone macOS can track, so each Python update could bring the prompt back unseen.
+
+While the service is waiting on a prompt, `immich-accelerator status`, the menu bar app and the dashboard say so and name the setting. The menu bar icon turns amber.
+
+| Program | Signed | Needs its own permission |
+|---|---|---|
+| Immich Accelerator Service (launcher) | project certificate | yes, the one you allow |
+| Python, Node, ffmpeg, libvips, exiftool, ML engine | ad hoc or Apple | no, covered by the launcher |
+| Menu bar app | Developer ID, notarized | no, it does not read the library |
+| `immich-accelerator` in Terminal or over SSH | | no, Terminal and SSH carry their own |
+
+A git (non-Homebrew) install's LaunchAgent still runs Python directly, so it can be asked again after a Python update.
+
 ## Updates
 
 The accelerator handles Immich updates automatically:
@@ -90,14 +107,16 @@ Real-time monitoring at `http://your-mac:8420`:
 immich-accelerator dashboard
 ```
 
-Shows service health, processing progress with live rates and ETAs, Apple Silicon hardware utilization, and system metrics. Mobile-friendly, check from your phone.
+The **Library** card says whether every photo has its thumbnail, search, faces and text (video transcodes are left to the job cards, since Immich's transcode policy skips some videos on purpose): complete, still processing, or missing work that nothing is queued to do. Immich never goes back for work that fell out of its queue (a Redis restart during a big import is enough), so that last state can last forever without anyone noticing. **Re-queue Missing** asks Immich to queue all of it, metadata first. With **Auto** on (the default), the accelerator does the same once a day when Immich is idle; on a complete library that queues nothing.
+
+Below it, the Apple Silicon engines show live rates and time left while they work, and step aside when everything is idle. Mobile-friendly, check from your phone.
 
 The dashboard and setup use the Immich API for job status and queue control. Create an API key from an **admin** account in Administration > API Keys with these permissions:
 
 | Permission | Used by | Why |
 |-----------|---------|-----|
 | `job.read` | Dashboard | Show queue activity (active/waiting counts) |
-| `job.create` | Dashboard | Re-queue button |
+| `job.create` | Dashboard, watcher | Re-queue Missing, and its daily Auto run |
 | `asset.read` | Setup | Detect upload library path |
 | `library.read` | Setup | Detect external library paths |
 

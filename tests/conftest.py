@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -103,6 +103,10 @@ def tmp_data_dir(tmp_path, monkeypatch):
     Same class of trap as read_pid's global process scan: the fixture looks
     isolating and is not.
     """
+    # Under the brew service, cmd_watch would ask brew to restart the real
+    # service (_move_onto_launcher). A test run from that environment must not.
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("IMMICH_ACCELERATOR_LAUNCHER", raising=False)
     data_dir = tmp_path / ".immich-accelerator"
     data_dir.mkdir()
     pid_dir = data_dir / "pids"
@@ -112,6 +116,7 @@ def tmp_data_dir(tmp_path, monkeypatch):
     config_file = data_dir / "config.json"
     lock_file = data_dir / "start.lock"
     pause_file = data_dir / "paused.json"
+    notice_file = data_dir / "notice.json"
     synthetic_conf = tmp_path / "synthetic.d" / "immich-accelerator"
     synthetic_conf.parent.mkdir(parents=True, exist_ok=True)
     legacy_synthetic = tmp_path / "synthetic.conf"
@@ -124,6 +129,12 @@ def tmp_data_dir(tmp_path, monkeypatch):
         LOG_DIR=log_dir,
         LOCK_FILE=lock_file,
         PAUSE_FILE=pause_file,
+        NOTICE_FILE=notice_file,
+        LAUNCHER_MOVE_FILE=data_dir / "launcher-move.version",
+        AUTO_REQUEUE_FILE=data_dir / "auto-requeue.json",
+        # The watch loop's daily re-queue asks Immich over HTTP. Never from a
+        # test: None is "could not ask", which leaves Immich alone.
+        immich_busy=MagicMock(return_value=None),
         # A real install has this file, and two tests wrote to and removed the
         # user's actual /etc/synthetic.d entry.
         SYNTHETIC_CONF=synthetic_conf,
@@ -149,6 +160,7 @@ def tmp_data_dir(tmp_path, monkeypatch):
             "log_dir": log_dir,
             "lock_file": lock_file,
             "pause_file": pause_file,
+            "notice_file": notice_file,
         }
 
 

@@ -22,7 +22,14 @@ import os
 import subprocess
 import time
 
-from .common import component_enabled, run_output
+from .common import (
+    attention,
+    component_enabled,
+    requeue_missing,
+    run_output,
+    auto_requeue_enabled,
+    set_auto_requeue,
+)
 from pathlib import Path
 
 log = logging.getLogger("dashboard")
@@ -333,6 +340,9 @@ def get_status(config: dict) -> dict:
                     raise ValueError(f"empty response from {immich_url}/api/jobs")
                 jobs = json.loads(body)
                 queue_map = {
+                    # Not a card of its own: it tells the Library card that
+                    # work further down the pipeline is on its way.
+                    "metadataExtraction": "metadata",
                     "thumbnailGeneration": "thumbnails",
                     "smartSearch": "clip",
                     "faceDetection": "faces",
@@ -454,6 +464,9 @@ def get_status(config: dict) -> dict:
         "queue_active": queue_status,
         "queue_counts": queue_counts,
         "jobs_api_error": jobs_api_error,
+        # Beside CONFIG_FILE, so the tests' fixture redirects it with the rest.
+        "attention": attention(CONFIG_FILE.parent),
+        "auto_requeue": auto_requeue_enabled(CONFIG_FILE.parent),
     }
 
     _cache = status
@@ -469,7 +482,7 @@ def _load_html() -> str:
 
 def create_app(config: dict):
     """Create the FastAPI dashboard app."""
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
     from fastapi.responses import HTMLResponse, JSONResponse
 
     app = FastAPI(title="Immich Accelerator Dashboard")
@@ -503,43 +516,37 @@ def create_app(config: dict):
 
     @app.post("/api/requeue")
     async def api_requeue():
-        """Trigger 'Run All Missing' for thumbnail, CLIP, faces, and OCR queues."""
-        import urllib.request, urllib.error
-
+        """Queue whatever Immich has not done yet, every stage."""
         live = _reload_config(config)
         api_key = live.get("api_key", "")
-        immich_url = live.get("immich_url", "http://localhost:2283")
         if not api_key:
             return JSONResponse({"error": "No API key configured"}, status_code=400)
+        return JSONResponse(
+            requeue_missing(live.get("immich_url", "http://localhost:2283"), api_key)
+        )
 
-        results = {}
-        for queue in [
-            "thumbnailGeneration",
-            "smartSearch",
-            "faceDetection",
-            "ocr",
-            "videoConversion",
-        ]:
-            try:
-                data = b'{"command": "start", "force": false}'
-                req = urllib.request.Request(
-                    f"{immich_url}/api/jobs/{queue}",
-                    data=data,
-                    method="PUT",
-                    headers={
-                        "x-api-key": api_key,
-                        "Content-Type": "application/json",
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    results[queue] = "ok"
-            except urllib.error.HTTPError as e:
-                # 400 "already running" is fine — job was already queued
-                results[queue] = "ok" if e.code == 400 else "failed"
-            except Exception:
-                results[queue] = "failed"
+    async def api_auto_requeue(request):
+        """Switch the watcher's daily re-queue of missing work on or off."""
+        try:
+            enabled = (await request.json())["enabled"]
+            if not isinstance(enabled, bool):
+                raise ValueError("enabled must be true or false")
+        except Exception:
+            return JSONResponse({"error": "expected {\"enabled\": true|false}"}, status_code=400)
+        try:
+            set_auto_requeue(CONFIG_FILE.parent, enabled)
+        except OSError as e:
+            log.warning("could not save auto_requeue: %s", e)
+            return JSONResponse({"error": "could not save the setting"}, status_code=500)
+        global _cache_ts
+        _cache_ts = 0  # the next status shows the new value
+        return JSONResponse({"auto_requeue": enabled})
 
-        return JSONResponse(results)
+    # Annotated here, not in the signature: this module uses postponed
+    # annotations and imports FastAPI lazily, so FastAPI would see the string
+    # "Request", fail to resolve it, and treat the request as a query field.
+    api_auto_requeue.__annotations__["request"] = Request
+    app.post("/api/auto-requeue")(api_auto_requeue)
 
     return app
 

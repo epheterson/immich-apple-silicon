@@ -47,7 +47,8 @@ struct AcceleratorBarMain {
         AcceleratorBarApp.main()
     }
 
-    /// Draw a Settings pane straight to a PNG. `render <pane> <path>`.
+    /// Draw a Settings pane, or the menu-bar panel with `menu`, straight to a
+    /// PNG. `render <pane> <path>`.
     ///
     /// Not a screenshot: the window renders itself into a bitmap through
     /// cacheDisplay, so this needs no Screen Recording permission and works
@@ -65,7 +66,11 @@ struct AcceleratorBarMain {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
-        let host = NSHostingController(rootView: SettingsView(model: .shared))
+        // "menu" draws the menu-bar panel instead of a Settings pane.
+        let host: NSViewController = pane == "menu"
+            ? NSHostingController(rootView: MenuView(model: .shared)
+                .frame(width: Metrics.panelWidth))
+            : NSHostingController(rootView: SettingsView(model: .shared))
         let window = NSWindow(contentViewController: host)
         window.styleMask = [.titled, .closable]
         window.title = "Immich Accelerator Settings"
@@ -83,7 +88,9 @@ struct AcceleratorBarMain {
 
         // Let layout, the status poll and any async row content settle. A
         // single spin renders an empty split view.
-        let deadline = Date().addingTimeInterval(3)
+        // The panel waits on a status pass, whose network probes have their own
+        // timeouts of a few seconds.
+        let deadline = Date().addingTimeInterval(pane == "menu" ? 12 : 3)
         while Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.05))
         }

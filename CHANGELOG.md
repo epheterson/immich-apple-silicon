@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.18.0 - 2026-10-28
+
+### Fixed
+- **A Homebrew update no longer stalls a NAS library behind a prompt nobody sees.** macOS asks before a background service reads a network volume, and remembers the answer by the program's signature. The service ran Homebrew's Python, which has no signature macOS can track, so a Python update could put a new prompt on the Mac's screen while every read of the library waited for it: the worker looked healthy and did nothing. The Homebrew service now starts a small launcher, `Immich Accelerator Service`, signed with the project's own certificate; everything the service runs inherits its permission, and macOS keeps it across updates of the accelerator, Python and Node. Existing installs move onto it by themselves on upgrade. **NAS users get one prompt from "Immich Accelerator Service" after this update; click Allow on the Mac's screen (or in System Settings > Privacy & Security > Files & Folders), and that is the last one.** The same applies to Local Network access.
+
+### Added
+- **The menu bar app, the dashboard and `status` say when something needs you.** When macOS is holding the library for a permission (told apart from a stuck NAS by whether the mount still answers), or blocking the database connection, or when the worker is paused because the library or database is gone, the menu bar panel leads with what happened and what to click, with a button to the right Privacy & Security pane, and the icon turns amber. The dashboard shows the same as a banner. Before, all of this was in a log file.
+- **The dashboard says whether the whole library is done.** A Library card shows thumbnails, search, faces and text across every photo: complete, still processing, or missing work nothing is queued to do, with the photo and video counts. Immich never goes back for work that fell out of its queue (a Redis restart during a big import is enough), and an idle queue looked the same whether the library was finished or forgotten: on the release Mac, 40,162 photos had gone months without search, faces or text. The Apple Silicon engine cards now show only what is running, with rates and time left, and step aside when everything is idle.
+- **Missing work is re-queued by itself once a day.** While every Immich queue is idle, the accelerator asks Immich to queue whatever it has not done, metadata first; on a complete library that queues nothing. The **Auto** switch beside Re-queue Missing turns it off. Re-queue Missing now covers metadata too, which is where an asset that never got a thumbnail is usually stuck.
+
 ## 1.17.13 - 2026-10-26
 
 ### Changed

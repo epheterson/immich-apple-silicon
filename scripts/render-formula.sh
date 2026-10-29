@@ -5,6 +5,7 @@
 # WARNING: this is an UNQUOTED heredoc. No backticks or $( ) in the body (command
 # substitution corrupts the formula); shell vars are ${VAR}, Ruby is #{...}.
 # Required env: OUT SRC_URL SRC_SHA ML_URL ML_SHA REPO OWNER VERSION
+# Optional: NATIVE_URL + NATIVE_SHA, SERVICE_URL + SERVICE_SHA
 set -euo pipefail
 : "${OUT:?} ${SRC_URL:?} ${SRC_SHA:?} ${ML_URL:?} ${ML_SHA:?} ${REPO:?} ${OWNER:?} ${VERSION:?}"
 
@@ -31,6 +32,27 @@ if [ -n "${NATIVE_URL:-}" ]; then
 "
 fi
 
+# The signed launcher the service runs (service/main.swift). Optional like the
+# native bundle: without it the service runs the CLI directly, as before, and
+# macOS forgets the user's network-volume Allow whenever Python is upgraded.
+SERVICE_RESOURCE=""
+SERVICE_INSTALL=""
+SERVICE_RUN='run [bin/"immich-accelerator", "watch"]'
+if [ -n "${SERVICE_URL:-}" ]; then
+  : "${SERVICE_SHA:?}"
+  SERVICE_RESOURCE="
+  resource \"service_launcher\" do
+    url \"${SERVICE_URL}\"
+    sha256 \"${SERVICE_SHA}\"
+  end
+"
+  SERVICE_INSTALL="    resource(\"service_launcher\").stage do
+      libexec.install Dir[\"*\"]
+    end
+"
+  SERVICE_RUN='run opt_libexec/"Immich Accelerator Service.app/Contents/MacOS/immich-accelerator-service"'
+fi
+
 cat > "$OUT" << EOF
 class ImmichAccelerator < Formula
   desc "Run Immich compute natively on Apple Silicon"
@@ -43,7 +65,7 @@ class ImmichAccelerator < Formula
     url "${ML_URL}"
     sha256 "${ML_SHA}"
   end
-${NATIVE_RESOURCE}
+${NATIVE_RESOURCE}${SERVICE_RESOURCE}
   depends_on :macos
   depends_on arch: :arm64
   # node@22 is the keg-only LTS that satisfies Immich's
@@ -64,7 +86,7 @@ ${NATIVE_RESOURCE}
     resource("ml").stage do
       (libexec/"ml").install Dir["*"]
     end
-${NATIVE_INSTALL}    # Wrapper uses the ML venv Python so the CLI inherits its
+${NATIVE_INSTALL}${SERVICE_INSTALL}    # Wrapper uses the ML venv Python so the CLI inherits its
     # third-party deps (fastapi, uvicorn - required by the
     # dashboard and already pinned in ml/requirements.txt).
     # Prevents ModuleNotFoundError on fresh installs where
@@ -142,7 +164,7 @@ ${NATIVE_INSTALL}    # Wrapper uses the ML venv Python so the CLI inherits its
   end
 
   service do
-    run [bin/"immich-accelerator", "watch"]
+    ${SERVICE_RUN}
     keep_alive true
     log_path var/"log/immich-accelerator.log"
     error_log_path var/"log/immich-accelerator-error.log"

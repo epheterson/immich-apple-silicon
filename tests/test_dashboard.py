@@ -644,12 +644,243 @@ class TestDashboardHtmlDoneLabel:
 
     HTML_PATH = Path(__file__).parent.parent / "immich_accelerator" / "dashboard.html"
 
-    def test_qactive_checked_before_pct_done(self):
+    def test_an_active_queue_always_reads_as_working(self):
+        """The cards no longer say "done" at all (completion moved to the
+        Library card), and a queue Immich still reports active reads as
+        working even before a rate has been measured."""
         src = self.HTML_PATH.read_text()
-        qactive_branch = src.index("} else if (qActive) {")
-        pct_done_branch = src.index("} else if (p.pct >= 99.9) {")
-        assert qactive_branch < pct_done_branch, (
-            "the qActive branch must come before the pct>=99.9 'done' branch "
-            "in dashboard.html's rateText chain, or a still-active queue "
-            "renders as 'done' whenever the DB-derived ratio is already ~100%"
+        chips = src[src.index("// Chip cards\n") : src.index("// System")]
+        assert "const working = rate > 0 || qActive;" in chips
+        assert "'done'" not in chips
+
+
+class TestAttention:
+    """What needs a person: shown as a banner on the dashboard and a row in the
+    menu bar, from the two files the watch loop writes."""
+
+    def test_nothing_to_say(self, tmp_path):
+        from immich_accelerator.common import attention
+
+        assert attention(tmp_path) is None
+
+    def test_a_pending_permission_names_the_program_to_allow(self, tmp_path):
+        from immich_accelerator.common import attention
+
+        (tmp_path / "notice.json").write_text(
+            json.dumps(
+                {
+                    "reason": "media-permission",
+                    "detail": "/nas/immich",
+                    "since": 1.0,
+                    "who": "Immich Accelerator Service",
+                }
+            )
         )
+        got = attention(tmp_path)
+        assert got["reason"] == "media-permission"
+        assert "permission to read the library" in got["title"]
+        assert '"Immich Accelerator Service"' in got["action"]
+        assert "Files & Folders" in got["action"]
+
+    def test_a_notice_outranks_a_pause(self, tmp_path):
+        """The notice is the thing they can act on."""
+        from immich_accelerator.common import attention
+
+        (tmp_path / "paused.json").write_text(
+            json.dumps({"reason": "backend-unreachable", "detail": "Postgres"})
+        )
+        assert "Postgres not answering" in attention(tmp_path)["title"]
+        (tmp_path / "notice.json").write_text(
+            json.dumps({"reason": "local-network", "who": "Python"})
+        )
+        assert attention(tmp_path)["reason"] == "local-network"
+
+    def test_unknown_or_broken_files_are_ignored(self, tmp_path):
+        from immich_accelerator.common import attention
+
+        (tmp_path / "notice.json").write_text("{not json")
+        (tmp_path / "paused.json").write_text(json.dumps({"reason": "something-new"}))
+        assert attention(tmp_path) is None
+
+    def test_status_carries_it(self, tmp_data_dir, sample_config):
+        import immich_accelerator.dashboard as d
+
+        tmp_data_dir["notice_file"].write_text(
+            json.dumps({"reason": "media-permission", "who": "Python"})
+        )
+        d._cache, d._cache_ts = {}, 0
+        d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
+        try:
+            with patch("urllib.request.urlopen", side_effect=OSError), patch(
+                "immich_accelerator.dashboard._query_db",
+                return_value="200|100|10|150|80|70|120|5",
+            ), patch(
+                "immich_accelerator.dashboard._run", return_value="{ 1.50 2.00 3.00 }"
+            ):
+                status = get_status(sample_config)
+        finally:
+            d._cache, d._cache_ts, d._static_hw = {}, 0, None
+        assert status["attention"]["reason"] == "media-permission"
+
+    def test_the_page_draws_it_as_text(self):
+        """textContent, never innerHTML: the detail is a path a user chose."""
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        assert 'id="attention"' in html
+        assert "d.attention.title" in html
+        render = html[html.index("// Something a person has to do") :]
+        render = render[: render.index("// Services")]
+        assert "innerHTML" not in render
+
+
+class TestLibraryCoverage:
+    """Whether the library has everything, apart from what is running now.
+    An idle queue looks the same whether the library is done or forgotten,
+    which is how 40,162 photos sat without search, faces or text for months
+    behind job cards that said "idle"."""
+
+    def _html(self):
+        import immich_accelerator.dashboard as d
+
+        return (Path(d.__file__).parent / "dashboard.html").read_text()
+
+    def test_the_card_sits_apart_from_the_job_cards_with_the_requeue_button(self):
+        html = self._html()
+        body = html[html.index("<body>") :]
+        assert body.index('id="coverage"') < body.index('id="chips"')
+        library = body[body.index("<span>Library</span>") : body.index('id="coverage"')]
+        assert 'id="requeue-btn"' in library
+
+    def test_missing_work_nothing_runs_is_its_own_state(self):
+        html = self._html()
+        fn = html[html.index("function coverageState") :]
+        fn = fn[: fn.index("\n}\n")]
+        assert "'complete'" in fn and "'catching-up'" in fn and "'needs-queue'" in fn
+
+    def test_video_stays_with_the_job_cards(self):
+        """Immich transcodes only the videos its policy picks, so a video gap
+        is usually not a gap. It read as one here, so it is left out."""
+        html = self._html()
+        table = html[html.index("const COVERAGE") : html.index("];", html.index("const COVERAGE"))]
+        assert "'video'" not in table
+
+    def test_drawn_as_text(self):
+        html = self._html()
+        render = html[html.index("function renderCoverage") : html.index("function render(d)")]
+        assert "innerHTML" not in render
+
+    def test_the_engine_cards_show_activity_not_completion(self):
+        """Completion is the Library card's job. The engine cards said 99.9%
+        five times over on a page where nothing was running."""
+        html = self._html()
+        chips = html[html.index("// Chip cards\n") : html.index("// System")]
+        assert "p.pct" not in chips
+        assert "'Idle'" in chips
+
+    def test_never_shows_100_percent_while_anything_is_missing(self):
+        html = self._html()
+        render = html[html.index("function renderCoverage") : html.index("function render(d)")]
+        assert "missing > 0 ? Math.min(p.pct, 99.9) : 100" in render
+
+
+class TestAutoRequeueSwitch:
+    def test_the_switch_is_saved_apart_from_config_and_status_reports_it(self, tmp_data_dir, sample_config):
+        """Not in config.json: the watcher rewrites that file from a copy that
+        can be minutes old, which put a flipped switch back."""
+        from fastapi.testclient import TestClient
+
+        tmp_data_dir["config_file"].write_text(json.dumps(sample_config))
+        before = tmp_data_dir["config_file"].read_text()
+        client = TestClient(create_app(sample_config))
+        assert client.post("/api/auto-requeue", json={"enabled": False}).status_code == 200
+        assert (tmp_data_dir["data_dir"] / "auto-requeue.off").exists()
+        assert tmp_data_dir["config_file"].read_text() == before
+        assert self._status_says(sample_config) is False
+        assert client.post("/api/auto-requeue", json={"enabled": True}).status_code == 200
+        assert not (tmp_data_dir["data_dir"] / "auto-requeue.off").exists()
+        assert self._status_says(sample_config) is True
+
+    def _status_says(self, cfg):
+        import immich_accelerator.dashboard as d
+
+        d._cache, d._cache_ts = {}, 0
+        d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
+        try:
+            with patch("urllib.request.urlopen", side_effect=OSError), patch(
+                "immich_accelerator.dashboard._query_db",
+                return_value="200|100|10|150|80|70|120|5",
+            ), patch("immich_accelerator.dashboard._run", return_value="{ 1.50 2.00 3.00 }"):
+                return get_status(cfg)["auto_requeue"]
+        finally:
+            d._cache, d._cache_ts, d._static_hw = {}, 0, None
+
+    def test_rejects_anything_but_a_clear_answer(self, tmp_data_dir, sample_config):
+        from fastapi.testclient import TestClient
+
+        tmp_data_dir["config_file"].write_text(json.dumps(sample_config))
+        client = TestClient(create_app(sample_config))
+        for body in ({}, {"enabled": "false"}, {"enabled": 0}, {"enabled": None}):
+            assert client.post("/api/auto-requeue", json=body).status_code == 400, body
+        assert not (tmp_data_dir["data_dir"] / "auto-requeue.off").exists()
+
+    def test_the_page_puts_it_beside_the_button(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        actions = html[html.index('class="library-actions"') :]
+        actions = actions[: actions.index("</label>")]
+        assert actions.index('id="requeue-btn"') < actions.index('id="auto-requeue"')
+
+    def test_idle_engines_step_aside(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        assert "document.getElementById('engines').hidden = !anyWorking && !d.jobs_api_error;" in html
+
+
+class TestCoverageNeverClaimsMoreThanItKnows:
+    def _js(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        return html[html.index("function coverageState") : html.index("function render(d)")]
+
+    def test_unreadable_queues_are_unknown_not_forgotten(self):
+        """With a bad api_key every gap read "missing, not queued" while
+        Immich may have been working through it."""
+        js = self._js()
+        assert "if (!known) return 'unknown';" in js
+        assert "p.unqueued > 0 ? 'needs-queue'" in js
+
+    def test_an_unreadable_library_is_not_complete(self):
+        js = self._js()
+        assert "if (!drawn) worst = 'unknown';" in js
+        assert "'No library data'" in js
+
+    def test_the_jobs_error_stays_on_screen(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        assert "hidden = !anyWorking && !d.jobs_api_error" in html
+
+    def test_a_stale_status_cannot_flip_the_switch_back(self):
+        import immich_accelerator.dashboard as d
+
+        html = (Path(d.__file__).parent / "dashboard.html").read_text()
+        assert "if (d._clicks === autoClicks)" in html
+        refresh = html[html.index("async function refresh") :]
+        assert refresh.index("const clicks = autoClicks") < refresh.index("fetch('/api/status')")
+
+
+def test_work_on_its_way_from_an_earlier_stage_is_not_called_forgotten():
+    """Immich queues search, faces and text as thumbnails finish, and
+    thumbnails as metadata finishes. An idle later queue behind a busy earlier
+    one is catching up, not forgotten."""
+    import immich_accelerator.dashboard as d
+
+    html = (Path(d.__file__).parent / "dashboard.html").read_text()
+    assert "clip: ['metadata', 'thumbnails']" in html
+    assert "upstream.some(u => qa[u])" in html
+    src = Path(d.__file__).read_text()
+    assert '"metadataExtraction": "metadata"' in src

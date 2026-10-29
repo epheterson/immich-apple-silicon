@@ -107,6 +107,10 @@ struct MenuView: View {
     // to ignore the colors.
     private var statusRows: some View {
         VStack(spacing: Metrics.xs) {
+            if let attention = model.snap.attention {
+                AttentionRow(attention: attention)
+                    .padding(.bottom, Metrics.sm)
+            }
             if model.snap.workerEnabled {
                 StatusRow(
                     icon: "gearshape.2.fill", name: "Worker",
@@ -313,6 +317,47 @@ struct StatusRow: View {
         }
         .padding(.horizontal, Metrics.rowPadV)
         .padding(.vertical, Metrics.rowPadV)
+    }
+}
+
+/// Something only a person can fix, above everything else in the panel.
+///
+/// Before this, a service blocked on a macOS permission prompt nobody could
+/// see looked like a worker that was merely running: green dot, no work done,
+/// and the explanation in a log file. Amber rather than red, because nothing
+/// is broken; someone is needed.
+struct AttentionRow: View {
+    let attention: Attention
+
+    var body: some View {
+        HStack(alignment: .top, spacing: Metrics.md) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .frame(width: Metrics.iconColumn)
+            VStack(alignment: .leading, spacing: Metrics.sm) {
+                Text(attention.title).font(.rowTitle)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(attention.action).font(.rowDetail).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let url = attention.settingsURL {
+                    Button("Open Privacy & Security") {
+                        NSWorkspace.shared.open(url)
+                        WindowManager.shared.dismissMenuBarPanel()
+                    }
+                    .controlSize(.small)
+                    .padding(.top, Metrics.xs)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(Metrics.md)
+        .background(
+            RoundedRectangle(cornerRadius: Metrics.rowRadius)
+                .fill(Color.orange.opacity(0.12)))
+        .overlay(
+            RoundedRectangle(cornerRadius: Metrics.rowRadius)
+                .strokeBorder(Color.orange.opacity(0.35)))
+        .accessibilityElement(children: .contain)
     }
 }
 
