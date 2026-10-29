@@ -72,9 +72,6 @@ struct AcceleratorBarMain {
                 .frame(width: Metrics.panelWidth))
             : NSHostingController(rootView: SettingsView(model: .shared))
         let window = NSWindow(contentViewController: host)
-        // The panel is fed by the status poll, which only the running app
-        // starts. Without one pass it draws an empty snapshot.
-        if pane == "menu" { Task { await StatusModel.shared.refresh() } }
         window.styleMask = [.titled, .closable]
         window.title = "Immich Accelerator Settings"
         // Parked far off-screen and never ordered front. This used to call

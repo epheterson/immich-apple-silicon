@@ -796,8 +796,24 @@ class TestAutoRequeueSwitch:
         assert client.post("/api/auto-requeue", json={"enabled": False}).status_code == 200
         assert (tmp_data_dir["data_dir"] / "auto-requeue.off").exists()
         assert tmp_data_dir["config_file"].read_text() == before
+        assert self._status_says(sample_config) is False
         assert client.post("/api/auto-requeue", json={"enabled": True}).status_code == 200
         assert not (tmp_data_dir["data_dir"] / "auto-requeue.off").exists()
+        assert self._status_says(sample_config) is True
+
+    def _status_says(self, cfg):
+        import immich_accelerator.dashboard as d
+
+        d._cache, d._cache_ts = {}, 0
+        d._static_hw = {"mem_total_gb": 32.0, "cpus": 10}
+        try:
+            with patch("urllib.request.urlopen", side_effect=OSError), patch(
+                "immich_accelerator.dashboard._query_db",
+                return_value="200|100|10|150|80|70|120|5",
+            ), patch("immich_accelerator.dashboard._run", return_value="{ 1.50 2.00 3.00 }"):
+                return get_status(cfg)["auto_requeue"]
+        finally:
+            d._cache, d._cache_ts, d._static_hw = {}, 0, None
 
     def test_rejects_anything_but_a_clear_answer(self, tmp_data_dir, sample_config):
         from fastapi.testclient import TestClient
@@ -855,3 +871,16 @@ class TestCoverageNeverClaimsMoreThanItKnows:
         assert "if (d._clicks === autoClicks)" in html
         refresh = html[html.index("async function refresh") :]
         assert refresh.index("const clicks = autoClicks") < refresh.index("fetch('/api/status')")
+
+
+def test_work_on_its_way_from_an_earlier_stage_is_not_called_forgotten():
+    """Immich queues search, faces and text as thumbnails finish, and
+    thumbnails as metadata finishes. An idle later queue behind a busy earlier
+    one is catching up, not forgotten."""
+    import immich_accelerator.dashboard as d
+
+    html = (Path(d.__file__).parent / "dashboard.html").read_text()
+    assert "clip: ['metadata', 'thumbnails']" in html
+    assert "upstream.some(u => qa[u])" in html
+    src = Path(d.__file__).read_text()
+    assert '"metadataExtraction": "metadata"' in src

@@ -144,7 +144,8 @@ NOTICE_TEXT = {
 PAUSE_TEXT = {
     "library-unreachable": (
         "The worker is paused: the library is not reachable",
-        "It starts again on its own when {detail} is back.",
+        # Not the path: the dashboard serves this to anyone on the LAN.
+        "It starts again on its own when the library is back.",
     ),
     "backend-unreachable": (
         "The worker is paused: {detail} not answering",
@@ -193,7 +194,7 @@ MISSING_QUEUES = (
 AUTO_REQUEUE_EVERY = 24 * 3600
 
 
-def _immich(url: str, api_key: str, path: str, body: bytes | None = None, timeout: float = 10):
+def _immich(url: str, api_key: str, path: str, body: bytes | None = None, timeout: float = 10) -> dict:
     req = urllib.request.Request(
         f"{url.rstrip('/')}{path}",
         data=body,
@@ -212,8 +213,11 @@ def immich_busy(url: str, api_key: str) -> bool | None:
         jobs = _immich(url, api_key, "/api/jobs", timeout=5)
     except Exception:
         return None
+    if not jobs:
+        return None  # an empty answer is not an idle Immich
+    # Delayed is work too: retries waiting out their backoff.
     return any(
-        (q.get("jobCounts", {}).get("active", 0) + q.get("jobCounts", {}).get("waiting", 0)) > 0
+        sum(q.get("jobCounts", {}).get(k, 0) for k in ("active", "waiting", "delayed")) > 0
         for q in jobs.values()
         if isinstance(q, dict)
     )

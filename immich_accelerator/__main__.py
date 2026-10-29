@@ -7047,8 +7047,10 @@ def _watch_without_worker(config: dict) -> str | None:
     """
     log.info("Watching ML-only service (Ctrl+C to stop)...")
     # No worker reads the library here, so nothing would ever clear a notice
-    # about reading it, and the menu bar would stay amber over it.
+    # about reading it, or a pause of a worker that is now switched off, and
+    # the menu bar would stay amber over them.
     set_notice("")
+    set_paused("")
 
     # `brew services stop`/`restart` send SIGTERM to this watcher. The
     # dashboard runs detached (own session) and would survive; an ML this
@@ -7190,10 +7192,11 @@ def _auto_requeue(config: dict, now: float | None = None) -> None:
         return  # busy, or could not ask: try again on a later cycle
     results = requeue_missing(url, api_key)
     failed = [q for q, r in results.items() if r != "ok"]
-    try:
-        AUTO_REQUEUE_FILE.write_text(json.dumps({"last": now, "results": results}))
-    except OSError:
-        pass
+    if not failed:  # a refused stage is asked again next cycle, not tomorrow
+        try:
+            AUTO_REQUEUE_FILE.write_text(json.dumps({"last": now, "results": results}))
+        except OSError:
+            pass
     if failed:
         log.warning("Daily check for missing work: Immich refused %s", ", ".join(failed))
     else:
@@ -7242,6 +7245,10 @@ def _move_onto_launcher(wait: float = 60) -> None:
             LAUNCHER_APP,
         )
         return
+    # Anything this job left running (a relaunch after a crash) would survive
+    # the restart and stay attached to Python's permission. Stop it so it all
+    # comes back under the launcher.
+    stop_all_fast()
     try:
         LAUNCHER_MOVE_FILE.parent.mkdir(parents=True, exist_ok=True)
         LAUNCHER_MOVE_FILE.write_text(version)
@@ -7552,6 +7559,10 @@ def _watch_worker(config: dict) -> str | None:
             # 1.11.0 stop a healthy machine.
             down = backends_down(config)
             if down:
+                # Re-asked every cycle it stays down: a refusal that turns into
+                # a plain outage must stop telling people to flip a switch.
+                if backend_down_since is not None and not local_network_refused(config):
+                    clear_notice("local-network")
                 if backend_down_since is None:
                     backend_down_since = time.monotonic()
                     log.warning(

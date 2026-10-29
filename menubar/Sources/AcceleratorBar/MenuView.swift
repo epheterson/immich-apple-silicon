@@ -357,7 +357,7 @@ struct AttentionRow: View {
         .overlay(
             RoundedRectangle(cornerRadius: Metrics.rowRadius)
                 .strokeBorder(Color.orange.opacity(0.35)))
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }
 

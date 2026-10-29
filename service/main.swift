@@ -23,22 +23,36 @@ let argv: [UnsafeMutablePointer<CChar>?] = [strdup(cli), strdup("watch"), nil]
 // Lets the watcher see that it runs under this, and so on a stable identity.
 setenv("IMMICH_ACCELERATOR_LAUNCHER", Bundle.main.bundlePath, 1)
 
+// Watch for launchd's stop before starting anything, so a SIGTERM that lands
+// while the watcher is being spawned is held and passed on, not lost with the
+// launcher's default exit. The handlers run from dispatchMain, by which time
+// pid is set.
+let forwarded: [Int32] = [SIGTERM, SIGINT, SIGHUP]
 var pid: pid_t = 0
-let rc = posix_spawn(&pid, cli, nil, nil, argv, environ)
+var sources: [DispatchSourceSignal] = []
+for sig in forwarded {
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig)
+    source.setEventHandler { if pid > 0 { kill(pid, sig) } }
+    source.resume()
+    sources.append(source)
+}
+
+// The watcher gets those signals back at their defaults; ignoring them is
+// only how this process hands them to the dispatch sources.
+var attr: posix_spawnattr_t? = nil
+posix_spawnattr_init(&attr)
+var defaults = sigset_t()
+sigemptyset(&defaults)
+for sig in forwarded { sigaddset(&defaults, sig) }
+posix_spawnattr_setsigdefault(&attr, &defaults)
+posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSIGDEF))
+
+let rc = posix_spawn(&pid, cli, nil, &attr, argv, environ)
+posix_spawnattr_destroy(&attr)
 guard rc == 0 else {
     fputs("immich-accelerator-service: cannot start \(cli): \(String(cString: strerror(rc)))\n", stderr)
     exit(127)
-}
-
-// launchd stops the service with SIGTERM to this process; pass it on so the
-// watcher can stop the worker and ML the way it always has.
-var sources: [DispatchSourceSignal] = []
-for sig in [SIGTERM, SIGINT, SIGHUP] {
-    signal(sig, SIG_IGN)
-    let source = DispatchSource.makeSignalSource(signal: sig)
-    source.setEventHandler { kill(pid, sig) }
-    source.resume()
-    sources.append(source)
 }
 
 // Exit the way the watcher did, so launchd's KeepAlive sees what it always saw.

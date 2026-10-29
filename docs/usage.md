@@ -107,7 +107,7 @@ Real-time monitoring at `http://your-mac:8420`:
 immich-accelerator dashboard
 ```
 
-The **Library** card says whether every photo has its thumbnail, search, faces and text: complete, still processing, or missing work that nothing is queued to do. Immich never goes back for work that fell out of its queue (a Redis restart during a big import is enough), so that last state can last forever without anyone noticing. **Re-queue Missing** asks Immich to queue all of it, metadata first. With **Auto** on (the default), the accelerator does the same once a day when Immich is idle; on a complete library that queues nothing.
+The **Library** card says whether every photo has its thumbnail, search, faces and text (video transcodes are left to the job cards, since Immich's transcode policy skips some videos on purpose): complete, still processing, or missing work that nothing is queued to do. Immich never goes back for work that fell out of its queue (a Redis restart during a big import is enough), so that last state can last forever without anyone noticing. **Re-queue Missing** asks Immich to queue all of it, metadata first. With **Auto** on (the default), the accelerator does the same once a day when Immich is idle; on a complete library that queues nothing.
 
 Below it, the Apple Silicon engines show live rates and time left while they work, and step aside when everything is idle. Mobile-friendly, check from your phone.
 

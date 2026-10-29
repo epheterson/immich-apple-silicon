@@ -521,7 +521,12 @@ function renderCoverage(d) {
   for (const [key, label] of COVERAGE) {
     const p = d.progress[key];
     if (!p || !p.total) continue;
-    const active = !!(d.queue_active && d.queue_active[key]);
+    // Immich queues each stage when the one before finishes, so a stage is
+    // on its way while any stage before it is running.
+    const qa = d.queue_active || {};
+    const upstream = { thumbnails: ['metadata'], clip: ['metadata', 'thumbnails'],
+      faces: ['metadata', 'thumbnails'], ocr: ['metadata', 'thumbnails'] }[key] || [];
+    const active = !!qa[key] || upstream.some(u => qa[u]);
     const state = coverageState(p, active, known);
     drawn++;
     const missing = Math.max(p.total - p.done, 0);

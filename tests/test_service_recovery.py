@@ -2277,6 +2277,7 @@ class TestAPendingPermissionIsNamed:
 
     def test_a_watcher_with_no_worker_clears_it(self, tmp_data_dir):
         m.set_notice("media-permission", "/nas/immich")
+        m.set_paused("library-unreachable", "/nas/immich")
         # Stop at the first thing it does after starting up.
         with patch.object(m, "_start_without_worker", side_effect=KeyboardInterrupt()), \
              patch.object(m, "load_config", side_effect=KeyboardInterrupt()), \
@@ -2286,6 +2287,7 @@ class TestAPendingPermissionIsNamed:
             except KeyboardInterrupt:
                 pass
         assert m.read_notice() is None
+        assert m.read_paused() is None
 
     def test_since_is_when_it_started_not_the_last_cycle(self, tmp_data_dir):
         with patch.object(m.time, "time", return_value=100.0):
@@ -2356,12 +2358,15 @@ class TestTheServiceMovesOntoTheLauncher:
              patch.object(m, "_brew_prefix", return_value="/opt/homebrew"), \
              patch.object(m.subprocess, "Popen", **popen_kw) as popen, \
              patch.object(m.time, "sleep") as sleep, \
+             patch.object(m, "stop_all_fast") as self.stop, \
              patch.object(m, "log"):
             m._move_onto_launcher()
         return popen, sleep
 
     def test_restarts_the_brew_service_once_in_its_own_session(self, tmp_path, monkeypatch, tmp_data_dir):
         popen, sleep = self._run(tmp_path, monkeypatch)
+        # Whatever was left running comes back under the launcher too.
+        self.stop.assert_called_once()
         argv = popen.call_args.args[0]
         assert argv == ["/opt/homebrew/bin/brew", "services", "restart", "immich-accelerator"]
         assert popen.call_args.kwargs["start_new_session"] is True
@@ -2426,6 +2431,13 @@ class TestTheWatcherQueuesMissingWorkDaily:
         rq.assert_not_called()
         assert not m.AUTO_REQUEUE_FILE.exists(), "a skipped day must be retried"
 
+    def test_a_refused_stage_is_asked_again_next_cycle_not_tomorrow(self, tmp_data_dir):
+        with patch.object(m, "immich_busy", return_value=False), patch.object(
+            m, "requeue_missing", return_value={"smartSearch": "failed", "ocr": "ok"}
+        ), patch.object(m, "read_pid", return_value=4242), patch.object(m, "log"):
+            m._auto_requeue(dict(self.CFG), now=1_000_000.0)
+        assert not m.AUTO_REQUEUE_FILE.exists()
+
     def test_switched_off_means_off(self, tmp_data_dir):
         (tmp_data_dir["data_dir"] / "auto-requeue.off").touch()
         assert not self._run().called
@@ -2446,3 +2458,23 @@ class TestTheWatcherQueuesMissingWorkDaily:
 
         assert MISSING_QUEUES[0] == "metadataExtraction"
         assert MISSING_QUEUES.index("thumbnailGeneration") < MISSING_QUEUES.index("smartSearch")
+
+
+class TestImmichBusy:
+    """The daily re-queue only runs when this says False; anything it cannot
+    be sure of must come back None."""
+
+    def _busy(self, jobs):
+        from immich_accelerator import common
+
+        with patch.object(common, "_immich", return_value=jobs):
+            return common.immich_busy("http://immich", "k")
+
+    def test_an_empty_answer_is_not_idle(self):
+        assert self._busy({}) is None
+
+    def test_retries_waiting_out_a_backoff_count_as_work(self):
+        assert self._busy({"ocr": {"jobCounts": {"active": 0, "waiting": 0, "delayed": 3}}}) is True
+
+    def test_idle_is_idle(self):
+        assert self._busy({"ocr": {"jobCounts": {"active": 0, "waiting": 0, "delayed": 0}}}) is False

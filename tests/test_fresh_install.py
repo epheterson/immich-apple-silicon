@@ -1428,6 +1428,10 @@ class TestNodeVersionPreflight:
         assert "CommandLine.arguments" not in code
         assert 'appendingPathComponent("bin/immich-accelerator")' in code
         assert 'strdup("watch")' in code
+        # A stop that lands during the spawn is held, not lost; and the child
+        # gets the signals back at their defaults.
+        assert code.index("makeSignalSource") < code.index("posix_spawn(")
+        assert "POSIX_SPAWN_SETSIGDEF" in code
 
     def test_launcher_bundle_identifier_never_changes(self):
         """macOS remembers the user's Allow by this identifier. Changing it would

@@ -340,6 +340,9 @@ def get_status(config: dict) -> dict:
                     raise ValueError(f"empty response from {immich_url}/api/jobs")
                 jobs = json.loads(body)
                 queue_map = {
+                    # Not a card of its own: it tells the Library card that
+                    # work further down the pipeline is on its way.
+                    "metadataExtraction": "metadata",
                     "thumbnailGeneration": "thumbnails",
                     "smartSearch": "clip",
                     "faceDetection": "faces",
