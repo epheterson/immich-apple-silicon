@@ -213,7 +213,10 @@ final class InferenceWatchdog {
         guard age > Self.ceilingSeconds else { return }
         FileHandle.standardError.write(Data(
             "[native-ml] an inference call has not returned in \(Int(age))s (\(inFlight) in flight); exiting so the service restarts\n".utf8))
-        exit(75)   // EX_TEMPFAIL
+        // _exit, not exit: exit runs atexit handlers and C++ static
+        // destructors, MLX's among them, while a thread may be stuck inside
+        // Metal, which is the state this exists to escape.
+        _exit(75)   // EX_TEMPFAIL
     }
 }
 
