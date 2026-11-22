@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.18.1 - 2026-11-22
+
+### Fixed
+- **An inference call that never returns no longer stalls the ML service silently.** Every running /predict holds one of four slots, and nothing could take one back from a call that never came back: four of them and the service answered no inference at all, while its health check stayed green, so nothing restarted it. The native engine now exits when an inference call runs past 5 minutes, and the accelerator starts a fresh one within seconds; Immich retries the jobs that were cut off. A first-use model download does not count against the limit. On one M6 under macOS 27.0.1, Apple Vision text recognition never returned while CLIP was running. Thanks to @Funnytaoz for the detailed report and reproduction (#204).
+
 ## 1.18.0 - 2026-10-28
 
 ### Fixed

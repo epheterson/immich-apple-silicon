@@ -107,6 +107,7 @@ private final class Conn {
 
 func startServer(port: UInt16, models: Models, maxConcurrent: Int = 4) {
     let sem = DispatchSemaphore(value: maxConcurrent)
+    InferenceWatchdog.shared.start()
     let listener = try! NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: port)!)
     // NWListener reports a bind failure asynchronously through this handler, it
     // does not throw from the initializer. Without a handler the failure is
@@ -151,6 +152,69 @@ func startServer(port: UInt16, models: Models, maxConcurrent: Int = 4) {
         readRequest(conn, buffer: Data(), models: models, sem: sem)
     }
     listener.start(queue: .global())
+}
+
+// A /predict that never returns keeps its slot of the semaphore above forever.
+// Four of them and the service answers no inference at all, while /ping and
+// /health, which skip the semaphore, go on answering, so the supervisor sees a
+// healthy process and never restarts it. Reported in #204: Vision text
+// recognition calls that never came back while MLX work was in flight (M6,
+// macOS 27.0.1) stalled the service with nothing logged.
+//
+// No inference here is ever cancelled in place: a thread stuck inside Vision or
+// Metal cannot be got back. So past a ceiling the process exits and the
+// supervisor starts a fresh one, and Immich retries the jobs whose connections
+// dropped. The ceiling is far above any real request (a cold OCR start is
+// about 30 s) and a model download does not count against it, because a
+// first-use fetch legitimately holds a request for minutes.
+final class InferenceWatchdog {
+    static let shared = InferenceWatchdog()
+    static let ceilingSeconds: Double =
+        ProcessInfo.processInfo.environment["ML_STUCK_SECONDS"].flatMap(Double.init) ?? 300
+
+    private let lock = NSLock()
+    private var started: [UInt64: UInt64] = [:]   // token -> uptime ns
+    private var next: UInt64 = 0
+    private var lastFetch: UInt64 = 0
+    private var timer: DispatchSourceTimer?
+
+    func begin() -> UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        next += 1
+        started[next] = DispatchTime.now().uptimeNanoseconds
+        return next
+    }
+
+    func end(_ token: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        started[token] = nil
+    }
+
+    func start() {
+        let t = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        let every = min(15, max(1, Self.ceilingSeconds / 4))
+        t.schedule(deadline: .now() + every, repeating: every)
+        t.setEventHandler { [weak self] in self?.check() }
+        t.resume()
+        timer = t
+    }
+
+    private func check() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        if ZooCLIP.fetchProgress != nil { lastFetch = now }
+        // A request is timed from its start or from the end of the last
+        // download, whichever is later, so time spent fetching never counts.
+        let oldest = started.values.map { max($0, lastFetch) }.min()
+        let inFlight = started.count
+        lock.unlock()
+        guard let oldest else { return }
+        let age = Double(now - oldest) / 1e9
+        guard age > Self.ceilingSeconds else { return }
+        FileHandle.standardError.write(Data(
+            "[native-ml] an inference call has not returned in \(Int(age))s (\(inFlight) in flight); exiting so the service restarts\n".utf8))
+        exit(75)   // EX_TEMPFAIL
+    }
 }
 
 private func readRequest(_ conn: Conn, buffer: Data, models: Models, sem: DispatchSemaphore) {
@@ -307,6 +371,8 @@ private func handle(_ conn: Conn, method: String, path: String, ctype: String, b
         let image = extractPart(body, boundary: boundary, name: "image")
         let text = extractPart(body, boundary: boundary, name: "text").flatMap { String(data: $0, encoding: .utf8) }
         do {
+            let token = InferenceWatchdog.shared.begin()
+            defer { InferenceWatchdog.shared.end(token) }
             let response = try processPredict(entries: entries, imageData: image, text: text, models: models)
             respondJSON(conn, status: "200 OK", object: response)
         } catch let e as PredictError {
