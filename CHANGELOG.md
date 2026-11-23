@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.18.2 - 2026-11-22
+
+### Fixed
+- **1.18.1 reaches Homebrew.** Its release build could not install the pinned mlx on the build machine's newer Python, so `brew upgrade` stayed on 1.18.0. This release carries the 1.18.1 fix unchanged.
+
 ## 1.18.1 - 2026-11-22
 
 ### Fixed
