@@ -427,6 +427,24 @@ final class ZooCLIP {
         progressLock.lock(); _progress = p; progressLock.unlock()
     }
 
+    // Every fetch in flight, reported or not. /health advertises only the large
+    // ones, but the inference watchdog must not count any download as a stuck
+    // call: the base ONNX towers alone can take minutes on a slow connection.
+    nonisolated(unsafe) private static var _fetching = 0
+
+    static var fetching: Bool {
+        progressLock.lock(); defer { progressLock.unlock() }
+        return _fetching > 0 || _progress != nil
+    }
+
+    static func trackFetch() {
+        progressLock.lock(); _fetching += 1; progressLock.unlock()
+    }
+
+    static func untrackFetch() {
+        progressLock.lock(); _fetching -= 1; progressLock.unlock()
+    }
+
     static func holdsNoFiles(_ dir: URL) -> Bool {
         guard let walk = FileManager.default.enumerator(
             at: dir, includingPropertiesForKeys: [.isRegularFileKey]) else { return true }
@@ -450,6 +468,8 @@ final class ZooCLIP {
         // the external-data pass is the one measured in gigabytes.
         let reportable = all.count > base.count
         var completed = 0
+        trackFetch()
+        defer { untrackFetch() }
         if reportable { setProgress(FetchProgress(model: name, done: 0, total: all.count)) }
         defer { if reportable { setProgress(nil) } }
 

@@ -169,8 +169,13 @@ func startServer(port: UInt16, models: Models, maxConcurrent: Int = 4) {
 // first-use fetch legitimately holds a request for minutes.
 final class InferenceWatchdog {
     static let shared = InferenceWatchdog()
-    static let ceilingSeconds: Double =
-        ProcessInfo.processInfo.environment["ML_STUCK_SECONDS"].flatMap(Double.init) ?? 300
+    static let ceilingSeconds: Double = {
+        // A testing knob. Anything that is not a positive, finite number of
+        // seconds would either never trip or trip on every request.
+        let v = ProcessInfo.processInfo.environment["ML_STUCK_SECONDS"].flatMap(Double.init)
+        if let v, v.isFinite, v > 0 { return v }
+        return 300
+    }()
 
     private let lock = NSLock()
     private var started: [UInt64: UInt64] = [:]   // token -> uptime ns
@@ -200,9 +205,12 @@ final class InferenceWatchdog {
     }
 
     private func check() {
-        let now = DispatchTime.now().uptimeNanoseconds
+        let fetching = ZooCLIP.fetching
         lock.lock()
-        if ZooCLIP.fetchProgress != nil { lastFetch = now }
+        // Read under the lock: a request that began after an earlier reading
+        // would be newer than `now`, and the unsigned subtraction below traps.
+        let now = DispatchTime.now().uptimeNanoseconds
+        if fetching { lastFetch = now }
         // A request is timed from its start or from the end of the last
         // download, whichever is later, so time spent fetching never counts.
         let oldest = started.values.map { max($0, lastFetch) }.min()
