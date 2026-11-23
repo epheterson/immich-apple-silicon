@@ -24,9 +24,15 @@ jobs:
       - name: onnxruntime
         run: brew install onnxruntime
 
+      # mlx 0.31.1 has no wheel for the runner's default Python any more, so
+      # the metallib comes from a pinned one, as in ci.yml.
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
       - name: metallib matching mlx-swift 0.31.6
         run: |
-          pip3 install --break-system-packages "mlx==0.31.1" || pip3 install "mlx==0.31.1"
+          python3 -m pip install "mlx==0.31.1"
           # mlx 0.31.1 splits into namespace packages (mlx + mlx-metal), so
           # mlx.__file__ is None; find the metallib under mlx.__path__ instead.
           MLX_DIR="$(python3 -c 'import mlx; print(list(mlx.__path__)[0])')"

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.18.2 - 2026-11-22
+
+### Fixed
+- **1.18.1 reaches Homebrew.** Its release build could not install the pinned mlx on the build machine's newer Python, so `brew upgrade` stayed on 1.18.0. This release carries the 1.18.1 fix unchanged.
+
+### Changed
+- **The bundled Python ML service is synced with upstream immich-ml-metal**, which stops tracking two stray `.DS_Store` files. No behavior change (#203).
+
 ## 1.18.1 - 2026-11-22
 
 ### Fixed
