@@ -11,9 +11,10 @@ name: Upstream sync check
 #   3. Merge to fork main, bump the `ml` submodule, release.
 #
 # Standing patches we always carry forward (must survive every sync):
-#   - mlx>=0.22.0,<0.31.2  (0.31.1 is the last known-good; 0.31.2 through 0.32.2
-#     hard-crash CLIP inference, #38 / #103). Re-test any lift with the real-model
-#     gate scripts/ml-preflight.py, never a proxy/STUB_MODE test.
+#   - an exact mlx pin (mlx==X.Y.Z), gate-tested with scripts/ml-preflight.py,
+#     never a proxy/STUB_MODE test (#38 / #103).
+#   - src/mlx_thread.py: every MLX call on one thread. mlx 0.31.2+ streams are
+#     per-thread, and without it CLIP fails with "There is no Stream(...)".
 
 on:
   schedule:
@@ -105,7 +106,8 @@ jobs:
           3. Merge to fork \`main\`, bump the \`ml\` submodule here, cut a release.
 
           Standing patches to carry forward every sync:
-          - \`mlx>=0.22.0,<0.31.2\` (#38, #103; CLIP threading crash, every release from 0.31.2 through 0.32.2 gate-tested bad)
+          - An exact, gate-tested \`mlx==X.Y.Z\` pin (#38, #103).
+          - \`src/mlx_thread.py\`: every MLX call on one thread. mlx 0.31.2+ streams are per-thread; without it CLIP fails with \`There is no Stream(...)\`.
 
           _Opened automatically by the weekly upstream-sync check; updates in place until synced._
           EOF
@@ -122,21 +124,18 @@ jobs:
           fi
 
   mlx-pin:
-    # Notify when an mlx newer than the latest KNOWN-BAD (0.32.2) ships, so we
-    # re-test before allowing it. Both 0.31.2 (gpu stream) and 0.32.0 (cpu stream)
-    # hard-crash real CLIP inference in the worker thread pool with "There is no
-    # Stream(...)" (#38, #103). The pin is `mlx>=0.22.0,<0.31.2` (0.31.1, the last
-    # known-good). A re-test MUST run the real /predict service via
-    # scripts/ml-preflight.py, not a proxy: both bad versions pass image_encoder
-    # and STUB_MODE tests yet crash the real service (that is what shipped the
-    # v1.5.29 regression).
+    # Notify when an mlx newer than the pinned one ships, so we gate-test it and
+    # move the pin. The ml fork pins an exact mlx; a new one is allowed only
+    # after the real /predict service passes scripts/ml-preflight.py. Proxy
+    # tests (image_encoder, STUB_MODE) passed on 0.31.2 and 0.32.0 while the
+    # real service crashed (#38, #103; the v1.5.29 regression).
     runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: write # open or update the tracking issue
     env:
-      LATEST_BAD: "0.32.2" # newest mlx gate-tested and found to crash; nag only for something newer
-      MLX_TITLE: "mlx > 0.32.2 is available, re-test the CLIP pin (#38, #103)"
+      MLX_PINNED: "0.32.5" # the pinned mlx (ml/requirements.txt); nag only for something newer
+      MLX_TITLE: "A newer mlx is available, gate-test it and move the pin"
     steps:
       - name: Check PyPI for mlx newer than the latest known-bad
         id: mlx
@@ -145,10 +144,10 @@ jobs:
           python3 -m pip install --quiet --disable-pip-version-check packaging
           # Python fetches PyPI itself (urllib); don't pipe curl into `python3 -`
           # with a heredoc, the pipe and the heredoc both claim stdin.
-          NEWER="$(LATEST_BAD="$LATEST_BAD" python3 <<'PY'
+          NEWER="$(MLX_PINNED="$MLX_PINNED" python3 <<'PY'
           import json, os, time, urllib.request
           from packaging.version import Version
-          latest_bad = Version(os.environ["LATEST_BAD"])
+          pinned = Version(os.environ["MLX_PINNED"])
           # PyPI occasionally resets the TLS handshake from CI runners; retry so a
           # transient blip doesn't fail the weekly check.
           for attempt in range(4):
@@ -168,7 +167,7 @@ jobs:
                   v = Version(ver)
               except Exception:
                   continue
-              if v > latest_bad and not v.is_prerelease:
+              if v > pinned and not v.is_prerelease:
                   newer.append(v)
           newer.sort()
           print(newer[-1] if newer else "")
@@ -176,9 +175,9 @@ jobs:
           )"
           echo "newer=$NEWER" >> "$GITHUB_OUTPUT"
           if [ -n "$NEWER" ]; then
-            echo "⚠️  mlx $NEWER is available (> $LATEST_BAD); pin re-test warranted."
+            echo "⚠️  mlx $NEWER is available (> $MLX_PINNED); pin re-test warranted."
           else
-            echo "✅ No mlx > $LATEST_BAD yet. Pin stands."
+            echo "✅ No mlx > $MLX_PINNED yet. Pin stands."
           fi
 
       - name: Open or update pin re-test issue
@@ -190,15 +189,15 @@ jobs:
         run: |
           set -euo pipefail
           BODY="$(cat <<EOF
-          A newer mlx than the latest known-bad is on PyPI: **$NEWER** (we pin \`mlx>=0.22.0,<0.31.2\`, i.e. 0.31.1; #38, #103).
+          A newer mlx than the pinned $MLX_PINNED is on PyPI: **$NEWER** (#38, #103).
 
-          Both \`mlx==0.31.2\` (\`Stream(gpu, 0)\`) and \`mlx==0.32.0\` (\`Stream(cpu, 1)\`) hard-crash real CLIP inference in the worker thread pool. **Do NOT lift the pin on a proxy test** — a \`STUB_MODE\` test or a bare \`mlx_clip.image_encoder\` loop passes on both bad versions; only the real service crashes (this is what shipped the v1.5.29 regression, #103).
+          **Do NOT move the pin on a proxy test.** A \`STUB_MODE\` test or a bare \`mlx_clip.image_encoder\` loop passed on 0.31.2 and 0.32.0 while the real service crashed (the v1.5.29 regression, #103).
 
           Re-test **$NEWER** with the real-model gate on Apple Silicon:
 
           1. Build a full ml venv (fork \`requirements.txt\`) with \`mlx==$NEWER\` \`mlx-metal==$NEWER\`.
           2. \`python3 scripts/ml-preflight.py --python <venv>/bin/python3 --src <immich-ml-metal checkout>\` — it boots the real service (\`STUB_MODE=false\`) and hammers \`/predict\` with concurrent CLIP inference.
-          3. **Pass = exit 0, service alive, no \`Stream(...)\` abort.** Only then bump the pin in the ml fork \`requirements.txt\` and re-sync the submodule.
+          3. **Pass = exit 0, service alive, no \`Stream(...)\` abort.** Only then bump the pin in the ml fork \`requirements.txt\`, raise \`MLX_PINNED\` in this workflow to match, and re-sync the submodule.
 
           _Opened automatically by the weekly mlx-pin check; updates in place until resolved._
           EOF

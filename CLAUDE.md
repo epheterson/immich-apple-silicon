@@ -25,7 +25,7 @@
 
 Any change to the mlx pin or the `ml` submodule MUST pass `scripts/ml-preflight.py` on real Apple Silicon before merge. The gate boots the actual ML service with `STUB_MODE=false` and hammers `/predict` with real concurrent CLIP inference, then detects the SIGABRT.
 
-A green unit test, a `STUB_MODE=true` test (the fork's own `test_predict.py`), or a bare `mlx_clip.image_encoder` loop is **NOT** sufficient and does **NOT** count as validation. mlx 0.31.2 (gpu-stream) and 0.32.0 (cpu-stream) both pass those proxies yet hard-crash the real `/predict` service (#38, #103). Proxy validation is exactly how a bad pin shipped once already. Run the real gate, or do not ship the change.
+A green unit test, a `STUB_MODE=true` test (the fork's own `test_predict.py`), or a bare `mlx_clip.image_encoder` loop is **NOT** sufficient and does **NOT** count as validation. mlx 0.31.2 (gpu-stream) and 0.32.0 (cpu-stream) both pass those proxies yet hard-crash the real `/predict` service (#38, #103). Proxy validation is exactly how a bad pin shipped once already. Run the real gate, or do not ship the change. Since 1.18.3 every MLX call runs on one thread (`ml/src/mlx_thread.py`), which is what makes mlx 0.31.2+ work; keep any new MLX call on it.
 
 ## Immich compatibility
 
