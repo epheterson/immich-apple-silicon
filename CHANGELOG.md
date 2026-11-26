@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.18.3 - 2026-11-26
+
+### Changed
+- **The Python ML engine runs the current mlx (0.32.5) instead of 0.31.1.** From 0.31.2 on, mlx ties its GPU streams to the thread that created them, and the service loaded the CLIP model on one thread and ran it on others, so every newer mlx crashed CLIP with "There is no Stream(...)". All MLX work now runs on one thread. Search embeddings are unchanged (#188). The native engine, the default, is not affected.
+
 ## 1.18.2 - 2026-11-22
 
 ### Fixed
